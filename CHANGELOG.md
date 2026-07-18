@@ -1,5 +1,14 @@
 # Changelog
 
+## Phase 3 - 精确编辑与项目探索
+
+- 增加共享 `RepositoryIndex`，复用 Git NUL 文件索引与标准 ignore/exclude 语义。
+- 增加 `search_code`、`list_directory` 和精确匹配 `edit_file`。
+- `edit_file` 保留文件权限和 CRLF/LF 风格，原子写入前生成 unified diff 与增删统计。
+- 普通目录或 Git 故障时使用受限文件系统遍历，继续保持稳定排序和符号链接边界。
+
+兼容性：新增三个内置工具；protocol v1 与配置 schema 版本保持不变。
+
 ## Phase 2 - 工具调用闭环
 
 - 增加 `ToolRegistry`、统一 `ToolExecutor`、基线权限检查、确认回调和结构化审计。

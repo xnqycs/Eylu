@@ -56,29 +56,36 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return toolError(statErr.Error())
 	}
+	if err := writeFileAtomically(path, []byte(input.Content), mode); err != nil {
+		return toolError(err.Error())
+	}
+	return protocol.ToolResult{Content: fmt.Sprintf("wrote %d bytes to %s", len([]byte(input.Content)), input.Path), Metadata: map[string]any{"path": path, "bytes": len([]byte(input.Content))}}
+}
+
+func writeFileAtomically(path string, content []byte, mode os.FileMode) error {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".eylu-write-*.tmp")
 	if err != nil {
-		return toolError(err.Error())
+		return err
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
 	if err := temporary.Chmod(mode); err != nil {
 		temporary.Close()
-		return toolError(err.Error())
+		return err
 	}
-	if _, err := temporary.WriteString(input.Content); err != nil {
+	if _, err := temporary.Write(content); err != nil {
 		temporary.Close()
-		return toolError(err.Error())
+		return err
 	}
 	if err := temporary.Sync(); err != nil {
 		temporary.Close()
-		return toolError(err.Error())
+		return err
 	}
 	if err := temporary.Close(); err != nil {
-		return toolError(err.Error())
+		return err
 	}
 	if err := replaceAtomically(temporaryPath, path); err != nil {
-		return toolError(err.Error())
+		return err
 	}
-	return protocol.ToolResult{Content: fmt.Sprintf("wrote %d bytes to %s", len([]byte(input.Content)), input.Path), Metadata: map[string]any{"path": path, "bytes": len([]byte(input.Content))}}
+	return nil
 }

@@ -71,7 +71,7 @@ func TestChatToolLoopReadsAndBuilds(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		switch number {
 		case 1:
-			if len(body["tools"].([]any)) != 3 {
+			if len(body["tools"].([]any)) != 6 {
 				t.Fatalf("tools = %#v", body["tools"])
 			}
 			writeResponsesCompleted(w, `{"id":"resp_1","output":[{"type":"function_call","id":"fc_1","call_id":"call-read","name":"read_file","arguments":"{\"path\":\"main.go\"}"}]}`)

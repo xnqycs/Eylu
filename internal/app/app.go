@@ -208,8 +208,18 @@ func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions) (*tool.Execu
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize bash", Cause: err}
 	}
+	editFile, err := tool.NewEditFile(cfg.Workspace, int64(cfg.MaxReadBytes))
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize edit_file", Cause: err}
+	}
+	index, err := tool.NewRepositoryIndex(cfg.Workspace)
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize repository index", Cause: err}
+	}
+	searchCode := tool.NewSearchCode(index, cfg.MaxSearchResults, int64(cfg.MaxReadBytes))
+	listDirectory := tool.NewListDirectory(index, cfg.MaxSearchResults*10)
 	return &tool.Executor{
-		Registry: tool.NewRegistry(readFile, writeFile, bashTool), Policy: policy.BaselineChecker{},
+		Registry: tool.NewRegistry(readFile, writeFile, bashTool, editFile, searchCode, listDirectory), Policy: policy.BaselineChecker{},
 		Confirm: r.confirmTools(opts.approve), Audit: &toolAuditWriter{writer: r.stderr}, Workspace: cfg.Workspace,
 		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
 	}, nil
