@@ -14,19 +14,23 @@ import (
 type ConfirmFunc func(context.Context, policy.Request, policy.Outcome) (bool, error)
 
 type AuditRecord struct {
-	RequestID   string          `json:"request_id"`
-	CallID      string          `json:"call_id"`
-	Tool        string          `json:"tool"`
-	Risk        policy.Risk     `json:"risk"`
-	Decision    policy.Decision `json:"decision"`
-	Reason      string          `json:"reason"`
-	Confirmed   bool            `json:"confirmed"`
-	DurationMS  int64           `json:"duration_ms"`
-	IsError     bool            `json:"is_error"`
-	Truncated   bool            `json:"truncated"`
-	InputBytes  int             `json:"input_bytes"`
-	OutputBytes int             `json:"output_bytes"`
-	ExitCode    int             `json:"exit_code,omitempty"`
+	RequestID      string              `json:"request_id"`
+	CallID         string              `json:"call_id"`
+	Tool           string              `json:"tool"`
+	Risk           policy.Risk         `json:"risk"`
+	Decision       policy.Decision     `json:"decision"`
+	Reason         string              `json:"reason"`
+	Confirmed      bool                `json:"confirmed"`
+	DurationMS     int64               `json:"duration_ms"`
+	IsError        bool                `json:"is_error"`
+	Truncated      bool                `json:"truncated"`
+	InputBytes     int                 `json:"input_bytes"`
+	OutputBytes    int                 `json:"output_bytes"`
+	ExitCode       int                 `json:"exit_code,omitempty"`
+	Mode           string              `json:"mode"`
+	Classification policy.CommandClass `json:"classification"`
+	Confirmations  int                 `json:"confirmations"`
+	Warning        bool                `json:"warning"`
 }
 
 type AuditSink interface {
@@ -91,6 +95,7 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 	policyRequest := policy.Request{Tool: call.Name, Input: call.Arguments, Workspace: e.Workspace, Risk: item.Risk()}
 	outcome := checker.Check(ctx, policyRequest)
 	record.Risk, record.Decision, record.Reason = outcome.Risk, outcome.Decision, outcome.Reason
+	record.Mode, record.Classification, record.Warning = outcome.Mode.String(), outcome.Classification, outcome.Warning
 	switch outcome.Decision {
 	case policy.DecisionDeny:
 		result.IsError = true
@@ -102,16 +107,25 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 			result.Content = "confirmation required: " + outcome.Reason
 			return result
 		}
-		allowed, err := e.Confirm(ctx, policyRequest, outcome)
-		if err != nil {
-			result.IsError = true
-			result.Content = "confirmation failed: " + err.Error()
-			return result
+		confirmations := outcome.Confirmations
+		if confirmations <= 0 {
+			confirmations = 1
 		}
-		if !allowed {
-			result.IsError = true
-			result.Content = "confirmation rejected"
-			return result
+		for step := 1; step <= confirmations; step++ {
+			policyRequest.ConfirmationStep = step
+			policyRequest.ConfirmationTotal = confirmations
+			allowed, err := e.Confirm(ctx, policyRequest, outcome)
+			if err != nil {
+				result.IsError = true
+				result.Content = "confirmation failed: " + err.Error()
+				return result
+			}
+			if !allowed {
+				result.IsError = true
+				result.Content = fmt.Sprintf("confirmation rejected at step %d of %d", step, confirmations)
+				return result
+			}
+			record.Confirmations++
 		}
 		record.Confirmed = true
 	}

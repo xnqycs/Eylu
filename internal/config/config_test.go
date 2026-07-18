@@ -82,6 +82,19 @@ func TestValidateProvider(t *testing.T) {
 	}
 }
 
+func TestValidatePermissionModeAndClonePolicyLists(t *testing.T) {
+	cfg := Default(t.TempDir())
+	clone := cfg.Clone()
+	clone.AutoAllowCommands[0] = "changed"
+	if cfg.AutoAllowCommands[0] == "changed" {
+		t.Fatal("Clone shares policy command slices")
+	}
+	cfg.PermissionMode = "unsafe"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid permission mode error")
+	}
+}
+
 func validProvider(baseURL, model string) ProviderConfig {
 	return ProviderConfig{
 		Adapter: "openai_responses", BaseURL: baseURL, Model: model, TimeoutSeconds: 30,

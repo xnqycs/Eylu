@@ -14,6 +14,7 @@ import (
 
 	"Eylu/internal/agent"
 	contextledger "Eylu/internal/context"
+	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 )
@@ -97,7 +98,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	command := fields[0]
 	switch command {
 	case "/help":
-		fmt.Fprintln(r.stdout, "/new  /context  /providers  /provider add|edit|delete|use  /model [id]  /quit")
+		fmt.Fprintln(r.stdout, "/new  /context  /providers  /provider add|edit|delete|use  /model [id]  /mode manual|plan|auto|full  /quit")
 		return nil
 	case "/quit":
 		return errQuit
@@ -114,6 +115,17 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		return r.handleProviderSlash(ctx, reader, fields, manager, opts)
 	case "/model":
 		return r.handleModelSlash(ctx, fields, manager)
+	case "/mode":
+		if len(fields) != 2 {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /mode manual|plan|auto|full"}
+		}
+		mode, err := policy.ParseMode(fields[1])
+		if err != nil {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		}
+		opts.mode = mode.String()
+		fmt.Fprintf(r.stdout, "Permission mode: %s\n", opts.mode)
+		return nil
 	default:
 		return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("unknown command %s", command)}
 	}

@@ -1,5 +1,15 @@
 # Changelog
 
+## Phase 4 - 安全与四种权限模式
+
+- 增加 `manual`、`plan`、`auto`、`full` 本地权限矩阵及 `--mode`、`/mode` 热切换。
+- 增加链式命令分类、重定向/命令替换防绕过、白名单、阻止规则与高危模式。
+- 高危操作支持多重确认和醒目 warning；Plan 模式将拒绝结果作为 tool result 回传模型。
+- Windows 使用 Job Object、Unix 使用进程组，取消时回收整个命令子进程树。
+- 工具审计增加模式、命令分类、确认次数、warning、耗时和退出码。
+
+配置：新增命令策略列表和 `shell_environment` 白名单；默认权限模式保持 `manual`。
+
 ## Phase 3 - 精确编辑与项目探索
 
 - 增加共享 `RepositoryIndex`，复用 Git NUL 文件索引与标准 ignore/exclude 语义。

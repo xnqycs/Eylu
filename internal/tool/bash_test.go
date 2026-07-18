@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,7 +41,31 @@ func TestBashHelperProcess(t *testing.T) {
 		fmt.Fprint(os.Stdout, strings.Repeat("x", 200))
 	case "sleep":
 		time.Sleep(time.Second)
+	default:
+		if strings.HasPrefix(os.Args[separator+1], "tree|") {
+			marker := strings.TrimPrefix(os.Args[separator+1], "tree|")
+			time.Sleep(50 * time.Millisecond)
+			child := exec.Command(os.Args[0], "-test.run=TestBashTreeChildProcess", "--", marker)
+			_ = child.Start()
+			time.Sleep(time.Second)
+		}
 	}
+	os.Exit(0)
+}
+
+func TestBashTreeChildProcess(t *testing.T) {
+	separator := -1
+	for index, arg := range os.Args {
+		if arg == "--" {
+			separator = index
+			break
+		}
+	}
+	if separator < 0 || separator+1 >= len(os.Args) {
+		return
+	}
+	time.Sleep(400 * time.Millisecond)
+	_ = os.WriteFile(os.Args[separator+1], []byte("survived"), 0o600)
 	os.Exit(0)
 }
 
@@ -66,5 +91,24 @@ func TestBashResultTimeoutAndTruncation(t *testing.T) {
 	result = bashTool.Execute(ctx, json.RawMessage(`{"command":"sleep"}`))
 	if !result.IsError || !strings.Contains(result.Content, "cancelled") {
 		t.Fatalf("cancel = %#v", result)
+	}
+}
+
+func TestBashCancellationKillsProcessTree(t *testing.T) {
+	workspace := t.TempDir()
+	marker := filepath.Join(workspace, "child-survived")
+	bashTool, err := NewBash(workspace, 1024, helperShell{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	result := bashTool.Execute(ctx, mustJSON(t, map[string]any{"command": "tree|" + marker}))
+	if !result.IsError || !strings.Contains(result.Content, "cancelled") {
+		t.Fatalf("result = %#v", result)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("child process survived cancellation: %v", err)
 	}
 }

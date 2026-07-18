@@ -81,6 +81,7 @@ type chatOptions struct {
 	adapter  string
 	timeout  time.Duration
 	approve  bool
+	mode     string
 }
 
 func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
@@ -115,6 +116,7 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().StringVar(&opts.adapter, "adapter", openai_responses.Name, "model driver adapter")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 0, "request timeout")
 	cmd.Flags().BoolVarP(&opts.approve, "yes", "y", false, "approve tools that require confirmation")
+	cmd.Flags().StringVar(&opts.mode, "mode", "", "permission mode: manual, plan, auto, or full")
 	return cmd
 }
 
@@ -158,6 +160,15 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return err
 	}
 	cfg := manager.Config()
+	modeName := cfg.PermissionMode
+	if opts.mode != "" {
+		modeName = opts.mode
+	}
+	mode, err := policy.ParseMode(modeName)
+	if err != nil {
+		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+	}
+	modelRuntime.PermissionMode = mode.String()
 	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
@@ -208,6 +219,7 @@ func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions) (*tool.Execu
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize bash", Cause: err}
 	}
+	bashTool.AllowEnvironment(cfg.ShellEnvironment)
 	editFile, err := tool.NewEditFile(cfg.Workspace, int64(cfg.MaxReadBytes))
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize edit_file", Cause: err}
@@ -218,8 +230,17 @@ func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions) (*tool.Execu
 	}
 	searchCode := tool.NewSearchCode(index, cfg.MaxSearchResults, int64(cfg.MaxReadBytes))
 	listDirectory := tool.NewListDirectory(index, cfg.MaxSearchResults*10)
+	modeName := cfg.PermissionMode
+	if opts.mode != "" {
+		modeName = opts.mode
+	}
+	mode, err := policy.ParseMode(modeName)
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+	}
+	checker := policy.NewChecker(policy.Config{Mode: mode, ReadOnlyCommands: cfg.ReadOnlyCommands, AutoAllowCommands: cfg.AutoAllowCommands, DangerousPatterns: cfg.DangerousCommands, BlockedPatterns: cfg.BlockedCommands})
 	return &tool.Executor{
-		Registry: tool.NewRegistry(readFile, writeFile, bashTool, editFile, searchCode, listDirectory), Policy: policy.BaselineChecker{},
+		Registry: tool.NewRegistry(readFile, writeFile, bashTool, editFile, searchCode, listDirectory), Policy: checker,
 		Confirm: r.confirmTools(opts.approve), Audit: &toolAuditWriter{writer: r.stderr}, Workspace: cfg.Workspace,
 		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
 	}, nil
@@ -241,7 +262,11 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 		if len(preview) > 512 {
 			preview = preview[:512] + "..."
 		}
-		fmt.Fprintf(r.stderr, "Approve %s tool %s? %s\n%s\n[y/N]: ", outcome.Risk, request.Tool, outcome.Reason, preview)
+		label := "CONFIRM"
+		if outcome.Warning {
+			label = "DANGER"
+		}
+		fmt.Fprintf(r.stderr, "%s [%d/%d] approve %s tool %s? %s\n%s\n[y/N]: ", label, request.ConfirmationStep, request.ConfirmationTotal, outcome.Risk, request.Tool, outcome.Reason, preview)
 		answer, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return false, err

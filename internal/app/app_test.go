@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,6 +12,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"Eylu/internal/agent"
+	"Eylu/internal/config"
+	"Eylu/internal/provider"
 )
 
 func TestChatEndToEnd(t *testing.T) {
@@ -126,5 +131,27 @@ func TestChatMissingProviderIsStructured(t *testing.T) {
 	}, strings.NewReader(""), &stdout, &stderr)
 	if code != exitConfig || !strings.Contains(stderr.String(), `"code":"config_error"`) {
 		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestModeSlashCommand(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.Default(workspace)
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, credentials: provider.NewCredentialStore()}
+	conversation := agent.NewConversation()
+	opts := chatOptions{}
+	if err := runtime.handleSlashCommand(context.Background(), bufio.NewReader(strings.NewReader("")), "/mode plan", conversation, manager, &opts); err != nil {
+		t.Fatal(err)
+	}
+	if opts.mode != "plan" || !strings.Contains(stdout.String(), "Permission mode: plan") {
+		t.Fatalf("opts = %#v, stdout = %q", opts, stdout.String())
+	}
+	if err := runtime.handleSlashCommand(context.Background(), bufio.NewReader(strings.NewReader("")), "/mode unsafe", conversation, manager, &opts); err == nil {
+		t.Fatal("expected invalid mode error")
 	}
 }

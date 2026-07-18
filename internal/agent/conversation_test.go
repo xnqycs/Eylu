@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,6 +112,29 @@ func TestConversationCancellation(t *testing.T) {
 	_, err := conversation.Send(ctx, "wait", testRuntime(fake, 1), true, nil)
 	if typed, ok := err.(*protocol.Error); !ok || typed.Code != protocol.ErrCancelled {
 		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestConversationModeChangesPromptAndClearsDriverState(t *testing.T) {
+	fake := &scriptedDriver{}
+	conversation := NewConversation()
+	runtime := testRuntime(fake, 1)
+	runtime.PermissionMode = "plan"
+	if _, err := conversation.Send(context.Background(), "plan it", runtime, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.requests[0].Model.Turns[0].Parts[0].Text; !strings.Contains(got, "Current permission mode: plan") || !strings.Contains(got, "modification plan") {
+		t.Fatalf("plan prompt = %q", got)
+	}
+	runtime.PermissionMode = "auto"
+	if _, err := conversation.Send(context.Background(), "execute it", runtime, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.requests[1].Model.DriverState) != 0 {
+		t.Fatal("driver state survived mode change")
+	}
+	if got := fake.requests[1].Model.Turns[0].Parts[0].Text; !strings.Contains(got, "Current permission mode: auto") {
+		t.Fatalf("auto prompt = %q", got)
 	}
 }
 

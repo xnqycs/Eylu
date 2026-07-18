@@ -39,6 +39,11 @@ type Bash struct {
 	workspace      string
 	shell          ShellAdapter
 	maxOutputBytes int
+	environment    []string
+}
+
+func (b *Bash) AllowEnvironment(names []string) {
+	b.environment = append([]string(nil), names...)
 }
 
 func NewBash(workspace string, maxOutputBytes int, shell ShellAdapter) (*Bash, error) {
@@ -90,12 +95,12 @@ func (b *Bash) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolRe
 	}
 	command := b.shell.Command(ctx, input.Command)
 	command.Dir = workingDirectory
-	command.Env = minimalEnvironment()
+	command.Env = minimalEnvironment(b.environment...)
 	stdout := &cappedBuffer{limit: b.maxOutputBytes}
 	stderr := &cappedBuffer{limit: b.maxOutputBytes}
 	command.Stdout = stdout
 	command.Stderr = stderr
-	err := command.Run()
+	err := runCommandTree(ctx, command)
 	exitCode := 0
 	if err != nil {
 		if ctx.Err() != nil {
@@ -158,11 +163,17 @@ func defaultShell() ShellAdapter {
 	return commandShell{name: "sh", path: "/bin/sh", args: []string{"-lc"}}
 }
 
-func minimalEnvironment() []string {
+func minimalEnvironment(extra ...string) []string {
 	allowed := map[string]struct{}{
 		"PATH": {}, "HOME": {}, "USERPROFILE": {}, "TEMP": {}, "TMP": {}, "SYSTEMROOT": {}, "COMSPEC": {}, "PATHEXT": {},
 		"LOCALAPPDATA": {}, "APPDATA": {}, "XDG_CACHE_HOME": {}, "LANG": {}, "LC_ALL": {}, "TERM": {}, "NO_COLOR": {},
 		"GOPATH": {}, "GOROOT": {}, "GOCACHE": {}, "GOENV": {}, "GOMODCACHE": {},
+	}
+	for _, name := range extra {
+		name = strings.ToUpper(strings.TrimSpace(name))
+		if name != "" {
+			allowed[name] = struct{}{}
+		}
 	}
 	values := make(map[string]string)
 	for _, item := range os.Environ() {

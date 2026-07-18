@@ -41,36 +41,49 @@ func (p ProviderConfig) Timeout(fallback time.Duration) time.Duration {
 }
 
 type Config struct {
-	Version          int                       `toml:"version" json:"version"`
-	ActiveProvider   string                    `toml:"active_provider" json:"active_provider"`
-	Providers        map[string]ProviderConfig `toml:"providers" json:"providers"`
-	Workspace        string                    `toml:"workspace,omitempty" json:"workspace,omitempty"`
-	PermissionMode   string                    `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
-	MaxTurns         int                       `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
-	MaxTotalTokens   int                       `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
-	ToolTimeoutSec   int                       `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
-	MaxOutputBytes   int                       `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
-	MaxReadBytes     int                       `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
-	MaxSearchResults int                       `toml:"max_search_results,omitempty" json:"max_search_results,omitempty"`
+	Version           int                       `toml:"version" json:"version"`
+	ActiveProvider    string                    `toml:"active_provider" json:"active_provider"`
+	Providers         map[string]ProviderConfig `toml:"providers" json:"providers"`
+	Workspace         string                    `toml:"workspace,omitempty" json:"workspace,omitempty"`
+	PermissionMode    string                    `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
+	MaxTurns          int                       `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
+	MaxTotalTokens    int                       `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
+	ToolTimeoutSec    int                       `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
+	MaxOutputBytes    int                       `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
+	MaxReadBytes      int                       `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
+	MaxSearchResults  int                       `toml:"max_search_results,omitempty" json:"max_search_results,omitempty"`
+	ReadOnlyCommands  []string                  `toml:"read_only_commands,omitempty" json:"read_only_commands,omitempty"`
+	AutoAllowCommands []string                  `toml:"auto_allow_commands,omitempty" json:"auto_allow_commands,omitempty"`
+	DangerousCommands []string                  `toml:"dangerous_commands,omitempty" json:"dangerous_commands,omitempty"`
+	BlockedCommands   []string                  `toml:"blocked_commands,omitempty" json:"blocked_commands,omitempty"`
+	ShellEnvironment  []string                  `toml:"shell_environment,omitempty" json:"shell_environment,omitempty"`
 }
 
 func Default(workspace string) Config {
 	return Config{
-		Version:          SchemaVersion,
-		Providers:        make(map[string]ProviderConfig),
-		Workspace:        workspace,
-		PermissionMode:   "manual",
-		MaxTurns:         20,
-		MaxTotalTokens:   1_000_000,
-		ToolTimeoutSec:   60,
-		MaxOutputBytes:   64 << 10,
-		MaxReadBytes:     1 << 20,
-		MaxSearchResults: 200,
+		Version:           SchemaVersion,
+		Providers:         make(map[string]ProviderConfig),
+		Workspace:         workspace,
+		PermissionMode:    "manual",
+		MaxTurns:          20,
+		MaxTotalTokens:    1_000_000,
+		ToolTimeoutSec:    60,
+		MaxOutputBytes:    64 << 10,
+		MaxReadBytes:      1 << 20,
+		MaxSearchResults:  200,
+		ReadOnlyCommands:  []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files"},
+		AutoAllowCommands: []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files", "go test", "go vet", "go build", "go list", "go env", "go version", "gofmt", "go fmt"},
+		DangerousCommands: []string{"rm -rf", "git reset --hard", "git clean -fd", "git push --force", "mkfs", "diskpart", "format ", "remove-item -recurse", "del /s", "rd /s"},
 	}
 }
 
 func (c Config) Clone() Config {
 	clone := c
+	clone.ReadOnlyCommands = append([]string(nil), c.ReadOnlyCommands...)
+	clone.AutoAllowCommands = append([]string(nil), c.AutoAllowCommands...)
+	clone.DangerousCommands = append([]string(nil), c.DangerousCommands...)
+	clone.BlockedCommands = append([]string(nil), c.BlockedCommands...)
+	clone.ShellEnvironment = append([]string(nil), c.ShellEnvironment...)
 	clone.Providers = make(map[string]ProviderConfig, len(c.Providers))
 	for name, provider := range c.Providers {
 		provider.Headers = cloneStringMap(provider.Headers)
@@ -98,6 +111,11 @@ func (c Config) Validate() error {
 	}
 	if c.ToolTimeoutSec <= 0 || c.MaxOutputBytes <= 0 || c.MaxReadBytes <= 0 || c.MaxSearchResults <= 0 {
 		return errors.New("resource limits must be greater than zero")
+	}
+	switch c.PermissionMode {
+	case "manual", "plan", "auto", "full":
+	default:
+		return fmt.Errorf("invalid permission_mode %q", c.PermissionMode)
 	}
 	return nil
 }
@@ -266,6 +284,21 @@ func merge(dst *Config, src Config) {
 	}
 	if src.MaxSearchResults != 0 {
 		dst.MaxSearchResults = src.MaxSearchResults
+	}
+	if src.ReadOnlyCommands != nil {
+		dst.ReadOnlyCommands = append([]string(nil), src.ReadOnlyCommands...)
+	}
+	if src.AutoAllowCommands != nil {
+		dst.AutoAllowCommands = append([]string(nil), src.AutoAllowCommands...)
+	}
+	if src.DangerousCommands != nil {
+		dst.DangerousCommands = append([]string(nil), src.DangerousCommands...)
+	}
+	if src.BlockedCommands != nil {
+		dst.BlockedCommands = append([]string(nil), src.BlockedCommands...)
+	}
+	if src.ShellEnvironment != nil {
+		dst.ShellEnvironment = append([]string(nil), src.ShellEnvironment...)
 	}
 }
 

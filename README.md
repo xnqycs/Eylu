@@ -49,6 +49,17 @@ Agent 默认提供以下工具：
 go run . chat "读取 go.mod 并执行 go test ./..." --provider work --yes
 ```
 
+权限模式可通过 `--mode` 或交互命令 `/mode` 切换：
+
+| 模式 | 行为 |
+|---|---|
+| `manual` | 读取自动执行；写入和命令确认；高危操作确认两次。 |
+| `plan` | 读取与已分类的只读命令执行；写入和其他命令拒绝；最终生成实施计划。 |
+| `auto` | 写入与命令白名单自动执行；未知命令确认；高危操作确认两次。 |
+| `full` | 普通操作自动执行；高危操作显示警告并确认。 |
+
+命令分类会检查链式命令、重定向、命令替换、阻止规则和高危模式。`read_only_commands`、`auto_allow_commands`、`dangerous_commands`、`blocked_commands` 与 `shell_environment` 可在 TOML 中配置。
+
 配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。配置文件仅保存凭据引用；交互式首次引导会优先保存到系统 keyring。
 
 当前多轮 transcript、已关闭 session 和 DriverState 保存在进程内；Phase 8 的事件日志与快照会提供跨进程恢复。
