@@ -23,6 +23,7 @@ import (
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
+	"Eylu/internal/skill"
 	"Eylu/internal/tool"
 )
 
@@ -36,18 +37,19 @@ const (
 )
 
 type runtime struct {
-	stdin       io.Reader
-	stdout      io.Writer
-	stderr      io.Writer
-	configPath  string
-	workspace   string
-	output      string
-	credentials *provider.CredentialStore
-	inputReader *bufio.Reader
+	stdin         io.Reader
+	stdout        io.Writer
+	stderr        io.Writer
+	configPath    string
+	workspace     string
+	output        string
+	credentials   *provider.CredentialStore
+	inputReader   *bufio.Reader
+	trustPrompted map[string]bool
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	r := &runtime{stdin: stdin, stdout: stdout, stderr: stderr, credentials: provider.NewCredentialStore()}
+	r := &runtime{stdin: stdin, stdout: stdout, stderr: stderr, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool)}
 	root := r.rootCommand(ctx)
 	root.SetArgs(args)
 	root.SetIn(stdin)
@@ -70,18 +72,19 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 	root.PersistentFlags().StringVar(&r.configPath, "config", "", "config file path")
 	root.PersistentFlags().StringVar(&r.workspace, "workspace", "", "workspace directory")
 	root.PersistentFlags().StringVar(&r.output, "output", "text", "output format: text or json")
-	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx))
+	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand())
 	return root
 }
 
 type chatOptions struct {
-	provider string
-	model    string
-	baseURL  string
-	adapter  string
-	timeout  time.Duration
-	approve  bool
-	mode     string
+	provider    string
+	model       string
+	baseURL     string
+	adapter     string
+	timeout     time.Duration
+	approve     bool
+	mode        string
+	trustSkills bool
 }
 
 func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
@@ -117,6 +120,7 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 0, "request timeout")
 	cmd.Flags().BoolVarP(&opts.approve, "yes", "y", false, "approve tools that require confirmation")
 	cmd.Flags().StringVar(&opts.mode, "mode", "", "permission mode: manual, plan, auto, or full")
+	cmd.Flags().BoolVar(&opts.trustSkills, "trust-workspace-skills", false, "trust and load project-level skills for this workspace")
 	return cmd
 }
 
@@ -169,6 +173,11 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	modelRuntime.PermissionMode = mode.String()
+	skillRegistry, skillSession, err := r.loadSkillRuntime(cfg, opts, conversation)
+	if err != nil {
+		return err
+	}
+	modelRuntime.SkillCatalog = skillRegistry.Catalog()
 	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
@@ -188,7 +197,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 			return nil
 		}
 	}
-	executor, err := r.toolExecutor(cfg, opts)
+	executor, err := r.toolExecutor(cfg, opts, skillRegistry, skillSession)
 	if err != nil {
 		return err
 	}
@@ -206,7 +215,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	return nil
 }
 
-func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions) (*tool.Executor, error) {
+func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session) (*tool.Executor, error) {
 	readFile, err := tool.NewReadFile(cfg.Workspace, cfg.MaxReadBytes)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize read_file", Cause: err}
@@ -239,8 +248,12 @@ func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions) (*tool.Execu
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	checker := policy.NewChecker(policy.Config{Mode: mode, ReadOnlyCommands: cfg.ReadOnlyCommands, AutoAllowCommands: cfg.AutoAllowCommands, DangerousPatterns: cfg.DangerousCommands, BlockedPatterns: cfg.BlockedCommands})
+	registered := []tool.Tool{readFile, writeFile, bashTool, editFile, searchCode, listDirectory}
+	if skillRegistry != nil && len(skillRegistry.Active()) > 0 {
+		registered = append(registered, tool.NewActivateSkill(skillRegistry, skillSession), tool.NewReadSkillResource(skillSession))
+	}
 	return &tool.Executor{
-		Registry: tool.NewRegistry(readFile, writeFile, bashTool, editFile, searchCode, listDirectory), Policy: checker,
+		Registry: tool.NewRegistry(registered...), Policy: checker,
 		Confirm: r.confirmTools(opts.approve), Audit: &toolAuditWriter{writer: r.stderr}, Workspace: cfg.Workspace,
 		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
 	}, nil

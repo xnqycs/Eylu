@@ -60,6 +60,28 @@ go run . chat "读取 go.mod 并执行 go test ./..." --provider work --yes
 
 命令分类会检查链式命令、重定向、命令替换、阻止规则和高危模式。`read_only_commands`、`auto_allow_commands`、`dangerous_commands`、`blocked_commands` 与 `shell_environment` 可在 TOML 中配置。
 
+## Agent Skills
+
+Eylu 默认扫描以下目录，并按项目级高于用户级、Eylu 原生目录高于跨客户端目录的顺序处理同名 Skill：
+
+```text
+<workspace>/.eylu/skills
+<workspace>/.agents/skills
+~/.eylu/skills
+~/.agents/skills
+```
+
+项目级 Skill 需要工作区信任。TTY 会显示规范化路径并确认；脚本化运行使用 `--trust-workspace-skills`，也可通过 `eylu skills trust|revoke` 管理。启动上下文只加载名称、描述和来源；模型调用 `activate_skill` 后加载 protected 正文，再按需调用 `read_skill_resource`。
+
+```powershell
+go run . skills list
+go run . skills show code-review
+go run . skills validate ".agents/skills/code-review"
+go run . skills diagnose --output json
+```
+
+交互会话支持 `/skills` 和 `/skill <name>`。Skill 的 `allowed-tools` 仅作为提示和审计信息，工具执行继续服从当前权限模式。
+
 配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。配置文件仅保存凭据引用；交互式首次引导会优先保存到系统 keyring。
 
 当前多轮 transcript、已关闭 session 和 DriverState 保存在进程内；Phase 8 的事件日志与快照会提供跨进程恢复。

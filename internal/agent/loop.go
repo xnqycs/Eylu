@@ -72,6 +72,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 				}
 			}
 			result := executor.Execute(ctx, requestID, call)
+			c.captureSkillResult(result)
 			toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
 			if emit != nil {
 				if err := emit(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &result}); err != nil {

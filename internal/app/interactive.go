@@ -98,7 +98,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	command := fields[0]
 	switch command {
 	case "/help":
-		fmt.Fprintln(r.stdout, "/new  /context  /providers  /provider add|edit|delete|use  /model [id]  /mode manual|plan|auto|full  /quit")
+		fmt.Fprintln(r.stdout, "/new  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /mode manual|plan|auto|full  /quit")
 		return nil
 	case "/quit":
 		return errQuit
@@ -111,6 +111,13 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	case "/providers":
 		r.printProviders(manager)
 		return nil
+	case "/skills":
+		return r.handleSkillsSlash(conversation, manager.Config(), *opts)
+	case "/skill":
+		if len(fields) != 2 {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /skill <name>"}
+		}
+		return r.activateSkillSlash(conversation, manager.Config(), *opts, fields[1])
 	case "/provider":
 		return r.handleProviderSlash(ctx, reader, fields, manager, opts)
 	case "/model":

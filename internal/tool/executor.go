@@ -31,6 +31,14 @@ type AuditRecord struct {
 	Classification policy.CommandClass `json:"classification"`
 	Confirmations  int                 `json:"confirmations"`
 	Warning        bool                `json:"warning"`
+	SkillName      string              `json:"skill_name,omitempty"`
+	SkillSource    string              `json:"skill_source,omitempty"`
+	SkillDigest    string              `json:"skill_digest,omitempty"`
+	SkillTrigger   string              `json:"skill_trigger,omitempty"`
+	SkillActivated string              `json:"skill_activated_at,omitempty"`
+	AllowedTools   string              `json:"allowed_tools,omitempty"`
+	SkillResource  string              `json:"skill_resource,omitempty"`
+	ResourceBytes  int                 `json:"resource_bytes,omitempty"`
 }
 
 type AuditSink interface {
@@ -67,6 +75,14 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 			if exitCode, ok := result.Metadata["exit_code"].(int); ok {
 				record.ExitCode = exitCode
 			}
+			record.SkillName, _ = result.Metadata["skill_name"].(string)
+			record.SkillSource, _ = result.Metadata["skill_source"].(string)
+			record.SkillDigest, _ = result.Metadata["skill_digest"].(string)
+			record.SkillTrigger, _ = result.Metadata["trigger"].(string)
+			record.SkillActivated, _ = result.Metadata["activated_at"].(string)
+			record.AllowedTools, _ = result.Metadata["allowed_tools"].(string)
+			record.SkillResource, _ = result.Metadata["resource"].(string)
+			record.ResourceBytes, _ = result.Metadata["bytes"].(int)
 		}
 		if e != nil && e.Audit != nil {
 			e.Audit.Record(record)

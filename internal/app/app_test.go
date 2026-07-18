@@ -19,6 +19,7 @@ import (
 )
 
 func TestChatEndToEnd(t *testing.T) {
+	isolateUserState(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/responses" {
 			t.Fatalf("path = %s", r.URL.Path)
@@ -58,6 +59,7 @@ func TestChatEndToEnd(t *testing.T) {
 }
 
 func TestChatToolLoopReadsAndBuilds(t *testing.T) {
+	isolateUserState(t)
 	workspace := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module fixture\n\ngo 1.24.0\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -124,6 +126,7 @@ func containsFunctionOutput(input []any, callID, content string) bool {
 }
 
 func TestChatMissingProviderIsStructured(t *testing.T) {
+	isolateUserState(t)
 	temp := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	code := Execute(context.Background(), []string{
@@ -132,6 +135,15 @@ func TestChatMissingProviderIsStructured(t *testing.T) {
 	if code != exitConfig || !strings.Contains(stderr.String(), `"code":"config_error"`) {
 		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
 	}
+}
+
+func isolateUserState(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("EYLU_STATE_DIR", filepath.Join(home, "state"))
+	return home
 }
 
 func TestModeSlashCommand(t *testing.T) {

@@ -1,5 +1,15 @@
 # Changelog
 
+## Phase 5 - Agent Skills
+
+- 增加兼容 Agent Skills 规范的严格 frontmatter parser、固定目录发现、优先级、shadow/invalid 诊断。
+- 增加项目级工作区信任、原子持久化、撤销和非 TTY 显式信任选项。
+- 增加 catalog 渐进披露、`activate_skill`、protected digest 去重和 `read_skill_resource` 路径边界。
+- 增加 `/skills`、`/skill` 与 `eylu skills list|show|validate|diagnose|trust|revoke`。
+- Skill 脚本继续通过 `bash`、当前权限模式、超时、进程树和审计执行。
+
+兼容性：仅在发现有效 Skill 时增加 catalog 和两个 Skill 工具；无 Skill 环境保持原请求结构。
+
 ## Phase 4 - 安全与四种权限模式
 
 - 增加 `manual`、`plan`、`auto`、`full` 本地权限矩阵及 `--mode`、`/mode` 热切换。
