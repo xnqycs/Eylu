@@ -32,13 +32,14 @@ func New(client *http.Client) *Driver {
 func (d *Driver) Name() string { return Name }
 
 func (d *Driver) Capabilities() driver.Capabilities {
-	return driver.Capabilities{TextStreaming: false, ToolCalling: true, ParallelTools: true, Reasoning: true, ImageInput: true, RemoteSession: true}
+	return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, Reasoning: true, ImageInput: true, RemoteSession: true}
 }
 
 type requestBody struct {
-	Model string      `json:"model"`
-	Input []inputItem `json:"input"`
-	Tools []tool      `json:"tools,omitempty"`
+	Model  string      `json:"model"`
+	Input  []inputItem `json:"input"`
+	Tools  []tool      `json:"tools,omitempty"`
+	Stream bool        `json:"stream,omitempty"`
 }
 
 type inputItem struct {
@@ -60,29 +61,33 @@ type responseBody struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
-	Output []struct {
-		Type      string `json:"type"`
-		Role      string `json:"role"`
-		ID        string `json:"id"`
-		CallID    string `json:"call_id"`
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-		Content   []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-	} `json:"output"`
-	Usage struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-		OutputDetail struct {
-			ReasoningTokens int `json:"reasoning_tokens"`
-		} `json:"output_tokens_details"`
-	} `json:"usage"`
+	Output []responseItem `json:"output"`
+	Usage  responseUsage  `json:"usage"`
+}
+
+type responseItem struct {
+	Type      string `json:"type"`
+	Role      string `json:"role"`
+	ID        string `json:"id"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	Content   []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+type responseUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	OutputDetail struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"output_tokens_details"`
 }
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
-	body := requestBody{Model: req.Model.Model}
+	body := requestBody{Model: req.Model.Model, Stream: req.Stream}
 	for _, turn := range req.Model.Turns {
 		for _, part := range turn.Parts {
 			if part.Kind == protocol.PartText && part.Text != "" {
@@ -119,12 +124,16 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		return protocol.ModelResponse{}, mapTransportError(ctx, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
+	}
+	if req.Stream {
+		return d.readStream(ctx, resp.Body, emit)
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrNetwork, Message: "read model response", Retryable: true, Cause: err}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
 	}
 	var decoded responseBody
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -133,6 +142,29 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	if decoded.Error != nil {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProvider, Message: decoded.Error.Message}
 	}
+	result := convertResponse(decoded)
+	if len(result.Turn.Parts) == 0 {
+		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "provider returned no text or tool calls"}
+	}
+	if emit != nil {
+		for _, part := range result.Turn.Parts {
+			if part.Kind == protocol.PartText {
+				if err := emit(protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: part.Text}); err != nil {
+					return protocol.ModelResponse{}, err
+				}
+			}
+		}
+		if err := emit(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &result.Usage}); err != nil {
+			return protocol.ModelResponse{}, err
+		}
+		if err := emit(protocol.ModelEvent{Kind: protocol.EventResponseDone, Response: &result}); err != nil {
+			return protocol.ModelResponse{}, err
+		}
+	}
+	return result, nil
+}
+
+func convertResponse(decoded responseBody) protocol.ModelResponse {
 	result := protocol.ModelResponse{
 		Turn:  protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()},
 		Stop:  protocol.StopCompleted,
@@ -144,9 +176,6 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 			for _, content := range item.Content {
 				if content.Type == "output_text" && content.Text != "" {
 					result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartText, Text: content.Text})
-					if emit != nil {
-						_ = emit(protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: content.Text})
-					}
 				}
 			}
 		case "function_call":
@@ -159,14 +188,10 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 			result.Stop = protocol.StopToolUse
 		}
 	}
-	if len(result.Turn.Parts) == 0 {
-		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "provider returned no text or tool calls"}
+	if decoded.ID != "" {
+		result.DriverState, _ = json.Marshal(map[string]string{"response_id": decoded.ID})
 	}
-	if emit != nil {
-		_ = emit(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &result.Usage})
-		_ = emit(protocol.ModelEvent{Kind: protocol.EventResponseDone, Response: &result})
-	}
-	return result, nil
+	return result
 }
 
 func mapTransportError(ctx context.Context, err error) error {

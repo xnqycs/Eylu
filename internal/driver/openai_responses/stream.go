@@ -1,0 +1,152 @@
+package openai_responses
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"Eylu/internal/driver"
+	"Eylu/internal/protocol"
+)
+
+type responseStreamEvent struct {
+	Type        string       `json:"type"`
+	Delta       string       `json:"delta"`
+	Arguments   string       `json:"arguments"`
+	OutputIndex int          `json:"output_index"`
+	Item        responseItem `json:"item"`
+	Response    responseBody `json:"response"`
+	Error       *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type callAccumulator struct {
+	ID        string
+	Name      string
+	Arguments strings.Builder
+}
+
+func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc) (protocol.ModelResponse, error) {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 64<<10), 8<<20)
+	var data strings.Builder
+	text := strings.Builder{}
+	calls := make(map[int]*callAccumulator)
+	var final *protocol.ModelResponse
+	completed := false
+	dispatch := func() error {
+		payload := strings.TrimSpace(data.String())
+		data.Reset()
+		if payload == "" {
+			return nil
+		}
+		if payload == "[DONE]" {
+			completed = true
+			return nil
+		}
+		var event responseStreamEvent
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			return &protocol.Error{Code: protocol.ErrProtocol, Message: "decode Responses stream event", Cause: err}
+		}
+		switch event.Type {
+		case "response.output_text.delta":
+			text.WriteString(event.Delta)
+			if emit != nil && event.Delta != "" {
+				return emit(protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: event.Delta})
+			}
+		case "response.output_item.added":
+			if event.Item.Type == "function_call" {
+				call := &callAccumulator{ID: event.Item.CallID, Name: event.Item.Name}
+				if call.ID == "" {
+					call.ID = event.Item.ID
+				}
+				call.Arguments.WriteString(event.Item.Arguments)
+				calls[event.OutputIndex] = call
+			}
+		case "response.function_call_arguments.delta":
+			if call := calls[event.OutputIndex]; call != nil {
+				call.Arguments.WriteString(event.Delta)
+			}
+		case "response.function_call_arguments.done":
+			if call := calls[event.OutputIndex]; call != nil && event.Arguments != "" {
+				call.Arguments.Reset()
+				call.Arguments.WriteString(event.Arguments)
+			}
+		case "response.completed":
+			converted := convertResponse(event.Response)
+			final = &converted
+			completed = true
+		case "response.failed", "error":
+			message := "Responses stream failed"
+			if event.Error != nil && event.Error.Message != "" {
+				message = event.Error.Message
+			}
+			return &protocol.Error{Code: protocol.ErrProvider, Message: message}
+		}
+		return nil
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := dispatch(); err != nil {
+				return protocol.ModelResponse{}, err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
+			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if data.Len() > 0 {
+		if err := dispatch(); err != nil {
+			return protocol.ModelResponse{}, err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			return protocol.ModelResponse{}, mapTransportError(ctx, ctx.Err())
+		}
+		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrNetwork, Message: "read Responses stream", Retryable: true, Cause: err}
+	}
+	if !completed {
+		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrNetwork, Message: "Responses stream ended before completion", Retryable: true}
+	}
+	if final == nil {
+		built := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted}
+		if text.Len() > 0 {
+			built.Turn.Parts = append(built.Turn.Parts, protocol.Part{Kind: protocol.PartText, Text: text.String()})
+		}
+		for index := 0; index < len(calls); index++ {
+			call := calls[index]
+			if call == nil {
+				continue
+			}
+			toolCall := protocol.ToolCall{ID: call.ID, Name: call.Name, Arguments: json.RawMessage(call.Arguments.String())}
+			built.Turn.Parts = append(built.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &toolCall})
+			built.Stop = protocol.StopToolUse
+		}
+		final = &built
+	}
+	if len(final.Turn.Parts) == 0 {
+		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "provider stream returned no text or tool calls"}
+	}
+	if emit != nil {
+		if err := emit(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &final.Usage}); err != nil {
+			return protocol.ModelResponse{}, err
+		}
+		if err := emit(protocol.ModelEvent{Kind: protocol.EventResponseDone, Response: final}); err != nil {
+			return protocol.ModelResponse{}, err
+		}
+	}
+	return *final, nil
+}

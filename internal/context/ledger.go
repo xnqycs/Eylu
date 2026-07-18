@@ -1,0 +1,263 @@
+package context
+
+import (
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+	"sync"
+
+	"Eylu/internal/protocol"
+)
+
+type Category string
+
+const (
+	CategorySystemPrompt      Category = "system_prompt"
+	CategorySkillCatalog      Category = "skill_catalog"
+	CategorySkillBody         Category = "skill_body"
+	CategoryMCPInstructions   Category = "mcp_instructions"
+	CategoryMCPToolSchema     Category = "mcp_tool_schema"
+	CategoryMCPResource       Category = "mcp_resource"
+	CategoryMCPToolResult     Category = "mcp_tool_result"
+	CategoryBuiltinToolSchema Category = "builtin_tool_schema"
+	CategoryUserMessage       Category = "user_message"
+	CategoryAgentMessage      Category = "agent_message"
+	CategoryBuiltinToolResult Category = "builtin_tool_result"
+	CategoryProjectContext    Category = "project_context"
+	CategorySummary           Category = "summary"
+	CategoryDriverState       Category = "driver_state"
+	CategoryOutputReserve     Category = "output_reserve"
+)
+
+var categoryOrder = []Category{
+	CategorySystemPrompt,
+	CategorySkillCatalog,
+	CategorySkillBody,
+	CategoryMCPInstructions,
+	CategoryMCPToolSchema,
+	CategoryMCPResource,
+	CategoryMCPToolResult,
+	CategoryBuiltinToolSchema,
+	CategoryUserMessage,
+	CategoryAgentMessage,
+	CategoryBuiltinToolResult,
+	CategoryProjectContext,
+	CategorySummary,
+	CategoryDriverState,
+	CategoryOutputReserve,
+}
+
+var categoryLabels = map[Category]string{
+	CategorySystemPrompt:      "System prompt",
+	CategorySkillCatalog:      "Skill catalog",
+	CategorySkillBody:         "Skill body",
+	CategoryMCPInstructions:   "MCP instructions",
+	CategoryMCPToolSchema:     "MCP tool schemas",
+	CategoryMCPResource:       "MCP resources",
+	CategoryMCPToolResult:     "MCP tool results",
+	CategoryBuiltinToolSchema: "Tool schemas",
+	CategoryUserMessage:       "User messages",
+	CategoryAgentMessage:      "Agent messages",
+	CategoryBuiltinToolResult: "Tool results",
+	CategoryProjectContext:    "Project context",
+	CategorySummary:           "Summary",
+	CategoryDriverState:       "Driver state",
+	CategoryOutputReserve:     "Output reserve",
+}
+
+type TokenEstimator interface {
+	Estimate(string) int
+}
+
+type ApproxEstimator struct {
+	BytesPerToken int
+}
+
+func (e ApproxEstimator) Estimate(text string) int {
+	ratio := e.BytesPerToken
+	if ratio <= 0 {
+		ratio = 4
+	}
+	if text == "" {
+		return 0
+	}
+	return (len([]byte(text)) + ratio - 1) / ratio
+}
+
+type Block struct {
+	ID        string         `json:"id"`
+	Category  Category       `json:"category"`
+	Source    string         `json:"source"`
+	Bytes     int            `json:"bytes"`
+	Tokens    int            `json:"tokens"`
+	Exact     bool           `json:"exact"`
+	Protected bool           `json:"protected,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+type CategoryUsage struct {
+	Category Category `json:"category"`
+	Label    string   `json:"label"`
+	Blocks   int      `json:"blocks"`
+	Bytes    int      `json:"bytes"`
+	Tokens   int      `json:"tokens"`
+	Exact    bool     `json:"exact"`
+}
+
+type Report struct {
+	Provider        string          `json:"provider"`
+	Model           string          `json:"model"`
+	ContextWindow   int             `json:"context_window,omitempty"`
+	LimitSource     string          `json:"limit_source"`
+	InputTokens     int             `json:"input_tokens"`
+	OutputReserve   int             `json:"output_reserve"`
+	Percent         float64         `json:"percent,omitempty"`
+	Categories      []CategoryUsage `json:"categories"`
+	LastUsage       protocol.Usage  `json:"last_provider_usage"`
+	MeasurementKind string          `json:"measurement_kind"`
+}
+
+type Ledger struct {
+	mu        sync.RWMutex
+	estimator TokenEstimator
+	blocks    []Block
+	lastUsage protocol.Usage
+}
+
+func New(estimator TokenEstimator) *Ledger {
+	if estimator == nil {
+		estimator = ApproxEstimator{BytesPerToken: 4}
+	}
+	return &Ledger{estimator: estimator}
+}
+
+func (l *Ledger) Reset() {
+	l.mu.Lock()
+	l.blocks = nil
+	l.lastUsage = protocol.Usage{}
+	l.mu.Unlock()
+}
+
+func (l *Ledger) AddText(id string, category Category, source, text string, protected bool) Block {
+	block := Block{ID: id, Category: category, Source: source, Bytes: len([]byte(text)), Tokens: l.estimator.Estimate(text), Exact: false, Protected: protected}
+	l.Add(block)
+	return block
+}
+
+func (l *Ledger) Add(block Block) {
+	l.mu.Lock()
+	l.blocks = append(l.blocks, block)
+	l.mu.Unlock()
+}
+
+func (l *Ledger) SetLastUsage(usage protocol.Usage) {
+	l.mu.Lock()
+	l.lastUsage = usage
+	l.mu.Unlock()
+}
+
+func (l *Ledger) Blocks() []Block {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	result := make([]Block, len(l.blocks))
+	copy(result, l.blocks)
+	return result
+}
+
+func (l *Ledger) Report(providerName, model string, contextWindow int) Report {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	usage := make(map[Category]*CategoryUsage, len(categoryOrder))
+	for _, category := range categoryOrder {
+		usage[category] = &CategoryUsage{Category: category, Label: categoryLabels[category], Exact: true}
+	}
+	for _, block := range l.blocks {
+		item, ok := usage[block.Category]
+		if !ok {
+			item = &CategoryUsage{Category: block.Category, Label: string(block.Category), Exact: true}
+			usage[block.Category] = item
+		}
+		item.Blocks++
+		item.Bytes += block.Bytes
+		item.Tokens += block.Tokens
+		item.Exact = item.Exact && block.Exact
+	}
+	report := Report{Provider: providerName, Model: model, ContextWindow: contextWindow, LastUsage: l.lastUsage, MeasurementKind: "estimated"}
+	for _, category := range categoryOrder {
+		item := *usage[category]
+		report.Categories = append(report.Categories, item)
+		if category == CategoryOutputReserve {
+			report.OutputReserve += item.Tokens
+		} else {
+			report.InputTokens += item.Tokens
+		}
+	}
+	unknown := make([]Category, 0)
+	for category := range usage {
+		found := false
+		for _, known := range categoryOrder {
+			if category == known {
+				found = true
+				break
+			}
+		}
+		if !found {
+			unknown = append(unknown, category)
+		}
+	}
+	sort.Slice(unknown, func(i, j int) bool { return unknown[i] < unknown[j] })
+	for _, category := range unknown {
+		report.Categories = append(report.Categories, *usage[category])
+	}
+	if contextWindow > 0 {
+		report.LimitSource = "provider_config"
+		report.Percent = float64(report.InputTokens+report.OutputReserve) / float64(contextWindow) * 100
+	} else {
+		report.LimitSource = "unknown"
+	}
+	return report
+}
+
+func RenderText(w io.Writer, report Report) error {
+	limit := "unknown"
+	percent := "unknown"
+	if report.ContextWindow > 0 {
+		limit = fmt.Sprintf("%d", report.ContextWindow)
+		percent = fmt.Sprintf("%.1f%%", report.Percent)
+	}
+	if _, err := fmt.Fprintf(w, "Context  %d input + %d reserved / %s  (%s)\n", report.InputTokens, report.OutputReserve, limit, percent); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "Provider %s · model %s · limit %s\n\n", report.Provider, report.Model, report.LimitSource); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "Category                 Blocks    Tokens   Input"); err != nil {
+		return err
+	}
+	for _, item := range report.Categories {
+		share := 0.0
+		if report.InputTokens > 0 && item.Category != CategoryOutputReserve {
+			share = float64(item.Tokens) / float64(report.InputTokens) * 100
+		}
+		mark := "estimated"
+		if item.Exact {
+			mark = "exact"
+		}
+		if _, err := fmt.Fprintf(w, "%-24s %6d %9d %6.1f%%  %s\n", truncate(item.Label, 24), item.Blocks, item.Tokens, share, mark); err != nil {
+			return err
+		}
+	}
+	if report.LastUsage.InputTokens > 0 || report.LastUsage.OutputTokens > 0 {
+		_, err := fmt.Fprintf(w, "\nLast provider usage: %d input, %d output\n", report.LastUsage.InputTokens, report.LastUsage.OutputTokens)
+		return err
+	}
+	return nil
+}
+
+func truncate(value string, width int) string {
+	if len(value) <= width {
+		return value
+	}
+	return strings.TrimSpace(value[:width])
+}

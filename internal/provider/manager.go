@@ -60,6 +60,16 @@ func (m *Manager) Get(name string) (config.ProviderConfig, bool) {
 	return p, ok
 }
 
+func (m *Manager) Snapshot(name string) (Snapshot, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	providerConfig, ok := m.cfg.Providers[name]
+	if !ok {
+		return Snapshot{}, false
+	}
+	return Snapshot{Name: name, Config: providerConfig, Generation: m.generation}, true
+}
+
 func (m *Manager) List() []Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()

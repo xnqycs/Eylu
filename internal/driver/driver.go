@@ -22,6 +22,7 @@ type Request struct {
 	BaseURL string
 	APIKey  string
 	Headers map[string]string
+	Stream  bool
 	Model   protocol.ModelRequest
 }
 

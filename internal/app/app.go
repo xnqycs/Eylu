@@ -8,15 +8,15 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
+	"Eylu/internal/agent"
 	"Eylu/internal/config"
 	"Eylu/internal/driver"
+	"Eylu/internal/driver/openai_chat"
 	"Eylu/internal/driver/openai_responses"
 	"Eylu/internal/logging"
 	"Eylu/internal/protocol"
@@ -85,6 +85,9 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 		Short: "send a prompt to the active model",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 && isTerminal(r.stdin) {
+				return r.runInteractive(ctx, opts)
+			}
 			prompt := ""
 			if len(args) == 1 {
 				prompt = args[0]
@@ -110,40 +113,84 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 }
 
 func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) error {
-	loaded, manager, err := r.loadManager()
+	manager, err := r.prepareManager(ctx, opts)
 	if err != nil {
 		return err
 	}
-	if len(loaded.Config.Providers) == 0 {
-		if opts.baseURL != "" && opts.model != "" {
-			loaded.Config.Providers["runtime"] = config.ProviderConfig{
-				Adapter: opts.adapter, BaseURL: opts.baseURL, Model: opts.model,
-				Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"},
-			}
-			loaded.Config.ActiveProvider = "runtime"
-			manager, err = provider.NewManager(loaded.Path, loaded.Config, nil)
-			if err != nil {
+	conversation := agent.NewConversation()
+	return r.sendPrompt(ctx, conversation, manager, prompt, opts)
+}
+
+func (r *runtime) prepareManager(ctx context.Context, opts chatOptions) (*provider.Manager, error) {
+	loaded, manager, err := r.loadManager()
+	if err != nil {
+		return nil, err
+	}
+	if len(loaded.Config.Providers) > 0 {
+		return manager, nil
+	}
+	if opts.baseURL != "" && opts.model != "" {
+		loaded.Config.Providers["runtime"] = config.ProviderConfig{
+			Adapter: opts.adapter, BaseURL: opts.baseURL, Model: opts.model,
+			Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"},
+		}
+		loaded.Config.ActiveProvider = "runtime"
+		return provider.NewManager(loaded.Path, loaded.Config, nil)
+	}
+	if isTerminal(r.stdin) {
+		if err := r.onboard(ctx, manager); err != nil {
+			return nil, err
+		}
+		return manager, nil
+	}
+	return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "no provider configured; run eylu providers add or pass --base-url and --model"}
+}
+
+func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
+	modelRuntime, err := r.resolveRuntime(manager, opts)
+	if err != nil {
+		return err
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, modelRuntime.Timeout)
+	defer cancel()
+	stream := r.output == "text"
+	var emit driver.EmitFunc
+	if stream {
+		emit = func(event protocol.ModelEvent) error {
+			if event.Kind == protocol.EventTextDelta {
+				_, err := fmt.Fprint(r.stdout, event.Delta)
 				return err
 			}
-		} else if isTerminal(r.stdin) {
-			if err := r.onboard(ctx, manager); err != nil {
-				return err
-			}
-		} else {
-			return &protocol.Error{Code: protocol.ErrConfig, Message: "no provider configured; run eylu providers add or pass --base-url and --model"}
+			return nil
 		}
 	}
-	var snapshot provider.Snapshot
-	if opts.provider != "" {
-		providerConfig, ok := manager.Get(opts.provider)
-		if !ok {
-			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", opts.provider)}
+	response, err := conversation.Send(requestCtx, prompt, modelRuntime, stream, emit)
+	if err != nil {
+		if stream {
+			fmt.Fprintln(r.stdout)
 		}
-		snapshot = provider.Snapshot{Name: opts.provider, Config: providerConfig}
+		return err
+	}
+	if r.output == "json" {
+		return json.NewEncoder(r.stdout).Encode(response)
+	}
+	fmt.Fprintln(r.stdout)
+	return nil
+}
+
+func (r *runtime) resolveRuntime(manager *provider.Manager, opts chatOptions) (agent.Runtime, error) {
+	var snapshot provider.Snapshot
+	var err error
+	if opts.provider != "" {
+		var ok bool
+		snapshot, ok = manager.Snapshot(opts.provider)
+		if !ok {
+			return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", opts.provider)}
+		}
 	} else {
 		snapshot, err = manager.Active()
 		if err != nil {
-			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+			return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
 	}
 	providerConfig := snapshot.Config
@@ -157,53 +204,27 @@ func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) 
 		providerConfig.Adapter = opts.adapter
 	}
 	if err := config.ValidateProvider(snapshot.Name, providerConfig); err != nil {
-		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
+	snapshot.Config = providerConfig
 	apiKey := os.Getenv("EYLU_API_KEY")
 	if apiKey == "" {
 		apiKey, err = r.credentials.Resolve(providerConfig.Credential)
 		if err != nil {
-			return &protocol.Error{Code: protocol.ErrCredential, Message: "provider credential is unavailable", Cause: err}
+			return agent.Runtime{}, &protocol.Error{Code: protocol.ErrCredential, Message: "provider credential is unavailable", Cause: err}
 		}
 	}
 	requestTimeout := providerConfig.Timeout(60 * time.Second)
 	if opts.timeout > 0 {
 		requestTimeout = opts.timeout
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, requestTimeout)
-	defer cancel()
-	registry := driver.NewRegistry(openai_responses.New(&http.Client{Timeout: requestTimeout}))
+	httpClient := &http.Client{Timeout: requestTimeout}
+	registry := driver.NewRegistry(openai_responses.New(httpClient), openai_chat.New(httpClient))
 	modelDriver, err := registry.Get(providerConfig.Adapter)
 	if err != nil {
-		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
-	request := protocol.ModelRequest{
-		ProtocolVersion: protocol.Version,
-		Model:           providerConfig.Model,
-		Turns: []protocol.Turn{{
-			ID: uuid.NewString(), Role: protocol.RoleUser, CreatedAt: time.Now().UTC(),
-			Parts: []protocol.Part{{Kind: protocol.PartText, Text: prompt}},
-		}},
-	}
-	response, err := modelDriver.Generate(requestCtx, driver.Request{
-		BaseURL: providerConfig.BaseURL,
-		APIKey:  apiKey,
-		Headers: providerConfig.Headers,
-		Model:   request,
-	}, nil)
-	if err != nil {
-		return err
-	}
-	if r.output == "json" {
-		return json.NewEncoder(r.stdout).Encode(response)
-	}
-	for _, part := range response.Turn.Parts {
-		if part.Kind == protocol.PartText {
-			fmt.Fprint(r.stdout, part.Text)
-		}
-	}
-	fmt.Fprintln(r.stdout)
-	return nil
+	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, Timeout: requestTimeout}, nil
 }
 
 func (r *runtime) loadManager() (config.Loaded, *provider.Manager, error) {
@@ -254,12 +275,4 @@ func exitCode(err error) int {
 	default:
 		return exitInternal
 	}
-}
-
-func absoluteWorkspace(path string) string {
-	if path == "" {
-		path, _ = os.Getwd()
-	}
-	path, _ = filepath.Abs(path)
-	return path
 }
