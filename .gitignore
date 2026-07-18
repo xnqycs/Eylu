@@ -1,0 +1,37 @@
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local configuration, credentials, and Eylu state
+/.eylu/
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Logs
+*.log
+
+# Go build and test artifacts
+/bin/
+/build/
+/dist/
+/tmp/
+/[Ee]ylu
+/[Ee]ylu.exe
+*.test
+coverage.out
+coverage.html
+.coverprofile
