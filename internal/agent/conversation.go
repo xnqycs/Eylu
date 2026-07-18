@@ -36,6 +36,7 @@ type Conversation struct {
 	providerAdapter    string
 	providerBaseURL    string
 	providerModel      string
+	toolDefinitions    []protocol.ToolDefinition
 	ledger             *contextledger.Ledger
 	lastRuntime        Runtime
 }
@@ -85,11 +86,20 @@ func (c *Conversation) NewSession() string {
 func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := c.prepareRuntime(prompt, runtime); err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	c.appendUser(prompt)
+	c.toolDefinitions = nil
+	return c.generate(ctx, runtime, nil, stream, emit)
+}
+
+func (c *Conversation) prepareRuntime(prompt string, runtime Runtime) error {
 	if prompt == "" {
-		return protocol.ModelResponse{}, errors.New("prompt is empty")
+		return errors.New("prompt is empty")
 	}
 	if runtime.Driver == nil {
-		return protocol.ModelResponse{}, errors.New("model driver is nil")
+		return errors.New("model driver is nil")
 	}
 	if c.providerName != runtime.Provider.Name || c.providerGeneration != runtime.Provider.Generation || c.providerAdapter != runtime.Provider.Config.Adapter || c.providerBaseURL != runtime.Provider.Config.BaseURL || c.providerModel != runtime.Provider.Config.Model {
 		c.driverState = nil
@@ -99,11 +109,18 @@ func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime,
 		c.providerBaseURL = runtime.Provider.Config.BaseURL
 		c.providerModel = runtime.Provider.Config.Model
 	}
+	return nil
+}
+
+func (c *Conversation) appendUser(prompt string) {
 	userTurn := protocol.Turn{
 		ID: uuid.NewString(), Role: protocol.RoleUser, CreatedAt: time.Now().UTC(),
 		Parts: []protocol.Part{{Kind: protocol.PartText, Text: prompt}},
 	}
 	c.turns = append(c.turns, userTurn)
+}
+
+func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	requestTurns := make([]protocol.Turn, 0, len(c.turns)+1)
 	requestTurns = append(requestTurns, protocol.Turn{ID: "system", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: SystemPrompt}}})
 	requestTurns = append(requestTurns, cloneTurns(c.turns)...)
@@ -116,6 +133,7 @@ func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime,
 			ProtocolVersion: protocol.Version,
 			Model:           runtime.Provider.Config.Model,
 			Turns:           requestTurns,
+			Tools:           definitions,
 			DriverState:     append(json.RawMessage(nil), c.driverState...),
 		},
 	}
@@ -158,6 +176,10 @@ func (c *Conversation) rebuildLedger(runtime Runtime) {
 				c.ledger.AddText(id, contextledger.CategoryBuiltinToolResult, source, part.ToolResult.Content, false)
 			}
 		}
+	}
+	for _, definition := range c.toolDefinitions {
+		content := definition.Description + "\n" + string(definition.InputSchema)
+		c.ledger.AddText("tool-schema:"+definition.Name, contextledger.CategoryBuiltinToolSchema, definition.Name, content, true)
 	}
 	if len(c.driverState) > 0 {
 		c.ledger.AddText("driver-state", contextledger.CategoryDriverState, runtime.Provider.Name, string(c.driverState), false)

@@ -36,15 +36,28 @@ func (d *Driver) Capabilities() driver.Capabilities {
 }
 
 type requestBody struct {
-	Model  string      `json:"model"`
-	Input  []inputItem `json:"input"`
-	Tools  []tool      `json:"tools,omitempty"`
-	Stream bool        `json:"stream,omitempty"`
+	Model  string `json:"model"`
+	Input  []any  `json:"input"`
+	Tools  []tool `json:"tools,omitempty"`
+	Stream bool   `json:"stream,omitempty"`
 }
 
 type inputItem struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+}
+
+type functionCallInput struct {
+	Type      string `json:"type"`
+	CallID    string `json:"call_id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type functionCallOutput struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Output string `json:"output"`
 }
 
 type tool struct {
@@ -90,12 +103,17 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	body := requestBody{Model: req.Model.Model, Stream: req.Stream}
 	for _, turn := range req.Model.Turns {
 		for _, part := range turn.Parts {
-			if part.Kind == protocol.PartText && part.Text != "" {
+			switch {
+			case part.Kind == protocol.PartText && part.Text != "":
 				role := string(turn.Role)
 				if turn.Role == protocol.RoleAgent {
 					role = "assistant"
 				}
 				body.Input = append(body.Input, inputItem{Role: role, Content: part.Text})
+			case part.Kind == protocol.PartToolCall && part.ToolCall != nil:
+				body.Input = append(body.Input, functionCallInput{Type: "function_call", CallID: part.ToolCall.ID, Name: part.ToolCall.Name, Arguments: string(part.ToolCall.Arguments)})
+			case part.Kind == protocol.PartToolResult && part.ToolResult != nil:
+				body.Input = append(body.Input, functionCallOutput{Type: "function_call_output", CallID: part.ToolResult.CallID, Output: part.ToolResult.Content})
 			}
 		}
 	}

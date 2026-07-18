@@ -47,6 +47,7 @@ type Config struct {
 	Workspace        string                    `toml:"workspace,omitempty" json:"workspace,omitempty"`
 	PermissionMode   string                    `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
 	MaxTurns         int                       `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
+	MaxTotalTokens   int                       `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
 	ToolTimeoutSec   int                       `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
 	MaxOutputBytes   int                       `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
 	MaxReadBytes     int                       `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
@@ -60,6 +61,7 @@ func Default(workspace string) Config {
 		Workspace:        workspace,
 		PermissionMode:   "manual",
 		MaxTurns:         20,
+		MaxTotalTokens:   1_000_000,
 		ToolTimeoutSec:   60,
 		MaxOutputBytes:   64 << 10,
 		MaxReadBytes:     1 << 20,
@@ -91,8 +93,8 @@ func (c Config) Validate() error {
 			return err
 		}
 	}
-	if c.MaxTurns <= 0 {
-		return errors.New("max_turns must be greater than zero")
+	if c.MaxTurns <= 0 || c.MaxTotalTokens <= 0 {
+		return errors.New("turn and token budgets must be greater than zero")
 	}
 	if c.ToolTimeoutSec <= 0 || c.MaxOutputBytes <= 0 || c.MaxReadBytes <= 0 || c.MaxSearchResults <= 0 {
 		return errors.New("resource limits must be greater than zero")
@@ -250,6 +252,9 @@ func merge(dst *Config, src Config) {
 	if src.MaxTurns != 0 {
 		dst.MaxTurns = src.MaxTurns
 	}
+	if src.MaxTotalTokens != 0 {
+		dst.MaxTotalTokens = src.MaxTotalTokens
+	}
 	if src.ToolTimeoutSec != 0 {
 		dst.ToolTimeoutSec = src.ToolTimeoutSec
 	}
@@ -282,6 +287,7 @@ func applyEnvironment(cfg *Config, environ []string) {
 	}
 	for key, target := range map[string]*int{
 		"EYLU_MAX_TURNS":        &cfg.MaxTurns,
+		"EYLU_MAX_TOTAL_TOKENS": &cfg.MaxTotalTokens,
 		"EYLU_TOOL_TIMEOUT":     &cfg.ToolTimeoutSec,
 		"EYLU_MAX_OUTPUT_BYTES": &cfg.MaxOutputBytes,
 	} {

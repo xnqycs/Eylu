@@ -24,7 +24,8 @@ func TestGenerateTextRequest(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if body.Model != "test-model" || len(body.Input) != 1 || body.Input[0].Content != "hello" {
+		first, ok := body.Input[0].(map[string]any)
+		if body.Model != "test-model" || len(body.Input) != 1 || !ok || first["content"] != "hello" {
 			t.Fatalf("request body = %#v", body)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -77,5 +78,42 @@ func TestGenerateMapsHTTPAndTimeoutErrors(t *testing.T) {
 	}, nil)
 	if typed, ok := err.(*protocol.Error); !ok || typed.Code != protocol.ErrTimeout {
 		t.Fatalf("timeout error = %#v", err)
+	}
+}
+
+func TestGenerateMapsToolHistory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		input := body["input"].([]any)
+		if len(input) != 4 {
+			t.Fatalf("input = %#v", input)
+		}
+		call := input[2].(map[string]any)
+		output := input[3].(map[string]any)
+		if call["type"] != "function_call" || call["arguments"] != `{"path":"main.go"}` || output["type"] != "function_call_output" || output["call_id"] != "call-1" || output["output"] != "package main" {
+			t.Fatalf("call = %#v, output = %#v", call, output)
+		}
+		tools := body["tools"].([]any)
+		if tools[0].(map[string]any)["name"] != "read_file" {
+			t.Fatalf("tools = %#v", tools)
+		}
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}`))
+	}))
+	defer server.Close()
+	call := protocol.ToolCall{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"main.go"}`)}
+	result := protocol.ToolResult{CallID: "call-1", Content: "package main"}
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, APIKey: "key", Model: protocol.ModelRequest{
+		Model: "model", Tools: []protocol.ToolDefinition{{Name: "read_file", Description: "read", InputSchema: json.RawMessage(`{"type":"object"}`)}}, Turns: []protocol.Turn{
+			{Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "system"}}},
+			{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "read"}}},
+			{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}},
+			{Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &result}}},
+		},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 }

@@ -70,3 +70,28 @@ func TestChatStreamMergesTextAndRejectsDisconnect(t *testing.T) {
 		t.Fatalf("disconnect error = %#v", err)
 	}
 }
+
+func TestChatMapsToolHistory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Messages) != 4 || len(body.Messages[2].ToolCalls) != 1 || body.Messages[2].ToolCalls[0].Function.Arguments != `{"path":"main.go"}` || body.Messages[3].Role != "tool" || body.Messages[3].ToolCallID != "call-1" || body.Messages[3].Content != "package main" {
+			t.Fatalf("messages = %#v", body.Messages)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+	call := protocol.ToolCall{ID: "call-1", Name: "read_file", Arguments: json.RawMessage(`{"path":"main.go"}`)}
+	result := protocol.ToolResult{CallID: "call-1", Content: "package main"}
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, APIKey: "key", Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{
+		{Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "system"}}},
+		{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "read"}}},
+		{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}},
+		{Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &result}}},
+	}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+}

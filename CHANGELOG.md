@@ -1,5 +1,16 @@
 # Changelog
 
+## Phase 2 - 工具调用闭环
+
+- 增加 `ToolRegistry`、统一 `ToolExecutor`、基线权限检查、确认回调和结构化审计。
+- 增加工作区受限的 `read_file`、原子 `write_file` 与跨平台 `bash` 工具。
+- 增加显式 Agent Loop、多工具执行、call ID 配对、工具失败回传、迭代和 token 预算。
+- Responses 与 Chat 驱动增加 tool call/result 双向映射。
+
+配置：新增 `max_total_tokens` / `EYLU_MAX_TOTAL_TOKENS`；现有配置文件继续按默认值加载。
+
+安全：shell 仅继承白名单环境；所有工具统一经过本地策略、超时、输出上限和审计。
+
 ## Phase 1 - 多轮流式会话
 
 - 增加内存 transcript、session 边界、关闭会话快照和 Provider generation 感知。

@@ -27,6 +27,8 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 	}
 	conversation := agent.NewConversation()
 	reader := bufio.NewReader(r.stdin)
+	r.inputReader = reader
+	defer func() { r.inputReader = nil }()
 	fmt.Fprintf(r.stdout, "Eylu session %s\nType /help for commands.\n", conversation.SessionID())
 	for {
 		fmt.Fprint(r.stdout, "> ")

@@ -81,6 +81,22 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			}
 		case "response.completed":
 			converted := convertResponse(event.Response)
+			finalText := responseText(converted)
+			emittedText := text.String()
+			missingText := ""
+			if strings.HasPrefix(finalText, emittedText) {
+				missingText = strings.TrimPrefix(finalText, emittedText)
+			} else if emittedText == "" {
+				missingText = finalText
+			}
+			if missingText != "" {
+				text.WriteString(missingText)
+				if emit != nil {
+					if err := emit(protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: missingText}); err != nil {
+						return err
+					}
+				}
+			}
 			final = &converted
 			completed = true
 		case "response.failed", "error":
@@ -149,4 +165,14 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 		}
 	}
 	return *final, nil
+}
+
+func responseText(response protocol.ModelResponse) string {
+	var text strings.Builder
+	for _, part := range response.Turn.Parts {
+		if part.Kind == protocol.PartText {
+			text.WriteString(part.Text)
+		}
+	}
+	return text.String()
 }

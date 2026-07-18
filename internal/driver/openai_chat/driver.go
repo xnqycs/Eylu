@@ -101,11 +101,16 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	for _, turn := range req.Model.Turns {
 		message := chatMessage{Role: chatRole(turn.Role)}
 		for _, part := range turn.Parts {
-			if part.Kind == protocol.PartText {
+			switch {
+			case part.Kind == protocol.PartText:
 				message.Content += part.Text
+			case part.Kind == protocol.PartToolCall && part.ToolCall != nil:
+				message.ToolCalls = append(message.ToolCalls, chatToolCall{ID: part.ToolCall.ID, Type: "function", Function: chatFunction{Name: part.ToolCall.Name, Arguments: string(part.ToolCall.Arguments)}})
+			case part.Kind == protocol.PartToolResult && part.ToolResult != nil:
+				body.Messages = append(body.Messages, chatMessage{Role: "tool", ToolCallID: part.ToolResult.CallID, Content: part.ToolResult.Content})
 			}
 		}
-		if message.Content != "" {
+		if message.Content != "" || len(message.ToolCalls) > 0 {
 			body.Messages = append(body.Messages, message)
 		}
 	}

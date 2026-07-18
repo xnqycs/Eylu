@@ -34,6 +34,18 @@ go run . chat "检查当前项目" --provider work
 
 在终端直接运行 `go run . chat` 会进入多轮交互会话。可用命令包括 `/help`、`/new`、`/context`、`/providers`、`/provider add|edit|delete|use`、`/model` 与 `/quit`。文本输出实时呈现模型增量；`--output json` 输出完整响应对象。
 
+Agent 默认提供以下工具：
+
+- `read_file`：读取工作区内 UTF-8 文件，限制读取字节并拒绝路径穿越。
+- `write_file`：在确认后原子创建或替换文件，父目录创建必须由模型显式声明。
+- `bash`：在确认后通过平台 shell 执行命令，限制环境、超时与输出大小。
+
+只读工具直接执行；写入与命令工具会在 TTY 中确认。脚本化运行可使用 `--yes` 明确授权本次请求中的确认项：
+
+```powershell
+go run . chat "读取 go.mod 并执行 go test ./..." --provider work --yes
+```
+
 配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。配置文件仅保存凭据引用；交互式首次引导会优先保存到系统 keyring。
 
 当前多轮 transcript、已关闭 session 和 DriverState 保存在进程内；Phase 8 的事件日志与快照会提供跨进程恢复。

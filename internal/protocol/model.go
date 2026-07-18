@@ -97,16 +97,19 @@ const (
 	EventResponseStart EventKind = "response_start"
 	EventTextDelta     EventKind = "text_delta"
 	EventToolCallDelta EventKind = "tool_call_delta"
+	EventToolStart     EventKind = "tool_start"
+	EventToolResult    EventKind = "tool_result"
 	EventUsage         EventKind = "usage"
 	EventResponseDone  EventKind = "response_done"
 	EventError         EventKind = "error"
 )
 
 type ModelEvent struct {
-	Kind     EventKind      `json:"kind"`
-	Delta    string         `json:"delta,omitempty"`
-	ToolCall *ToolCall      `json:"tool_call,omitempty"`
-	Usage    *Usage         `json:"usage,omitempty"`
-	Response *ModelResponse `json:"response,omitempty"`
-	Error    *Error         `json:"error,omitempty"`
+	Kind       EventKind      `json:"kind"`
+	Delta      string         `json:"delta,omitempty"`
+	ToolCall   *ToolCall      `json:"tool_call,omitempty"`
+	ToolResult *ToolResult    `json:"tool_result,omitempty"`
+	Usage      *Usage         `json:"usage,omitempty"`
+	Response   *ModelResponse `json:"response,omitempty"`
+	Error      *Error         `json:"error,omitempty"`
 }

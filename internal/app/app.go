@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,8 +20,10 @@ import (
 	"Eylu/internal/driver/openai_chat"
 	"Eylu/internal/driver/openai_responses"
 	"Eylu/internal/logging"
+	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
+	"Eylu/internal/tool"
 )
 
 const (
@@ -40,6 +43,7 @@ type runtime struct {
 	workspace   string
 	output      string
 	credentials *provider.CredentialStore
+	inputReader *bufio.Reader
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -76,6 +80,7 @@ type chatOptions struct {
 	baseURL  string
 	adapter  string
 	timeout  time.Duration
+	approve  bool
 }
 
 func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
@@ -109,6 +114,7 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "API base URL override")
 	cmd.Flags().StringVar(&opts.adapter, "adapter", openai_responses.Name, "model driver adapter")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 0, "request timeout")
+	cmd.Flags().BoolVarP(&opts.approve, "yes", "y", false, "approve tools that require confirmation")
 	return cmd
 }
 
@@ -151,20 +157,31 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	if err != nil {
 		return err
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, modelRuntime.Timeout)
+	cfg := manager.Config()
+	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
+	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
 	stream := r.output == "text"
 	var emit driver.EmitFunc
 	if stream {
 		emit = func(event protocol.ModelEvent) error {
-			if event.Kind == protocol.EventTextDelta {
+			switch event.Kind {
+			case protocol.EventTextDelta:
 				_, err := fmt.Fprint(r.stdout, event.Delta)
 				return err
+			case protocol.EventToolStart:
+				fmt.Fprintf(r.stderr, "\n[tool] %s call_id=%s\n", event.ToolCall.Name, event.ToolCall.ID)
+			case protocol.EventToolResult:
+				fmt.Fprintf(r.stderr, "[tool] completed call_id=%s error=%t truncated=%t\n", event.ToolResult.CallID, event.ToolResult.IsError, event.ToolResult.Truncated)
 			}
 			return nil
 		}
 	}
-	response, err := conversation.Send(requestCtx, prompt, modelRuntime, stream, emit)
+	executor, err := r.toolExecutor(cfg, opts)
+	if err != nil {
+		return err
+	}
+	response, err := conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens}, stream, emit)
 	if err != nil {
 		if stream {
 			fmt.Fprintln(r.stdout)
@@ -176,6 +193,51 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	}
 	fmt.Fprintln(r.stdout)
 	return nil
+}
+
+func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions) (*tool.Executor, error) {
+	readFile, err := tool.NewReadFile(cfg.Workspace, cfg.MaxReadBytes)
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize read_file", Cause: err}
+	}
+	writeFile, err := tool.NewWriteFile(cfg.Workspace)
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize write_file", Cause: err}
+	}
+	bashTool, err := tool.NewBash(cfg.Workspace, cfg.MaxOutputBytes, nil)
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize bash", Cause: err}
+	}
+	return &tool.Executor{
+		Registry: tool.NewRegistry(readFile, writeFile, bashTool), Policy: policy.BaselineChecker{},
+		Confirm: r.confirmTools(opts.approve), Audit: &toolAuditWriter{writer: r.stderr}, Workspace: cfg.Workspace,
+		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
+	}, nil
+}
+
+func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
+	return func(ctx context.Context, request policy.Request, outcome policy.Outcome) (bool, error) {
+		if approve {
+			return true, nil
+		}
+		if !isTerminal(r.stdin) {
+			return false, nil
+		}
+		reader := r.inputReader
+		if reader == nil {
+			reader = bufio.NewReader(r.stdin)
+		}
+		preview := logging.Redact(string(request.Input), os.Getenv("EYLU_API_KEY"))
+		if len(preview) > 512 {
+			preview = preview[:512] + "..."
+		}
+		fmt.Fprintf(r.stderr, "Approve %s tool %s? %s\n%s\n[y/N]: ", outcome.Risk, request.Tool, outcome.Reason, preview)
+		answer, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return false, err
+		}
+		return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes"), nil
+	}
 }
 
 func (r *runtime) resolveRuntime(manager *provider.Manager, opts chatOptions) (agent.Runtime, error) {
