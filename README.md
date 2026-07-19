@@ -34,7 +34,7 @@ go run . chat "检查当前项目" --provider work
 - `openai_responses`：使用 `/v1/responses` 和类型化 SSE 事件。
 - `openai_chat`：使用 `/v1/chat/completions` 和 Chat Completions 流。
 
-在终端直接运行 `go run . chat` 会进入多轮交互会话。可用命令包括 `/help`、`/new`、`/context`、`/providers`、`/provider add|edit|delete|use`、`/model` 与 `/quit`。文本输出实时呈现模型增量；`--output json` 输出完整响应对象。
+在终端直接运行 `go run . chat` 会进入多轮交互会话。可用命令包括 `/help`、`/new`、`/context`、`/skills`、`/skill`、`/providers`、`/provider add|edit|delete|use`、`/model`、`/mode` 与 `/quit`。文本输出实时呈现模型增量；`--output json` 输出完整响应对象。
 
 TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、多行输入、Markdown、工具状态/详情、确认弹窗、Provider 表单、模型筛选、Skill 状态与上下文进度。Provider 表单的 API Key 使用 password input；模型面板支持刷新、筛选、选择和手工 ID。`Ctrl-C` 在请求期间先取消，第二次退出；`Ctrl-T` 打开最近工具详情。
 
@@ -45,6 +45,23 @@ go run . chat "检查项目" --provider work --output jsonl
 ```
 
 `--no-animation` 保留静态状态与耗时；`TERM=dumb`、管道和结构化输出使用静态路径；`NO_COLOR` 会移除 ANSI 颜色。`--output jsonl` 逐行输出 context、模型事件、工具审计和最终响应，便于脚本消费。
+
+## 会话恢复
+
+每次 chat 都会创建持久化 session。可以指定稳定 ID，或恢复当前工作区最近使用的 session：
+
+```powershell
+go run . chat "检查项目" --session review-1 --provider work
+go run . chat "继续处理" --resume --provider work
+go run . sessions list
+go run . sessions show review-1 --output json
+go run . sessions delete review-1
+go run . sessions migrate review-1
+```
+
+`/new` 会先刷新当前快照并追加关闭事件，再创建空 session；历史记录仍可通过 `--session <id>` 恢复。删除操作在终端中确认，脚本环境使用 `sessions delete <id> --yes`。
+
+默认状态目录为 `~/.eylu/state/sessions`，`EYLU_STATE_DIR` 可修改其父目录。每个 session 使用 `events.jsonl` 作为事实日志，`snapshot.json` 加速恢复；超过 16 KiB 的工具输出按 SHA-256 保存为附件并在加载时校验。恢复 Skill 时会重新读取正文并复核保存的 digest。schema 版本不兼容时需显式运行迁移命令，迁移前会保留 v0 备份。
 
 Agent 默认提供以下工具：
 
@@ -110,13 +127,15 @@ max_project_map_bytes = 32768
 max_tool_context_bytes = 8192
 skill_catalog_page_bytes = 8192
 max_summary_bytes = 16384
+max_sessions = 100
+max_session_bytes = 536870912
 ```
 
 项目地图稳定登记受限文件树、语言统计、入口、配置和最近修改文件。Responses 驱动在端点支持时使用远端 response state 减少重复传输；HTTP 网关拒绝该能力时会自动记忆并切换到完整上下文请求。
 
 配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。配置文件仅保存凭据引用；交互式首次引导会优先保存到系统 keyring。
 
-当前多轮 transcript、已关闭 session 和 DriverState 保存在进程内；Phase 8 的事件日志与快照会提供跨进程恢复。
+session 保存完整 Eylu transcript、上下文账本、权限模式、Provider generation、模型引用和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。清除 DriverState 后仍可使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
 
 ## 开发质量门槛
 

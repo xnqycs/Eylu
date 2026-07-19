@@ -37,12 +37,15 @@ type Runtime struct {
 }
 
 type ProtectedSkill struct {
-	Name    string
-	Source  string
-	Entry   string
-	Root    string
-	Digest  string
-	Content string
+	Name         string    `json:"name"`
+	Source       string    `json:"source"`
+	Entry        string    `json:"entry"`
+	Root         string    `json:"root"`
+	Digest       string    `json:"digest"`
+	Content      string    `json:"content,omitempty"`
+	Trigger      string    `json:"trigger,omitempty"`
+	ActivatedAt  time.Time `json:"activated_at,omitempty"`
+	AllowedTools string    `json:"allowed_tools,omitempty"`
 }
 
 type Conversation struct {
@@ -272,8 +275,17 @@ func (c *Conversation) captureSkillResult(result protocol.ToolResult) bool {
 	c.protectedSkills[name] = ProtectedSkill{
 		Name: name, Source: stringMetadata(result.Metadata, "skill_source"), Entry: stringMetadata(result.Metadata, "skill_entry"),
 		Root: stringMetadata(result.Metadata, "skill_root"), Digest: digest, Content: content,
+		Trigger: stringMetadata(result.Metadata, "trigger"), AllowedTools: stringMetadata(result.Metadata, "allowed_tools"),
+	}
+	if activated := stringMetadata(result.Metadata, "activated_at"); activated != "" {
+		c.protectedSkills[name] = withActivatedAt(c.protectedSkills[name], activated)
 	}
 	return true
+}
+
+func withActivatedAt(item ProtectedSkill, value string) ProtectedSkill {
+	item.ActivatedAt, _ = time.Parse(time.RFC3339Nano, value)
+	return item
 }
 
 func stringMetadata(metadata map[string]any, key string) string {
@@ -294,7 +306,23 @@ func cloneTurns(turns []protocol.Turn) []protocol.Turn {
 	result := make([]protocol.Turn, len(turns))
 	for index, turn := range turns {
 		result[index] = turn
-		result[index].Parts = append([]protocol.Part(nil), turn.Parts...)
+		result[index].Parts = make([]protocol.Part, len(turn.Parts))
+		for partIndex, part := range turn.Parts {
+			result[index].Parts[partIndex] = part
+			if part.ToolCall != nil {
+				call := *part.ToolCall
+				call.Arguments = append(json.RawMessage(nil), part.ToolCall.Arguments...)
+				result[index].Parts[partIndex].ToolCall = &call
+			}
+			if part.ToolResult != nil {
+				toolResult := *part.ToolResult
+				toolResult.Metadata = make(map[string]any, len(part.ToolResult.Metadata))
+				for key, value := range part.ToolResult.Metadata {
+					toolResult.Metadata[key] = value
+				}
+				result[index].Parts[partIndex].ToolResult = &toolResult
+			}
+		}
 	}
 	return result
 }

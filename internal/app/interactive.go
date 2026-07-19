@@ -26,7 +26,10 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 	if err != nil {
 		return err
 	}
-	conversation := agent.NewConversation()
+	conversation, err := r.openConversation(manager, &opts)
+	if err != nil {
+		return err
+	}
 	if !opts.noTUI && isTerminal(r.stdout) && !strings.EqualFold(os.Getenv("TERM"), "dumb") && r.output == "text" {
 		return r.runTUI(ctx, conversation, manager, opts)
 	}
@@ -106,8 +109,11 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	case "/quit":
 		return errQuit
 	case "/new":
-		old := conversation.NewSession()
-		fmt.Fprintf(r.stdout, "Closed session %s. New session %s.\n", old, conversation.SessionID())
+		old, current, err := r.rotateSession(conversation, manager, *opts)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(r.stdout, "Closed session %s. New session %s.\n", old, current)
 		return nil
 	case "/context":
 		return contextledger.RenderText(r.stdout, conversation.ContextReport())
@@ -120,11 +126,29 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		if len(fields) != 2 {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /skill <name>"}
 		}
-		return r.activateSkillSlash(conversation, manager.Config(), *opts, fields[1])
+		if err := r.activateSkillSlash(conversation, manager.Config(), *opts, fields[1]); err != nil {
+			return err
+		}
+		if r.session != nil {
+			return r.session.Sync(conversation, manager, *opts, nil)
+		}
+		return nil
 	case "/provider":
-		return r.handleProviderSlash(ctx, reader, fields, manager, opts)
+		if err := r.handleProviderSlash(ctx, reader, fields, manager, opts); err != nil {
+			return err
+		}
+		if r.session != nil {
+			return r.session.Sync(conversation, manager, *opts, nil)
+		}
+		return nil
 	case "/model":
-		return r.handleModelSlash(ctx, fields, manager)
+		if err := r.handleModelSlash(ctx, fields, manager); err != nil {
+			return err
+		}
+		if r.session != nil {
+			return r.session.Sync(conversation, manager, *opts, nil)
+		}
+		return nil
 	case "/mode":
 		if len(fields) != 2 {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /mode manual|plan|auto|full"}
@@ -134,6 +158,11 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
 		opts.mode = mode.String()
+		if r.session != nil {
+			if err := r.session.Sync(conversation, manager, *opts, nil); err != nil {
+				return err
+			}
+		}
 		fmt.Fprintf(r.stdout, "Permission mode: %s\n", opts.mode)
 		return nil
 	default:

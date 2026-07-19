@@ -54,7 +54,13 @@ func (r *runtime) loadSkillRuntime(cfg config.Config, opts chatOptions, conversa
 	if conversation != nil {
 		initial = conversation.ActivatedSkillDigests()
 	}
-	return registry, skill.NewSession(registry, initial), nil
+	session := skill.NewSession(registry, initial)
+	if r.session != nil && conversation != nil {
+		for _, diagnostic := range r.session.RevalidateSkills(registry, session, conversation) {
+			fmt.Fprintf(r.stderr, "[session] %s\n", diagnostic)
+		}
+	}
+	return registry, session, nil
 }
 
 func (r *runtime) confirmSkillTrust(workspace string) bool {

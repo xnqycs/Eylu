@@ -71,3 +71,26 @@ func TestLedgerUnknownCategoryContributesToTotals(t *testing.T) {
 		t.Fatalf("report = %#v", report)
 	}
 }
+
+func TestLedgerStateRoundTrip(t *testing.T) {
+	ledger := New(ApproxEstimator{BytesPerToken: 1})
+	ledger.AddText("user", CategoryUserMessage, "turn", "hello", false)
+	ledger.SetLastUsage(protocol.Usage{InputTokens: 5, OutputTokens: 1, Exact: true})
+	ledger.RecordCompression(CompressionEvent{BeforeTokens: 10, AfterTokens: 5, OmittedTurns: 2})
+	restored := New(nil)
+	restored.Restore(ledger.State())
+	report := restored.Report("provider", "model", 100)
+	if report.InputTokens != 5 || report.LastUsage.InputTokens != 5 || report.CompressionCount != 1 || report.LastCompression.OmittedTurns != 2 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestLedgerStateDoesNotShareMetadataMap(t *testing.T) {
+	ledger := New(nil)
+	ledger.ReplaceBlocks([]Block{{ID: "block", Category: CategoryUserMessage, Metadata: map[string]any{"key": "saved"}}})
+	state := ledger.State()
+	state.Blocks[0].Metadata["key"] = "changed"
+	if value := ledger.Blocks()[0].Metadata["key"]; value != "saved" {
+		t.Fatalf("metadata = %v", value)
+	}
+}

@@ -64,6 +64,8 @@ type Config struct {
 	MaxToolContextBytes   int                       `toml:"max_tool_context_bytes,omitempty" json:"max_tool_context_bytes,omitempty"`
 	SkillCatalogPageBytes int                       `toml:"skill_catalog_page_bytes,omitempty" json:"skill_catalog_page_bytes,omitempty"`
 	MaxSummaryBytes       int                       `toml:"max_summary_bytes,omitempty" json:"max_summary_bytes,omitempty"`
+	MaxSessions           int                       `toml:"max_sessions,omitempty" json:"max_sessions,omitempty"`
+	MaxSessionBytes       int64                     `toml:"max_session_bytes,omitempty" json:"max_session_bytes,omitempty"`
 }
 
 func Default(workspace string) Config {
@@ -88,6 +90,8 @@ func Default(workspace string) Config {
 		MaxToolContextBytes:   8 << 10,
 		SkillCatalogPageBytes: 8 << 10,
 		MaxSummaryBytes:       16 << 10,
+		MaxSessions:           100,
+		MaxSessionBytes:       512 << 20,
 	}
 }
 
@@ -128,6 +132,9 @@ func (c Config) Validate() error {
 	}
 	if c.TokenBytesPerToken <= 0 || c.ReservedOutputTokens <= 0 || c.ContextRecentRounds <= 0 || c.MaxProjectMapBytes <= 0 || c.MaxToolContextBytes <= 0 || c.SkillCatalogPageBytes <= 0 || c.MaxSummaryBytes <= 0 {
 		return errors.New("context limits must be greater than zero")
+	}
+	if c.MaxSessions <= 0 || c.MaxSessionBytes <= 0 {
+		return errors.New("session limits must be greater than zero")
 	}
 	switch c.PermissionMode {
 	case "manual", "plan", "auto", "full":
@@ -338,6 +345,12 @@ func merge(dst *Config, src Config) {
 	if src.MaxSummaryBytes != 0 {
 		dst.MaxSummaryBytes = src.MaxSummaryBytes
 	}
+	if src.MaxSessions != 0 {
+		dst.MaxSessions = src.MaxSessions
+	}
+	if src.MaxSessionBytes != 0 {
+		dst.MaxSessionBytes = src.MaxSessionBytes
+	}
 }
 
 func applyEnvironment(cfg *Config, environ []string) {
@@ -368,11 +381,17 @@ func applyEnvironment(cfg *Config, environ []string) {
 		"EYLU_MAX_TOOL_CONTEXT_BYTES":   &cfg.MaxToolContextBytes,
 		"EYLU_SKILL_CATALOG_PAGE_BYTES": &cfg.SkillCatalogPageBytes,
 		"EYLU_MAX_SUMMARY_BYTES":        &cfg.MaxSummaryBytes,
+		"EYLU_MAX_SESSIONS":             &cfg.MaxSessions,
 	} {
 		if value := env[key]; value != "" {
 			if parsed, err := strconv.Atoi(value); err == nil {
 				*target = parsed
 			}
+		}
+	}
+	if value := env["EYLU_MAX_SESSION_BYTES"]; value != "" {
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+			cfg.MaxSessionBytes = parsed
 		}
 	}
 	if cfg.ActiveProvider != "" {

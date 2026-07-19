@@ -139,6 +139,11 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
 	_, err = b.conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens}, true, modelEvents)
+	if b.runtime.session != nil {
+		if syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, err); err == nil {
+			err = syncErr
+		}
+	}
 	report := b.conversation.ContextReport()
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &report})
 	return err
@@ -190,8 +195,15 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 	}
 	switch fields[0] {
 	case "/new":
-		old := b.conversation.NewSession()
-		return fmt.Sprintf("Closed session %s. New session %s.", old, b.conversation.SessionID()), nil
+		b.mu.Lock()
+		opts := b.opts
+		b.mu.Unlock()
+		old, current, err := b.runtime.rotateSession(b.conversation, b.manager, opts)
+		if err != nil {
+			return "", err
+		}
+		b.skillSession = skill.NewSession(b.skills, nil)
+		return fmt.Sprintf("Closed session %s. New session %s.", old, current), nil
 	case "/mode":
 		if len(fields) != 2 {
 			return "", fmt.Errorf("usage: /mode manual|plan|auto|full")
@@ -202,7 +214,13 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 		}
 		b.mu.Lock()
 		b.opts.mode = mode.String()
+		opts := b.opts
 		b.mu.Unlock()
+		if b.runtime.session != nil {
+			if err := b.runtime.session.Sync(b.conversation, b.manager, opts, nil); err != nil {
+				return "", err
+			}
+		}
 		return "Permission mode: " + mode.String(), nil
 	case "/skill":
 		if len(fields) != 2 {
@@ -218,6 +236,14 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 			result.Metadata["trigger"] = "user"
 		}
 		b.conversation.RegisterSkillResult(result)
+		b.mu.Lock()
+		opts := b.opts
+		b.mu.Unlock()
+		if b.runtime.session != nil {
+			if err := b.runtime.session.Sync(b.conversation, b.manager, opts, nil); err != nil {
+				return "", err
+			}
+		}
 		return result.Content, nil
 	case "/provider":
 		if len(fields) != 3 {

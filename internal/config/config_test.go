@@ -98,13 +98,13 @@ func TestValidatePermissionModeAndClonePolicyLists(t *testing.T) {
 func TestContextLimitEnvironmentOverrides(t *testing.T) {
 	workspace := t.TempDir()
 	loaded, err := Load(LoadOptions{ExplicitPath: filepath.Join(t.TempDir(), "missing.toml"), Workspace: workspace, Environ: []string{
-		"EYLU_TOKEN_BYTES_PER_TOKEN=3", "EYLU_RESERVED_OUTPUT_TOKENS=1024", "EYLU_CONTEXT_RECENT_ROUNDS=2", "EYLU_MAX_PROJECT_MAP_BYTES=4096", "EYLU_MAX_TOOL_CONTEXT_BYTES=2048", "EYLU_SKILL_CATALOG_PAGE_BYTES=1024", "EYLU_MAX_SUMMARY_BYTES=3072",
+		"EYLU_TOKEN_BYTES_PER_TOKEN=3", "EYLU_RESERVED_OUTPUT_TOKENS=1024", "EYLU_CONTEXT_RECENT_ROUNDS=2", "EYLU_MAX_PROJECT_MAP_BYTES=4096", "EYLU_MAX_TOOL_CONTEXT_BYTES=2048", "EYLU_SKILL_CATALOG_PAGE_BYTES=1024", "EYLU_MAX_SUMMARY_BYTES=3072", "EYLU_MAX_SESSIONS=7", "EYLU_MAX_SESSION_BYTES=123456",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := loaded.Config
-	if cfg.TokenBytesPerToken != 3 || cfg.ReservedOutputTokens != 1024 || cfg.ContextRecentRounds != 2 || cfg.MaxProjectMapBytes != 4096 || cfg.MaxToolContextBytes != 2048 || cfg.SkillCatalogPageBytes != 1024 || cfg.MaxSummaryBytes != 3072 {
+	if cfg.TokenBytesPerToken != 3 || cfg.ReservedOutputTokens != 1024 || cfg.ContextRecentRounds != 2 || cfg.MaxProjectMapBytes != 4096 || cfg.MaxToolContextBytes != 2048 || cfg.SkillCatalogPageBytes != 1024 || cfg.MaxSummaryBytes != 3072 || cfg.MaxSessions != 7 || cfg.MaxSessionBytes != 123456 {
 		t.Fatalf("context config = %#v", cfg)
 	}
 }

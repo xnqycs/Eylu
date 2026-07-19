@@ -47,6 +47,7 @@ type runtime struct {
 	credentials   *provider.CredentialStore
 	inputReader   *bufio.Reader
 	trustPrompted map[string]bool
+	session       *sessionRuntime
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -81,7 +82,7 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 	root.PersistentFlags().StringVar(&r.configPath, "config", "", "config file path")
 	root.PersistentFlags().StringVar(&r.workspace, "workspace", "", "workspace directory")
 	root.PersistentFlags().StringVar(&r.output, "output", "text", "output format: text, json, or jsonl")
-	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand())
+	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand(), r.sessionsCommand())
 	return root
 }
 
@@ -96,6 +97,8 @@ type chatOptions struct {
 	trustSkills bool
 	noAnimation bool
 	noTUI       bool
+	sessionID   string
+	resume      bool
 }
 
 func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
@@ -134,6 +137,9 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.trustSkills, "trust-workspace-skills", false, "trust and load project-level skills for this workspace")
 	cmd.Flags().BoolVar(&opts.noAnimation, "no-animation", false, "disable terminal animations")
 	cmd.Flags().BoolVar(&opts.noTUI, "no-tui", false, "use the line-oriented interactive interface")
+	cmd.Flags().StringVar(&opts.sessionID, "session", "", "create or open a session ID")
+	cmd.Flags().BoolVar(&opts.resume, "resume", false, "resume the most recent session in this workspace")
+	cmd.MarkFlagsMutuallyExclusive("session", "resume")
 	return cmd
 }
 
@@ -142,7 +148,10 @@ func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) 
 	if err != nil {
 		return err
 	}
-	conversation := agent.NewConversation()
+	conversation, err := r.openConversation(manager, &opts)
+	if err != nil {
+		return err
+	}
 	return r.sendPrompt(ctx, conversation, manager, prompt, opts)
 }
 
@@ -245,11 +254,18 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return err
 	}
 	response, err := conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens}, stream, emit)
+	syncErr := error(nil)
+	if r.session != nil {
+		syncErr = r.session.Sync(conversation, manager, opts, err)
+	}
 	if err != nil {
 		if r.output == "text" {
 			fmt.Fprintln(r.stdout)
 		}
 		return err
+	}
+	if syncErr != nil {
+		return syncErr
 	}
 	if r.output == "json" {
 		return json.NewEncoder(r.stdout).Encode(response)

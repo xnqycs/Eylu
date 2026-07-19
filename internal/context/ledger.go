@@ -147,6 +147,13 @@ type Ledger struct {
 	lastCompression  *CompressionEvent
 }
 
+type LedgerState struct {
+	Blocks           []Block           `json:"blocks"`
+	LastUsage        protocol.Usage    `json:"last_usage"`
+	CompressionCount int               `json:"compression_count"`
+	LastCompression  *CompressionEvent `json:"last_compression,omitempty"`
+}
+
 func New(estimator TokenEstimator) *Ledger {
 	if estimator == nil {
 		estimator = ApproxEstimator{BytesPerToken: 4}
@@ -174,7 +181,7 @@ func (l *Ledger) SetEstimator(estimator TokenEstimator) {
 
 func (l *Ledger) ReplaceBlocks(blocks []Block) {
 	l.mu.Lock()
-	l.blocks = append(l.blocks[:0], blocks...)
+	l.blocks = cloneBlocks(blocks)
 	l.mu.Unlock()
 }
 
@@ -207,8 +214,44 @@ func (l *Ledger) RecordCompression(event CompressionEvent) {
 func (l *Ledger) Blocks() []Block {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	result := make([]Block, len(l.blocks))
-	copy(result, l.blocks)
+	return cloneBlocks(l.blocks)
+}
+
+func (l *Ledger) State() LedgerState {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	state := LedgerState{Blocks: cloneBlocks(l.blocks), LastUsage: l.lastUsage, CompressionCount: l.compressionCount}
+	if l.lastCompression != nil {
+		copy := *l.lastCompression
+		state.LastCompression = &copy
+	}
+	return state
+}
+
+func (l *Ledger) Restore(state LedgerState) {
+	l.mu.Lock()
+	l.blocks = cloneBlocks(state.Blocks)
+	l.lastUsage = state.LastUsage
+	l.compressionCount = state.CompressionCount
+	l.lastCompression = nil
+	if state.LastCompression != nil {
+		copy := *state.LastCompression
+		l.lastCompression = &copy
+	}
+	l.mu.Unlock()
+}
+
+func cloneBlocks(blocks []Block) []Block {
+	result := make([]Block, len(blocks))
+	for index, block := range blocks {
+		result[index] = block
+		if block.Metadata != nil {
+			result[index].Metadata = make(map[string]any, len(block.Metadata))
+			for key, value := range block.Metadata {
+				result[index].Metadata[key] = value
+			}
+		}
+	}
 	return result
 }
 
