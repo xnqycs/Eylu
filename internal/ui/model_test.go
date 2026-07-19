@@ -385,6 +385,65 @@ func TestChatInputBandUsesOnePromptAndNativeCursor(t *testing.T) {
 	}
 }
 
+func TestViewportContentStartsAtEmptyInputCursorColumnAndKeepsHeaderPosition(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	_ = model.input.Focus()
+	model.timeline = []timelineItem{{kind: timelineMessage, role: "agent", text: "Aligned response"}}
+	model.refreshViewport()
+
+	view := model.View()
+	if view.Cursor == nil {
+		t.Fatal("empty input cursor is missing")
+	}
+	header := strings.Split(view.Content, "\n")[0]
+	if !strings.HasPrefix(header, "Eylu") {
+		t.Fatalf("header moved: %q", header)
+	}
+	assertInset := func(name string) {
+		t.Helper()
+		for _, line := range strings.Split(ansi.Strip(model.renderViewport()), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			left := lipgloss.Width(line) - lipgloss.Width(strings.TrimLeft(line, " "))
+			if left != view.Cursor.Position.X {
+				t.Fatalf("%s column=%d cursor column=%d line=%q", name, left, view.Cursor.Position.X, line)
+			}
+		}
+	}
+	assertInset("timeline")
+
+	model.screen = screenProviders
+	model.snapshot.Providers = []ProviderItem{{Name: "work", Adapter: "openai_responses", Model: "model", Active: true}}
+	model.refreshViewport()
+	assertInset("providers")
+
+	model.screen = screenProviderForm
+	model.form = newProviderFormModel(ProviderForm{Name: "work", BaseURL: "https://example.com/v1", Model: "model", Adapter: "openai_responses"}, model.viewportContentWidth())
+	model.refreshViewport()
+	assertInset("provider form")
+
+	model.screen = screenModels
+	model.models = []string{"model"}
+	model.refreshViewport()
+	assertInset("models")
+
+	model.screen = screenSkills
+	model.snapshot.Skills = []SkillItem{{Name: "review", Source: "project", Status: "active", Activated: true}}
+	model.refreshViewport()
+	assertInset("skills")
+
+	model.screen = screenContext
+	model.refreshViewport()
+	assertInset("context")
+
+	model.screen = screenToolDetail
+	model.timeline = []timelineItem{{kind: timelineTool, tool: &toolView{name: "read_file", arguments: `{"path":"README.md"}`, content: "ok"}}}
+	model.toolCursor = 0
+	model.refreshViewport()
+	assertInset("tool detail")
+}
+
 func TestTimelineMarkdownCacheInvalidatesOnTextAndWidth(t *testing.T) {
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, Width: 80, Height: 24})
 	model.timeline = []timelineItem{{kind: timelineMessage, role: "agent", text: "**cached response**"}}
@@ -658,7 +717,7 @@ func TestResizeStormLongWordsAndStaleAnimationTick(t *testing.T) {
 		height := 10 + index%35
 		_, _ = model.Update(tea.WindowSizeMsg{Width: width, Height: height})
 	}
-	if model.width < 40 || model.height < 12 || model.viewport.Width() != model.width || model.viewport.Height() != model.layout().viewportHeight {
+	if model.width < 40 || model.height < 12 || model.viewport.Width() != model.viewportContentWidth() || model.viewport.Height() != model.layout().viewportHeight {
 		t.Fatalf("size=%dx%d viewport=%dx%d", model.width, model.height, model.viewport.Width(), model.viewport.Height())
 	}
 	word := strings.Repeat("界", 50)
@@ -807,9 +866,9 @@ func TestMouseSelectionCopiesPlainWideTextAndShowsToast(t *testing.T) {
 	})
 	model.viewport.SetContent("alpha\n你好 world")
 	model.viewport.SetHeight(4)
-	_, _ = model.handleMouse(tea.MouseClickMsg{X: 1, Y: 1, Button: tea.MouseLeft})
-	_, _ = model.handleMouse(tea.MouseMotionMsg{X: 4, Y: 2, Button: tea.MouseLeft})
-	_, command := model.handleMouse(tea.MouseReleaseMsg{X: 4, Y: 2, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseClickMsg{X: 3, Y: 1, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseMotionMsg{X: 6, Y: 2, Button: tea.MouseLeft})
+	_, command := model.handleMouse(tea.MouseReleaseMsg{X: 6, Y: 2, Button: tea.MouseLeft})
 	if command == nil {
 		t.Fatal("selection did not produce clipboard command")
 	}
@@ -872,10 +931,10 @@ func TestMouseSelectionScrollsBeyondViewportAndCopiesFullHistory(t *testing.T) {
 	model.viewport.SetWidth(40)
 	model.viewport.SetHeight(3)
 	model.viewport.SetContent("line-00\nline-01\nline-02\nline-03\nline-04\nline-05\nline-06")
-	_, _ = model.handleMouse(tea.MouseClickMsg{X: 0, Y: 1, Button: tea.MouseLeft})
-	_, _ = model.handleMouse(tea.MouseMotionMsg{X: 6, Y: 3, Button: tea.MouseLeft})
-	_, _ = model.handleMouse(tea.MouseWheelMsg{X: 6, Y: 3, Button: tea.MouseWheelDown})
-	_, command := model.handleMouse(tea.MouseReleaseMsg{X: 6, Y: 3, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseClickMsg{X: 2, Y: 1, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseMotionMsg{X: 8, Y: 3, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseWheelMsg{X: 8, Y: 3, Button: tea.MouseWheelDown})
+	_, command := model.handleMouse(tea.MouseReleaseMsg{X: 8, Y: 3, Button: tea.MouseLeft})
 	if command == nil {
 		t.Fatal("scrolling selection did not produce clipboard command")
 	}

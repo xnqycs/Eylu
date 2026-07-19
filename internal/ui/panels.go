@@ -17,7 +17,7 @@ func (m *Model) handleProvidersKey(key string) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		m.providerCursor = clampCursor(m.providerCursor+1, len(providers))
 	case "a":
-		m.form = newProviderFormModel(ProviderForm{Adapter: "openai_responses"}, m.width)
+		m.form = newProviderFormModel(ProviderForm{Adapter: "openai_responses"}, m.viewportContentWidth())
 		m.screen = screenProviderForm
 	case "e":
 		if len(providers) > 0 {
@@ -140,7 +140,7 @@ func (m *Model) openProviderForm(item ProviderItem) {
 	m.form = newProviderFormModel(ProviderForm{
 		OriginalName: item.Name, Name: item.Name, BaseURL: item.BaseURL, Model: item.Model,
 		Adapter: item.Adapter, ContextWindow: item.ContextWindow,
-	}, m.width)
+	}, m.viewportContentWidth())
 	m.screen = screenProviderForm
 }
 

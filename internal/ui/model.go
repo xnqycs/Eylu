@@ -739,7 +739,7 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 		return m, m.loadSnapshotCmd()
 	case "/provider":
 		if len(fields) >= 2 && fields[1] == "add" {
-			m.form = newProviderFormModel(ProviderForm{Adapter: "openai_responses"}, m.width)
+			m.form = newProviderFormModel(ProviderForm{Adapter: "openai_responses"}, m.viewportContentWidth())
 			m.screen = screenProviderForm
 			return m, nil
 		}

@@ -115,13 +115,13 @@ func (m *Model) resize(width, height int) {
 	m.width = max(40, width)
 	m.height = max(12, height)
 	m.input.SetWidth(m.width)
-	m.modelFilter.SetWidth(max(20, m.width-6))
+	m.modelFilter.SetWidth(max(20, m.viewportContentWidth()-6))
 	m.approvalReason.SetWidth(max(20, m.width-12))
 	if m.planGate != nil {
 		m.planGate.feedback.SetWidth(max(20, m.width-12))
 	}
-	m.form.setWidth(m.width)
-	m.viewport.SetWidth(m.width)
+	m.form.setWidth(m.viewportContentWidth())
+	m.viewport.SetWidth(m.viewportContentWidth())
 	m.updateViewportHeight()
 	m.refreshViewport()
 }
@@ -302,12 +302,13 @@ func (m *Model) renderStatus() string {
 
 func (m *Model) renderTimeline() string {
 	var output strings.Builder
+	contentWidth := m.viewportContentWidth()
 	for index := range m.timeline {
 		item := &m.timeline[index]
 		switch item.kind {
 		case timelineMessage:
 			if item.role == "user" {
-				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.User.Render("YOU"), wrapPlain(item.text, m.width-2))
+				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.User.Render("YOU"), wrapPlain(item.text, max(1, contentWidth-2)))
 			} else {
 				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.Agent.Render("EYLU"), m.renderTimelineMarkdown(item))
 			}
@@ -318,7 +319,7 @@ func (m *Model) renderTimeline() string {
 			if item.err {
 				style = m.styles.Error
 			}
-			fmt.Fprintf(&output, "%s\n\n", style.Render(wrapPlain(item.text, m.width-2)))
+			fmt.Fprintf(&output, "%s\n\n", style.Render(wrapPlain(item.text, max(1, contentWidth-2))))
 		}
 	}
 	return strings.TrimRight(output.String(), "\n")
@@ -328,12 +329,13 @@ func (m *Model) renderTimelineMarkdown(item *timelineItem) string {
 	if item == nil {
 		return ""
 	}
-	if item.renderedSource == item.text && item.renderedWidth == m.width &&
+	contentWidth := m.viewportContentWidth()
+	if item.renderedSource == item.text && item.renderedWidth == contentWidth &&
 		item.renderedWorkspace == m.snapshot.Workspace && item.renderedNoColor == m.noColor {
 		return item.renderedText
 	}
 	item.renderedSource = item.text
-	item.renderedWidth = m.width
+	item.renderedWidth = contentWidth
 	item.renderedWorkspace = m.snapshot.Workspace
 	item.renderedNoColor = m.noColor
 	item.renderedText = m.renderMarkdown(item.text)
@@ -358,17 +360,18 @@ func (m *Model) renderTool(tool *toolView) string {
 	if tool.durationMS > 0 {
 		duration = "  " + FormatDurationMS(tool.durationMS)
 	}
-	detail := summarizeLine(tool.arguments, max(20, m.width-30))
+	contentWidth := m.viewportContentWidth()
+	detail := summarizeLine(tool.arguments, max(20, contentWidth-30))
 	if tool.path != "" {
 		detail = fmt.Sprintf("%s  %s  %d lines", m.renderFileLocationLink(tool.path), formatByteCount(tool.generatedBytes), tool.generatedLines)
 	}
 	lines := []string{fmt.Sprintf("> %s  %s%s", tool.name, state, duration)}
 	if detail != "" {
-		lines = append(lines, "  "+ansi.Truncate(detail, max(10, m.width-2), "..."))
+		lines = append(lines, "  "+ansi.Truncate(detail, max(10, contentWidth-2), "..."))
 	}
 	if tool.preview != "" {
 		for _, line := range strings.Split(tool.preview, "\n") {
-			lines = append(lines, "  "+truncateColumns(line, max(10, m.width-2)))
+			lines = append(lines, "  "+truncateColumns(line, max(10, contentWidth-2)))
 		}
 	}
 	return m.styles.Tool.Render(strings.Join(lines, "\n"))
@@ -421,7 +424,7 @@ func (m *Model) renderProviders() string {
 			active = "*"
 		}
 		line := fmt.Sprintf("%s%s %-18s %-20s %s", cursor, active, item.Name, item.Adapter, item.Model)
-		line = truncateColumns(line, m.width)
+		line = truncateColumns(line, m.viewportContentWidth())
 		if item.Active {
 			line = m.styles.Active.Render(line)
 		}
@@ -443,7 +446,7 @@ func (m *Model) renderModels() string {
 		if index == m.modelCursor {
 			cursor = "> "
 		}
-		line := cursor + truncateColumns(model, max(8, m.width-3))
+		line := cursor + truncateColumns(model, max(8, m.viewportContentWidth()-3))
 		if model == m.snapshot.Model {
 			line = m.styles.Active.Render(line)
 		}
@@ -465,7 +468,7 @@ func (m *Model) renderSkills() string {
 			active = "*"
 		}
 		line := fmt.Sprintf("%s%s %-24s %-16s %s", cursor, active, item.Name, item.Source, item.Status)
-		line = truncateColumns(line, m.width)
+		line = truncateColumns(line, m.viewportContentWidth())
 		if item.Activated {
 			line = m.styles.Active.Render(line)
 		}
@@ -647,23 +650,46 @@ func wrapLimited(value string, width, maxLines int) string {
 }
 
 func (m *Model) renderMarkdown(value string) string {
+	contentWidth := m.viewportContentWidth()
 	if m.noColor || strings.TrimSpace(value) == "" {
-		return wrapPlain(value, m.width-2)
+		return wrapPlain(value, max(1, contentWidth-2))
 	}
-	width := max(20, m.width-2)
+	width := max(20, contentWidth-2)
 	if m.markdown.renderer == nil || m.markdown.width != width {
 		renderer, err := glamour.NewTermRenderer(glamour.WithStyles(eyluMarkdownStyle()), glamour.WithWordWrap(width))
 		if err != nil {
-			return wrapPlain(value, m.width-2)
+			return wrapPlain(value, max(1, contentWidth-2))
 		}
 		m.markdown.renderer = renderer
 		m.markdown.width = width
 	}
 	rendered, err := m.markdown.renderer.Render(value)
 	if err != nil {
-		return wrapPlain(value, m.width-2)
+		return wrapPlain(value, max(1, contentWidth-2))
 	}
 	return rewriteLocalTerminalLinks(strings.TrimSpace(rendered), m.snapshot.Workspace)
+}
+
+func (m *Model) viewportLeftInset() int {
+	return lipgloss.Width(m.input.Prompt)
+}
+
+func (m *Model) viewportContentWidth() int {
+	return max(1, m.width-m.viewportLeftInset())
+}
+
+func indentBlock(value string, width int) string {
+	if value == "" || width <= 0 {
+		return value
+	}
+	prefix := strings.Repeat(" ", width)
+	lines := strings.Split(value, "\n")
+	for index, line := range lines {
+		if line != "" {
+			lines[index] = prefix + line
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func rewriteLocalTerminalLinks(rendered, workspace string) string {

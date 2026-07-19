@@ -70,7 +70,7 @@ func (m *Model) handleMouse(message tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		lines := selectionLines(m.viewport.GetContent(), m.viewport.Width())
-		point := clampSelectionPoint(lines, m.viewport.YOffset()+localY, event.X)
+		point := clampSelectionPoint(lines, m.viewport.YOffset()+localY, event.X-m.viewportLeftInset())
 		m.selection = selectionState{active: true, dragging: true, anchor: point, focus: point, lines: lines}
 		m.followOutput = false
 		return m, nil
@@ -121,13 +121,13 @@ func (m *Model) selectionPointAt(localY, column int, scroll bool) selectionPoint
 		}
 	}
 	visibleRow := min(max(0, localY), height-1)
-	return clampSelectionPoint(m.selection.lines, m.viewport.YOffset()+visibleRow, column)
+	return clampSelectionPoint(m.selection.lines, m.viewport.YOffset()+visibleRow, column-m.viewportLeftInset())
 }
 
 func (m *Model) renderViewport() string {
 	view := m.viewport.View()
 	if !m.selection.active {
-		return view
+		return indentBlock(view, m.viewportLeftInset())
 	}
 	lines := strings.Split(view, "\n")
 	start, end := normalizedSelection(m.selection.anchor, m.selection.focus)
@@ -148,7 +148,7 @@ func (m *Model) renderViewport() string {
 		suffix := ansi.Cut(lines[row], right, width)
 		lines[row] = prefix + m.styles.Selection.Render(middle) + suffix
 	}
-	return strings.Join(lines, "\n")
+	return indentBlock(strings.Join(lines, "\n"), m.viewportLeftInset())
 }
 
 func visibleSelectionLines(content string, width, height, offset int) []selectionLine {
