@@ -19,20 +19,13 @@ import (
 
 const SchemaVersion = 1
 
-type CredentialRef struct {
-	Type    string `toml:"type" json:"type"`
-	Service string `toml:"service,omitempty" json:"service,omitempty"`
-	Account string `toml:"account,omitempty" json:"account,omitempty"`
-	Env     string `toml:"env,omitempty" json:"env,omitempty"`
-}
-
 type ProviderConfig struct {
 	Adapter        string            `toml:"adapter" json:"adapter"`
 	BaseURL        string            `toml:"base_url" json:"base_url"`
+	APIKey         string            `toml:"api_key,omitempty" json:"-"`
 	Model          string            `toml:"model" json:"model"`
 	ContextWindow  int               `toml:"context_window,omitempty" json:"context_window,omitempty"`
 	TimeoutSeconds int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
-	Credential     CredentialRef     `toml:"credential" json:"credential"`
 	Headers        map[string]string `toml:"headers,omitempty" json:"headers,omitempty"`
 	Routing        ProviderRouting   `toml:"routing,omitempty" json:"routing,omitempty"`
 }
@@ -243,14 +236,6 @@ func ValidateProvider(name string, p ProviderConfig) error {
 			return fmt.Errorf("provider %q routing task %q is duplicated", name, task)
 		}
 		seenTasks[task] = true
-	}
-	switch p.Credential.Type {
-	case "", "keyring", "env", "memory", "none":
-	default:
-		return fmt.Errorf("provider %q credential type %q is invalid", name, p.Credential.Type)
-	}
-	if p.Credential.Type == "env" && p.Credential.Env == "" {
-		return fmt.Errorf("provider %q credential env is required", name)
 	}
 	return nil
 }

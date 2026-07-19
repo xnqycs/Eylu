@@ -21,7 +21,6 @@ func TestManagerPublishesAfterSaveAndRollsBack(t *testing.T) {
 	}
 	providerConfig := config.ProviderConfig{
 		Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "one",
-		Credential: config.CredentialRef{Type: "none"},
 	}
 	if err := manager.Upsert("work", providerConfig, true); err != nil {
 		t.Fatal(err)
@@ -41,7 +40,7 @@ func TestManagerPublishesAfterSaveAndRollsBack(t *testing.T) {
 func TestManagerInFlightSnapshotAndNextGeneration(t *testing.T) {
 	cfg := config.Default()
 	cfg.ActiveProvider = "work"
-	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://one.example/v1", Model: "one", Credential: config.CredentialRef{Type: "none"}}
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://one.example/v1", Model: "one"}
 	manager, err := NewManager("unused", cfg, func(string, config.Config) error { return nil })
 	if err != nil {
 		t.Fatal(err)

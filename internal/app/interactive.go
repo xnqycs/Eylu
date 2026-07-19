@@ -242,13 +242,7 @@ func (r *runtime) handleModelSlash(ctx context.Context, fields []string, manager
 		fmt.Fprintf(r.stdout, "Model: %s\n", fields[1])
 		return nil
 	}
-	key := os.Getenv("EYLU_API_KEY")
-	if key == "" {
-		key, err = r.credentials.Resolve(snapshot.Config.Credential)
-		if err != nil {
-			return &protocol.Error{Code: protocol.ErrCredential, Message: "provider credential is unavailable", Cause: err}
-		}
-	}
+	key := providerAPIKey(snapshot.Config)
 	listCtx, cancel := context.WithTimeout(ctx, snapshot.Config.Timeout(30*time.Second))
 	defer cancel()
 	models, err := provider.NewModelLister(&http.Client{Timeout: snapshot.Config.Timeout(30 * time.Second)}).List(listCtx, snapshot.Config.BaseURL, key, snapshot.Config.Headers)

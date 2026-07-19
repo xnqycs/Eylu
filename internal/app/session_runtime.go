@@ -15,7 +15,6 @@ import (
 
 	"Eylu/internal/agent"
 	"Eylu/internal/environment"
-	"Eylu/internal/logging"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 	"Eylu/internal/session"
@@ -31,6 +30,7 @@ type sessionRuntime struct {
 	persistedSkills map[string]string
 	revalidated     bool
 	workspace       string
+	redact          func(string) string
 }
 
 func (r *runtime) openConversation(ctx context.Context, manager *provider.Manager, opts *chatOptions) (*agent.Conversation, error) {
@@ -81,7 +81,7 @@ func (r *runtime) openConversation(ctx context.Context, manager *provider.Manage
 			if restoreErr != nil {
 				return nil, sessionProtocolError("restore session", restoreErr)
 			}
-			controller := newSessionRuntime(store, stored, workspace)
+			controller := newSessionRuntime(store, stored, workspace, r.redact)
 			if stored.ClosedAt != nil {
 				events, reopenErr := store.Append(id, []session.Event{{Type: session.EventSessionReopened}})
 				if reopenErr != nil {
@@ -124,16 +124,16 @@ func (r *runtime) openConversation(ctx context.Context, manager *provider.Manage
 	if err != nil {
 		return nil, sessionProtocolError("create session", err)
 	}
-	r.session = newSessionRuntime(store, stored, workspace)
+	r.session = newSessionRuntime(store, stored, workspace, r.redact)
 	return conversation, nil
 }
 
-func newSessionRuntime(store *session.Store, snapshot session.Snapshot, workspace string) *sessionRuntime {
+func newSessionRuntime(store *session.Store, snapshot session.Snapshot, workspace string, redact func(string) string) *sessionRuntime {
 	digests := make(map[string]string, len(snapshot.Skills))
 	for _, item := range snapshot.Skills {
 		digests[item.Name] = item.Digest
 	}
-	return &sessionRuntime{store: store, snapshot: snapshot, persistedTurns: len(snapshot.Turns), persistedSkills: digests, workspace: workspace}
+	return &sessionRuntime{store: store, snapshot: snapshot, persistedTurns: len(snapshot.Turns), persistedSkills: digests, workspace: workspace, redact: redact}
 }
 
 func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, runErr error) error {
@@ -189,7 +189,10 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	})
 	lastError := ""
 	if runErr != nil {
-		lastError = logging.Redact(runErr.Error(), os.Getenv("EYLU_API_KEY"))
+		lastError = runErr.Error()
+		if s.redact != nil {
+			lastError = s.redact(lastError)
+		}
 		events = append(events, session.Event{Type: session.EventErrorRecorded, Error: lastError})
 	}
 	prepared, err := s.store.Append(state.SessionID, events)
@@ -255,7 +258,7 @@ func (r *runtime) rotateSession(ctx context.Context, conversation *agent.Convers
 	if err != nil {
 		return oldID, "", sessionProtocolError("create replacement session", err)
 	}
-	r.session = newSessionRuntime(r.session.store, stored, r.workspace)
+	r.session = newSessionRuntime(r.session.store, stored, r.workspace, r.redact)
 	return oldID, conversation.SessionID(), nil
 }
 

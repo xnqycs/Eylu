@@ -39,27 +39,6 @@ func TestFormatRequestCompletionUsesInterruptedLabelAndScaledDurations(t *testin
 	}
 }
 
-type tuiTestKeyring struct{ values map[string]string }
-
-func (k *tuiTestKeyring) Set(service, account, secret string) error {
-	if k.values == nil {
-		k.values = make(map[string]string)
-	}
-	k.values[service+"/"+account] = secret
-	return nil
-}
-func (k *tuiTestKeyring) Get(service, account string) (string, error) {
-	value, ok := k.values[service+"/"+account]
-	if !ok {
-		return "", errors.New("missing")
-	}
-	return value, nil
-}
-func (k *tuiTestKeyring) Delete(service, account string) error {
-	delete(k.values, service+"/"+account)
-	return nil
-}
-
 func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 	t.Setenv("EYLU_API_KEY", "tui-secret")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +58,7 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := config.Default()
 	cfg.ActiveProvider = "work"
-	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test", Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"}}
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test"}
 	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +68,7 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, workspace: workspace, credentials: provider.NewCredentialStoreWith(&tuiTestKeyring{}, os.LookupEnv), trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, workspace: workspace, trustPrompted: make(map[string]bool)}
 	conversation := agent.NewConversationWithEnvironment(environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: "2026-07-19"})
 	backend := &tuiBackend{runtime: runtime, conversation: conversation, manager: manager, skills: registry, skillSession: skill.NewSession(registry, nil)}
 	events := make([]ui.Event, 0)
@@ -142,7 +121,7 @@ func TestTUIBackendStreamsFileToolArgumentsBeforeExecution(t *testing.T) {
 	cfg := config.Default()
 	cfg.PermissionMode = "full"
 	cfg.ActiveProvider = "work"
-	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test", Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"}}
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test"}
 	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +130,7 @@ func TestTUIBackendStreamsFileToolArgumentsBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, credentials: provider.NewCredentialStoreWith(&tuiTestKeyring{}, os.LookupEnv), trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, trustPrompted: make(map[string]bool)}
 	backend := &tuiBackend{runtime: runtime, conversation: agent.NewConversation(), manager: manager, skills: registry, skillSession: skill.NewSession(registry, nil)}
 	events := make([]ui.Event, 0)
 	if err := backend.Submit(context.Background(), "op-write", ui.Submission{Text: "create live.txt"}, func(event ui.Event) { events = append(events, event) }); err != nil {
@@ -180,15 +159,14 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := config.Default()
 	cfg.ActiveProvider = "work"
-	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "model", Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"}}
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "model"}
 	configPath := filepath.Join(t.TempDir(), "config.toml")
 	manager, err := provider.NewManager(configPath, cfg, config.Save)
 	if err != nil {
 		t.Fatal(err)
 	}
 	registry, _ := skill.Discover(skill.DiscoveryOptions{Workspace: workspace, Home: t.TempDir()})
-	keyring := &tuiTestKeyring{}
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, credentials: provider.NewCredentialStoreWith(keyring, os.LookupEnv), trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, trustPrompted: make(map[string]bool)}
 	backend := &tuiBackend{runtime: runtime, conversation: agent.NewConversation(), manager: manager, skills: registry, skillSession: skill.NewSession(registry, nil)}
 	confirm := backend.confirmTools("op", false, func(event ui.Event) {
 		if event.Kind != ui.EventApproval || event.Approval == nil {
@@ -210,8 +188,8 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "provider-secret") || keyring.values["eylu/provider:new"] != "provider-secret" {
-		t.Fatalf("config=%s keyring=%#v", data, keyring.values)
+	if !strings.Contains(string(data), "api_key = 'provider-secret'") {
+		t.Fatalf("config=%s", data)
 	}
 	if err := backend.SetModel(context.Background(), "work", "work-updated"); err != nil {
 		t.Fatal(err)
@@ -254,7 +232,7 @@ func TestTUIBackendPreparesGitAwareFileAndSkillReferences(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.ActiveProvider = "work"
-	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "test", Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"}}
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "test"}
 	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +241,7 @@ func TestTUIBackendPreparesGitAwareFileAndSkillReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, credentials: provider.NewCredentialStoreWith(&tuiTestKeyring{}, os.LookupEnv), trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, trustPrompted: make(map[string]bool)}
 	backend := &tuiBackend{runtime: runtime, conversation: agent.NewConversation(), manager: manager, skills: registry, skillSession: skill.NewSession(registry, nil)}
 	files, err := backend.ListFiles(context.Background())
 	if err != nil {

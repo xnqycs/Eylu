@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -50,7 +51,8 @@ type runtime struct {
 	configPath         string
 	workspace          string
 	output             string
-	credentials        *provider.CredentialStore
+	secretMu           sync.RWMutex
+	apiKeys            []string
 	inputReader        *bufio.Reader
 	trustPrompted      map[string]bool
 	session            *sessionRuntime
@@ -61,7 +63,7 @@ type runtime struct {
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	r := &runtime{stdin: stdin, stdout: stdout, stderr: stderr, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool), metrics: &metrics.Collector{}}
+	r := &runtime{stdin: stdin, stdout: stdout, stderr: stderr, trustPrompted: make(map[string]bool), metrics: &metrics.Collector{}}
 	root := r.rootCommand(ctx)
 	root.SetArgs(args)
 	root.SetIn(stdin)
@@ -214,7 +216,6 @@ func (r *runtime) prepareManager(ctx context.Context, opts chatOptions) (*provid
 	if opts.baseURL != "" && opts.model != "" {
 		loaded.Config.Providers["runtime"] = config.ProviderConfig{
 			Adapter: opts.adapter, BaseURL: opts.baseURL, Model: opts.model,
-			Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"},
 		}
 		loaded.Config.ActiveProvider = "runtime"
 		return provider.NewManager(loaded.Path, loaded.Config, nil)
@@ -473,7 +474,7 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 			reader = bufio.NewReader(r.stdin)
 		}
 		modelReason, preview := approvalRequestDetails(request.Tool, request.Input)
-		preview = logging.Redact(preview, os.Getenv("EYLU_API_KEY"))
+		preview = r.redact(preview)
 		if len(preview) > 512 {
 			preview = preview[:512] + "..."
 		}
@@ -546,13 +547,7 @@ func (r *runtime) resolveRuntimeForPrompt(manager *provider.Manager, opts chatOp
 		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	snapshot.Config = providerConfig
-	apiKey := os.Getenv("EYLU_API_KEY")
-	if apiKey == "" {
-		apiKey, err = r.credentials.Resolve(providerConfig.Credential)
-		if err != nil {
-			return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrCredential, Message: "provider credential is unavailable", Cause: err}
-		}
-	}
+	apiKey := providerAPIKey(providerConfig)
 	requestTimeout := providerConfig.Timeout(60 * time.Second)
 	if opts.timeout > 0 {
 		requestTimeout = opts.timeout
@@ -590,12 +585,40 @@ func (r *runtime) loadManager() (config.Loaded, *provider.Manager, error) {
 	if err != nil {
 		return config.Loaded{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
+	r.rememberProviderAPIKeys(loaded.Config)
 	r.workspace = loaded.Workspace
 	manager, err := provider.NewManager(loaded.Path, loaded.Config, nil)
 	if err != nil {
 		return config.Loaded{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
 	return loaded, manager, nil
+}
+
+func providerAPIKey(providerConfig config.ProviderConfig) string {
+	if apiKey := os.Getenv("EYLU_API_KEY"); apiKey != "" {
+		return apiKey
+	}
+	return providerConfig.APIKey
+}
+
+func (r *runtime) rememberProviderAPIKeys(cfg config.Config) {
+	apiKeys := make([]string, 0, len(cfg.Providers))
+	for _, providerConfig := range cfg.Providers {
+		if providerConfig.APIKey != "" {
+			apiKeys = append(apiKeys, providerConfig.APIKey)
+		}
+	}
+	r.secretMu.Lock()
+	r.apiKeys = apiKeys
+	r.secretMu.Unlock()
+}
+
+func (r *runtime) redact(value string) string {
+	r.secretMu.RLock()
+	secrets := append([]string(nil), r.apiKeys...)
+	r.secretMu.RUnlock()
+	secrets = append(secrets, os.Getenv("EYLU_API_KEY"))
+	return logging.Redact(value, secrets...)
 }
 
 func (r *runtime) resolveWorkspace() (string, error) {
@@ -622,7 +645,7 @@ func (r *runtime) printError(err error) {
 	if !errors.As(err, &typed) {
 		typed = &protocol.Error{Code: protocol.ErrProtocol, Message: err.Error()}
 	}
-	message := logging.Redact(typed.Message, os.Getenv("EYLU_API_KEY"))
+	message := r.redact(typed.Message)
 	if r.output == "json" || r.output == "jsonl" {
 		payload := map[string]any{"error": map[string]any{"code": typed.Code, "message": message, "retryable": typed.Retryable}}
 		if r.output == "jsonl" {

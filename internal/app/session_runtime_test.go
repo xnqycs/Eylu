@@ -110,7 +110,6 @@ func TestNewClosesOldSessionAndCreatesIsolatedSession(t *testing.T) {
 	cfg.ActiveProvider = "test"
 	cfg.Providers["test"] = config.ProviderConfig{
 		Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "model",
-		Credential: config.CredentialRef{Type: "none"},
 	}
 	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
 	if err != nil {
@@ -120,7 +119,7 @@ func TestNewClosesOldSessionAndCreatesIsolatedSession(t *testing.T) {
 	captures := 0
 	runtime := &runtime{
 		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, workspace: workspace,
-		credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool),
+		trustPrompted: make(map[string]bool),
 		environmentCapture: func(context.Context, string) environment.Context {
 			captures++
 			return environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: fmt.Sprintf("capture-%d", captures)}
@@ -169,7 +168,7 @@ func TestOpenConversationCapturesLegacyEnvironmentOnce(t *testing.T) {
 	}
 	cfg := config.Default()
 	cfg.ActiveProvider = "test"
-	cfg.Providers["test"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "model", Credential: config.CredentialRef{Type: "none"}}
+	cfg.Providers["test"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "model"}
 	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
 	if err != nil {
 		t.Fatal(err)

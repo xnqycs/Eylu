@@ -18,7 +18,6 @@ import (
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
-	"Eylu/internal/logging"
 	"Eylu/internal/metrics"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
@@ -462,7 +461,7 @@ func (b *tuiBackend) confirmTools(operationID string, approve bool, emit func(ui
 			return tool.Confirmation{Approved: true}, nil
 		}
 		modelReason, preview := approvalRequestDetails(request.Tool, request.Input)
-		preview = logging.Redact(preview, os.Getenv("EYLU_API_KEY"))
+		preview = b.runtime.redact(preview)
 		if len(preview) > 512 {
 			preview = preview[:512] + "..."
 		}
@@ -619,25 +618,18 @@ func (b *tuiBackend) SetMode(_ context.Context, value string) error {
 func (b *tuiBackend) UpsertProvider(_ context.Context, form ui.ProviderForm) error {
 	candidate := config.ProviderConfig{
 		Adapter: form.Adapter, BaseURL: form.BaseURL, Model: form.Model, ContextWindow: form.ContextWindow,
-		TimeoutSeconds: 60, Credential: config.CredentialRef{Type: "env", Env: "EYLU_API_KEY"},
+		TimeoutSeconds: 60,
 	}
 	if form.OriginalName != "" {
 		if current, ok := b.manager.Get(form.OriginalName); ok {
-			candidate.Credential = current.Credential
+			candidate.APIKey = current.APIKey
 			candidate.Headers = current.Headers
 			candidate.TimeoutSeconds = current.TimeoutSeconds
 			candidate.Routing = current.Routing
 		}
 	}
 	if form.APIKey != "" {
-		ref := config.CredentialRef{Type: "keyring", Service: "eylu", Account: "provider:" + form.Name}
-		if err := b.runtime.credentials.Save(ref, form.APIKey); err != nil {
-			ref.Type = "memory"
-			if memoryErr := b.runtime.credentials.Save(ref, form.APIKey); memoryErr != nil {
-				return memoryErr
-			}
-		}
-		candidate.Credential = ref
+		candidate.APIKey = form.APIKey
 	}
 	if err := b.manager.Upsert(form.Name, candidate, true); err != nil {
 		return err
@@ -647,6 +639,7 @@ func (b *tuiBackend) UpsertProvider(_ context.Context, form ui.ProviderForm) err
 			return err
 		}
 	}
+	b.runtime.rememberProviderAPIKeys(b.manager.Config())
 	b.mu.Lock()
 	b.opts.provider = ""
 	b.mu.Unlock()
@@ -664,7 +657,11 @@ func (b *tuiBackend) DeleteProvider(_ context.Context, name string) error {
 			}
 		}
 	}
-	return b.manager.Delete(name, replacement)
+	if err := b.manager.Delete(name, replacement); err != nil {
+		return err
+	}
+	b.runtime.rememberProviderAPIKeys(b.manager.Config())
+	return nil
 }
 
 func (b *tuiBackend) UseProvider(_ context.Context, name string) error {
@@ -700,14 +697,7 @@ func (b *tuiBackend) FetchModels(ctx context.Context, name string) ([]string, er
 			return nil, err
 		}
 	}
-	key := os.Getenv("EYLU_API_KEY")
-	if key == "" {
-		var err error
-		key, err = b.runtime.credentials.Resolve(snapshot.Config.Credential)
-		if err != nil {
-			return nil, err
-		}
-	}
+	key := providerAPIKey(snapshot.Config)
 	timeout := snapshot.Config.Timeout(30 * time.Second)
 	listCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

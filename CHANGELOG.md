@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Provider API Key 改为与 `base_url` 同表的 `api_key` 明文字段；移除凭据引用、系统凭据库实现及对应依赖，配置 Key 继续从 JSON/session 状态中排除并参与日志脱敏。
 - workspace 从配置 schema 迁移为 `--workspace > EYLU_WORKSPACE > cwd` 运行时上下文；新 session 将 OS、日期和 Git 状态快照注入 system prompt 并持久化，旧 session 首次恢复时自动补采并清除旧 DriverState。
 - TUI 历史区增加按显示列拖选、跨 viewport 滚轮扩展、系统剪贴板自动复制与短时状态提示；选区稳定覆盖 ANSI/OSC 与中文宽字符。输入框增加 1 至 8 行动态高度及 `Shift+Enter`/`Ctrl+Enter` 换行，并统一修正原生光标坐标。
 - 增加统一 `/` 与 `@` 补全面板、顶层 Skill 命令、Git-aware 文件候选，以及带边界校验和上下文预算的 Skill/文件引用注入。
@@ -108,8 +109,8 @@
 
 ## Phase 0 - 可运行骨架
 
-- 初始化 Go module `Eylu`、Cobra CLI、protocol v1、ProviderManager 与凭据抽象。
+- 初始化 Go module `Eylu`、Cobra CLI、protocol v1、ProviderManager 与 Provider 配置抽象。
 - 增加 Provider CRUD、模型发现、首次引导、Responses 同步驱动与统一错误码。
-- 配置文件只保存凭据引用，敏感日志统一脱敏。
+- Provider API Key 随 Provider 配置持久化，敏感日志统一脱敏。
 
 兼容性：初始配置 schema 版本为 1，初始领域协议版本为 1。

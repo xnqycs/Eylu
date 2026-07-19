@@ -25,8 +25,6 @@ type providerOptions struct {
 	adapter         string
 	baseURL         string
 	model           string
-	credentialType  string
-	credentialEnv   string
 	apiKey          string
 	contextWindow   int
 	timeout         time.Duration
@@ -81,8 +79,6 @@ func (r *runtime) providersListCommand() *cobra.Command {
 func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Command {
 	var opts providerOptions
 	opts.adapter = openai_responses.Name
-	opts.credentialType = "env"
-	opts.credentialEnv = "EYLU_API_KEY"
 	cmd := &cobra.Command{
 		Use: verb + " <name>", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -126,20 +122,16 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 			if cmd.Flags().Changed("output-cost") || !editing {
 				candidate.Routing.OutputCostPerMillion = opts.outputCost
 			}
-			if cmd.Flags().Changed("credential-type") || cmd.Flags().Changed("credential-env") || !editing {
-				candidate.Credential = credentialRef(name, opts)
+			if cmd.Flags().Changed("api-key") || !editing {
+				candidate.APIKey = opts.apiKey
 			}
 			if err := config.ValidateProvider(name, candidate); err != nil {
 				return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 			}
-			if opts.apiKey != "" {
-				if err := r.credentials.Save(candidate.Credential, opts.apiKey); err != nil {
-					return &protocol.Error{Code: protocol.ErrCredential, Message: "store provider credential", Cause: err}
-				}
-			}
 			if err := manager.Upsert(name, candidate, opts.activate); err != nil {
 				return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 			}
+			r.rememberProviderAPIKeys(manager.Config())
 			fmt.Fprintf(r.stdout, "Provider %s saved.\n", name)
 			return nil
 		},
@@ -147,9 +139,7 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 	cmd.Flags().StringVar(&opts.adapter, "adapter", opts.adapter, "driver adapter")
 	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "API base URL")
 	cmd.Flags().StringVar(&opts.model, "model", "", "model ID")
-	cmd.Flags().StringVar(&opts.credentialType, "credential-type", opts.credentialType, "keyring, env, memory, or none")
-	cmd.Flags().StringVar(&opts.credentialEnv, "credential-env", opts.credentialEnv, "credential environment variable")
-	cmd.Flags().StringVar(&opts.apiKey, "api-key", "", "API key to store (prefer interactive setup or an environment variable)")
+	cmd.Flags().StringVar(&opts.apiKey, "api-key", "", "API key to store in the provider configuration")
 	cmd.Flags().IntVar(&opts.contextWindow, "context-window", 0, "model context window")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 60*time.Second, "request timeout")
 	cmd.Flags().BoolVar(&opts.activate, "activate", true, "make provider active")
@@ -158,19 +148,6 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 	cmd.Flags().Float64Var(&opts.inputCost, "input-cost", 0, "input cost per million tokens")
 	cmd.Flags().Float64Var(&opts.outputCost, "output-cost", 0, "output cost per million tokens")
 	return cmd
-}
-
-func credentialRef(name string, opts providerOptions) config.CredentialRef {
-	ref := config.CredentialRef{Type: opts.credentialType}
-	switch opts.credentialType {
-	case "keyring":
-		ref.Service, ref.Account = "eylu", "provider:"+name
-	case "memory":
-		ref.Service, ref.Account = "eylu", "provider:"+name
-	case "env":
-		ref.Env = opts.credentialEnv
-	}
-	return ref
 }
 
 func (r *runtime) providerDeleteCommand() *cobra.Command {
@@ -184,14 +161,13 @@ func (r *runtime) providerDeleteCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		providerConfig, ok := manager.Get(args[0])
-		if !ok {
+		if _, ok := manager.Get(args[0]); !ok {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", args[0])}
 		}
 		if err := manager.Delete(args[0], replacement); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
-		_ = r.credentials.Delete(providerConfig.Credential)
+		r.rememberProviderAPIKeys(manager.Config())
 		fmt.Fprintf(r.stdout, "Provider %s deleted.\n", args[0])
 		return nil
 	}
@@ -239,13 +215,7 @@ func (r *runtime) providerModelsCommand(ctx context.Context) *cobra.Command {
 				}
 				cfg = snapshot.Config
 			}
-			key := os.Getenv("EYLU_API_KEY")
-			if key == "" {
-				key, err = r.credentials.Resolve(cfg.Credential)
-				if err != nil {
-					return &protocol.Error{Code: protocol.ErrCredential, Message: "provider credential is unavailable", Cause: err}
-				}
-			}
+			key := providerAPIKey(cfg)
 			listCtx, cancel := context.WithTimeout(ctx, cfg.Timeout(30*time.Second))
 			defer cancel()
 			models, err := provider.NewModelLister(&http.Client{Timeout: cfg.Timeout(30 * time.Second)}).List(listCtx, cfg.BaseURL, key, cfg.Headers)
@@ -279,14 +249,6 @@ func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error 
 	if err != nil {
 		return &protocol.Error{Code: protocol.ErrCredential, Message: "read API key", Cause: err}
 	}
-	ref := config.CredentialRef{Type: "keyring", Service: "eylu", Account: "provider:" + name}
-	if err := r.credentials.Save(ref, secret); err != nil {
-		ref.Type = "memory"
-		if memoryErr := r.credentials.Save(ref, secret); memoryErr != nil {
-			return &protocol.Error{Code: protocol.ErrCredential, Message: "store API key", Cause: err}
-		}
-		fmt.Fprintln(r.stderr, "System keyring unavailable; credential is available for this process only.")
-	}
 	model := ""
 	models, listErr := provider.NewModelLister(&http.Client{Timeout: 20 * time.Second}).List(ctx, baseURL, secret, nil)
 	if listErr == nil && len(models) > 0 {
@@ -309,10 +271,11 @@ func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error 
 	if model == "" {
 		return &protocol.Error{Code: protocol.ErrConfig, Message: "model ID is required"}
 	}
-	candidate := config.ProviderConfig{Adapter: openai_responses.Name, BaseURL: baseURL, Model: model, TimeoutSeconds: 60, Credential: ref}
+	candidate := config.ProviderConfig{Adapter: openai_responses.Name, BaseURL: baseURL, APIKey: secret, Model: model, TimeoutSeconds: 60}
 	if err := manager.Upsert(name, candidate, true); err != nil {
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
+	r.rememberProviderAPIKeys(manager.Config())
 	return nil
 }
 

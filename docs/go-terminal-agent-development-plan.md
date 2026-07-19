@@ -138,7 +138,7 @@ internal/agent     会话循环、状态机、预算、上下文压缩
 | YAML frontmatter | `gopkg.in/yaml.v3` | 只解析 `SKILL.md` 元数据，正文保留原始 Markdown |
 | TUI | `charm.land/bubbletea/v2` + `charm.land/bubbles/v2` | Phase 0 用于首次引导，Phase 7 完成交互主界面；网络、模型和工具事件以消息进入单一 Update/View 循环 |
 | 终端样式 | `charm.land/lipgloss/v2` | Phase 7 完整引入，核心层不依赖 TUI |
-| 凭据存储 | `github.com/zalando/go-keyring` | API Key 写入系统 keyring；支持环境变量引用和当前进程内存回退 |
+| Provider 配置 | `github.com/pelletier/go-toml/v2` | API Key 与 API 地址写入同一个 Provider TOML 表，部署时限制配置文件的系统访问权限 |
 | Markdown | `glamour` | 渲染失败时回退纯文本 |
 | 持久化 | JSONL 事件日志 + JSON 快照 | schema 版本化，写入采用临时文件替换 |
 
@@ -173,22 +173,17 @@ active_provider = "work"
 [providers.work]
 adapter = "openai_responses"
 base_url = "https://gateway.example.com/v1"
+api_key = "sk-example"
 model = "team-coding-model"
 context_window = 128000
-
-[providers.work.credential]
-type = "keyring"
-service = "eylu"
-account = "provider:work"
 
 [providers.local]
 adapter = "custom_http"
 base_url = "http://127.0.0.1:11434"
 model = "local-coder"
-credential = { type = "none" }
 ```
 
-Provider 是用户可管理的服务配置，`adapter` 指向内部 `ModelDriver` 实现。API Key 内容不写入 TOML，配置只保存 keyring 引用；`CredentialStore` 首版实现 `keyring`、`env`、`memory` 和 `none`。`context_window` 为可选值，用于 `/context` 计算模型窗口占比。
+Provider 是用户可管理的服务配置，`adapter` 指向内部 `ModelDriver` 实现。API Key 通过 `api_key` 与 `base_url` 保存在同一个 TOML 表；`EYLU_API_KEY` 可作为进程级临时覆盖。`context_window` 为可选值，用于 `/context` 计算模型窗口占比。
 
 Skill 采用零配置默认启用模式，Provider、模型和通用运行参数进入 TOML。程序固定扫描项目级和用户级约定目录；扫描数量、入口大小、资源大小和递归深度使用代码内安全常量，并通过 `eylu skills diagnose` 展示实际值。
 
@@ -213,9 +208,9 @@ TTY 启动时发现有效 Provider 数量为 0，直接展示分步引导：Prov
 
 模型列表接口只保证基础模型信息，`context_window` 由 adapter 扩展元数据、用户输入或后续模型能力注册表提供。上限来源缺失时 `/context` 仍显示已用 token 和分类占比，并把窗口上限标记为 `unknown`。非 TTY 启动且 Provider 为空时输出结构化错误和 `eylu providers add` 用法。
 
-API Key 输入组件关闭回显。keyring 可用时保存到系统凭据库；keyring 服务缺失时提供环境变量引用或仅当前进程有效的 `memory` 存储选择。Provider 更新失败保持原配置和原运行时快照，并显示字段级错误。配置写入使用进程锁、临时文件、刷新和原子替换。
+API Key 输入组件关闭回显，提交后明文写入 Provider 的 `api_key` 字段。Provider 更新失败保持原配置和原运行时快照，并显示字段级错误。配置写入使用进程锁、临时文件、刷新和原子替换；部署时应通过 Windows ACL 或 Unix 文件权限限制其他用户访问。
 
-模型列表请求设置独立的 10 秒超时、2 MiB 响应上限和 5000 个模型条目上限，支持 context 取消。Provider 重命名时同步迁移 keyring account；删除时清理对应凭据。任何配置或凭据步骤失败都会回滚候选变更，活动 generation 保持原值。
+模型列表请求设置独立的 10 秒超时、2 MiB 响应上限和 5000 个模型条目上限，支持 context 取消。Provider 重命名和删除直接随配置表完成。任何配置写入步骤失败都会回滚候选变更，活动 generation 保持原值。
 
 ### 2.6 依赖方向
 
@@ -231,7 +226,7 @@ cmd/app ──→ agent ──→ protocol ←── driver implementations
 
 - `internal/protocol` 只依赖 Go 标准库，定义 Eylu v1 类型。
 - `internal/agent` 只接收 `ModelDriver` 接口，驱动实现由 `internal/app` 注入。
-- `internal/provider` 管理 Provider 配置、凭据引用、模型目录和 driver 快照；Provider 名称属于用户配置，Driver 名称属于内部 adapter registry。
+- `internal/provider` 管理 Provider 配置、模型目录和 driver 快照；Provider 名称属于用户配置，Driver 名称属于内部 adapter registry。
 - `internal/skill` 只负责本地 Skill 的发现、解析和资源定位；模型调用与脚本执行继续由既有分层负责。
 - `internal/driver/*` 可以依赖外部 SDK，并负责协议字段、鉴权头、SSE 事件和错误码映射。
 - `internal/session` 保存 Eylu transcript 与 opaque driver state，供应商原始响应进入可选调试附件。
@@ -347,9 +342,9 @@ type ProviderConfig struct {
     Name          string
     Adapter       string
     BaseURL       string
+    APIKey        string
     Model         string
     ContextWindow *int
-    Credential    CredentialRef
 }
 
 type ModelInfo struct {
@@ -370,8 +365,8 @@ type ModelLister interface {
 
 type ProviderManager interface {
     List() []ProviderConfig
-    Add(ctx context.Context, candidate ProviderConfig, secret SecretInput) error
-    Update(ctx context.Context, name string, candidate ProviderConfig, secret *SecretInput) error
+    Add(ctx context.Context, candidate ProviderConfig) error
+    Update(ctx context.Context, name string, candidate ProviderConfig) error
     Delete(ctx context.Context, name string) error
     Use(ctx context.Context, name string) error
     Current() (ProviderSnapshot, bool)
@@ -577,7 +572,7 @@ type ContextReport struct {
 - `cobra` 根命令和 `eylu chat [prompt]`。
 - Provider 配置加载、参数校验、统一错误和退出码。
 - `DriverRegistry`、`ModelDriver` 和一个可配置真实 HTTP 驱动。
-- `ProviderManager`、`CredentialStore`、首次启动引导、凭据脱敏日志和请求超时。
+- `ProviderManager`、首次启动引导、API Key 脱敏日志和请求超时。
 
 **本期暂缓**：对话历史、工具、流式 UI、会话恢复。
 
@@ -585,9 +580,9 @@ type ContextReport struct {
 
 - 定义 Eylu protocol v1：turn、part、model event、tool call、tool result、stop kind 和 error code。
 - 为 protocol 类型建立 JSON fixture 和向后兼容测试，session schema 引用明确版本。
-- 定义 `config.Config` 与 `ProviderConfig`，验证活动 Provider、adapter、凭据引用、API Base URL、模型、上下文窗口、超时和工作目录。
+- 定义 `config.Config` 与 `ProviderConfig`，验证活动 Provider、adapter、API Base URL、模型、上下文窗口、超时和工作目录。
 - 为 ModelDriver 注入 `http.Client` 或 SDK client，便于测试替换。
-- 实现 `eylu providers list|add|edit|delete|use|models` 与配置原子写入；API Key 使用遮罩输入并存入 `CredentialStore`。
+- 实现 `eylu providers list|add|edit|delete|use|models` 与配置原子写入；API Key 使用遮罩输入并写入 Provider 的 `api_key` 字段。
 - 实现 OpenAI-compatible `ModelLister`：请求 `{BaseURL}/models`，解析 `data[].id`，支持搜索选择、刷新和手工模型 ID。
 - Provider 为空且 stdin 为 TTY 时进入配置引导；非 TTY 模式输出结构化配置错误和恢复命令。
 - 将 `go run . chat "你好"` 的成功响应打印到 stdout，诊断信息打印到 stderr。
@@ -604,7 +599,7 @@ EYLU_API_KEY=... go run . chat "你好" --provider work
 $env:EYLU_API_KEY="..."; go run . chat "你好" --provider work
 ```
 
-首次启动能在引导中完成 API 地址、Key 和模型配置；模型列表来自 `/v1/models` 兼容端点，并始终支持手工模型 ID；能从当前 Provider 收到文本；缺少凭据、超时、HTTP 4xx/5xx 时有明确错误和非零退出码；日志和 TOML 中没有凭据内容。
+首次启动能在引导中完成 API 地址、Key 和模型配置；模型列表来自 `/v1/models` 兼容端点，并始终支持手工模型 ID；能从当前 Provider 收到文本；缺少 API Key、超时、HTTP 4xx/5xx 时有明确错误和非零退出码；日志中隐藏 API Key，TOML 明文保存 `api_key`。
 
 **退出条件**：`go test ./...`、`go vet ./...`、`gofmt -l .` 通过，真实驱动和 fake server 各完成一次验证；`internal/agent`、`internal/tool`、`internal/policy`、`internal/session` 不导入供应商 SDK 包。
 
@@ -908,7 +903,7 @@ Driver state             0         0     0.0%
 | 层级 | 目标 | 运行方式 |
 |---|---|---|
 | 单元测试 | 配置、消息、策略、路径、命令分类、ContextLedger、上下文压缩 | 每次提交 |
-| Provider contract | CRUD、keyring 引用、模型目录、generation 热更新、原子回滚 | fake HTTP server + 临时配置目录 |
+| Provider contract | CRUD、API Key 配置、模型目录、generation 热更新、原子回滚 | fake HTTP server + 临时配置目录 |
 | Driver contract | Eylu 双向映射、流式聚合、错误映射 | fake HTTP server |
 | Tool contract | schema、风险标签、结果结构、取消和超时 | 临时工作区 |
 | Skill contract | 规范解析、目录优先级、渐进披露、资源边界、权限裁决 | 临时项目与用户目录 |
@@ -920,7 +915,7 @@ Driver state             0         0     0.0%
 ### 5.2 必测失败路径
 
 - 凭据缺失、认证失败、限流、服务端错误、连接中断。
-- Provider 配置为空、Key 存储失败、`/v1/models` 缺失或响应畸形、手工模型 ID、热更新校验失败、活动 Provider 删除和并发配置写入。
+- Provider 配置为空、配置写入失败、`/v1/models` 缺失或响应畸形、手工模型 ID、热更新校验失败、活动 Provider 删除和并发配置写入。
 - 流式响应中途取消、外部响应未完成、驱动映射为 `StopLength` 和未知事件。
 - 工具输入 JSON 错误、未知工具、重复 Eylu tool call ID。
 - 工作区路径穿越、符号链接、权限不足、文件编码错误。
@@ -957,7 +952,7 @@ go test -race ./...
 | 工具循环失控 | 成本增加、终端卡住 | 最大轮数、总 token 预算、单工具超时、全局取消 |
 | 模型生成危险命令 | 文件或系统损坏 | 工作区边界、命令分类、黑名单、高危二次确认 |
 | Provider 热更新竞态 | 请求混用地址、凭据或 DriverState | 不可变快照、generation、请求级捕获、串行写入、失败回滚 |
-| Provider 凭据泄露 | API Key 出现在配置、日志或终端历史 | password input、系统 keyring、TOML 引用、统一脱敏、memory 回退 |
+| Provider API Key 泄露 | API Key 出现在日志、终端历史或被其他本地用户读取 | password input、统一脱敏、限制配置文件访问权限、提醒 CLI 参数会进入 shell 历史 |
 | TUI 动画与异步输出竞争 | 画面错位、输入阻塞、CPU 占用升高 | 单写入循环、固定帧率、operation ID、稳定尺寸、静态降级 |
 | 第三方 Skill 供应链 | 指令注入、恶意脚本、数据外传 | 项目信任、来源展示、内容 digest、统一 Policy、远程安装延后交付 |
 | Skill 内容在会话中变化 | 行为漂移、回放结果失真 | 激活 digest、恢复时复核、变化诊断、显式重新激活 |
@@ -1001,7 +996,7 @@ go test -race ./...
 
 ## 10. 建议的首轮实现顺序
 
-1. Phase 0 先交付 ProviderManager、凭据存储、首次引导、模型发现和单次 chat，确保空配置也有完整启动路径。
+1. Phase 0 先交付 ProviderManager、Provider 配置持久化、首次引导、模型发现和单次 chat，确保空配置也有完整启动路径。
 2. Phase 1 交付多轮流式会话、`/new`、基础 `/context` 和 Provider 运行时管理，固定 session 与 provider generation 语义。
 3. 立即实现 Phase 2 的工具 registry、Agent Loop 和基础资源限制，工具数量保持在三个。
 4. 将路径边界、命令超时、输出截断和日志脱敏作为 Phase 2 的强制基线。
@@ -1026,8 +1021,7 @@ Skill 实现遵循以下开放规范和客户端接入指南：
 - [Agent Skills Specification](https://agentskills.io/specification)
 - [How to add skills support to your agent](https://agentskills.io/client-implementation/adding-skills-support)
 
-终端与凭据实现参考：
+终端实现参考：
 
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea)
 - [Bubbles v2 spinner](https://pkg.go.dev/charm.land/bubbles/v2/spinner)
-- [go-keyring](https://github.com/zalando/go-keyring)

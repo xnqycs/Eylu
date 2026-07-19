@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,7 +53,7 @@ func TestLoadPrecedenceAndSave(t *testing.T) {
 	}
 }
 
-func TestConfigNeverContainsSecret(t *testing.T) {
+func TestConfigPersistsProviderAPIKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	cfg := Default()
 	cfg.ActiveProvider = "work"
@@ -64,11 +65,25 @@ func TestConfigNeverContainsSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "sk-test-secret") {
-		t.Fatal("config persisted a credential value")
+	if !strings.Contains(string(data), "api_key = 'sk-test-secret'") {
+		t.Fatalf("config did not persist provider API key: %s", data)
 	}
 	if strings.Contains(string(data), "workspace") {
 		t.Fatalf("config persisted runtime workspace: %s", data)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.Providers["work"].APIKey != "sk-test-secret" {
+		t.Fatal("provider API key did not round-trip")
+	}
+	encoded, err := json.Marshal(loaded.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "sk-test-secret") {
+		t.Fatal("provider API key leaked into JSON runtime state")
 	}
 }
 
@@ -151,8 +166,7 @@ func TestProviderRoutingValidationAndClone(t *testing.T) {
 	cfg.RoutingMode = "auto"
 	cfg.Providers["routed"] = ProviderConfig{
 		Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "model",
-		Credential: CredentialRef{Type: "none"},
-		Routing:    ProviderRouting{Tasks: []string{"coding", "testing"}, Priority: 2, InputCostPerMillion: 1.25, OutputCostPerMillion: 4.5},
+		Routing: ProviderRouting{Tasks: []string{"coding", "testing"}, Priority: 2, InputCostPerMillion: 1.25, OutputCostPerMillion: 4.5},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -234,7 +248,6 @@ func TestSkillRegistryValidationAndClone(t *testing.T) {
 
 func validProvider(baseURL, model string) ProviderConfig {
 	return ProviderConfig{
-		Adapter: "openai_responses", BaseURL: baseURL, Model: model, TimeoutSeconds: 30,
-		Credential: CredentialRef{Type: "env", Env: "EYLU_API_KEY"},
+		Adapter: "openai_responses", BaseURL: baseURL, APIKey: "sk-test-secret", Model: model, TimeoutSeconds: 30,
 	}
 }

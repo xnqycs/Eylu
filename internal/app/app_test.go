@@ -46,13 +46,20 @@ func TestChatEndToEnd(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"phase zero works"}]}],"usage":{"input_tokens":3,"output_tokens":3}}`))
 	}))
 	defer server.Close()
-	t.Setenv("EYLU_API_KEY", "e2e-secret")
+	t.Setenv("EYLU_API_KEY", "")
 	temp := t.TempDir()
+	configPath := filepath.Join(temp, "config.toml")
+	cfg := config.Default()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", APIKey: "e2e-secret", Model: "test-model"}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
 	var stdout, stderr bytes.Buffer
 	code := Execute(context.Background(), []string{
-		"--config", filepath.Join(temp, "config.toml"),
+		"--config", configPath,
 		"--workspace", temp,
-		"chat", "hello", "--base-url", server.URL + "/v1", "--model", "test-model",
+		"chat", "hello",
 	}, strings.NewReader(""), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
@@ -97,6 +104,49 @@ func TestResolveWorkspacePrecedence(t *testing.T) {
 	current, _ = filepath.Abs(current)
 	if resolved != filepath.Clean(current) {
 		t.Fatalf("current workspace = %s, want %s", resolved, current)
+	}
+}
+
+func TestProvidersAddPersistsAPIKeyInConfig(t *testing.T) {
+	isolateUserState(t)
+	workspace := t.TempDir()
+	configPath := filepath.Join(workspace, "config.toml")
+	var stdout, stderr bytes.Buffer
+	code := Execute(context.Background(), []string{
+		"--config", configPath,
+		"--workspace", workspace,
+		"providers", "add", "work",
+		"--base-url", "https://example.com/v1",
+		"--model", "test-model",
+		"--api-key", "stored-secret",
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
+	}
+	loaded, err := config.Load(config.LoadOptions{ExplicitPath: configPath, Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.Providers["work"].APIKey != "stored-secret" {
+		t.Fatalf("provider=%#v", loaded.Config.Providers["work"])
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("credential")) {
+		t.Fatalf("legacy credential configuration remains: %s", data)
+	}
+}
+
+func TestRuntimeRedactsConfiguredAPIKeys(t *testing.T) {
+	runtime := &runtime{}
+	cfg := config.Default()
+	cfg.Providers["work"] = config.ProviderConfig{APIKey: "stored-secret"}
+	runtime.rememberProviderAPIKeys(cfg)
+	redacted := runtime.redact("request failed with stored-secret")
+	if strings.Contains(redacted, "stored-secret") || !strings.Contains(redacted, "[REDACTED]") {
+		t.Fatalf("redacted=%q", redacted)
 	}
 }
 
@@ -177,7 +227,7 @@ func TestRootChatEntryPoints(t *testing.T) {
 }
 
 func TestRootAndChatExposeSameChatFlags(t *testing.T) {
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, trustPrompted: make(map[string]bool)}
 	root := runtime.rootCommand(context.Background())
 	var chatCommandFound bool
 	for _, command := range root.Commands() {
@@ -334,7 +384,7 @@ func TestModeSlashCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, credentials: provider.NewCredentialStore()}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr}
 	conversation := agent.NewConversation()
 	opts := chatOptions{}
 	if err := runtime.handleSlashCommand(context.Background(), bufio.NewReader(strings.NewReader("")), "/mode plan", conversation, manager, &opts); err != nil {
@@ -350,7 +400,7 @@ func TestModeSlashCommand(t *testing.T) {
 
 func TestContextSlashRendersAllCategories(t *testing.T) {
 	var output bytes.Buffer
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &output, stderr: &bytes.Buffer{}, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &output, stderr: &bytes.Buffer{}, trustPrompted: make(map[string]bool)}
 	conversation := agent.NewConversation()
 	if err := runtime.handleSlashCommand(context.Background(), bufio.NewReader(strings.NewReader("")), "/context", conversation, nil, &chatOptions{}); err != nil {
 		t.Fatal(err)

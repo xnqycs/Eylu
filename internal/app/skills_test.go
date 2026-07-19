@@ -22,7 +22,7 @@ func TestProjectSkillRequiresExplicitTrust(t *testing.T) {
 	workspace := t.TempDir()
 	createAppSkill(t, filepath.Join(workspace, ".agents", "skills", "project-skill"), "project-skill", "Project workflow when requested.", "PROJECT BODY")
 	cfg := config.Default()
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, credentials: nil, trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, trustPrompted: make(map[string]bool)}
 	conversation := agent.NewConversation()
 	registry, _, err := runtime.loadSkillRuntime(cfg, chatOptions{}, conversation)
 	if err != nil {
@@ -108,7 +108,7 @@ func TestSkillsCLIValidateListAndExplicitActivation(t *testing.T) {
 	}
 
 	var slashOut, slashErr bytes.Buffer
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &slashOut, stderr: &slashErr, workspace: workspace, credentials: nil, trustPrompted: make(map[string]bool)}
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &slashOut, stderr: &slashErr, workspace: workspace, trustPrompted: make(map[string]bool)}
 	conversation := agent.NewConversation()
 	if err := runtime.activateSkillSlash(conversation, config.Default(), chatOptions{}, "user-skill"); err != nil {
 		t.Fatal(err)
