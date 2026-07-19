@@ -140,6 +140,14 @@ func TestTrustStorePersistsAndRevokes(t *testing.T) {
 	}
 }
 
+func TestCatalogNormalizesMultilineDescriptions(t *testing.T) {
+	registry := newRegistry([]Record{{Skill: Skill{Name: "demo", Description: "first line\n  second line", Source: SourceBuiltin}, Status: StatusActive}}, nil)
+	catalog := registry.Catalog()
+	if !strings.Contains(catalog, "first line second line") || strings.Count(catalog, "\n") != 2 {
+		t.Fatalf("catalog = %q", catalog)
+	}
+}
+
 func createNamedSkill(t *testing.T, root, name, description, body string) string {
 	t.Helper()
 	directory := filepath.Join(root, name)

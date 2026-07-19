@@ -40,4 +40,34 @@ func TestLedgerKnownWindowPercentage(t *testing.T) {
 	if report.Percent != 50 || report.LimitSource != "provider_config" {
 		t.Fatalf("report = %#v", report)
 	}
+	if !report.LimitKnown || report.TotalTokens != 100 || report.Categories[9].Measurement != "estimated" {
+		t.Fatalf("stable report fields = %#v", report)
+	}
+}
+
+func TestLedgerSourceBreakdownAndCompression(t *testing.T) {
+	ledger := New(ApproxEstimator{BytesPerToken: 1})
+	ledger.AddText("catalog-1", CategorySkillCatalog, "page:1/2", "abc", true)
+	ledger.AddText("catalog-2", CategorySkillCatalog, "page:2/2", "de", true)
+	event := CompressionEvent{BeforeTokens: 20, AfterTokens: 10, OmittedTurns: 4, SummaryBytes: 30}
+	ledger.RecordCompression(event)
+	report := ledger.Report("work", "model", 100)
+	var catalog CategoryUsage
+	for _, category := range report.Categories {
+		if category.Category == CategorySkillCatalog {
+			catalog = category
+		}
+	}
+	if catalog.Tokens != 5 || len(catalog.Sources) != 2 || catalog.Sources[0].Source != "page:1/2" || report.CompressionCount != 1 || report.LastCompression.OmittedTurns != 4 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestLedgerUnknownCategoryContributesToTotals(t *testing.T) {
+	ledger := New(ApproxEstimator{BytesPerToken: 1})
+	ledger.AddText("future", Category("future_context"), "extension", "12345", false)
+	report := ledger.Report("work", "model", 100)
+	if report.InputTokens != 5 || report.Categories[len(report.Categories)-1].Category != "future_context" || report.Categories[len(report.Categories)-1].Measurement != "estimated" {
+		t.Fatalf("report = %#v", report)
+	}
 }

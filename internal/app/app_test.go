@@ -167,3 +167,17 @@ func TestModeSlashCommand(t *testing.T) {
 		t.Fatal("expected invalid mode error")
 	}
 }
+
+func TestContextSlashRendersAllCategories(t *testing.T) {
+	var output bytes.Buffer
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &output, stderr: &bytes.Buffer{}, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool)}
+	conversation := agent.NewConversation()
+	if err := runtime.handleSlashCommand(context.Background(), bufio.NewReader(strings.NewReader("")), "/context", conversation, nil, &chatOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"System prompt", "Skill catalog", "Skill resources", "MCP instructions", "Tool schemas", "Project context", "Driver state", "Output reserve"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("context output missing %q:\n%s", expected, output.String())
+		}
+	}
+}

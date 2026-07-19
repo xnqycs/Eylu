@@ -102,16 +102,18 @@ func TestAgentSkillActivationResourceAndProtectedContext(t *testing.T) {
 		t.Fatalf("digests = %#v", digests)
 	}
 	report := conversation.ContextReport()
-	var catalogTokens, bodyTokens int
+	var catalogTokens, bodyTokens, resourceTokens int
 	for _, category := range report.Categories {
 		switch category.Category {
 		case "skill_catalog":
 			catalogTokens = category.Tokens
 		case "skill_body":
 			bodyTokens = category.Tokens
+		case "skill_resource":
+			resourceTokens = category.Tokens
 		}
 	}
-	if catalogTokens == 0 || bodyTokens == 0 {
+	if catalogTokens == 0 || bodyTokens == 0 || resourceTokens == 0 {
 		t.Fatalf("context report = %#v", report)
 	}
 	conversation.NewSession()

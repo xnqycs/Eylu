@@ -16,6 +16,7 @@ import (
 
 	"Eylu/internal/agent"
 	"Eylu/internal/config"
+	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
 	"Eylu/internal/driver/openai_chat"
 	"Eylu/internal/driver/openai_responses"
@@ -173,6 +174,24 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	modelRuntime.PermissionMode = mode.String()
+	modelRuntime.Workspace = cfg.Workspace
+	modelRuntime.TokenEstimator = contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
+	modelRuntime.OutputReserveTokens = cfg.ReservedOutputTokens
+	modelRuntime.ContextRecentRounds = cfg.ContextRecentRounds
+	modelRuntime.MaxProjectMapBytes = cfg.MaxProjectMapBytes
+	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
+	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
+	modelRuntime.MaxSummaryBytes = cfg.MaxSummaryBytes
+	modelRuntime.ContextEvent = func(event contextledger.Event) {
+		switch event.Kind {
+		case contextledger.EventCompression:
+			if event.Compression != nil {
+				fmt.Fprintf(r.stderr, "[context] compressed before=%d after=%d omitted_turns=%d summary_bytes=%d\n", event.Compression.BeforeTokens, event.Compression.AfterTokens, event.Compression.OmittedTurns, event.Compression.SummaryBytes)
+			}
+		case contextledger.EventBudget:
+			fmt.Fprintf(r.stderr, "[context] budget input=%d reserve=%d window=%d percent=%.1f\n", event.InputTokens, event.OutputReserve, event.ContextWindow, event.Percent)
+		}
+	}
 	skillRegistry, skillSession, err := r.loadSkillRuntime(cfg, opts, conversation)
 	if err != nil {
 		return err

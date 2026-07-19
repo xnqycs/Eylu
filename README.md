@@ -82,6 +82,26 @@ go run . skills diagnose --output json
 
 交互会话支持 `/skills` 和 `/skill <name>`。Skill 的 `allowed-tools` 仅作为提示和审计信息，工具执行继续服从当前权限模式。
 
+## 上下文管理
+
+Eylu 使用同一个 `PromptBuilder` 生成模型请求和 `ContextLedger`，`/context` 会在一张表中列出 system prompt、Skill catalog/正文/资源、MCP、工具 schema、user/agent 消息、工具结果、项目地图、摘要、DriverState 与输出预留。Skill 和 MCP 类别会按来源展开；最近一次 Provider usage 独立显示。
+
+已知上下文窗口达到上限时，Eylu 保留 system prompt、项目地图、当前用户目标、最近完整轮次和已激活 Skill，按完整的 tool call/result 原子组压缩较早内容。结构化摘要持续记录目标、完成修改、未完成任务、失败尝试、验证结果与 Skill digest；完整 transcript 仍保留在会话中。大工具结果进入模型前使用有头尾的受限片段，原始会话结果保持不变。
+
+上下文参数可写入 TOML，也支持同名 `EYLU_*` 环境变量：
+
+```toml
+token_bytes_per_token = 4
+reserved_output_tokens = 8192
+context_recent_rounds = 3
+max_project_map_bytes = 32768
+max_tool_context_bytes = 8192
+skill_catalog_page_bytes = 8192
+max_summary_bytes = 16384
+```
+
+项目地图稳定登记受限文件树、语言统计、入口、配置和最近修改文件。Responses 驱动在端点支持时使用远端 response state 减少重复传输；HTTP 网关拒绝该能力时会自动记忆并切换到完整上下文请求。
+
 配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。配置文件仅保存凭据引用；交互式首次引导会优先保存到系统 keyring。
 
 当前多轮 transcript、已关闭 session 和 DriverState 保存在进程内；Phase 8 的事件日志与快照会提供跨进程恢复。

@@ -41,39 +41,53 @@ func (p ProviderConfig) Timeout(fallback time.Duration) time.Duration {
 }
 
 type Config struct {
-	Version           int                       `toml:"version" json:"version"`
-	ActiveProvider    string                    `toml:"active_provider" json:"active_provider"`
-	Providers         map[string]ProviderConfig `toml:"providers" json:"providers"`
-	Workspace         string                    `toml:"workspace,omitempty" json:"workspace,omitempty"`
-	PermissionMode    string                    `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
-	MaxTurns          int                       `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
-	MaxTotalTokens    int                       `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
-	ToolTimeoutSec    int                       `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
-	MaxOutputBytes    int                       `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
-	MaxReadBytes      int                       `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
-	MaxSearchResults  int                       `toml:"max_search_results,omitempty" json:"max_search_results,omitempty"`
-	ReadOnlyCommands  []string                  `toml:"read_only_commands,omitempty" json:"read_only_commands,omitempty"`
-	AutoAllowCommands []string                  `toml:"auto_allow_commands,omitempty" json:"auto_allow_commands,omitempty"`
-	DangerousCommands []string                  `toml:"dangerous_commands,omitempty" json:"dangerous_commands,omitempty"`
-	BlockedCommands   []string                  `toml:"blocked_commands,omitempty" json:"blocked_commands,omitempty"`
-	ShellEnvironment  []string                  `toml:"shell_environment,omitempty" json:"shell_environment,omitempty"`
+	Version               int                       `toml:"version" json:"version"`
+	ActiveProvider        string                    `toml:"active_provider" json:"active_provider"`
+	Providers             map[string]ProviderConfig `toml:"providers" json:"providers"`
+	Workspace             string                    `toml:"workspace,omitempty" json:"workspace,omitempty"`
+	PermissionMode        string                    `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
+	MaxTurns              int                       `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
+	MaxTotalTokens        int                       `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
+	ToolTimeoutSec        int                       `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
+	MaxOutputBytes        int                       `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
+	MaxReadBytes          int                       `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
+	MaxSearchResults      int                       `toml:"max_search_results,omitempty" json:"max_search_results,omitempty"`
+	ReadOnlyCommands      []string                  `toml:"read_only_commands,omitempty" json:"read_only_commands,omitempty"`
+	AutoAllowCommands     []string                  `toml:"auto_allow_commands,omitempty" json:"auto_allow_commands,omitempty"`
+	DangerousCommands     []string                  `toml:"dangerous_commands,omitempty" json:"dangerous_commands,omitempty"`
+	BlockedCommands       []string                  `toml:"blocked_commands,omitempty" json:"blocked_commands,omitempty"`
+	ShellEnvironment      []string                  `toml:"shell_environment,omitempty" json:"shell_environment,omitempty"`
+	TokenBytesPerToken    int                       `toml:"token_bytes_per_token,omitempty" json:"token_bytes_per_token,omitempty"`
+	ReservedOutputTokens  int                       `toml:"reserved_output_tokens,omitempty" json:"reserved_output_tokens,omitempty"`
+	ContextRecentRounds   int                       `toml:"context_recent_rounds,omitempty" json:"context_recent_rounds,omitempty"`
+	MaxProjectMapBytes    int                       `toml:"max_project_map_bytes,omitempty" json:"max_project_map_bytes,omitempty"`
+	MaxToolContextBytes   int                       `toml:"max_tool_context_bytes,omitempty" json:"max_tool_context_bytes,omitempty"`
+	SkillCatalogPageBytes int                       `toml:"skill_catalog_page_bytes,omitempty" json:"skill_catalog_page_bytes,omitempty"`
+	MaxSummaryBytes       int                       `toml:"max_summary_bytes,omitempty" json:"max_summary_bytes,omitempty"`
 }
 
 func Default(workspace string) Config {
 	return Config{
-		Version:           SchemaVersion,
-		Providers:         make(map[string]ProviderConfig),
-		Workspace:         workspace,
-		PermissionMode:    "manual",
-		MaxTurns:          20,
-		MaxTotalTokens:    1_000_000,
-		ToolTimeoutSec:    60,
-		MaxOutputBytes:    64 << 10,
-		MaxReadBytes:      1 << 20,
-		MaxSearchResults:  200,
-		ReadOnlyCommands:  []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files"},
-		AutoAllowCommands: []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files", "go test", "go vet", "go build", "go list", "go env", "go version", "gofmt", "go fmt"},
-		DangerousCommands: []string{"rm -rf", "git reset --hard", "git clean -fd", "git push --force", "mkfs", "diskpart", "format ", "remove-item -recurse", "del /s", "rd /s"},
+		Version:               SchemaVersion,
+		Providers:             make(map[string]ProviderConfig),
+		Workspace:             workspace,
+		PermissionMode:        "manual",
+		MaxTurns:              20,
+		MaxTotalTokens:        1_000_000,
+		ToolTimeoutSec:        60,
+		MaxOutputBytes:        64 << 10,
+		MaxReadBytes:          1 << 20,
+		MaxSearchResults:      200,
+		ReadOnlyCommands:      []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files"},
+		AutoAllowCommands:     []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files", "go test", "go vet", "go build", "go list", "go env", "go version", "gofmt", "go fmt"},
+		DangerousCommands:     []string{"rm -rf", "git reset --hard", "git clean -fd", "git push --force", "mkfs", "diskpart", "format ", "remove-item -recurse", "del /s", "rd /s"},
+		TokenBytesPerToken:    4,
+		ReservedOutputTokens:  8192,
+		ContextRecentRounds:   3,
+		MaxProjectMapBytes:    32 << 10,
+		MaxToolContextBytes:   8 << 10,
+		SkillCatalogPageBytes: 8 << 10,
+		MaxSummaryBytes:       16 << 10,
 	}
 }
 
@@ -111,6 +125,9 @@ func (c Config) Validate() error {
 	}
 	if c.ToolTimeoutSec <= 0 || c.MaxOutputBytes <= 0 || c.MaxReadBytes <= 0 || c.MaxSearchResults <= 0 {
 		return errors.New("resource limits must be greater than zero")
+	}
+	if c.TokenBytesPerToken <= 0 || c.ReservedOutputTokens <= 0 || c.ContextRecentRounds <= 0 || c.MaxProjectMapBytes <= 0 || c.MaxToolContextBytes <= 0 || c.SkillCatalogPageBytes <= 0 || c.MaxSummaryBytes <= 0 {
+		return errors.New("context limits must be greater than zero")
 	}
 	switch c.PermissionMode {
 	case "manual", "plan", "auto", "full":
@@ -300,6 +317,27 @@ func merge(dst *Config, src Config) {
 	if src.ShellEnvironment != nil {
 		dst.ShellEnvironment = append([]string(nil), src.ShellEnvironment...)
 	}
+	if src.TokenBytesPerToken != 0 {
+		dst.TokenBytesPerToken = src.TokenBytesPerToken
+	}
+	if src.ReservedOutputTokens != 0 {
+		dst.ReservedOutputTokens = src.ReservedOutputTokens
+	}
+	if src.ContextRecentRounds != 0 {
+		dst.ContextRecentRounds = src.ContextRecentRounds
+	}
+	if src.MaxProjectMapBytes != 0 {
+		dst.MaxProjectMapBytes = src.MaxProjectMapBytes
+	}
+	if src.MaxToolContextBytes != 0 {
+		dst.MaxToolContextBytes = src.MaxToolContextBytes
+	}
+	if src.SkillCatalogPageBytes != 0 {
+		dst.SkillCatalogPageBytes = src.SkillCatalogPageBytes
+	}
+	if src.MaxSummaryBytes != 0 {
+		dst.MaxSummaryBytes = src.MaxSummaryBytes
+	}
 }
 
 func applyEnvironment(cfg *Config, environ []string) {
@@ -319,10 +357,17 @@ func applyEnvironment(cfg *Config, environ []string) {
 		cfg.PermissionMode = value
 	}
 	for key, target := range map[string]*int{
-		"EYLU_MAX_TURNS":        &cfg.MaxTurns,
-		"EYLU_MAX_TOTAL_TOKENS": &cfg.MaxTotalTokens,
-		"EYLU_TOOL_TIMEOUT":     &cfg.ToolTimeoutSec,
-		"EYLU_MAX_OUTPUT_BYTES": &cfg.MaxOutputBytes,
+		"EYLU_MAX_TURNS":                &cfg.MaxTurns,
+		"EYLU_MAX_TOTAL_TOKENS":         &cfg.MaxTotalTokens,
+		"EYLU_TOOL_TIMEOUT":             &cfg.ToolTimeoutSec,
+		"EYLU_MAX_OUTPUT_BYTES":         &cfg.MaxOutputBytes,
+		"EYLU_TOKEN_BYTES_PER_TOKEN":    &cfg.TokenBytesPerToken,
+		"EYLU_RESERVED_OUTPUT_TOKENS":   &cfg.ReservedOutputTokens,
+		"EYLU_CONTEXT_RECENT_ROUNDS":    &cfg.ContextRecentRounds,
+		"EYLU_MAX_PROJECT_MAP_BYTES":    &cfg.MaxProjectMapBytes,
+		"EYLU_MAX_TOOL_CONTEXT_BYTES":   &cfg.MaxToolContextBytes,
+		"EYLU_SKILL_CATALOG_PAGE_BYTES": &cfg.SkillCatalogPageBytes,
+		"EYLU_MAX_SUMMARY_BYTES":        &cfg.MaxSummaryBytes,
 	} {
 		if value := env[key]; value != "" {
 			if parsed, err := strconv.Atoi(value); err == nil {

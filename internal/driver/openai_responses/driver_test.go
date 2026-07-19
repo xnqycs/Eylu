@@ -117,3 +117,60 @@ func TestGenerateMapsToolHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRemoteStateSendsOnlyNewInputAndChangedSystemBlocks(t *testing.T) {
+	previous := []protocol.Turn{
+		{ID: "system", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "base"}}},
+		{ID: "project-map", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "old map"}}},
+		{ID: "user-1", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "old question"}}},
+		{ID: "agent-1", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "old answer"}}},
+	}
+	state := remoteState{ResponseID: "resp_1", SystemDigests: systemTurnDigests(previous)}
+	current := append([]protocol.Turn(nil), previous...)
+	current[1] = protocol.Turn{ID: "project-map", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "new map"}}}
+	current = append(current, protocol.Turn{ID: "user-2", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "new question"}}})
+	input := remoteInputTurns(current, state)
+	if len(input) != 2 || input[0].ID != "project-map" || input[1].ID != "user-2" {
+		t.Fatalf("remote input = %#v", input)
+	}
+	encoded := encodeRemoteState(json.RawMessage(`{"response_id":"resp_2"}`), current, false)
+	decoded := decodeRemoteState(encoded)
+	if decoded.ResponseID != "resp_2" || len(decoded.SystemDigests) != 2 {
+		t.Fatalf("state = %#v", decoded)
+	}
+}
+
+func TestGenerateFallsBackWhenHTTPGatewayRejectsPreviousResponse(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var body requestBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if requests == 1 {
+			if body.PreviousResponseID != "resp_old" || len(body.Input) != 1 {
+				t.Fatalf("incremental body = %#v", body)
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"previous_response_id is only supported on Responses WebSocket v2"}}`))
+			return
+		}
+		if body.PreviousResponseID != "" || len(body.Input) != 4 {
+			t.Fatalf("fallback body = %#v", body)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_new","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}`))
+	}))
+	defer server.Close()
+	turns := []protocol.Turn{
+		{ID: "system", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "base"}}},
+		{ID: "user-old", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "old"}}},
+		{ID: "agent-old", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "answer"}}},
+		{ID: "user-new", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "new"}}},
+	}
+	state, _ := json.Marshal(remoteState{ResponseID: "resp_old", SystemDigests: systemTurnDigests(turns)})
+	response, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, APIKey: "key", Model: protocol.ModelRequest{Model: "model", Turns: turns, DriverState: state}}, nil)
+	if err != nil || requests != 2 || !decodeRemoteState(response.DriverState).DisablePrevious {
+		t.Fatalf("response=%#v requests=%d err=%v", response, requests, err)
+	}
+}

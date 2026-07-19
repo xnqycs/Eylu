@@ -81,6 +81,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			}
 		}
 		c.turns = append(c.turns, toolTurn)
+		c.projectMapDirty = true
 		c.rebuildLedger(runtime)
 	}
 	return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("agent iteration limit exceeded (%d)", maxTurns)}

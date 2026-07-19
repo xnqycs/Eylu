@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 
@@ -20,12 +19,21 @@ import (
 const SystemPrompt = `You are Eylu, a terminal programming agent working in a local repository. Follow the user's request, preserve unrelated files, report failures accurately, and keep responses concise. Tool availability and local permission policy are authoritative.`
 
 type Runtime struct {
-	Provider       provider.Snapshot
-	APIKey         string
-	Driver         driver.ModelDriver
-	Timeout        time.Duration
-	PermissionMode string
-	SkillCatalog   string
+	Provider              provider.Snapshot
+	APIKey                string
+	Driver                driver.ModelDriver
+	Timeout               time.Duration
+	PermissionMode        string
+	SkillCatalog          string
+	Workspace             string
+	TokenEstimator        contextledger.TokenEstimator
+	OutputReserveTokens   int
+	ContextRecentRounds   int
+	MaxProjectMapBytes    int
+	MaxToolContextBytes   int
+	SkillCatalogPageBytes int
+	MaxSummaryBytes       int
+	ContextEvent          func(contextledger.Event)
 }
 
 type ProtectedSkill struct {
@@ -38,28 +46,34 @@ type ProtectedSkill struct {
 }
 
 type Conversation struct {
-	mu                 sync.Mutex
-	sessionID          string
-	turns              []protocol.Turn
-	closed             map[string][]protocol.Turn
-	driverState        json.RawMessage
-	providerName       string
-	providerGeneration uint64
-	providerAdapter    string
-	providerBaseURL    string
-	providerModel      string
-	permissionMode     string
-	systemPrompt       string
-	skillCatalog       string
-	protectedSkills    map[string]ProtectedSkill
-	toolDefinitions    []protocol.ToolDefinition
-	ledger             *contextledger.Ledger
-	lastRuntime        Runtime
+	mu                  sync.Mutex
+	sessionID           string
+	turns               []protocol.Turn
+	closed              map[string][]protocol.Turn
+	driverState         json.RawMessage
+	providerName        string
+	providerGeneration  uint64
+	providerAdapter     string
+	providerBaseURL     string
+	providerModel       string
+	permissionMode      string
+	systemPrompt        string
+	skillCatalog        string
+	protectedSkills     map[string]ProtectedSkill
+	toolDefinitions     []protocol.ToolDefinition
+	ledger              *contextledger.Ledger
+	lastRuntime         Runtime
+	summary             string
+	omittedTurnIDs      map[string]struct{}
+	projectMap          string
+	projectMapWorkspace string
+	projectMapMaxBytes  int
+	projectMapDirty     bool
 }
 
 func NewConversation() *Conversation {
-	conversation := &Conversation{sessionID: uuid.NewString(), closed: make(map[string][]protocol.Turn), ledger: contextledger.New(nil), permissionMode: "manual", protectedSkills: make(map[string]ProtectedSkill)}
-	conversation.systemPrompt = promptForRuntime("manual", "")
+	conversation := &Conversation{sessionID: uuid.NewString(), closed: make(map[string][]protocol.Turn), ledger: contextledger.New(nil), permissionMode: "manual", protectedSkills: make(map[string]ProtectedSkill), omittedTurnIDs: make(map[string]struct{}), projectMapDirty: true}
+	conversation.systemPrompt = promptForRuntime("manual")
 	conversation.rebuildLedger(Runtime{})
 	return conversation
 }
@@ -102,7 +116,14 @@ func (c *Conversation) NewSession() string {
 	}
 	c.skillCatalog = c.lastRuntime.SkillCatalog
 	c.protectedSkills = make(map[string]ProtectedSkill)
-	c.systemPrompt = promptForRuntime(c.permissionMode, c.skillCatalog)
+	c.summary = ""
+	c.omittedTurnIDs = make(map[string]struct{})
+	c.projectMap = ""
+	c.projectMapWorkspace = ""
+	c.projectMapMaxBytes = 0
+	c.projectMapDirty = true
+	c.systemPrompt = promptForRuntime(c.permissionMode)
+	c.ledger.Reset()
 	c.rebuildLedger(c.lastRuntime)
 	return old
 }
@@ -138,7 +159,7 @@ func (c *Conversation) prepareRuntime(prompt string, runtime Runtime) error {
 		c.providerModel = runtime.Provider.Config.Model
 		c.permissionMode = mode
 		c.skillCatalog = runtime.SkillCatalog
-		c.systemPrompt = promptForRuntime(mode, runtime.SkillCatalog)
+		c.systemPrompt = promptForRuntime(mode)
 	}
 	return nil
 }
@@ -152,18 +173,10 @@ func (c *Conversation) appendUser(prompt string) {
 }
 
 func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
-	requestTurns := make([]protocol.Turn, 0, len(c.turns)+1)
-	requestTurns = append(requestTurns, protocol.Turn{ID: "system", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: c.systemPrompt}}})
-	protectedNames := make([]string, 0, len(c.protectedSkills))
-	for name := range c.protectedSkills {
-		protectedNames = append(protectedNames, name)
+	prepared, err := c.prepareRequestContext(runtime, definitions)
+	if err != nil {
+		return protocol.ModelResponse{}, err
 	}
-	sort.Strings(protectedNames)
-	for _, name := range protectedNames {
-		protected := c.protectedSkills[name]
-		requestTurns = append(requestTurns, protocol.Turn{ID: "skill:" + name + ":" + protected.Digest, Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: protected.Content}}})
-	}
-	requestTurns = append(requestTurns, cloneTurns(c.turns)...)
 	request := driver.Request{
 		BaseURL: runtime.Provider.Config.BaseURL,
 		APIKey:  runtime.APIKey,
@@ -172,8 +185,8 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 		Model: protocol.ModelRequest{
 			ProtocolVersion: protocol.Version,
 			Model:           runtime.Provider.Config.Model,
-			Turns:           requestTurns,
-			Tools:           definitions,
+			Turns:           prepared.Turns,
+			Tools:           prepared.Tools,
 			DriverState:     append(json.RawMessage(nil), c.driverState...),
 		},
 	}
@@ -201,44 +214,12 @@ func (c *Conversation) ContextReport() contextledger.Report {
 }
 
 func (c *Conversation) rebuildLedger(runtime Runtime) {
-	c.ledger.Reset()
-	c.ledger.AddText("system", contextledger.CategorySystemPrompt, "eylu", c.systemPrompt, true)
-	for _, turn := range c.turns {
-		for index, part := range turn.Parts {
-			source := turn.ID
-			id := turn.ID + ":" + strconv.Itoa(index)
-			switch {
-			case part.Kind == protocol.PartText && turn.Role == protocol.RoleUser:
-				c.ledger.AddText(id, contextledger.CategoryUserMessage, source, part.Text, false)
-			case part.Kind == protocol.PartText && turn.Role == protocol.RoleAgent:
-				c.ledger.AddText(id, contextledger.CategoryAgentMessage, source, part.Text, false)
-			case part.Kind == protocol.PartToolResult && part.ToolResult != nil:
-				c.ledger.AddText(id, contextledger.CategoryBuiltinToolResult, source, part.ToolResult.Content, false)
-			}
-		}
-	}
-	for _, definition := range c.toolDefinitions {
-		content := definition.Description + "\n" + string(definition.InputSchema)
-		c.ledger.AddText("tool-schema:"+definition.Name, contextledger.CategoryBuiltinToolSchema, definition.Name, content, true)
-	}
-	if c.skillCatalog != "" {
-		c.ledger.AddText("skill-catalog", contextledger.CategorySkillCatalog, "discovery", c.skillCatalog, true)
-	}
-	for _, name := range protectedNamesFromMap(c.protectedSkills) {
-		protected := c.protectedSkills[name]
-		c.ledger.AddText("skill-body:"+name+":"+protected.Digest, contextledger.CategorySkillBody, name, protected.Content, true)
-	}
-	if len(c.driverState) > 0 {
-		c.ledger.AddText("driver-state", contextledger.CategoryDriverState, runtime.Provider.Name, string(c.driverState), false)
-	}
-	reserve := 8192
-	if runtime.Provider.Config.ContextWindow > 0 && runtime.Provider.Config.ContextWindow < reserve*2 {
-		reserve = runtime.Provider.Config.ContextWindow / 4
-	}
-	c.ledger.Add(contextledger.Block{ID: "output-reserve", Category: contextledger.CategoryOutputReserve, Source: "runtime", Tokens: reserve, Exact: false})
+	c.refreshProjectMap(runtime)
+	prepared := c.buildPromptContext(runtime, c.toolDefinitions)
+	c.ledger.ReplaceBlocks(prepared.Blocks)
 }
 
-func promptForRuntime(mode, catalog string) string {
+func promptForRuntime(mode string) string {
 	base := SystemPrompt + "\nCurrent permission mode: " + mode + ". Local policy decisions are final."
 	modePrompt := ""
 	switch mode {
@@ -251,10 +232,7 @@ func promptForRuntime(mode, catalog string) string {
 	default:
 		modePrompt = " Reads run automatically. Writes and commands request confirmation; dangerous operations require two confirmations."
 	}
-	if catalog == "" {
-		return base + modePrompt
-	}
-	return base + modePrompt + "\nThe following skills provide specialized instructions. When a task matches a description, call activate_skill with its name before proceeding. Skill resources must be read with read_skill_resource after activation.\n" + catalog
+	return base + modePrompt
 }
 
 func (c *Conversation) ActivatedSkillDigests() map[string]string {

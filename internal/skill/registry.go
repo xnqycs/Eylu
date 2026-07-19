@@ -69,6 +69,7 @@ func (r *Registry) Catalog() string {
 }
 
 func escapeCatalog(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;", "'", "&apos;")
 	return replacer.Replace(value)
 }

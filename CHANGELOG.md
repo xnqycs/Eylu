@@ -1,5 +1,17 @@
 # Changelog
 
+## Phase 6 - 上下文管理
+
+- 增加同源 `PromptBuilder` 与全分类 `ContextLedger`，请求内容、工具 schema、DriverState 和 `/context` 使用同一组 blocks。
+- 增加稳定项目地图、Skill catalog 分页、Skill/MCP 来源明细与 exact/estimated 标记。
+- 增加上下文预算、完整 tool call/result 原子组压缩、结构化摘要和大工具结果模型片段。
+- 完整 transcript 与压缩请求视图分离；已激活 Skill 正文继续作为 protected block 按 digest 去重。
+- Responses DriverState 支持增量远端输入；端点拒绝 `previous_response_id` 时自动回退并记忆兼容能力。
+
+配置：新增 token 近似比率、输出预留、最近轮次、项目地图、工具片段、Skill catalog 页和摘要上限；均支持 `EYLU_*` 环境变量覆盖。
+
+兼容性：protocol v1 与配置 schema 版本保持不变；已有配置自动使用安全默认值。
+
 ## Phase 5 - Agent Skills
 
 - 增加兼容 Agent Skills 规范的严格 frontmatter parser、固定目录发现、优先级、shadow/invalid 诊断。
