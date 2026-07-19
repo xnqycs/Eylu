@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -129,9 +130,16 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	if len(state.Turns) < s.persistedTurns {
 		return fmt.Errorf("session transcript shrank from %d to %d turns", s.persistedTurns, len(state.Turns))
 	}
-	providerState, err := selectedSessionProvider(manager, opts)
-	if err != nil {
-		return err
+	providerState := session.ProviderState{
+		Name: state.Provider.Name, Generation: state.Provider.Generation, Adapter: state.Provider.Adapter,
+		BaseURL: state.Provider.BaseURL, Model: state.Provider.Model, ContextWindow: state.Provider.ContextWindow,
+	}
+	if providerState.Name == "" {
+		var err error
+		providerState, err = selectedSessionProvider(manager, opts)
+		if err != nil {
+			return err
+		}
 	}
 	state.Provider = agentProviderState(providerState)
 	state.Workspace = manager.Config().Workspace
@@ -219,6 +227,9 @@ func (r *runtime) rotateSession(conversation *agent.Conversation, manager *provi
 	if err := r.session.Close(conversation, manager, opts); err != nil {
 		return oldID, "", err
 	}
+	if err := r.closeMCP(); err != nil {
+		return oldID, "", sessionProtocolError("close MCP sessions", err)
+	}
 	conversation.NewSession()
 	stored, err := r.session.store.Create(snapshotFromConversation(conversation, manager, opts, session.Snapshot{}))
 	if err != nil {
@@ -255,7 +266,7 @@ func (s *sessionRuntime) RevalidateSkills(registry *skill.Registry, skillSession
 			continue
 		}
 		input, _ := json.Marshal(map[string]string{"name": persisted.Name})
-		result := activationTool.Execute(nil, input)
+		result := activationTool.Execute(context.Background(), input)
 		if result.IsError {
 			diagnostics = append(diagnostics, fmt.Sprintf("skill %s could not be revalidated: %s", persisted.Name, result.Content))
 			continue

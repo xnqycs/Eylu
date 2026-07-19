@@ -29,6 +29,15 @@ go run . providers models --provider work
 go run . chat "检查当前项目" --provider work
 ```
 
+Provider 可声明适用任务、优先级和每百万 token 成本。自动路由会先过滤 Driver 能力与上下文窗口，再按任务匹配、优先级、已知上下文标记、估算成本、上下文窗口和名称稳定排序：
+
+```powershell
+go run . providers add coding --base-url "https://api.openai.com/v1" --model "your-model" --credential-type env --credential-env EYLU_API_KEY --routing-task coding,debugging,testing --routing-priority 20 --input-cost 1.25 --output-cost 10
+go run . chat "审查并测试这个项目" --route auto --task review --require-reasoning
+```
+
+`routing_mode = "fixed"` 保持活动 Provider；`routing_mode = "auto"` 允许每个请求选择 Provider。显式 `--provider` 固定本次请求。文本模式在 stderr 输出路由决策与请求指标；JSONL 模式输出 `routing` 和 `metrics` 事件，指标包含 request ID、首 token/总耗时、工具成功率、压缩次数、usage 与估算成本。
+
 兼容端点可在 Provider 中选择两种 adapter：
 
 - `openai_responses`：使用 `/v1/responses` 和类型化 SSE 事件。
@@ -72,6 +81,8 @@ Agent 默认提供以下工具：
 - `search_code`：在 Git ignore 语义下进行字面量或 RE2 正则搜索。
 - `list_directory`：从共享仓库索引生成稳定、限深的目录树。
 
+Driver 声明并行工具能力时，连续的 `read_file`、`search_code`、`list_directory`、`read_skill_resource` 和显式只读 MCP 工具可按 `max_parallel_tools` 并发执行；结果与事件继续使用模型调用顺序。
+
 只读工具直接执行；写入与命令工具会在 TTY 中确认。脚本化运行可使用 `--yes` 明确授权本次请求中的确认项：
 
 ```powershell
@@ -111,6 +122,40 @@ go run . skills diagnose --output json
 
 交互会话支持 `/skills` 和 `/skill <name>`。Skill 的 `allowed-tools` 仅作为提示和审计信息，工具执行继续服从当前权限模式。
 
+签名 Skill 仓库使用 Ed25519 公钥建立信任。索引和包地址接受 HTTPS，测试环境可使用 loopback HTTP；私有仓库的 Bearer token 通过环境变量名称引用：
+
+```powershell
+go run . skills registries add official --index-url "https://skills.example.com/index.json" --public-key "release=<base64-ed25519-public-key>" --token-env EYLU_SKILL_TOKEN
+go run . skills remote official
+go run . skills install official/code-review --scope user
+go run . skills update code-review --scope user
+go run . skills verify code-review --scope user
+```
+
+安装前会校验索引签名、ZIP SHA-256、解压后目录 SHA-256、路径边界、文件数量和大小，再通过稳定 staging 原子替换。签名载荷固定为 `eylu-skill-v1`、名称、规范化版本、解析后的绝对 package URL、包摘要、目录摘要和 key ID，各字段以 LF 连接。`project` 安装到 `.eylu/skills`，`team` 安装到 `.agents/skills` 并更新可移植的 `.eylu/skills.lock.json`；替换未受管理的目录需要显式 `--force`。
+
+## MCP
+
+MCP server 通过 stdio 子进程接入。下面的 TOML 配置只转发列出的环境变量，工作目录必须位于当前 workspace 内；`read_only_tools` 是本地安全授权，server annotation 只参与展示：
+
+```toml
+[mcp_servers.repository]
+command = "repo-mcp"
+args = ["serve", "--stdio"]
+environment = ["REPO_MCP_TOKEN"]
+working_directory = "."
+read_only_tools = ["search", "inspect"]
+timeout_seconds = 30
+```
+
+```powershell
+go run . mcp list
+go run . mcp inspect repository --output json
+go run . chat "使用 repository 工具检查项目"
+```
+
+MCP instructions、tool schema、resource 内容和 tool result 分别进入 `ContextLedger`；server 配置或能力指纹变化会清除不再兼容的 DriverState。命令直接启动且不经过 shell，关闭 session、`/new` 和程序退出时会关闭子进程。
+
 ## 上下文管理
 
 Eylu 使用同一个 `PromptBuilder` 生成模型请求和 `ContextLedger`，`/context` 会在一张表中列出 system prompt、Skill catalog/正文/资源、MCP、工具 schema、user/agent 消息、工具结果、项目地图、摘要、DriverState 与输出预留。Skill 和 MCP 类别会按来源展开；最近一次 Provider usage 独立显示。
@@ -129,6 +174,7 @@ skill_catalog_page_bytes = 8192
 max_summary_bytes = 16384
 max_sessions = 100
 max_session_bytes = 536870912
+max_parallel_tools = 4
 ```
 
 项目地图稳定登记受限文件树、语言统计、入口、配置和最近修改文件。Responses 驱动在端点支持时使用远端 response state 减少重复传输；HTTP 网关拒绝该能力时会自动记忆并切换到完整上下文请求。
@@ -137,11 +183,25 @@ max_session_bytes = 536870912
 
 session 保存完整 Eylu transcript、上下文账本、权限模式、Provider generation、模型引用和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。清除 DriverState 后仍可使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
 
+## 发布
+
+`eylu version` 显示 version、commit、date 与构建器。GoReleaser 为 Linux、Windows、macOS 的 amd64/arm64 生成归档和 `Eylu_<version>_checksums.txt`；tag 工作流使用 Sigstore keyless 对 checksum 文件生成 `.sigstore.json` bundle。
+
+```bash
+goreleaser check
+goreleaser release --snapshot --clean --skip=sign
+```
+
+CI 在 Linux、Windows、macOS 执行测试、vet、原生构建和 smoke test；Linux 质量任务额外执行 race detector、格式检查与 Staticcheck。发布 tag 使用 `v*` 格式。
+
 ## 开发质量门槛
 
 ```bash
 gofmt -l .
+go mod verify
 go vet ./...
 go test ./...
 go test -race ./...
+staticcheck ./...
+actionlint
 ```

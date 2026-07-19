@@ -15,6 +15,7 @@ import (
 type LoopOptions struct {
 	MaxTurns       int
 	MaxTotalTokens int
+	RequestID      string
 }
 
 func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, executor *tool.Executor, options LoopOptions, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
@@ -35,7 +36,10 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 	c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 	seenCalls := make(map[string]struct{})
 	totalTokens := 0
-	requestID := uuid.NewString()
+	requestID := options.RequestID
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
 	var last protocol.ModelResponse
 	for iteration := 0; iteration < maxTurns; iteration++ {
 		if err := ctx.Err(); err != nil {
@@ -66,19 +70,41 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 				return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("duplicate tool call ID %q", call.ID)}
 			}
 			seenCalls[call.ID] = struct{}{}
-			if emit != nil {
-				if err := emit(protocol.ModelEvent{Kind: protocol.EventToolStart, ToolCall: &call}); err != nil {
-					return last, err
+		}
+		parallelTools := runtime.Driver.Capabilities().ParallelTools
+		for start := 0; start < len(calls); {
+			end := start + 1
+			if parallelTools && executor.CanExecuteConcurrently(calls[start]) {
+				for end < len(calls) && executor.CanExecuteConcurrently(calls[end]) {
+					end++
 				}
 			}
-			result := executor.Execute(ctx, requestID, call)
-			c.captureSkillResult(result)
-			toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
+			batch := calls[start:end]
 			if emit != nil {
-				if err := emit(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &result}); err != nil {
-					return last, err
+				for index := range batch {
+					call := batch[index]
+					if err := emit(protocol.ModelEvent{Kind: protocol.EventToolStart, ToolCall: &call}); err != nil {
+						return last, err
+					}
 				}
 			}
+			var results []protocol.ToolResult
+			if parallelTools && len(batch) > 1 && executor.CanExecuteConcurrently(batch[0]) {
+				results = executor.ExecuteConcurrent(ctx, requestID, batch)
+			} else {
+				results = []protocol.ToolResult{executor.Execute(ctx, requestID, batch[0])}
+			}
+			for index := range results {
+				result := results[index]
+				c.captureSkillResult(result)
+				toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
+				if emit != nil {
+					if err := emit(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &result}); err != nil {
+						return last, err
+					}
+				}
+			}
+			start = end
 		}
 		c.turns = append(c.turns, toolTurn)
 		c.projectMapDirty = true

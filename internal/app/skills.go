@@ -74,9 +74,10 @@ func (r *runtime) confirmSkillTrust(workspace string) bool {
 	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")
 }
 
-func (r *runtime) skillsCommand() *cobra.Command {
+func (r *runtime) skillsCommand(ctx context.Context) *cobra.Command {
 	command := &cobra.Command{Use: "skills", Short: "discover, validate, and diagnose Agent Skills"}
 	command.AddCommand(r.skillsListCommand(), r.skillsShowCommand(), r.skillsValidateCommand(), r.skillsDiagnoseCommand(), r.skillsTrustCommand(true), r.skillsTrustCommand(false))
+	command.AddCommand(r.skillRegistriesCommand(), r.skillsRemoteCommand(ctx), r.skillsInstallCommand(ctx), r.skillsUpdateCommand(ctx), r.skillsVerifyInstalledCommand())
 	return command
 }
 

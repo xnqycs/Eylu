@@ -35,6 +35,8 @@ func (l *ListDirectory) Definition() protocol.ToolDefinition {
 
 func (l *ListDirectory) Risk() policy.Risk { return policy.RiskRead }
 
+func (l *ListDirectory) ParallelSafe() bool { return true }
+
 func (l *ListDirectory) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Path          string `json:"path"`

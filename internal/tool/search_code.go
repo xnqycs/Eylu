@@ -49,6 +49,8 @@ func (s *SearchCode) Definition() protocol.ToolDefinition {
 
 func (s *SearchCode) Risk() policy.Risk { return policy.RiskRead }
 
+func (s *SearchCode) ParallelSafe() bool { return true }
+
 func (s *SearchCode) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Query      string `json:"query"`

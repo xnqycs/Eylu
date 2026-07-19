@@ -22,15 +22,19 @@ import (
 )
 
 type providerOptions struct {
-	adapter        string
-	baseURL        string
-	model          string
-	credentialType string
-	credentialEnv  string
-	apiKey         string
-	contextWindow  int
-	timeout        time.Duration
-	activate       bool
+	adapter         string
+	baseURL         string
+	model           string
+	credentialType  string
+	credentialEnv   string
+	apiKey          string
+	contextWindow   int
+	timeout         time.Duration
+	activate        bool
+	routingTasks    []string
+	routingPriority int
+	inputCost       float64
+	outputCost      float64
 }
 
 func (r *runtime) providersCommand(ctx context.Context) *cobra.Command {
@@ -67,7 +71,7 @@ func (r *runtime) providersListCommand() *cobra.Command {
 				if item.Name == loaded.Config.ActiveProvider {
 					marker = "*"
 				}
-				fmt.Fprintf(r.stdout, "%s %s\t%s\t%s\t%s\n", marker, item.Name, item.Config.Adapter, item.Config.Model, item.Config.BaseURL)
+				fmt.Fprintf(r.stdout, "%s %s\t%s\t%s\t%s\ttasks=%s\tpriority=%d\n", marker, item.Name, item.Config.Adapter, item.Config.Model, item.Config.BaseURL, strings.Join(item.Config.Routing.Tasks, ","), item.Config.Routing.Priority)
 			}
 			return nil
 		},
@@ -110,6 +114,18 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 			if cmd.Flags().Changed("timeout") || !editing {
 				candidate.TimeoutSeconds = int(opts.timeout / time.Second)
 			}
+			if cmd.Flags().Changed("routing-task") || !editing {
+				candidate.Routing.Tasks = append([]string(nil), opts.routingTasks...)
+			}
+			if cmd.Flags().Changed("routing-priority") || !editing {
+				candidate.Routing.Priority = opts.routingPriority
+			}
+			if cmd.Flags().Changed("input-cost") || !editing {
+				candidate.Routing.InputCostPerMillion = opts.inputCost
+			}
+			if cmd.Flags().Changed("output-cost") || !editing {
+				candidate.Routing.OutputCostPerMillion = opts.outputCost
+			}
 			if cmd.Flags().Changed("credential-type") || cmd.Flags().Changed("credential-env") || !editing {
 				candidate.Credential = credentialRef(name, opts)
 			}
@@ -137,6 +153,10 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 	cmd.Flags().IntVar(&opts.contextWindow, "context-window", 0, "model context window")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 60*time.Second, "request timeout")
 	cmd.Flags().BoolVar(&opts.activate, "activate", true, "make provider active")
+	cmd.Flags().StringSliceVar(&opts.routingTasks, "routing-task", nil, "routing task: general, coding, review, debugging, testing, or documentation")
+	cmd.Flags().IntVar(&opts.routingPriority, "routing-priority", 0, "automatic routing priority")
+	cmd.Flags().Float64Var(&opts.inputCost, "input-cost", 0, "input cost per million tokens")
+	cmd.Flags().Float64Var(&opts.outputCost, "output-cost", 0, "output cost per million tokens")
 	return cmd
 }
 

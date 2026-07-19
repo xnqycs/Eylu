@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -14,31 +15,36 @@ import (
 type ConfirmFunc func(context.Context, policy.Request, policy.Outcome) (bool, error)
 
 type AuditRecord struct {
-	RequestID      string              `json:"request_id"`
-	CallID         string              `json:"call_id"`
-	Tool           string              `json:"tool"`
-	Risk           policy.Risk         `json:"risk"`
-	Decision       policy.Decision     `json:"decision"`
-	Reason         string              `json:"reason"`
-	Confirmed      bool                `json:"confirmed"`
-	DurationMS     int64               `json:"duration_ms"`
-	IsError        bool                `json:"is_error"`
-	Truncated      bool                `json:"truncated"`
-	InputBytes     int                 `json:"input_bytes"`
-	OutputBytes    int                 `json:"output_bytes"`
-	ExitCode       int                 `json:"exit_code,omitempty"`
-	Mode           string              `json:"mode"`
-	Classification policy.CommandClass `json:"classification"`
-	Confirmations  int                 `json:"confirmations"`
-	Warning        bool                `json:"warning"`
-	SkillName      string              `json:"skill_name,omitempty"`
-	SkillSource    string              `json:"skill_source,omitempty"`
-	SkillDigest    string              `json:"skill_digest,omitempty"`
-	SkillTrigger   string              `json:"skill_trigger,omitempty"`
-	SkillActivated string              `json:"skill_activated_at,omitempty"`
-	AllowedTools   string              `json:"allowed_tools,omitempty"`
-	SkillResource  string              `json:"skill_resource,omitempty"`
-	ResourceBytes  int                 `json:"resource_bytes,omitempty"`
+	Timestamp          time.Time           `json:"timestamp"`
+	RequestID          string              `json:"request_id"`
+	SessionID          string              `json:"session_id,omitempty"`
+	ProviderName       string              `json:"provider_name,omitempty"`
+	ProviderGeneration uint64              `json:"provider_generation,omitempty"`
+	Model              string              `json:"model,omitempty"`
+	CallID             string              `json:"call_id"`
+	Tool               string              `json:"tool"`
+	Risk               policy.Risk         `json:"risk"`
+	Decision           policy.Decision     `json:"decision"`
+	Reason             string              `json:"reason"`
+	Confirmed          bool                `json:"confirmed"`
+	DurationMS         int64               `json:"duration_ms"`
+	IsError            bool                `json:"is_error"`
+	Truncated          bool                `json:"truncated"`
+	InputBytes         int                 `json:"input_bytes"`
+	OutputBytes        int                 `json:"output_bytes"`
+	ExitCode           int                 `json:"exit_code,omitempty"`
+	Mode               string              `json:"mode"`
+	Classification     policy.CommandClass `json:"classification"`
+	Confirmations      int                 `json:"confirmations"`
+	Warning            bool                `json:"warning"`
+	SkillName          string              `json:"skill_name,omitempty"`
+	SkillSource        string              `json:"skill_source,omitempty"`
+	SkillDigest        string              `json:"skill_digest,omitempty"`
+	SkillTrigger       string              `json:"skill_trigger,omitempty"`
+	SkillActivated     string              `json:"skill_activated_at,omitempty"`
+	AllowedTools       string              `json:"allowed_tools,omitempty"`
+	SkillResource      string              `json:"skill_resource,omitempty"`
+	ResourceBytes      int                 `json:"resource_bytes,omitempty"`
 }
 
 type AuditSink interface {
@@ -46,13 +52,18 @@ type AuditSink interface {
 }
 
 type Executor struct {
-	Registry       *Registry
-	Policy         policy.Checker
-	Confirm        ConfirmFunc
-	Audit          AuditSink
-	Workspace      string
-	Timeout        time.Duration
-	MaxOutputBytes int
+	Registry           *Registry
+	Policy             policy.Checker
+	Confirm            ConfirmFunc
+	Audit              AuditSink
+	Workspace          string
+	Timeout            time.Duration
+	MaxOutputBytes     int
+	SessionID          string
+	ProviderName       string
+	ProviderGeneration uint64
+	Model              string
+	MaxParallelTools   int
 }
 
 func (e *Executor) Definitions() []protocol.ToolDefinition {
@@ -62,10 +73,66 @@ func (e *Executor) Definitions() []protocol.ToolDefinition {
 	return e.Registry.Definitions()
 }
 
-func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.ToolCall) protocol.ToolResult {
+func (e *Executor) CanExecuteConcurrently(call protocol.ToolCall) bool {
+	if e == nil || e.Registry == nil {
+		return false
+	}
+	item, ok := e.Registry.Get(call.Name)
+	if !ok {
+		return false
+	}
+	safe, ok := item.(ParallelSafe)
+	return ok && safe.ParallelSafe()
+}
+
+func (e *Executor) ExecuteConcurrent(ctx context.Context, requestID string, calls []protocol.ToolCall) []protocol.ToolResult {
+	results := make([]protocol.ToolResult, len(calls))
+	if len(calls) == 0 {
+		return results
+	}
+	for _, call := range calls {
+		if !e.CanExecuteConcurrently(call) {
+			for index, sequential := range calls {
+				results[index] = e.Execute(ctx, requestID, sequential)
+			}
+			return results
+		}
+	}
+	limit := e.MaxParallelTools
+	if limit <= 0 {
+		limit = 4
+	}
+	if limit > len(calls) {
+		limit = len(calls)
+	}
+	semaphore := make(chan struct{}, limit)
+	var wait sync.WaitGroup
+	for index, call := range calls {
+		index, call := index, call
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+				results[index] = e.Execute(ctx, requestID, call)
+			case <-ctx.Done():
+				results[index] = e.Execute(ctx, requestID, call)
+			}
+		}()
+	}
+	wait.Wait()
+	return results
+}
+
+func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.ToolCall) (result protocol.ToolResult) {
 	started := time.Now()
-	result := protocol.ToolResult{CallID: call.ID}
-	record := AuditRecord{RequestID: requestID, CallID: call.ID, Tool: call.Name, InputBytes: len(call.Arguments)}
+	result = protocol.ToolResult{CallID: call.ID}
+	record := AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, CallID: call.ID, Tool: call.Name, InputBytes: len(call.Arguments)}
+	if e != nil {
+		record.SessionID, record.ProviderName = e.SessionID, e.ProviderName
+		record.ProviderGeneration, record.Model = e.ProviderGeneration, e.Model
+	}
 	defer func() {
 		record.DurationMS = time.Since(started).Milliseconds()
 		record.IsError = result.IsError
@@ -88,9 +155,21 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 			e.Audit.Record(record)
 		}
 	}()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result.CallID = call.ID
+			result.IsError = true
+			result.Content = fmt.Sprintf("tool execution panicked: %v", recovered)
+		}
+	}()
 	if e == nil || e.Registry == nil {
 		result.IsError = true
 		result.Content = "tool executor is unavailable"
+		return result
+	}
+	if ctx.Err() != nil {
+		result.IsError = true
+		result.Content = "tool execution cancelled"
 		return result
 	}
 	item, ok := e.Registry.Get(call.Name)

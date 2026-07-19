@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -107,6 +108,16 @@ func (c *Conversation) buildPromptContext(runtime Runtime, definitions []protoco
 	options := optionsForRuntime(runtime)
 	builder := contextledger.NewPromptBuilder(options.estimator)
 	builder.AddTextTurn("system", protocol.RoleSystem, c.systemPrompt, contextledger.CategorySystemPrompt, "eylu", true, nil)
+	for _, server := range runtime.MCPContexts {
+		if server.Instructions != "" {
+			content := fmt.Sprintf("<mcp_instructions server=%q>\n%s\n</mcp_instructions>", server.Server, server.Instructions)
+			builder.AddTextTurn("mcp-instructions:"+server.Server, protocol.RoleSystem, content, contextledger.CategoryMCPInstructions, server.Server, true, map[string]any{"server": server.Server})
+		}
+		if server.ResourceCatalog != "" {
+			content := fmt.Sprintf("<mcp_resources server=%q>\n%s\n</mcp_resources>", server.Server, server.ResourceCatalog)
+			builder.AddTextTurn("mcp-resources:"+server.Server, protocol.RoleSystem, content, contextledger.CategoryMCPResource, server.Server, true, map[string]any{"server": server.Server})
+		}
+	}
 	pages := contextledger.PaginateSkillCatalog(c.skillCatalog, options.catalogPageBytes)
 	for index, page := range pages {
 		content := page
@@ -135,7 +146,24 @@ func (c *Conversation) buildPromptContext(runtime Runtime, definitions []protoco
 			builder.AddTurn(contextTurn)
 		}
 	}
-	builder.AddTools(definitions, contextledger.CategoryBuiltinToolSchema, "builtin")
+	builtinDefinitions := make([]protocol.ToolDefinition, 0, len(definitions))
+	mcpDefinitions := make(map[string][]protocol.ToolDefinition)
+	for _, definition := range definitions {
+		if server := runtime.MCPToolServers[definition.Name]; server != "" {
+			mcpDefinitions[server] = append(mcpDefinitions[server], definition)
+		} else {
+			builtinDefinitions = append(builtinDefinitions, definition)
+		}
+	}
+	builder.AddTools(builtinDefinitions, contextledger.CategoryBuiltinToolSchema, "builtin")
+	mcpServers := make([]string, 0, len(mcpDefinitions))
+	for server := range mcpDefinitions {
+		mcpServers = append(mcpServers, server)
+	}
+	sort.Strings(mcpServers)
+	for _, server := range mcpServers {
+		builder.AddTools(mcpDefinitions[server], contextledger.CategoryMCPToolSchema, server)
+	}
 	builder.AddDriverState(runtime.Provider.Name, c.driverState)
 	builder.SetOutputReserve(options.outputReserve)
 	return builder.Result()

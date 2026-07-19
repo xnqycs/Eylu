@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -113,6 +115,38 @@ func TestSkillsCLIValidateListAndExplicitActivation(t *testing.T) {
 	}
 	if conversation.ActivatedSkillDigests()["user-skill"] == "" || !strings.Contains(slashOut.String(), "activated skill user-skill") || !strings.Contains(slashErr.String(), "trigger=user") {
 		t.Fatalf("digests=%#v stdout=%q stderr=%q", conversation.ActivatedSkillDigests(), slashOut.String(), slashErr.String())
+	}
+}
+
+func TestSkillRegistryCLIConfiguration(t *testing.T) {
+	isolateUserState(t)
+	workspace := t.TempDir()
+	configPath := filepath.Join(workspace, "config.toml")
+	publicKey := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
+	var stdout, stderr bytes.Buffer
+	args := []string{
+		"--config", configPath, "--workspace", workspace, "skills", "registries", "add", "team",
+		"--index-url", "https://registry.example/index.json", "--public-key", "release=" + publicKey, "--token-env", "TEAM_TOKEN",
+	}
+	if code := Execute(context.Background(), args, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("add exit=%d stderr=%s", code, stderr.String())
+	}
+	loaded, err := config.Load(config.LoadOptions{ExplicitPath: configPath, Workspace: workspace, Environ: os.Environ()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := loaded.Config.SkillRegistries["team"]
+	if registry.IndexURL != "https://registry.example/index.json" || registry.TokenEnvironment != "TEAM_TOKEN" || registry.PublicKeys["release"] != publicKey {
+		t.Fatalf("registry = %#v", registry)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Execute(context.Background(), []string{"--config", configPath, "--workspace", workspace, "skills", "registries", "delete", "team"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+		t.Fatalf("delete exit=%d stderr=%s", code, stderr.String())
+	}
+	loaded, err = config.Load(config.LoadOptions{ExplicitPath: configPath, Workspace: workspace, Environ: os.Environ()})
+	if err != nil || len(loaded.Config.SkillRegistries) != 0 {
+		t.Fatalf("registries=%#v error=%v", loaded.Config.SkillRegistries, err)
 	}
 }
 

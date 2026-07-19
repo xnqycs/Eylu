@@ -27,6 +27,8 @@ func (r *ReadSkillResource) Definition() protocol.ToolDefinition {
 
 func (r *ReadSkillResource) Risk() policy.Risk { return policy.RiskRead }
 
+func (r *ReadSkillResource) ParallelSafe() bool { return true }
+
 func (r *ReadSkillResource) Execute(_ context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Skill string `json:"skill"`

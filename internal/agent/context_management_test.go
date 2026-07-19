@@ -188,6 +188,58 @@ func TestContextualizeTurnKeepsFullTranscriptAndLimitsModelResult(t *testing.T) 
 	}
 }
 
+func TestMCPContextIsClassifiedByServer(t *testing.T) {
+	conversation := NewConversation()
+	conversation.turns = []protocol.Turn{{
+		ID: "tool-turn", Role: protocol.RoleTool,
+		Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: "mcp-call", Content: "mcp output", Metadata: map[string]any{"mcp_server": "fixture"}}}},
+	}}
+	mcpDefinition := protocol.ToolDefinition{Name: "mcp__fixture__echo", InputSchema: json.RawMessage(`{"type":"object"}`)}
+	builtinDefinition := protocol.ToolDefinition{Name: "read_file", InputSchema: json.RawMessage(`{"type":"object"}`)}
+	runtime := Runtime{
+		MCPContexts:    []MCPContext{{Server: "fixture", Instructions: "server instructions", ResourceCatalog: `[{"uri":"fixture://resource"}]`}},
+		MCPToolServers: map[string]string{"mcp__fixture__echo": "fixture"},
+	}
+	prepared := conversation.buildPromptContext(runtime, []protocol.ToolDefinition{builtinDefinition, mcpDefinition})
+	wanted := map[contextledger.Category]string{
+		contextledger.CategoryMCPInstructions: "fixture", contextledger.CategoryMCPResource: "fixture",
+		contextledger.CategoryMCPToolSchema: "fixture:mcp__fixture__echo", contextledger.CategoryMCPToolResult: "fixture",
+		contextledger.CategoryBuiltinToolSchema: "builtin:read_file",
+	}
+	for category, source := range wanted {
+		found := false
+		for _, block := range prepared.Blocks {
+			if block.Category == category && block.Source == source {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing category=%s source=%s blocks=%#v", category, source, prepared.Blocks)
+		}
+	}
+	if len(prepared.Tools) != 2 {
+		t.Fatalf("tools = %#v", prepared.Tools)
+	}
+}
+
+func TestMCPFingerprintChangeClearsDriverState(t *testing.T) {
+	conversation := NewConversation()
+	runtime := testRuntime(&contextCaptureDriver{}, 1)
+	runtime.MCPFingerprint = "first"
+	if err := conversation.prepareRuntime("prompt", runtime); err != nil {
+		t.Fatal(err)
+	}
+	conversation.driverState = json.RawMessage(`{"remote":"state"}`)
+	runtime.MCPFingerprint = "second"
+	if err := conversation.prepareRuntime("prompt", runtime); err != nil {
+		t.Fatal(err)
+	}
+	if len(conversation.driverState) != 0 {
+		t.Fatalf("driver state = %s", conversation.driverState)
+	}
+}
+
 func TestReasoningIsRetainedLocallyAndExcludedFromReplay(t *testing.T) {
 	model := &reasoningPolicyDriver{t: t}
 	conversation := NewConversation()

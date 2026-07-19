@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod verify
+      - run: go test ./...
+      - run: go vet ./...
+      - name: Build smoke binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            go build -trimpath -o dist/eylu.exe .
+          else
+            go build -trimpath -o dist/eylu .
+          fi
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/smoke.ps1 -Binary ./dist/eylu.exe
+      - name: Smoke test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash ./scripts/smoke.sh ./dist/eylu
+
+  quality:
+    name: Race and static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+      - run: go test -race ./...
+      - name: Staticcheck
+        shell: bash
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...

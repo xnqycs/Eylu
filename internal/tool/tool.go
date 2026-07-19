@@ -18,6 +18,12 @@ type Tool interface {
 	Execute(context.Context, json.RawMessage) protocol.ToolResult
 }
 
+// ParallelSafe is an explicit opt-in for tools whose executions do not mutate
+// shared state and may run beside other calls from the same model response.
+type ParallelSafe interface {
+	ParallelSafe() bool
+}
+
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool

@@ -14,9 +14,11 @@ import (
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/logging"
+	"Eylu/internal/metrics"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
+	"Eylu/internal/routing"
 	"Eylu/internal/skill"
 	"Eylu/internal/tool"
 	"Eylu/internal/ui"
@@ -75,6 +77,13 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 	if err != nil {
 		return ui.Snapshot{}, err
 	}
+	state := b.conversation.ExportState()
+	if state.Provider.Name != "" && opts.provider == "" {
+		if selected, ok := b.manager.Snapshot(state.Provider.Name); ok {
+			active = selected
+			active.Config.Model = state.Provider.Model
+		}
+	}
 	snapshot := ui.Snapshot{
 		SessionID: b.conversation.SessionID(), Mode: mode, Provider: active.Name, Model: active.Config.Model,
 		Context: b.conversation.ContextReport(),
@@ -100,11 +109,17 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 	b.mu.Lock()
 	opts := b.opts
 	b.mu.Unlock()
-	modelRuntime, err := b.runtime.resolveRuntime(b.manager, opts)
+	cfg := b.manager.Config()
+	contextReport := b.conversation.ContextReport()
+	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
+	estimatedInput := contextReport.InputTokens + estimator.Estimate(prompt)
+	modelRuntime, routeDecision, err := b.runtime.resolveRuntimeForPrompt(b.manager, opts, prompt, estimatedInput+cfg.ReservedOutputTokens, estimatedInput, cfg.ReservedOutputTokens, true)
 	if err != nil {
 		return err
 	}
-	cfg := b.manager.Config()
+	if routeDecision != nil {
+		emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: fmt.Sprintf("Routed %s task to %s.", routeDecision.Task, routeDecision.Provider)})
+	}
 	modeName := cfg.PermissionMode
 	if opts.mode != "" {
 		modeName = opts.mode
@@ -115,14 +130,39 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 	}
 	modelRuntime.PermissionMode = mode.String()
 	modelRuntime.SkillCatalog = b.skills.Catalog()
+	if err := b.runtime.configureMCPRuntime(ctx, cfg, &modelRuntime); err != nil {
+		return err
+	}
 	configureTUIContextRuntime(&modelRuntime, cfg, operationID, emit)
+	task := routing.Classify(prompt)
+	if routeDecision != nil {
+		task = routeDecision.Task
+	} else if opts.task != "" {
+		task = opts.task
+	}
+	observation := b.runtime.metricCollector().Begin(metrics.Metadata{
+		RequestID: operationID, SessionID: b.conversation.SessionID(), Provider: modelRuntime.Provider.Name,
+		ProviderGeneration: modelRuntime.Provider.Generation, Model: modelRuntime.Provider.Config.Model, Task: task,
+		InputCostPerMillion:  modelRuntime.Provider.Config.Routing.InputCostPerMillion,
+		OutputCostPerMillion: modelRuntime.Provider.Config.Routing.OutputCostPerMillion,
+	})
+	contextEvents := modelRuntime.ContextEvent
+	modelRuntime.ContextEvent = func(event contextledger.Event) {
+		observation.ObserveContextEvent(event)
+		if contextEvents != nil {
+			contextEvents(event)
+		}
+	}
 	confirm := b.confirmTools(operationID, opts.approve, emit)
 	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, &tuiAuditSink{operationID: operationID, emit: emit})
 	if err != nil {
 		return err
 	}
+	executor.SessionID, executor.ProviderName = b.conversation.SessionID(), modelRuntime.Provider.Name
+	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateConnecting})
 	modelEvents := func(event protocol.ModelEvent) error {
+		observation.ObserveModelEvent(event)
 		switch event.Kind {
 		case protocol.EventResponseStart:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateWaitingFirstToken})
@@ -138,7 +178,9 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
-	_, err = b.conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens}, true, modelEvents)
+	response, err := b.conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, true, modelEvents)
+	metric := observation.Finish(response.Usage, err)
+	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: fmt.Sprintf("Completed in %d ms; first token %d ms; tool success %.0f%%.", metric.DurationMS, metric.FirstTokenMS, metric.ToolSuccessRate*100)})
 	if b.runtime.session != nil {
 		if syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, err); err == nil {
 			err = syncErr
@@ -290,6 +332,7 @@ func (b *tuiBackend) UpsertProvider(_ context.Context, form ui.ProviderForm) err
 			candidate.Credential = current.Credential
 			candidate.Headers = current.Headers
 			candidate.TimeoutSeconds = current.TimeoutSeconds
+			candidate.Routing = current.Routing
 		}
 	}
 	if form.APIKey != "" {

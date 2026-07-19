@@ -34,6 +34,15 @@ type Runtime struct {
 	SkillCatalogPageBytes int
 	MaxSummaryBytes       int
 	ContextEvent          func(contextledger.Event)
+	MCPContexts           []MCPContext
+	MCPToolServers        map[string]string
+	MCPFingerprint        string
+}
+
+type MCPContext struct {
+	Server          string
+	Instructions    string
+	ResourceCatalog string
 }
 
 type ProtectedSkill struct {
@@ -72,6 +81,7 @@ type Conversation struct {
 	projectMapWorkspace string
 	projectMapMaxBytes  int
 	projectMapDirty     bool
+	mcpFingerprint      string
 }
 
 func NewConversation() *Conversation {
@@ -113,6 +123,7 @@ func (c *Conversation) NewSession() string {
 	c.providerAdapter = ""
 	c.providerBaseURL = ""
 	c.providerModel = ""
+	c.mcpFingerprint = ""
 	c.permissionMode = c.lastRuntime.PermissionMode
 	if c.permissionMode == "" {
 		c.permissionMode = "manual"
@@ -153,7 +164,7 @@ func (c *Conversation) prepareRuntime(prompt string, runtime Runtime) error {
 	if mode == "" {
 		mode = "manual"
 	}
-	if c.providerName != runtime.Provider.Name || c.providerGeneration != runtime.Provider.Generation || c.providerAdapter != runtime.Provider.Config.Adapter || c.providerBaseURL != runtime.Provider.Config.BaseURL || c.providerModel != runtime.Provider.Config.Model || c.permissionMode != mode || c.skillCatalog != runtime.SkillCatalog {
+	if c.providerName != runtime.Provider.Name || c.providerGeneration != runtime.Provider.Generation || c.providerAdapter != runtime.Provider.Config.Adapter || c.providerBaseURL != runtime.Provider.Config.BaseURL || c.providerModel != runtime.Provider.Config.Model || c.permissionMode != mode || c.skillCatalog != runtime.SkillCatalog || c.mcpFingerprint != runtime.MCPFingerprint {
 		c.driverState = nil
 		c.providerName = runtime.Provider.Name
 		c.providerGeneration = runtime.Provider.Generation
@@ -162,6 +173,7 @@ func (c *Conversation) prepareRuntime(prompt string, runtime Runtime) error {
 		c.providerModel = runtime.Provider.Config.Model
 		c.permissionMode = mode
 		c.skillCatalog = runtime.SkillCatalog
+		c.mcpFingerprint = runtime.MCPFingerprint
 		c.systemPrompt = promptForRuntime(mode)
 	}
 	return nil

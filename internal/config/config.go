@@ -1,11 +1,14 @@
 package config
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +34,32 @@ type ProviderConfig struct {
 	TimeoutSeconds int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
 	Credential     CredentialRef     `toml:"credential" json:"credential"`
 	Headers        map[string]string `toml:"headers,omitempty" json:"headers,omitempty"`
+	Routing        ProviderRouting   `toml:"routing,omitempty" json:"routing,omitempty"`
+}
+
+type ProviderRouting struct {
+	Tasks                []string `toml:"tasks,omitempty" json:"tasks,omitempty"`
+	Priority             int      `toml:"priority,omitempty" json:"priority,omitempty"`
+	InputCostPerMillion  float64  `toml:"input_cost_per_million,omitempty" json:"input_cost_per_million,omitempty"`
+	OutputCostPerMillion float64  `toml:"output_cost_per_million,omitempty" json:"output_cost_per_million,omitempty"`
+}
+
+type MCPServerConfig struct {
+	Command          string   `toml:"command" json:"command"`
+	Args             []string `toml:"args,omitempty" json:"args,omitempty"`
+	Environment      []string `toml:"environment,omitempty" json:"environment,omitempty"`
+	WorkingDirectory string   `toml:"working_directory,omitempty" json:"working_directory,omitempty"`
+	ReadOnlyTools    []string `toml:"read_only_tools,omitempty" json:"read_only_tools,omitempty"`
+	TimeoutSeconds   int      `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	Disabled         bool     `toml:"disabled,omitempty" json:"disabled,omitempty"`
+}
+
+type SkillRegistryConfig struct {
+	IndexURL         string            `toml:"index_url" json:"index_url"`
+	PublicKeys       map[string]string `toml:"public_keys" json:"public_keys"`
+	TokenEnvironment string            `toml:"token_environment,omitempty" json:"token_environment,omitempty"`
+	TimeoutSeconds   int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	Disabled         bool              `toml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 func (p ProviderConfig) Timeout(fallback time.Duration) time.Duration {
@@ -41,45 +70,53 @@ func (p ProviderConfig) Timeout(fallback time.Duration) time.Duration {
 }
 
 type Config struct {
-	Version               int                       `toml:"version" json:"version"`
-	ActiveProvider        string                    `toml:"active_provider" json:"active_provider"`
-	Providers             map[string]ProviderConfig `toml:"providers" json:"providers"`
-	Workspace             string                    `toml:"workspace,omitempty" json:"workspace,omitempty"`
-	PermissionMode        string                    `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
-	MaxTurns              int                       `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
-	MaxTotalTokens        int                       `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
-	ToolTimeoutSec        int                       `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
-	MaxOutputBytes        int                       `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
-	MaxReadBytes          int                       `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
-	MaxSearchResults      int                       `toml:"max_search_results,omitempty" json:"max_search_results,omitempty"`
-	ReadOnlyCommands      []string                  `toml:"read_only_commands,omitempty" json:"read_only_commands,omitempty"`
-	AutoAllowCommands     []string                  `toml:"auto_allow_commands,omitempty" json:"auto_allow_commands,omitempty"`
-	DangerousCommands     []string                  `toml:"dangerous_commands,omitempty" json:"dangerous_commands,omitempty"`
-	BlockedCommands       []string                  `toml:"blocked_commands,omitempty" json:"blocked_commands,omitempty"`
-	ShellEnvironment      []string                  `toml:"shell_environment,omitempty" json:"shell_environment,omitempty"`
-	TokenBytesPerToken    int                       `toml:"token_bytes_per_token,omitempty" json:"token_bytes_per_token,omitempty"`
-	ReservedOutputTokens  int                       `toml:"reserved_output_tokens,omitempty" json:"reserved_output_tokens,omitempty"`
-	ContextRecentRounds   int                       `toml:"context_recent_rounds,omitempty" json:"context_recent_rounds,omitempty"`
-	MaxProjectMapBytes    int                       `toml:"max_project_map_bytes,omitempty" json:"max_project_map_bytes,omitempty"`
-	MaxToolContextBytes   int                       `toml:"max_tool_context_bytes,omitempty" json:"max_tool_context_bytes,omitempty"`
-	SkillCatalogPageBytes int                       `toml:"skill_catalog_page_bytes,omitempty" json:"skill_catalog_page_bytes,omitempty"`
-	MaxSummaryBytes       int                       `toml:"max_summary_bytes,omitempty" json:"max_summary_bytes,omitempty"`
-	MaxSessions           int                       `toml:"max_sessions,omitempty" json:"max_sessions,omitempty"`
-	MaxSessionBytes       int64                     `toml:"max_session_bytes,omitempty" json:"max_session_bytes,omitempty"`
+	Version               int                            `toml:"version" json:"version"`
+	ActiveProvider        string                         `toml:"active_provider" json:"active_provider"`
+	Providers             map[string]ProviderConfig      `toml:"providers" json:"providers"`
+	MCPServers            map[string]MCPServerConfig     `toml:"mcp_servers,omitempty" json:"mcp_servers,omitempty"`
+	SkillRegistries       map[string]SkillRegistryConfig `toml:"skill_registries,omitempty" json:"skill_registries,omitempty"`
+	Workspace             string                         `toml:"workspace,omitempty" json:"workspace,omitempty"`
+	PermissionMode        string                         `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
+	RoutingMode           string                         `toml:"routing_mode,omitempty" json:"routing_mode,omitempty"`
+	MaxTurns              int                            `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
+	MaxTotalTokens        int                            `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
+	ToolTimeoutSec        int                            `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
+	MaxOutputBytes        int                            `toml:"max_output_bytes,omitempty" json:"max_output_bytes,omitempty"`
+	MaxReadBytes          int                            `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
+	MaxSearchResults      int                            `toml:"max_search_results,omitempty" json:"max_search_results,omitempty"`
+	MaxParallelTools      int                            `toml:"max_parallel_tools,omitempty" json:"max_parallel_tools,omitempty"`
+	ReadOnlyCommands      []string                       `toml:"read_only_commands,omitempty" json:"read_only_commands,omitempty"`
+	AutoAllowCommands     []string                       `toml:"auto_allow_commands,omitempty" json:"auto_allow_commands,omitempty"`
+	DangerousCommands     []string                       `toml:"dangerous_commands,omitempty" json:"dangerous_commands,omitempty"`
+	BlockedCommands       []string                       `toml:"blocked_commands,omitempty" json:"blocked_commands,omitempty"`
+	ShellEnvironment      []string                       `toml:"shell_environment,omitempty" json:"shell_environment,omitempty"`
+	TokenBytesPerToken    int                            `toml:"token_bytes_per_token,omitempty" json:"token_bytes_per_token,omitempty"`
+	ReservedOutputTokens  int                            `toml:"reserved_output_tokens,omitempty" json:"reserved_output_tokens,omitempty"`
+	ContextRecentRounds   int                            `toml:"context_recent_rounds,omitempty" json:"context_recent_rounds,omitempty"`
+	MaxProjectMapBytes    int                            `toml:"max_project_map_bytes,omitempty" json:"max_project_map_bytes,omitempty"`
+	MaxToolContextBytes   int                            `toml:"max_tool_context_bytes,omitempty" json:"max_tool_context_bytes,omitempty"`
+	SkillCatalogPageBytes int                            `toml:"skill_catalog_page_bytes,omitempty" json:"skill_catalog_page_bytes,omitempty"`
+	MaxSummaryBytes       int                            `toml:"max_summary_bytes,omitempty" json:"max_summary_bytes,omitempty"`
+	MaxSessions           int                            `toml:"max_sessions,omitempty" json:"max_sessions,omitempty"`
+	MaxSessionBytes       int64                          `toml:"max_session_bytes,omitempty" json:"max_session_bytes,omitempty"`
 }
 
 func Default(workspace string) Config {
 	return Config{
 		Version:               SchemaVersion,
 		Providers:             make(map[string]ProviderConfig),
+		MCPServers:            make(map[string]MCPServerConfig),
+		SkillRegistries:       make(map[string]SkillRegistryConfig),
 		Workspace:             workspace,
 		PermissionMode:        "manual",
+		RoutingMode:           "fixed",
 		MaxTurns:              20,
 		MaxTotalTokens:        1_000_000,
 		ToolTimeoutSec:        60,
 		MaxOutputBytes:        64 << 10,
 		MaxReadBytes:          1 << 20,
 		MaxSearchResults:      200,
+		MaxParallelTools:      4,
 		ReadOnlyCommands:      []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files"},
 		AutoAllowCommands:     []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files", "go test", "go vet", "go build", "go list", "go env", "go version", "gofmt", "go fmt"},
 		DangerousCommands:     []string{"rm -rf", "git reset --hard", "git clean -fd", "git push --force", "mkfs", "diskpart", "format ", "remove-item -recurse", "del /s", "rd /s"},
@@ -105,7 +142,20 @@ func (c Config) Clone() Config {
 	clone.Providers = make(map[string]ProviderConfig, len(c.Providers))
 	for name, provider := range c.Providers {
 		provider.Headers = cloneStringMap(provider.Headers)
+		provider.Routing.Tasks = append([]string(nil), provider.Routing.Tasks...)
 		clone.Providers[name] = provider
+	}
+	clone.MCPServers = make(map[string]MCPServerConfig, len(c.MCPServers))
+	for name, server := range c.MCPServers {
+		server.Args = append([]string(nil), server.Args...)
+		server.Environment = append([]string(nil), server.Environment...)
+		server.ReadOnlyTools = append([]string(nil), server.ReadOnlyTools...)
+		clone.MCPServers[name] = server
+	}
+	clone.SkillRegistries = make(map[string]SkillRegistryConfig, len(c.SkillRegistries))
+	for name, registry := range c.SkillRegistries {
+		registry.PublicKeys = cloneStringMap(registry.PublicKeys)
+		clone.SkillRegistries[name] = registry
 	}
 	return clone
 }
@@ -124,10 +174,31 @@ func (c Config) Validate() error {
 			return err
 		}
 	}
+	if len(c.MCPServers) > 32 {
+		return errors.New("mcp server limit exceeds 32")
+	}
+	for name, server := range c.MCPServers {
+		if err := validateMCPServer(name, server); err != nil {
+			return err
+		}
+	}
+	if len(c.SkillRegistries) > 16 {
+		return errors.New("skill registry limit exceeds 16")
+	}
+	for name, registry := range c.SkillRegistries {
+		if err := validateSkillRegistry(name, registry); err != nil {
+			return err
+		}
+	}
+	switch c.RoutingMode {
+	case "fixed", "auto":
+	default:
+		return fmt.Errorf("invalid routing_mode %q", c.RoutingMode)
+	}
 	if c.MaxTurns <= 0 || c.MaxTotalTokens <= 0 {
 		return errors.New("turn and token budgets must be greater than zero")
 	}
-	if c.ToolTimeoutSec <= 0 || c.MaxOutputBytes <= 0 || c.MaxReadBytes <= 0 || c.MaxSearchResults <= 0 {
+	if c.ToolTimeoutSec <= 0 || c.MaxOutputBytes <= 0 || c.MaxReadBytes <= 0 || c.MaxSearchResults <= 0 || c.MaxParallelTools <= 0 {
 		return errors.New("resource limits must be greater than zero")
 	}
 	if c.TokenBytesPerToken <= 0 || c.ReservedOutputTokens <= 0 || c.ContextRecentRounds <= 0 || c.MaxProjectMapBytes <= 0 || c.MaxToolContextBytes <= 0 || c.SkillCatalogPageBytes <= 0 || c.MaxSummaryBytes <= 0 {
@@ -161,6 +232,20 @@ func ValidateProvider(name string, p ProviderConfig) error {
 	if p.ContextWindow < 0 || p.TimeoutSeconds < 0 {
 		return fmt.Errorf("provider %q numeric limits cannot be negative", name)
 	}
+	if p.Routing.InputCostPerMillion < 0 || p.Routing.OutputCostPerMillion < 0 {
+		return fmt.Errorf("provider %q routing costs cannot be negative", name)
+	}
+	validTasks := map[string]bool{"general": true, "coding": true, "review": true, "debugging": true, "testing": true, "documentation": true}
+	seenTasks := make(map[string]bool, len(p.Routing.Tasks))
+	for _, task := range p.Routing.Tasks {
+		if !validTasks[task] {
+			return fmt.Errorf("provider %q routing task %q is invalid", name, task)
+		}
+		if seenTasks[task] {
+			return fmt.Errorf("provider %q routing task %q is duplicated", name, task)
+		}
+		seenTasks[task] = true
+	}
 	switch p.Credential.Type {
 	case "", "keyring", "env", "memory", "none":
 	default:
@@ -170,6 +255,80 @@ func ValidateProvider(name string, p ProviderConfig) error {
 		return fmt.Errorf("provider %q credential env is required", name)
 	}
 	return nil
+}
+
+var (
+	mcpNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+	envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+)
+
+func validateMCPServer(name string, server MCPServerConfig) error {
+	if !mcpNamePattern.MatchString(name) {
+		return fmt.Errorf("mcp server name %q is invalid", name)
+	}
+	if server.Disabled {
+		return nil
+	}
+	if strings.TrimSpace(server.Command) == "" {
+		return fmt.Errorf("mcp server %q command is required", name)
+	}
+	if server.TimeoutSeconds < 0 {
+		return fmt.Errorf("mcp server %q timeout cannot be negative", name)
+	}
+	seenEnvironment := make(map[string]bool, len(server.Environment))
+	for _, environment := range server.Environment {
+		if !envNamePattern.MatchString(environment) {
+			return fmt.Errorf("mcp server %q environment entry %q must be a variable name without a value", name, environment)
+		}
+		if seenEnvironment[environment] {
+			return fmt.Errorf("mcp server %q environment entry %q is duplicated", name, environment)
+		}
+		seenEnvironment[environment] = true
+	}
+	seenTools := make(map[string]bool, len(server.ReadOnlyTools))
+	for _, toolName := range server.ReadOnlyTools {
+		if strings.TrimSpace(toolName) == "" || seenTools[toolName] {
+			return fmt.Errorf("mcp server %q contains an invalid or duplicate read-only tool name", name)
+		}
+		seenTools[toolName] = true
+	}
+	return nil
+}
+
+func validateSkillRegistry(name string, registry SkillRegistryConfig) error {
+	if !mcpNamePattern.MatchString(name) {
+		return fmt.Errorf("skill registry name %q is invalid", name)
+	}
+	if registry.Disabled {
+		return nil
+	}
+	parsed, err := url.Parse(registry.IndexURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && loopbackHost(parsed.Hostname()))) {
+		return fmt.Errorf("skill registry %q index_url must use HTTPS or loopback HTTP", name)
+	}
+	if registry.TimeoutSeconds < 0 {
+		return fmt.Errorf("skill registry %q timeout cannot be negative", name)
+	}
+	if registry.TokenEnvironment != "" && !envNamePattern.MatchString(registry.TokenEnvironment) {
+		return fmt.Errorf("skill registry %q token_environment must be a variable name", name)
+	}
+	if len(registry.PublicKeys) == 0 {
+		return fmt.Errorf("skill registry %q requires at least one Ed25519 public key", name)
+	}
+	for keyID, encoded := range registry.PublicKeys {
+		if !mcpNamePattern.MatchString(keyID) {
+			return fmt.Errorf("skill registry %q key ID %q is invalid", name, keyID)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(decoded) != ed25519.PublicKeySize {
+			return fmt.Errorf("skill registry %q key %q is not an Ed25519 public key", name, keyID)
+		}
+	}
+	return nil
+}
+
+func loopbackHost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 type LoadOptions struct {
@@ -285,11 +444,30 @@ func merge(dst *Config, src Config) {
 			dst.Providers[name] = provider
 		}
 	}
+	if src.MCPServers != nil {
+		if dst.MCPServers == nil {
+			dst.MCPServers = make(map[string]MCPServerConfig)
+		}
+		for name, server := range src.MCPServers {
+			dst.MCPServers[name] = server
+		}
+	}
+	if src.SkillRegistries != nil {
+		if dst.SkillRegistries == nil {
+			dst.SkillRegistries = make(map[string]SkillRegistryConfig)
+		}
+		for name, registry := range src.SkillRegistries {
+			dst.SkillRegistries[name] = registry
+		}
+	}
 	if src.Workspace != "" {
 		dst.Workspace = src.Workspace
 	}
 	if src.PermissionMode != "" {
 		dst.PermissionMode = src.PermissionMode
+	}
+	if src.RoutingMode != "" {
+		dst.RoutingMode = src.RoutingMode
 	}
 	if src.MaxTurns != 0 {
 		dst.MaxTurns = src.MaxTurns
@@ -308,6 +486,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.MaxSearchResults != 0 {
 		dst.MaxSearchResults = src.MaxSearchResults
+	}
+	if src.MaxParallelTools != 0 {
+		dst.MaxParallelTools = src.MaxParallelTools
 	}
 	if src.ReadOnlyCommands != nil {
 		dst.ReadOnlyCommands = append([]string(nil), src.ReadOnlyCommands...)
@@ -369,11 +550,15 @@ func applyEnvironment(cfg *Config, environ []string) {
 	if value := env["EYLU_PERMISSION_MODE"]; value != "" {
 		cfg.PermissionMode = value
 	}
+	if value := env["EYLU_ROUTING_MODE"]; value != "" {
+		cfg.RoutingMode = value
+	}
 	for key, target := range map[string]*int{
 		"EYLU_MAX_TURNS":                &cfg.MaxTurns,
 		"EYLU_MAX_TOTAL_TOKENS":         &cfg.MaxTotalTokens,
 		"EYLU_TOOL_TIMEOUT":             &cfg.ToolTimeoutSec,
 		"EYLU_MAX_OUTPUT_BYTES":         &cfg.MaxOutputBytes,
+		"EYLU_MAX_PARALLEL_TOOLS":       &cfg.MaxParallelTools,
 		"EYLU_TOKEN_BYTES_PER_TOKEN":    &cfg.TokenBytesPerToken,
 		"EYLU_RESERVED_OUTPUT_TOKENS":   &cfg.ReservedOutputTokens,
 		"EYLU_CONTEXT_RECENT_ROUNDS":    &cfg.ContextRecentRounds,

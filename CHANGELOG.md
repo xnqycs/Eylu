@@ -1,5 +1,23 @@
 # Changelog
 
+## Phase 9 - 扩展生态与发布
+
+- 增加按任务、能力、上下文窗口、优先级和估算成本选择 Provider 的确定性自动路由；支持 `--route`、`--task` 与 `--require-reasoning`。
+- 增加首 token、总耗时、工具成功率、压缩次数、token usage 和估算成本指标，并将同一 request ID 传入工具审计。
+- 在 Driver 声明并行能力时并发执行连续的显式只读工具，提供并发上限、稳定结果顺序、取消收敛和 panic 隔离。
+- 基于官方 Go SDK 增加 MCP stdio 客户端，接入 instructions、tools 与 resources；环境变量按名称白名单转发，只读权限需本地显式配置。
+- 增加 Ed25519 签名 Skill 仓库、包和目录双 SHA-256 校验、安装/更新/验签、user/project/team 范围与团队锁文件。
+- 增加版本元数据、GoReleaser 六平台归档、SHA-256 checksums、Sigstore keyless 签名、三平台 CI 和发布工作流。
+
+依赖：新增 `github.com/modelcontextprotocol/go-sdk` 和 `golang.org/x/mod`；发布链路使用 GoReleaser v2、Cosign、Staticcheck 与 actionlint。
+
+## Phase 8 - 会话持久化
+
+- 增加 append-only JSONL 事件日志、原子 snapshot、SHA-256 附件、尾部损坏修复和显式 schema 迁移。
+- 增加 `--session`、`--resume` 与 `sessions list|show|delete|cleanup|migrate`，`/new` 会关闭旧 session 并持久化新边界。
+- 持久化完整 transcript、Provider generation、权限模式、上下文账本、Skill digest 和 opaque DriverState；敏感凭据保持在会话文件之外。
+- 增加 session 数量/容量清理策略、跨工作区校验、恢复时 Skill 重验证和远端 DriverState 失效处理。
+
 ## Phase 7 - 终端体验
 
 - 增加 Bubble Tea v2 单写入 TUI、Bubbles v2 textarea/viewport/spinner、Lip Gloss v2 七类样式和 Glamour v2 Markdown。

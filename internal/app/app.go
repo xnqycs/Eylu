@@ -15,15 +15,19 @@ import (
 	"github.com/spf13/cobra"
 
 	"Eylu/internal/agent"
+	"Eylu/internal/buildinfo"
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
 	"Eylu/internal/driver/openai_chat"
 	"Eylu/internal/driver/openai_responses"
 	"Eylu/internal/logging"
+	"Eylu/internal/mcpclient"
+	"Eylu/internal/metrics"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
+	"Eylu/internal/routing"
 	"Eylu/internal/skill"
 	"Eylu/internal/tool"
 )
@@ -48,15 +52,23 @@ type runtime struct {
 	inputReader   *bufio.Reader
 	trustPrompted map[string]bool
 	session       *sessionRuntime
+	metrics       *metrics.Collector
+	mcp           *mcpclient.Manager
+	mcpKey        string
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	r := &runtime{stdin: stdin, stdout: stdout, stderr: stderr, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool)}
+	r := &runtime{stdin: stdin, stdout: stdout, stderr: stderr, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool), metrics: &metrics.Collector{}}
 	root := r.rootCommand(ctx)
 	root.SetArgs(args)
 	root.SetIn(stdin)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
+	defer func() {
+		if err := r.closeMCP(); err != nil {
+			fmt.Fprintf(stderr, "[mcp] close: %v\n", err)
+		}
+	}()
 	if err := root.ExecuteContext(ctx); err != nil {
 		r.printError(err)
 		return exitCode(err)
@@ -79,26 +91,41 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 			}
 		},
 	}
+	root.Version = buildinfo.String()
 	root.PersistentFlags().StringVar(&r.configPath, "config", "", "config file path")
 	root.PersistentFlags().StringVar(&r.workspace, "workspace", "", "workspace directory")
 	root.PersistentFlags().StringVar(&r.output, "output", "text", "output format: text, json, or jsonl")
-	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand(), r.sessionsCommand())
+	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand(ctx), r.sessionsCommand(), r.mcpCommand(ctx), r.versionCommand())
 	return root
 }
 
+func (r *runtime) versionCommand() *cobra.Command {
+	return &cobra.Command{Use: "version", Short: "show Eylu build version", Args: cobra.NoArgs, RunE: func(*cobra.Command, []string) error {
+		info := buildinfo.Current()
+		if r.output != "text" {
+			return json.NewEncoder(r.stdout).Encode(info)
+		}
+		fmt.Fprintln(r.stdout, buildinfo.String())
+		return nil
+	}}
+}
+
 type chatOptions struct {
-	provider    string
-	model       string
-	baseURL     string
-	adapter     string
-	timeout     time.Duration
-	approve     bool
-	mode        string
-	trustSkills bool
-	noAnimation bool
-	noTUI       bool
-	sessionID   string
-	resume      bool
+	provider         string
+	model            string
+	baseURL          string
+	adapter          string
+	timeout          time.Duration
+	approve          bool
+	mode             string
+	trustSkills      bool
+	noAnimation      bool
+	noTUI            bool
+	sessionID        string
+	resume           bool
+	routeMode        string
+	task             string
+	requireReasoning bool
 }
 
 func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
@@ -139,6 +166,9 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.noTUI, "no-tui", false, "use the line-oriented interactive interface")
 	cmd.Flags().StringVar(&opts.sessionID, "session", "", "create or open a session ID")
 	cmd.Flags().BoolVar(&opts.resume, "resume", false, "resume the most recent session in this workspace")
+	cmd.Flags().StringVar(&opts.routeMode, "route", "", "provider routing mode: fixed or auto")
+	cmd.Flags().StringVar(&opts.task, "task", "", "routing task: general, coding, review, debugging, testing, or documentation")
+	cmd.Flags().BoolVar(&opts.requireReasoning, "require-reasoning", false, "require a driver with reasoning support")
 	cmd.MarkFlagsMutuallyExclusive("session", "resume")
 	return cmd
 }
@@ -181,11 +211,23 @@ func (r *runtime) prepareManager(ctx context.Context, opts chatOptions) (*provid
 }
 
 func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
-	modelRuntime, err := r.resolveRuntime(manager, opts)
+	cfg := manager.Config()
+	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
+	report := conversation.ContextReport()
+	estimatedInput := report.InputTokens + estimator.Estimate(prompt)
+	stream := r.output == "text" || r.output == "jsonl"
+	modelRuntime, routeDecision, err := r.resolveRuntimeForPrompt(manager, opts, prompt, estimatedInput+cfg.ReservedOutputTokens, estimatedInput, cfg.ReservedOutputTokens, stream)
 	if err != nil {
 		return err
 	}
-	cfg := manager.Config()
+	jsonlEncoder := json.NewEncoder(r.stdout)
+	if routeDecision != nil {
+		if r.output == "jsonl" {
+			_ = jsonlEncoder.Encode(map[string]any{"type": "routing", "routing": routeDecision})
+		} else {
+			fmt.Fprintf(r.stderr, "[routing] task=%s provider=%s %s\n", routeDecision.Task, routeDecision.Provider, routeDecision.Candidates[0].Reason)
+		}
+	}
 	modeName := cfg.PermissionMode
 	if opts.mode != "" {
 		modeName = opts.mode
@@ -203,8 +245,14 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
 	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
 	modelRuntime.MaxSummaryBytes = cfg.MaxSummaryBytes
-	jsonlEncoder := json.NewEncoder(r.stdout)
+	if err := r.configureMCPRuntime(ctx, cfg, &modelRuntime); err != nil {
+		return err
+	}
+	var observation *metrics.Observation
 	modelRuntime.ContextEvent = func(event contextledger.Event) {
+		if observation != nil {
+			observation.ObserveContextEvent(event)
+		}
 		if r.output == "jsonl" {
 			_ = jsonlEncoder.Encode(map[string]any{"type": "context", "context": event})
 			return
@@ -226,7 +274,6 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
-	stream := r.output == "text" || r.output == "jsonl"
 	var emit driver.EmitFunc
 	if stream {
 		emit = func(event protocol.ModelEvent) error {
@@ -253,7 +300,31 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	if err != nil {
 		return err
 	}
-	response, err := conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens}, stream, emit)
+	task := routing.Classify(prompt)
+	if routeDecision != nil {
+		task = routeDecision.Task
+	} else if opts.task != "" {
+		task = opts.task
+	}
+	observation = r.metricCollector().Begin(metrics.Metadata{
+		SessionID: conversation.SessionID(), Provider: modelRuntime.Provider.Name, ProviderGeneration: modelRuntime.Provider.Generation,
+		Model: modelRuntime.Provider.Config.Model, Task: task,
+		InputCostPerMillion:  modelRuntime.Provider.Config.Routing.InputCostPerMillion,
+		OutputCostPerMillion: modelRuntime.Provider.Config.Routing.OutputCostPerMillion,
+	})
+	executor.SessionID, executor.ProviderName = conversation.SessionID(), modelRuntime.Provider.Name
+	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
+	baseEmit := emit
+	emit = func(event protocol.ModelEvent) error {
+		observation.ObserveModelEvent(event)
+		if baseEmit != nil {
+			return baseEmit(event)
+		}
+		return nil
+	}
+	response, err := conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, stream, emit)
+	metric := observation.Finish(response.Usage, err)
+	r.reportMetric(jsonlEncoder, metric)
 	syncErr := error(nil)
 	if r.session != nil {
 		syncErr = r.session.Sync(conversation, manager, opts, err)
@@ -277,8 +348,22 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	return nil
 }
 
-func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session) (*tool.Executor, error) {
-	return r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, r.confirmTools(opts.approve), &toolAuditWriter{writer: r.stderr})
+func (r *runtime) metricCollector() *metrics.Collector {
+	if r.metrics == nil {
+		r.metrics = &metrics.Collector{}
+	}
+	return r.metrics
+}
+
+func (r *runtime) reportMetric(jsonlEncoder *json.Encoder, metric metrics.RequestMetric) {
+	if r.output == "jsonl" {
+		_ = jsonlEncoder.Encode(map[string]any{"type": "metrics", "metrics": metric})
+		return
+	}
+	if r.output == "text" {
+		fmt.Fprintf(r.stderr, "[metrics] timestamp=%s session_id=%s request_id=%s provider_name=%s provider_generation=%d model=%s first_token_ms=%d duration_ms=%d tool_success_rate=%.3f compression_count=%d input_tokens=%d output_tokens=%d estimated_cost=%.8f error_code=%s\n",
+			metric.Timestamp.Format(time.RFC3339Nano), metric.SessionID, metric.RequestID, metric.Provider, metric.ProviderGeneration, metric.Model, metric.FirstTokenMS, metric.DurationMS, metric.ToolSuccessRate, metric.CompressionCount, metric.Usage.InputTokens, metric.Usage.OutputTokens, metric.EstimatedCost, metric.ErrorCode)
+	}
 }
 
 func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session, confirm tool.ConfirmFunc, audit tool.AuditSink) (*tool.Executor, error) {
@@ -315,13 +400,16 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	}
 	checker := policy.NewChecker(policy.Config{Mode: mode, ReadOnlyCommands: cfg.ReadOnlyCommands, AutoAllowCommands: cfg.AutoAllowCommands, DangerousPatterns: cfg.DangerousCommands, BlockedPatterns: cfg.BlockedCommands})
 	registered := []tool.Tool{readFile, writeFile, bashTool, editFile, searchCode, listDirectory}
+	if r.mcp != nil {
+		registered = append(registered, r.mcp.Tools()...)
+	}
 	if skillRegistry != nil && len(skillRegistry.Active()) > 0 {
 		registered = append(registered, tool.NewActivateSkill(skillRegistry, skillSession), tool.NewReadSkillResource(skillSession))
 	}
 	return &tool.Executor{
 		Registry: tool.NewRegistry(registered...), Policy: checker,
 		Confirm: confirm, Audit: audit, Workspace: cfg.Workspace,
-		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
+		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes, MaxParallelTools: cfg.MaxParallelTools,
 	}, nil
 }
 
@@ -354,19 +442,46 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 	}
 }
 
-func (r *runtime) resolveRuntime(manager *provider.Manager, opts chatOptions) (agent.Runtime, error) {
+func (r *runtime) resolveRuntimeForPrompt(manager *provider.Manager, opts chatOptions, prompt string, requiredContext, estimatedInput, estimatedOutput int, stream bool) (agent.Runtime, *routing.Decision, error) {
 	var snapshot provider.Snapshot
+	var decision *routing.Decision
 	var err error
 	if opts.provider != "" {
 		var ok bool
 		snapshot, ok = manager.Snapshot(opts.provider)
 		if !ok {
-			return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", opts.provider)}
+			return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", opts.provider)}
 		}
 	} else {
-		snapshot, err = manager.Active()
+		routeMode := opts.routeMode
+		if routeMode == "" {
+			routeMode = manager.Config().RoutingMode
+		}
+		switch routeMode {
+		case "fixed":
+			snapshot, err = manager.Active()
+		case "auto":
+			task := opts.task
+			if task == "" {
+				task = routing.Classify(prompt)
+			}
+			if !routing.ValidTask(task) {
+				return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("invalid routing task %q", task)}
+			}
+			routeDecision, routeErr := routing.Select(manager.List(), routing.Request{
+				Task: task, RequiredContext: requiredContext, EstimatedInput: estimatedInput, EstimatedOutput: estimatedOutput,
+				Capabilities: driver.Capabilities{TextStreaming: stream, ToolCalling: true, Reasoning: opts.requireReasoning},
+			}, knownDriverCapabilities)
+			if routeErr != nil {
+				return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: routeErr.Error(), Cause: routeErr}
+			}
+			snapshot = routeDecision.Selected
+			decision = &routeDecision
+		default:
+			return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("invalid routing mode %q", routeMode)}
+		}
 		if err != nil {
-			return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+			return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
 	}
 	providerConfig := snapshot.Config
@@ -380,14 +495,14 @@ func (r *runtime) resolveRuntime(manager *provider.Manager, opts chatOptions) (a
 		providerConfig.Adapter = opts.adapter
 	}
 	if err := config.ValidateProvider(snapshot.Name, providerConfig); err != nil {
-		return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	snapshot.Config = providerConfig
 	apiKey := os.Getenv("EYLU_API_KEY")
 	if apiKey == "" {
 		apiKey, err = r.credentials.Resolve(providerConfig.Credential)
 		if err != nil {
-			return agent.Runtime{}, &protocol.Error{Code: protocol.ErrCredential, Message: "provider credential is unavailable", Cause: err}
+			return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrCredential, Message: "provider credential is unavailable", Cause: err}
 		}
 	}
 	requestTimeout := providerConfig.Timeout(60 * time.Second)
@@ -398,9 +513,20 @@ func (r *runtime) resolveRuntime(manager *provider.Manager, opts chatOptions) (a
 	registry := driver.NewRegistry(openai_responses.New(httpClient), openai_chat.New(httpClient))
 	modelDriver, err := registry.Get(providerConfig.Adapter)
 	if err != nil {
-		return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
-	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, Timeout: requestTimeout}, nil
+	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, Timeout: requestTimeout}, decision, nil
+}
+
+func knownDriverCapabilities(adapter string) (driver.Capabilities, bool) {
+	switch adapter {
+	case openai_responses.Name:
+		return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, Reasoning: true, ImageInput: true, RemoteSession: true}, true
+	case openai_chat.Name:
+		return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, ImageInput: true}, true
+	default:
+		return driver.Capabilities{}, false
+	}
 }
 
 func (r *runtime) loadManager() (config.Loaded, *provider.Manager, error) {

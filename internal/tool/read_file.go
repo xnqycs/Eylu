@@ -38,6 +38,8 @@ func (r *ReadFile) Definition() protocol.ToolDefinition {
 
 func (r *ReadFile) Risk() policy.Risk { return policy.RiskRead }
 
+func (r *ReadFile) ParallelSafe() bool { return true }
+
 func (r *ReadFile) Execute(_ context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Path string `json:"path"`

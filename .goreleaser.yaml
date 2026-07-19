@@ -1,0 +1,80 @@
+version: 2
+
+project_name: Eylu
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: eylu
+    main: .
+    binary: eylu
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X Eylu/internal/buildinfo.Version={{ .Version }}
+        -X Eylu/internal/buildinfo.Commit={{ .Commit }}
+        -X Eylu/internal/buildinfo.Date={{ .CommitDate }}
+        -X Eylu/internal/buildinfo.BuiltBy=goreleaser
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: eylu
+    ids:
+      - eylu
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "Eylu_{{ .Version }}_{{ title .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - CHANGELOG.md
+      - docs/go-terminal-agent-development-plan.md
+
+checksum:
+  name_template: Eylu_{{ .Version }}_checksums.txt
+  algorithm: sha256
+
+signs:
+  - id: checksum-cosign
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - --yes
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "merge conflict"
+      - Merge pull request
+      - Merge remote-tracking branch
+
+release:
+  draft: false
+  prerelease: auto
