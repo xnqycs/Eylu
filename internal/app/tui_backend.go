@@ -161,6 +161,10 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 	}
 	executor.SessionID, executor.ProviderName = b.conversation.SessionID(), modelRuntime.Provider.Name
 	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
+	emit(ui.Event{OperationID: operationID, Kind: ui.EventActivity, Activity: &ui.Activity{
+		Reasoning: modelRuntime.Driver.Capabilities().Reasoning, ReasoningKnown: true,
+		TokenBytesPerToken: max(1, cfg.TokenBytesPerToken), InputTokens: estimatedInput,
+	}})
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateConnecting})
 	var textDeltas driver.StreamDeltaBuffer
 	flushText := func() {
@@ -176,6 +180,8 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 		switch event.Kind {
 		case protocol.EventResponseStart:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateWaitingFirstToken})
+		case protocol.EventReasoningDelta:
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventReasoningDelta, Delta: event.Delta})
 		case protocol.EventTextDelta:
 			if batch, ready := textDeltas.Push(event.Delta, time.Now()); ready {
 				emit(ui.Event{OperationID: operationID, Kind: ui.EventTextDelta, Delta: batch})
@@ -186,6 +192,8 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventToolStart, ToolCall: event.ToolCall})
 		case protocol.EventToolResult:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventToolResult, ToolResult: event.ToolResult})
+		case protocol.EventUsage:
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventUsage, Usage: event.Usage})
 		}
 		return nil
 	}
@@ -216,6 +224,11 @@ func configureTUIContextRuntime(modelRuntime *agent.Runtime, cfg config.Config, 
 	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
 	modelRuntime.MaxSummaryBytes = cfg.MaxSummaryBytes
 	modelRuntime.ContextEvent = func(event contextledger.Event) {
+		if event.Kind == contextledger.EventBudget && event.InputTokens > 0 {
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventActivity, Activity: &ui.Activity{
+				TokenBytesPerToken: max(1, cfg.TokenBytesPerToken), InputTokens: event.InputTokens,
+			}})
+		}
 		if event.Kind == contextledger.EventCompression && event.Compression != nil {
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: fmt.Sprintf("Context compressed: %d to %d tokens, %d turns summarized.", event.Compression.BeforeTokens, event.Compression.AfterTokens, event.Compression.OmittedTurns)})
 		}

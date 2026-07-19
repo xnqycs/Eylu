@@ -101,17 +101,23 @@ type Model struct {
 	contextExpand  bool
 	approval       *ApprovalRequest
 
-	operationID     string
-	eventChannel    chan Event
-	cancel          context.CancelFunc
-	startedAt       time.Time
-	retryAt         time.Time
-	cancelRequested bool
-	followOutput    bool
-	animation       bool
-	noColor         bool
-	operationSeq    uint64
-	markdown        markdownRenderCache
+	operationID          string
+	eventChannel         chan Event
+	cancel               context.CancelFunc
+	startedAt            time.Time
+	retryAt              time.Time
+	cancelRequested      bool
+	activity             Activity
+	operationUsage       protocol.Usage
+	streamedBytes        int
+	reasoningBytes       int
+	roundReasoningTokens int
+	roundReasoningExact  bool
+	followOutput         bool
+	animation            bool
+	noColor              bool
+	operationSeq         uint64
+	markdown             markdownRenderCache
 }
 
 type snapshotMsg struct {
@@ -330,12 +336,35 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		if event.State == StateRetryBackoff && event.RetryAfter > 0 {
 			m.retryAt = m.clock.Now().Add(event.RetryAfter)
 		}
+	case EventActivity:
+		if event.Activity != nil {
+			if event.Activity.ReasoningKnown {
+				m.activity.Reasoning = event.Activity.Reasoning
+				m.activity.ReasoningKnown = true
+			}
+			if event.Activity.TokenBytesPerToken > 0 {
+				m.activity.TokenBytesPerToken = event.Activity.TokenBytesPerToken
+			}
+			if event.Activity.InputTokens > 0 {
+				m.activity.InputTokens = event.Activity.InputTokens
+				m.activity.InputExact = event.Activity.InputExact
+				m.reasoningBytes = 0
+				m.roundReasoningTokens = 0
+				m.roundReasoningExact = false
+			}
+		}
+	case EventReasoningDelta:
+		m.activity.Reasoning = true
+		m.activity.ReasoningKnown = true
+		m.reasoningBytes += len([]byte(event.Delta))
 	case EventTextDelta:
 		m.state = StateStreaming
+		m.streamedBytes += len([]byte(event.Delta))
 		m.appendAgentDelta(event.Delta)
 	case EventToolCallDelta:
 		m.state = StatePreparingTool
 		if event.ToolCallDelta != nil {
+			m.streamedBytes += len([]byte(event.ToolCallDelta.Delta))
 			m.applyToolCallDelta(*event.ToolCallDelta)
 		}
 	case EventToolStart:
@@ -359,6 +388,19 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 	case EventContext:
 		if event.Context != nil {
 			m.snapshot.Context = *event.Context
+		}
+	case EventUsage:
+		if event.Usage != nil && event.Usage.Exact {
+			m.operationUsage.InputTokens += event.Usage.InputTokens
+			m.operationUsage.OutputTokens += event.Usage.OutputTokens
+			m.operationUsage.ReasoningTokens += event.Usage.ReasoningTokens
+			m.operationUsage.Exact = true
+			m.activity.InputTokens = event.Usage.InputTokens
+			m.activity.InputExact = true
+			m.streamedBytes = 0
+			m.reasoningBytes = 0
+			m.roundReasoningTokens = event.Usage.ReasoningTokens
+			m.roundReasoningExact = true
 		}
 	case EventNotice:
 		m.appendNotice(event.Notice, event.Error)
@@ -478,6 +520,12 @@ func (m *Model) startRequest(prompt string) (tea.Model, tea.Cmd) {
 	m.cancel = cancel
 	m.cancelRequested = false
 	m.startedAt = m.clock.Now()
+	m.activity = Activity{TokenBytesPerToken: 4}
+	m.operationUsage = protocol.Usage{}
+	m.streamedBytes = 0
+	m.reasoningBytes = 0
+	m.roundReasoningTokens = 0
+	m.roundReasoningExact = false
 	m.state = StateConnecting
 	m.timeline = append(m.timeline, timelineItem{kind: timelineMessage, role: "user", text: prompt})
 	m.followOutput = true

@@ -47,7 +47,7 @@ go run . "审查并测试这个项目" --route auto --task review --require-reas
 
 兼容入口 `go run . chat [prompt]` 继续可用。prompt 与子命令同名时，可使用 `go run . -- "sessions"` 将其作为对话内容发送。
 
-TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、单行命令带、Markdown、工具状态/详情、确认弹窗、Provider 表单、模型筛选、Skill 状态与上下文进度。命令带使用原生终端光标，支持中文输入与横向视口。TUI 会把 provider 发出的极小文本与工具参数 delta 合并成小批次，并缓存已完成的 Markdown 渲染，减少长会话重绘。模型生成 `write_file` 或 `edit_file` 参数时，时间线会实时显示目标路径、内容增量、字节数和行数，完整参数通过后再执行权限检查与原子写入；已存在的本地文件路径可点击并打开所在目录。Provider 表单的 API Key 使用 password input；模型面板支持刷新、筛选、选择和手工 ID。`Ctrl-C` 在请求期间第一次取消，第二次退出；`Ctrl-T` 打开最近工具详情。
+TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、单行命令带、Markdown、工具状态/详情、确认弹窗、Provider 表单、模型筛选、Skill 状态与上下文进度。命令带使用原生终端光标，支持中文输入与横向视口。流式活动行展示阶段、耗时、每回合发送 token、实时接收 token 和 thinking 状态；Responses reasoning summary delta 与 Chat `reasoning_content` 用于实时估算，Provider usage 到达后校正为精确累计值。TUI 会把 provider 发出的极小文本与工具参数 delta 合并成小批次，并缓存已完成的 Markdown 渲染，减少长会话重绘。模型生成 `write_file` 或 `edit_file` 参数时，时间线会实时显示目标路径、内容增量、字节数和行数，完整参数通过后再执行权限检查与原子写入；已存在的本地文件路径可点击并打开所在目录。Provider 表单的 API Key 使用 password input；模型面板支持刷新、筛选、选择和手工 ID。`Ctrl-C` 在请求期间第一次取消，第二次退出；`Ctrl-T` 打开最近工具详情。
 
 ```powershell
 go run . --no-animation

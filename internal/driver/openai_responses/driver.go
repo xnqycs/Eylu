@@ -37,11 +37,16 @@ func (d *Driver) Capabilities() driver.Capabilities {
 }
 
 type requestBody struct {
-	Model              string `json:"model"`
-	Input              []any  `json:"input"`
-	Tools              []tool `json:"tools,omitempty"`
-	Stream             bool   `json:"stream,omitempty"`
-	PreviousResponseID string `json:"previous_response_id,omitempty"`
+	Model              string           `json:"model"`
+	Input              []any            `json:"input"`
+	Tools              []tool           `json:"tools,omitempty"`
+	Stream             bool             `json:"stream,omitempty"`
+	PreviousResponseID string           `json:"previous_response_id,omitempty"`
+	Reasoning          *reasoningConfig `json:"reasoning,omitempty"`
+}
+
+type reasoningConfig struct {
+	Summary string `json:"summary,omitempty"`
 }
 
 type remoteState struct {
@@ -83,7 +88,7 @@ type responseBody struct {
 		Message string `json:"message"`
 	} `json:"error"`
 	Output []responseItem `json:"output"`
-	Usage  responseUsage  `json:"usage"`
+	Usage  *responseUsage `json:"usage"`
 }
 
 type responseItem struct {
@@ -109,6 +114,9 @@ type responseUsage struct {
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	body := requestBody{Model: req.Model.Model, Stream: req.Stream}
+	if req.Stream {
+		body.Reasoning = &reasoningConfig{Summary: "auto"}
+	}
 	state := decodeRemoteState(req.Model.DriverState)
 	if !state.DisablePrevious {
 		body.PreviousResponseID = state.ResponseID
@@ -125,12 +133,12 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	if emit != nil {
 		_ = emit(protocol.ModelEvent{Kind: protocol.EventResponseStart})
 	}
+	disablePrevious := state.DisablePrevious
 	resp, err := d.send(ctx, endpoint, req, payload)
 	if err != nil {
 		return protocol.ModelResponse{}, mapTransportError(ctx, err)
 	}
-	disablePrevious := state.DisablePrevious
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	for resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if body.PreviousResponseID != "" && resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(string(raw)), "previous_response_id") {
@@ -138,23 +146,21 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 			body.PreviousResponseID = ""
 			body.Input = nil
 			appendResponseInput(&body, req.Model.Turns)
-			payload, err = json.Marshal(body)
-			if err != nil {
-				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "encode fallback model request", Cause: err}
-			}
-			resp, err = d.send(ctx, endpoint, req, payload)
-			if err != nil {
-				return protocol.ModelResponse{}, mapTransportError(ctx, err)
-			}
+		} else if body.Reasoning != nil && resp.StatusCode == http.StatusBadRequest {
+			body.Reasoning = nil
 		} else {
 			return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
 		}
+		payload, err = json.Marshal(body)
+		if err != nil {
+			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "encode fallback model request", Cause: err}
+		}
+		resp, err = d.send(ctx, endpoint, req, payload)
+		if err != nil {
+			return protocol.ModelResponse{}, mapTransportError(ctx, err)
+		}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
-	}
 	if req.Stream {
 		result, streamErr := d.readStream(ctx, resp.Body, emit)
 		if streamErr != nil {
@@ -302,9 +308,14 @@ func systemTurnDigests(turns []protocol.Turn) map[string]string {
 
 func convertResponse(decoded responseBody) protocol.ModelResponse {
 	result := protocol.ModelResponse{
-		Turn:  protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()},
-		Stop:  protocol.StopCompleted,
-		Usage: protocol.Usage{InputTokens: decoded.Usage.InputTokens, OutputTokens: decoded.Usage.OutputTokens, ReasoningTokens: decoded.Usage.OutputDetail.ReasoningTokens, Exact: true},
+		Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()},
+		Stop: protocol.StopCompleted,
+	}
+	if decoded.Usage != nil {
+		result.Usage = protocol.Usage{
+			InputTokens: decoded.Usage.InputTokens, OutputTokens: decoded.Usage.OutputTokens,
+			ReasoningTokens: decoded.Usage.OutputDetail.ReasoningTokens, Exact: true,
+		}
 	}
 	for _, item := range decoded.Output {
 		switch item.Type {

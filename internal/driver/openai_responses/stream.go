@@ -67,6 +67,10 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			return &protocol.Error{Code: protocol.ErrProtocol, Message: "decode Responses stream event", Cause: err}
 		}
 		switch event.Type {
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+			if emit != nil && event.Delta != "" {
+				return emit(protocol.ModelEvent{Kind: protocol.EventReasoningDelta, Delta: event.Delta})
+			}
 		case "response.output_text.delta":
 			text.WriteString(event.Delta)
 			if emit != nil && event.Delta != "" {

@@ -103,14 +103,15 @@ type ModelResponse struct {
 type EventKind string
 
 const (
-	EventResponseStart EventKind = "response_start"
-	EventTextDelta     EventKind = "text_delta"
-	EventToolCallDelta EventKind = "tool_call_delta"
-	EventToolStart     EventKind = "tool_start"
-	EventToolResult    EventKind = "tool_result"
-	EventUsage         EventKind = "usage"
-	EventResponseDone  EventKind = "response_done"
-	EventError         EventKind = "error"
+	EventResponseStart  EventKind = "response_start"
+	EventReasoningDelta EventKind = "reasoning_delta"
+	EventTextDelta      EventKind = "text_delta"
+	EventToolCallDelta  EventKind = "tool_call_delta"
+	EventToolStart      EventKind = "tool_start"
+	EventToolResult     EventKind = "tool_result"
+	EventUsage          EventKind = "usage"
+	EventResponseDone   EventKind = "response_done"
+	EventError          EventKind = "error"
 )
 
 type ModelEvent struct {

@@ -110,21 +110,78 @@ func (m *Model) renderHeader() string {
 }
 
 func (m *Model) renderLoading() string {
-	label := stateLabel(m.state)
 	if !m.busy() {
 		return strings.Repeat(" ", max(1, m.width))
 	}
-	prefix := "..."
+	prefix := "*"
 	if m.animation {
 		prefix = m.spinner.View()
 	}
-	elapsed := m.clock.Now().Sub(m.startedAt).Round(100 * time.Millisecond)
-	retry := ""
+	elapsed := time.Duration(0)
+	if !m.startedAt.IsZero() {
+		elapsed = max(time.Duration(0), m.clock.Now().Sub(m.startedAt)).Round(time.Second)
+	}
+	details := []string{elapsed.String(), m.renderInputActivity(), m.renderTokenActivity()}
+	if thinking := m.renderThinkingActivity(); thinking != "" {
+		details = append(details, thinking)
+	}
 	if m.state == StateRetryBackoff && !m.retryAt.IsZero() {
 		remaining := max(time.Duration(0), m.retryAt.Sub(m.clock.Now())).Round(100 * time.Millisecond)
-		retry = fmt.Sprintf("  next in %s", remaining)
+		details = append(details, fmt.Sprintf("next in %s", remaining))
 	}
-	return padWidth(m.styles.Loading.Render(fmt.Sprintf("%s %s  %s%s", prefix, label, elapsed, retry)), m.width)
+	lead := m.styles.Loading.Render(fmt.Sprintf("%s %s...", prefix, activityLabel(m.state)))
+	metadata := m.styles.Status.Render(fmt.Sprintf("(%s)", strings.Join(details, " · ")))
+	rendered := ansi.Truncate(lead+"  "+metadata, m.width, "...")
+	return padWidth(rendered, m.width)
+}
+
+func (m *Model) renderInputActivity() string {
+	marker := ""
+	if m.activity.InputTokens > 0 && !m.activity.InputExact {
+		marker = "≈"
+	}
+	return fmt.Sprintf("↑ %s%d sent", marker, m.activity.InputTokens)
+}
+
+func (m *Model) renderTokenActivity() string {
+	bytesPerToken := m.activity.TokenBytesPerToken
+	if bytesPerToken <= 0 {
+		bytesPerToken = 4
+	}
+	estimatedTokens := 0
+	if m.streamedBytes > 0 {
+		estimatedTokens = (m.streamedBytes + bytesPerToken - 1) / bytesPerToken
+	}
+	tokens := m.operationUsage.OutputTokens + estimatedTokens
+	estimated := estimatedTokens > 0 || (tokens > 0 && !m.operationUsage.Exact)
+	marker := ""
+	if estimated {
+		marker = "≈"
+	}
+	return fmt.Sprintf("↓ %s%d received", marker, tokens)
+}
+
+func (m *Model) renderThinkingActivity() string {
+	switch m.state {
+	case StateWaitingFirstToken, StateStreaming, StatePreparingTool:
+	default:
+		return ""
+	}
+	bytesPerToken := m.activity.TokenBytesPerToken
+	if bytesPerToken <= 0 {
+		bytesPerToken = 4
+	}
+	if m.roundReasoningExact {
+		if m.roundReasoningTokens > 0 {
+			return fmt.Sprintf("thinking %d tokens", m.roundReasoningTokens)
+		}
+		return ""
+	}
+	if m.reasoningBytes > 0 {
+		estimatedTokens := (m.reasoningBytes + bytesPerToken - 1) / bytesPerToken
+		return fmt.Sprintf("thinking ≈%d tokens", estimatedTokens)
+	}
+	return ""
 }
 
 func (m *Model) renderStatus() string {
@@ -427,7 +484,7 @@ func localContainingDirectoryURL(workspace, target string) (string, bool) {
 	if filepath.VolumeName(localPath) != "" {
 		candidates = append(candidates, localPath)
 	} else {
-		relative := strings.TrimLeft(localPath, `/\\`)
+		relative := strings.TrimLeft(localPath, "/\\")
 		if relative == "" {
 			return "", false
 		}
@@ -501,6 +558,31 @@ func stateLabel(state OperationState) string {
 		return "Cancelled"
 	default:
 		return string(state)
+	}
+}
+
+func activityLabel(state OperationState) string {
+	switch state {
+	case StateConnecting:
+		return "Connecting"
+	case StateFetchingModels:
+		return "Fetching models"
+	case StateWaitingFirstToken:
+		return "Thinking"
+	case StateStreaming:
+		return "Composing"
+	case StatePreparingTool:
+		return "Planning change"
+	case StateExecutingTool:
+		return "Running tool"
+	case StateAwaitingApproval:
+		return "Awaiting approval"
+	case StateRetryBackoff:
+		return "Retrying"
+	case StateCancelling:
+		return "Cancelling"
+	default:
+		return stateLabel(state)
 	}
 }
 

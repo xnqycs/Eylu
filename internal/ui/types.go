@@ -32,21 +32,33 @@ const (
 type EventKind string
 
 const (
-	EventState         EventKind = "state"
-	EventTextDelta     EventKind = "text_delta"
-	EventToolCallDelta EventKind = "tool_call_delta"
-	EventToolStart     EventKind = "tool_start"
-	EventToolResult    EventKind = "tool_result"
-	EventToolAudit     EventKind = "tool_audit"
-	EventApproval      EventKind = "approval"
-	EventContext       EventKind = "context"
-	EventNotice        EventKind = "notice"
+	EventState          EventKind = "state"
+	EventActivity       EventKind = "activity"
+	EventReasoningDelta EventKind = "reasoning_delta"
+	EventTextDelta      EventKind = "text_delta"
+	EventToolCallDelta  EventKind = "tool_call_delta"
+	EventToolStart      EventKind = "tool_start"
+	EventToolResult     EventKind = "tool_result"
+	EventToolAudit      EventKind = "tool_audit"
+	EventApproval       EventKind = "approval"
+	EventContext        EventKind = "context"
+	EventUsage          EventKind = "usage"
+	EventNotice         EventKind = "notice"
 )
+
+type Activity struct {
+	Reasoning          bool `json:"reasoning"`
+	ReasoningKnown     bool `json:"reasoning_known,omitempty"`
+	TokenBytesPerToken int  `json:"token_bytes_per_token"`
+	InputTokens        int  `json:"input_tokens,omitempty"`
+	InputExact         bool `json:"input_exact,omitempty"`
+}
 
 type Event struct {
 	OperationID   string                  `json:"operation_id"`
 	Kind          EventKind               `json:"kind"`
 	State         OperationState          `json:"state,omitempty"`
+	Activity      *Activity               `json:"activity,omitempty"`
 	Delta         string                  `json:"delta,omitempty"`
 	ToolCallDelta *protocol.ToolCallDelta `json:"tool_call_delta,omitempty"`
 	ToolCall      *protocol.ToolCall      `json:"tool_call,omitempty"`
@@ -54,6 +66,7 @@ type Event struct {
 	ToolAudit     *ToolAudit              `json:"tool_audit,omitempty"`
 	Approval      *ApprovalRequest        `json:"-"`
 	Context       *contextledger.Report   `json:"context,omitempty"`
+	Usage         *protocol.Usage         `json:"usage,omitempty"`
 	Notice        string                  `json:"notice,omitempty"`
 	Error         bool                    `json:"error,omitempty"`
 	RetryAfter    time.Duration           `json:"retry_after,omitempty"`

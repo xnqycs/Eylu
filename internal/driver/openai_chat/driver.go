@@ -47,10 +47,11 @@ type chatRequest struct {
 }
 
 type chatMessage struct {
-	Role       string         `json:"role"`
-	Content    string         `json:"content,omitempty"`
-	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
+	Role             string         `json:"role"`
+	Content          string         `json:"content,omitempty"`
+	ReasoningContent string         `json:"reasoning_content,omitempty"`
+	ToolCalls        []chatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string         `json:"tool_call_id,omitempty"`
 }
 
 type chatTool struct {
@@ -238,6 +239,11 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			result.Usage = usageFromChat(chunk)
 		}
 		for _, choice := range chunk.Choices {
+			if choice.Delta.ReasoningContent != "" && emit != nil {
+				if err := emit(protocol.ModelEvent{Kind: protocol.EventReasoningDelta, Delta: choice.Delta.ReasoningContent}); err != nil {
+					return protocol.ModelResponse{}, err
+				}
+			}
 			if choice.Delta.Content != "" {
 				text.WriteString(choice.Delta.Content)
 				if emit != nil {

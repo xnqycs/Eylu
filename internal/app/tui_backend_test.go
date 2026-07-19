@@ -73,16 +73,22 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 	}
 	var text strings.Builder
 	textEvents := 0
-	foundContext := false
+	inputActivities := 0
+	foundContext, foundActivity, foundUsage := false, false, false
 	for _, event := range events {
 		if event.Kind == ui.EventTextDelta {
 			textEvents++
 			text.WriteString(event.Delta)
 		}
 		foundContext = foundContext || event.Kind == ui.EventContext && event.Context != nil
+		foundActivity = foundActivity || event.Kind == ui.EventActivity && event.Activity != nil && event.Activity.Reasoning && event.Activity.ReasoningKnown && event.Activity.TokenBytesPerToken == cfg.TokenBytesPerToken && event.Activity.InputTokens > 0
+		if event.Kind == ui.EventActivity && event.Activity != nil && event.Activity.InputTokens > 0 {
+			inputActivities++
+		}
+		foundUsage = foundUsage || event.Kind == ui.EventUsage && event.Usage != nil && event.Usage.OutputTokens == 2 && event.Usage.Exact
 	}
-	if text.String() != "TUI works" || textEvents != 1 || !foundContext || stdout.Len() != 0 || stderr.Len() != 0 {
-		t.Fatalf("text=%q textEvents=%d context=%t stdout=%q stderr=%q events=%#v", text.String(), textEvents, foundContext, stdout.String(), stderr.String(), events)
+	if text.String() != "TUI works" || textEvents != 1 || inputActivities < 2 || !foundContext || !foundActivity || !foundUsage || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("text=%q textEvents=%d inputActivities=%d context=%t activity=%t usage=%t stdout=%q stderr=%q events=%#v", text.String(), textEvents, inputActivities, foundContext, foundActivity, foundUsage, stdout.String(), stderr.String(), events)
 	}
 }
 

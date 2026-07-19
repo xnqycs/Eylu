@@ -85,7 +85,7 @@ func (o *Observation) ObserveModelEvent(event protocol.ModelEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	switch event.Kind {
-	case protocol.EventTextDelta:
+	case protocol.EventTextDelta, protocol.EventReasoningDelta:
 		if event.Delta != "" && o.firstToken.IsZero() {
 			o.firstToken = time.Now()
 		}

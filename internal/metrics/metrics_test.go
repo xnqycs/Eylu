@@ -39,11 +39,16 @@ func TestObservationRecordsErrorAndFallbackUsage(t *testing.T) {
 }
 
 func TestToolCallDeltaMarksFirstToken(t *testing.T) {
-	observation := (&Collector{}).Begin(Metadata{})
-	time.Sleep(time.Millisecond)
-	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventToolCallDelta, ToolCallDelta: &protocol.ToolCallDelta{Name: "write_file"}})
-	metric := observation.Finish(protocol.Usage{}, nil)
-	if metric.FirstTokenMS < 1 {
-		t.Fatalf("metric = %#v", metric)
+	for _, event := range []protocol.ModelEvent{
+		{Kind: protocol.EventToolCallDelta, ToolCallDelta: &protocol.ToolCallDelta{Name: "write_file"}},
+		{Kind: protocol.EventReasoningDelta, Delta: "thinking"},
+	} {
+		observation := (&Collector{}).Begin(Metadata{})
+		time.Sleep(time.Millisecond)
+		observation.ObserveModelEvent(event)
+		metric := observation.Finish(protocol.Usage{}, nil)
+		if metric.FirstTokenMS < 1 {
+			t.Fatalf("event=%s metric=%#v", event.Kind, metric)
+		}
 	}
 }

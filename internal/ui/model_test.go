@@ -95,6 +95,70 @@ func TestOperationStatesStaleMessagesApprovalAndCancellation(t *testing.T) {
 	}
 }
 
+func TestStreamingActivityShowsEstimatedExactTokensAndThinking(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 19, 12, 0, 14, 0, time.UTC)}
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Clock: clock, Width: 100, Height: 24})
+	model.operationID = "op-activity"
+	model.eventChannel = make(chan Event, 8)
+	model.startedAt = clock.now.Add(-14 * time.Second)
+
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventActivity, Activity: &Activity{Reasoning: true, ReasoningKnown: true, TokenBytesPerToken: 4, InputTokens: 1200}})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventReasoningDelta, Delta: strings.Repeat("r", 204)})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventTextDelta, Delta: strings.Repeat("x", 2936)})
+	estimated := ansi.Strip(model.renderLoading())
+	for _, expected := range []string{"Composing...", "14s", "↑ ≈1200 sent", "↓ ≈734 received", "thinking ≈51 tokens"} {
+		if !strings.Contains(estimated, expected) {
+			t.Fatalf("estimated activity missing %q: %q", expected, estimated)
+		}
+	}
+
+	usage := protocol.Usage{InputTokens: 1100, OutputTokens: 700, ReasoningTokens: 320, Exact: true}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventUsage, Usage: &usage})
+	exact := ansi.Strip(model.renderLoading())
+	for _, expected := range []string{"↑ 1100 sent", "↓ 700 received", "thinking 320 tokens"} {
+		if !strings.Contains(exact, expected) {
+			t.Fatalf("exact activity missing %q: %q", expected, exact)
+		}
+	}
+	if strings.Contains(exact, "≈") {
+		t.Fatalf("exact activity remained estimated: %q", exact)
+	}
+	model.state = StateExecutingTool
+	if toolActivity := ansi.Strip(model.renderLoading()); strings.Contains(toolActivity, "thinking") {
+		t.Fatalf("tool activity reported active thinking: %q", toolActivity)
+	}
+	model.state = StateWaitingFirstToken
+
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventActivity, Activity: &Activity{InputTokens: 1500, TokenBytesPerToken: 4}})
+	pending := ansi.Strip(model.renderLoading())
+	for _, expected := range []string{"Thinking...", "↑ ≈1500 sent"} {
+		if !strings.Contains(pending, expected) {
+			t.Fatalf("pending activity missing %q: %q", expected, pending)
+		}
+	}
+	if strings.Contains(pending, "thinking 320") || strings.Contains(pending, "+ tokens") {
+		t.Fatalf("pending activity reused a prior-round token count: %q", pending)
+	}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventReasoningDelta, Delta: strings.Repeat("z", 40)})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventTextDelta, Delta: strings.Repeat("y", 40)})
+	nextTurn := ansi.Strip(model.renderLoading())
+	for _, expected := range []string{"↓ ≈710 received", "thinking ≈10 tokens"} {
+		if !strings.Contains(nextTurn, expected) {
+			t.Fatalf("next turn activity missing %q: %q", expected, nextTurn)
+		}
+	}
+	inexactUsage := protocol.Usage{}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventUsage, Usage: &inexactUsage})
+	if local := ansi.Strip(model.renderLoading()); !strings.Contains(local, "thinking ≈10 tokens") {
+		t.Fatalf("local thinking estimate was lost without exact usage: %q", local)
+	}
+
+	model.resize(40, 16)
+	if width := lipgloss.Width(ansi.Strip(model.renderLoading())); width > 40 {
+		t.Fatalf("activity width=%d line=%q", width, ansi.Strip(model.renderLoading()))
+	}
+}
+
 func TestInterruptRequestCancelsThenQuits(t *testing.T) {
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true})
 	model.operationID = "op-interrupt"
