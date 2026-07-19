@@ -274,7 +274,7 @@ func (b *tuiBackend) prepareSubmission(ctx context.Context, submission ui.Submis
 		snapshot := index.Refresh(ctx)
 		if snapshot.Diagnostic != "" {
 			if _, statErr := os.Stat(filepath.Join(cfg.Workspace, ".git")); statErr == nil {
-				return "", fmt.Errorf("Git file index unavailable: %s", snapshot.Diagnostic)
+				return "", fmt.Errorf("git file index unavailable: %s", snapshot.Diagnostic)
 			}
 		}
 		indexed := make(map[string]struct{}, len(snapshot.Files))
@@ -426,7 +426,7 @@ func (b *tuiBackend) ListFiles(ctx context.Context) ([]ui.FileItem, error) {
 	snapshot := index.Refresh(ctx)
 	if snapshot.Diagnostic != "" {
 		if _, statErr := os.Stat(filepath.Join(cfg.Workspace, ".git")); statErr == nil {
-			return nil, fmt.Errorf("Git file index unavailable: %s", snapshot.Diagnostic)
+			return nil, fmt.Errorf("git file index unavailable: %s", snapshot.Diagnostic)
 		}
 	}
 	result := make([]ui.FileItem, 0, len(snapshot.Files))
