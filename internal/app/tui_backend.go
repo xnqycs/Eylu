@@ -95,7 +95,7 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 	}
 	snapshot := ui.Snapshot{
 		SessionID: b.conversation.SessionID(), Workspace: b.runtime.workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
-		Context: b.conversation.ContextReport(),
+		Context: b.conversation.ContextReport(), TodoList: state.TodoList,
 	}
 	managerActive, _ := b.manager.Active()
 	for _, item := range b.manager.List() {
@@ -167,7 +167,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 		}
 	}
 	confirm := b.confirmTools(operationID, opts.approve, emit)
-	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, &tuiAuditSink{operationID: operationID, emit: emit})
+	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, b.askUser(operationID, emit), &tuiAuditSink{operationID: operationID, emit: emit})
 	if err != nil {
 		return err
 	}
@@ -475,6 +475,24 @@ func (b *tuiBackend) confirmTools(operationID string, approve bool, emit func(ui
 			return tool.Confirmation{Approved: decision.Approved, RejectionReason: decision.Reason}, nil
 		case <-ctx.Done():
 			return tool.Confirmation{}, ctx.Err()
+		}
+	}
+}
+
+func (b *tuiBackend) askUser(operationID string, emit func(ui.Event)) tool.AskFunc {
+	return func(ctx context.Context, request protocol.AskRequest) (protocol.AskResponse, error) {
+		response := make(chan ui.AskDecision, 1)
+		emit(ui.Event{OperationID: operationID, Kind: ui.EventAsk, Ask: &ui.AskRequest{
+			Questions: append([]protocol.AskQuestion(nil), request.Questions...), Response: response,
+		}})
+		select {
+		case decision := <-response:
+			if decision.Cancelled {
+				return protocol.AskResponse{}, tool.ErrAskDismissed
+			}
+			return protocol.AskResponse{Answers: decision.Answers}, nil
+		case <-ctx.Done():
+			return protocol.AskResponse{}, ctx.Err()
 		}
 	}
 }

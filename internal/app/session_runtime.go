@@ -183,9 +183,10 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 		events = append(events, session.Event{Type: session.EventSkillActivated, Skill: &skillState})
 	}
 	ledger := state.Ledger
+	todoList := state.TodoList
 	events = append(events, session.Event{
 		Type: session.EventContextUpdated, SkillCatalog: state.SkillCatalog, Summary: state.Summary,
-		OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: &ledger,
+		TodoList: &todoList, OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: &ledger,
 	})
 	lastError := ""
 	if runErr != nil {
@@ -327,7 +328,7 @@ func snapshotFromAgentState(state agent.ConversationState, previous session.Snap
 			BaseURL: state.Provider.BaseURL, Model: state.Provider.Model, ContextWindow: state.Provider.ContextWindow,
 		},
 		Turns: state.Turns, DriverState: append(json.RawMessage(nil), state.DriverState...), SkillCatalog: state.SkillCatalog,
-		Summary: state.Summary, OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: state.Ledger,
+		Summary: state.Summary, TodoList: cloneProtocolTodoList(state.TodoList), OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: state.Ledger,
 	}
 	if snapshot.CreatedAt.IsZero() {
 		snapshot.CreatedAt = time.Now().UTC()
@@ -346,8 +347,12 @@ func agentStateFromSnapshot(snapshot session.Snapshot) agent.ConversationState {
 			BaseURL: snapshot.Provider.BaseURL, Model: snapshot.Provider.Model, ContextWindow: snapshot.Provider.ContextWindow,
 		},
 		Workspace: snapshot.Workspace, Environment: snapshot.Environment, PermissionMode: snapshot.PermissionMode, SkillCatalog: snapshot.SkillCatalog,
-		Summary: snapshot.Summary, OmittedTurnIDs: snapshot.OmittedTurnIDs, Ledger: snapshot.Ledger,
+		Summary: snapshot.Summary, TodoList: cloneProtocolTodoList(snapshot.TodoList), OmittedTurnIDs: snapshot.OmittedTurnIDs, Ledger: snapshot.Ledger,
 	}
+}
+
+func cloneProtocolTodoList(list protocol.TodoList) protocol.TodoList {
+	return protocol.TodoList{Explanation: list.Explanation, Items: append([]protocol.TodoItem(nil), list.Items...)}
 }
 
 func (r *runtime) captureEnvironment(ctx context.Context, workspace string) environment.Context {

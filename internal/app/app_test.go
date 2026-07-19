@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,9 +14,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"Eylu/internal/agent"
 	"Eylu/internal/config"
+	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 )
 
@@ -308,7 +312,8 @@ func TestChatToolLoopReadsAndBuilds(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		switch number {
 		case 1:
-			if len(body["tools"].([]any)) != 6 {
+			tools := body["tools"].([]any)
+			if len(tools) != 7 || !containsFunctionTool(tools, "todolist") {
 				t.Fatalf("tools = %#v", body["tools"])
 			}
 			writeResponsesCompleted(w, `{"id":"resp_1","output":[{"type":"function_call","id":"fc_1","call_id":"call-read","name":"read_file","arguments":"{\"path\":\"main.go\"}"}]}`)
@@ -343,6 +348,16 @@ func TestChatToolLoopReadsAndBuilds(t *testing.T) {
 
 func writeResponsesCompleted(w http.ResponseWriter, response string) {
 	_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":" + response + "}\n\n"))
+}
+
+func containsFunctionTool(tools []any, name string) bool {
+	for _, raw := range tools {
+		definition, ok := raw.(map[string]any)
+		if ok && definition["name"] == name {
+			return true
+		}
+	}
+	return false
 }
 
 func containsFunctionOutput(input []any, callID, content string) bool {
@@ -409,6 +424,103 @@ func TestContextSlashRendersAllCategories(t *testing.T) {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("context output missing %q:\n%s", expected, output.String())
 		}
+	}
+}
+
+func TestTasksSlashRendersCurrentTodoList(t *testing.T) {
+	var output bytes.Buffer
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &output, stderr: &bytes.Buffer{}, trustPrompted: make(map[string]bool)}
+	state := agent.NewConversation().ExportState()
+	state.TodoList = protocol.TodoList{Items: []protocol.TodoItem{
+		{ID: "inspect", Content: "Inspect current files", Status: protocol.TodoCompleted},
+		{ID: "implement", Content: "Implement terminal flow", Status: protocol.TodoInProgress},
+		{ID: "later", Content: "Run smoke test", Status: protocol.TodoPending},
+		{ID: "dropped", Content: "Discard obsolete path", Status: protocol.TodoCancelled},
+	}}
+	conversation, err := agent.RestoreConversation(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.handleSlashCommand(context.Background(), bufio.NewReader(strings.NewReader("")), "/tasks", conversation, nil, &chatOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"[x] Inspect current files", "[>] Implement terminal flow", "[ ] Run smoke test", "[-] Discard obsolete path"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("tasks output missing %q:\n%s", expected, output.String())
+		}
+	}
+}
+
+func TestTextAskSupportsSingleMultipleAndCustomAnswers(t *testing.T) {
+	input := strings.NewReader("1abc\n2\n1,3,o\ncustom detail\n")
+	var output bytes.Buffer
+	runtime := &runtime{stdin: input, stdout: &bytes.Buffer{}, stderr: &output, inputReader: bufio.NewReader(input)}
+	response, err := runtime.askUser(context.Background(), protocol.AskRequest{Questions: []protocol.AskQuestion{
+		{ID: "scope", Header: "Scope", Question: "Choose scope", Options: []protocol.AskOption{{Label: "Small", Description: "Small change"}, {Label: "Full", Description: "Full change"}}},
+		{ID: "checks", Header: "Checks", Question: "Choose checks", Multiple: true, Options: []protocol.AskOption{{Label: "Unit", Description: "Unit tests"}, {Label: "Vet", Description: "Static checks"}, {Label: "Smoke", Description: "Smoke test"}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := response.Answers["scope"]; len(got) != 1 || got[0] != "Full" {
+		t.Fatalf("scope answers = %#v", got)
+	}
+	if got := response.Answers["checks"]; len(got) != 3 || got[0] != "Unit" || got[1] != "Smoke" || got[2] != "custom detail" {
+		t.Fatalf("check answers = %#v", got)
+	}
+	if !strings.Contains(output.String(), "Other") || !strings.Contains(output.String(), "Invalid selection") {
+		t.Fatalf("text ask output = %q", output.String())
+	}
+}
+
+func TestTextAskCancellationReleasesAndPreservesPendingInput(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	buffered := bufio.NewReader(reader)
+	runtime := &runtime{stdin: reader, stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, inputReader: buffered}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := runtime.askUser(ctx, protocol.AskRequest{Questions: []protocol.AskQuestion{{
+			ID: "scope", Header: "Scope", Question: "Choose scope", Options: []protocol.AskOption{{Label: "Small", Description: "Focused"}, {Label: "Full", Description: "Complete"}},
+		}}})
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		runtime.inputMu.Lock()
+		started := runtime.inputRead != nil
+		runtime.inputMu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ask did not start terminal read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("text ask did not release after cancellation")
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, "next prompt\n")
+		writeDone <- err
+	}()
+	line, err := runtime.readInteractiveLine(context.Background(), buffered)
+	if err != nil || strings.TrimSpace(line) != "next prompt" {
+		t.Fatalf("preserved line=%q err=%v", line, err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

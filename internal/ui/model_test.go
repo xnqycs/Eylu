@@ -170,6 +170,204 @@ func TestApprovalRejectReasonAndImmediateInterruptDecisions(t *testing.T) {
 	}
 }
 
+func TestAskWorkbenchSingleMultipleCustomBackAndCancel(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-ask"
+	model.eventChannel = make(chan Event, 4)
+	response := make(chan AskDecision, 1)
+	questions := []protocol.AskQuestion{
+		{ID: "scope", Header: "Scope", Question: "Choose implementation scope", Options: []protocol.AskOption{{Label: "Small", Description: "Focused change"}, {Label: "Full", Description: "Complete flow"}}},
+		{ID: "checks", Header: "Checks", Question: "Choose verification", Multiple: true, Options: []protocol.AskOption{{Label: "Unit", Description: "Focused tests"}, {Label: "Vet", Description: "Static checks"}, {Label: "Smoke", Description: "Interactive smoke"}}},
+	}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-ask", Kind: EventAsk, Ask: &AskRequest{Questions: questions, Response: response}})
+	if model.state != StateAwaitingInput || model.ask == nil || !strings.Contains(ansi.Strip(model.View().Content), "Choose implementation scope") {
+		t.Fatalf("state=%s ask=%#v\n%s", model.state, model.ask, ansi.Strip(model.View().Content))
+	}
+	compact := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 12})
+	compact.snapshot.TodoList = protocol.TodoList{Items: []protocol.TodoItem{{ID: "hidden", Content: "Hidden while asking", Status: protocol.TodoInProgress}}}
+	compact.ask = newAskState(&AskRequest{Questions: questions[:1]}, 40)
+	compactView := ansi.Strip(compact.View().Content)
+	if lipgloss.Height(compactView) != 12 || strings.Contains(compactView, "Hidden while asking") || strings.Contains(compactView, "Message Eylu") {
+		t.Fatalf("compact ask layout:\n%s", compactView)
+	}
+	for _, line := range strings.Split(compactView, "\n") {
+		if lipgloss.Width(line) > 40 {
+			t.Fatalf("compact ask line width=%d line=%q", lipgloss.Width(line), line)
+		}
+	}
+	_, _ = model.handleAskKey("down")
+	_, _ = model.handleAskKey("enter")
+	if model.ask.question != 1 {
+		t.Fatalf("question index = %d", model.ask.question)
+	}
+	_, _ = model.handleAskKey("left")
+	if model.ask.question != 0 {
+		t.Fatalf("back question index = %d", model.ask.question)
+	}
+	_, _ = model.handleAskKey("right")
+	_, _ = model.handleAskKey("space")
+	_, _ = model.handleAskKey("tab")
+	if !model.ask.editing {
+		t.Fatal("custom input did not open")
+	}
+	_, _ = model.Update(tea.PasteMsg{Content: "custom detail"})
+	_, command := model.handleAskKey("enter")
+	if command == nil || model.ask != nil {
+		t.Fatalf("command=%v ask=%#v", command, model.ask)
+	}
+	decision := <-response
+	if got := decision.Answers["scope"]; len(got) != 1 || got[0] != "Full" {
+		t.Fatalf("scope=%#v", got)
+	}
+	if got := decision.Answers["checks"]; len(got) != 2 || got[0] != "Unit" || got[1] != "custom detail" {
+		t.Fatalf("checks=%#v", got)
+	}
+
+	cancelResponse := make(chan AskDecision, 1)
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-ask", Kind: EventAsk, Ask: &AskRequest{Questions: questions[:1], Response: cancelResponse}})
+	_, cancelCommand := model.handleAskKey("esc")
+	if decision := <-cancelResponse; !decision.Cancelled || cancelCommand == nil || model.ask != nil {
+		t.Fatalf("cancel decision=%#v command=%v ask=%#v", decision, cancelCommand, model.ask)
+	}
+
+	interruptResponse := make(chan AskDecision, 1)
+	model.ask = newAskState(&AskRequest{Questions: questions[:1], Response: interruptResponse}, model.width)
+	model.state = StateAwaitingInput
+	model.cancel = func() {}
+	_, interruptCommand := model.handleInterrupt()
+	if decision := <-interruptResponse; !decision.Cancelled || interruptCommand == nil || model.state != StateCancelling {
+		t.Fatalf("interrupt decision=%#v command=%v state=%s", decision, interruptCommand, model.state)
+	}
+}
+
+func TestTaskPanelTasksScreenAndHiddenTodoTimelineAcrossLayouts(t *testing.T) {
+	list := protocol.TodoList{Items: []protocol.TodoItem{
+		{ID: "done_one", Content: "Completed one", Status: protocol.TodoCompleted},
+		{ID: "pending_one", Content: "Pending one", Status: protocol.TodoPending},
+		{ID: "done_two", Content: "Completed two", Status: protocol.TodoCompleted},
+		{ID: "active", Content: "Implement workbench", Status: protocol.TodoInProgress},
+		{ID: "pending_two", Content: "Pending two", Status: protocol.TodoPending},
+		{ID: "done_three", Content: "Completed three", Status: protocol.TodoCompleted},
+		{ID: "pending_three", Content: "Pending three", Status: protocol.TodoPending},
+		{ID: "pending_four", Content: "Pending four", Status: protocol.TodoPending},
+	}}
+	for _, size := range []struct{ width, height int }{{40, 12}, {80, 24}} {
+		model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: size.width, Height: size.height})
+		model.snapshot.TodoList = list
+		_ = model.input.Focus()
+		model.input.SetValue("message")
+		model.refreshViewport()
+		view := model.View()
+		plain := ansi.Strip(view.Content)
+		if !strings.Contains(plain, "Implement workbench") {
+			t.Fatalf("%dx%d task panel missing:\n%s", size.width, size.height, plain)
+		}
+		for _, line := range strings.Split(plain, "\n") {
+			if strings.Contains(line, "Implement workbench") {
+				left := lipgloss.Width(line) - lipgloss.Width(strings.TrimLeft(line, " "))
+				want := model.viewportLeftInset() + 2
+				if left != want {
+					t.Fatalf("%dx%d task inset=%d want=%d line=%q", size.width, size.height, left, want, line)
+				}
+			}
+		}
+		if size.width >= 80 {
+			for _, expected := range []string{"Pending one", "Pending two", "Pending three", "Pending four", "... +3 completed"} {
+				if !strings.Contains(plain, expected) {
+					t.Fatalf("wide task panel missing %q:\n%s", expected, plain)
+				}
+			}
+			for _, completed := range []string{"Completed one", "Completed two", "Completed three"} {
+				if strings.Contains(plain, completed) {
+					t.Fatalf("completed overflow item %q remained visible:\n%s", completed, plain)
+				}
+			}
+			if model.layout().taskRows != 0 {
+				t.Fatalf("wide task rows=%d layout=%#v", model.layout().taskRows, model.layout())
+			}
+		}
+		for _, line := range strings.Split(plain, "\n") {
+			if lipgloss.Width(line) > size.width {
+				t.Fatalf("%dx%d line width=%d line=%q", size.width, size.height, lipgloss.Width(line), line)
+			}
+		}
+		if view.Cursor == nil || view.Cursor.Position.Y != model.layout().inputContentRow {
+			t.Fatalf("%dx%d cursor=%#v layout=%#v", size.width, size.height, view.Cursor, model.layout())
+		}
+	}
+	pendingItems := []protocol.TodoItem{{ID: "active", Content: "Active task", Status: protocol.TodoInProgress}}
+	for index := 1; index <= 11; index++ {
+		pendingItems = append(pendingItems, protocol.TodoItem{ID: fmt.Sprintf("pending_%d", index), Content: fmt.Sprintf("Pending task %d", index), Status: protocol.TodoPending})
+	}
+	pendingModel := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	pendingModel.snapshot.TodoList = protocol.TodoList{Items: pendingItems}
+	pendingModel.state = StateWaitingFirstToken
+	pendingPanel := ansi.Strip(pendingModel.renderTaskPanel(6))
+	if lipgloss.Height(pendingPanel) != 6 || !strings.Contains(pendingPanel, "... +7 pending") || pendingModel.taskPanelRows() != 6 {
+		t.Fatalf("pending overflow panel:\n%s", pendingPanel)
+	}
+	completedModel := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	completedModel.snapshot.TodoList = protocol.TodoList{Items: []protocol.TodoItem{
+		{ID: "active", Content: "Task A", Status: protocol.TodoInProgress},
+		{ID: "open_one", Content: "Task B", Status: protocol.TodoPending},
+		{ID: "open_two", Content: "Task C", Status: protocol.TodoPending},
+	}}
+	completedModel.timeline = []timelineItem{{kind: timelineNotice, text: "Completed in 25s."}}
+	completedModel.state = StateCompleted
+	_ = completedModel.input.Focus()
+	completedModel.refreshViewport()
+	completedView := ansi.Strip(completedModel.View().Content)
+	completedRow, summaryRow := -1, -1
+	for row, line := range strings.Split(completedView, "\n") {
+		if strings.Contains(line, "Completed in 25s.") {
+			completedRow = row
+		}
+		if strings.Contains(line, "3 tasks (0 done, 1 in progress, 2 open)") {
+			summaryRow = row
+		}
+	}
+	if completedRow < 0 || summaryRow != completedRow+2 {
+		t.Fatalf("completed/task spacing completed_row=%d summary_row=%d:\n%s", completedRow, summaryRow, completedView)
+	}
+
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.snapshot.TodoList = list
+	_, _ = model.executeSlash("/tasks")
+	if model.screen != screenTasks {
+		t.Fatalf("screen = %s", model.screen)
+	}
+	model.refreshViewport()
+	for _, expected := range []string{"[>] Implement workbench", "[ ] Pending one", "[x] Completed one"} {
+		if !strings.Contains(model.viewport.GetContent(), expected) {
+			t.Fatalf("tasks screen missing %q:\n%s", expected, model.viewport.GetContent())
+		}
+	}
+	if strings.Index(model.viewport.GetContent(), "Completed one") < strings.Index(model.viewport.GetContent(), "Pending four") {
+		t.Fatalf("completed tasks were not moved to the end:\n%s", model.viewport.GetContent())
+	}
+
+	model.screen = screenChat
+	model.operationID = "op-todo"
+	model.eventChannel = make(chan Event, 2)
+	call := protocol.ToolCall{ID: "call-todo", Name: "todolist", Arguments: []byte(`{"items":[]}`)}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-todo", Kind: EventToolStart, ToolCall: &call})
+	result := protocol.ToolResult{CallID: "call-todo", Content: "details", TodoList: &list}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-todo", Kind: EventToolResult, ToolResult: &result})
+	if len(model.snapshot.TodoList.Items) != 8 || strings.Contains(ansi.Strip(model.renderTimeline()), "todolist") || model.timeline[len(model.timeline)-1].tool.todoList == nil {
+		t.Fatalf("snapshot=%#v tool=%#v", model.snapshot.TodoList, model.timeline[len(model.timeline)-1].tool)
+	}
+}
+
+func TestMarkdownInlineCodeUsesThemeColorWithoutBackground(t *testing.T) {
+	style := eyluMarkdownStyle()
+	if style.Code.Color == nil || *style.Code.Color != eyluAccentColor {
+		t.Fatalf("inline code color=%v", style.Code.Color)
+	}
+	if style.Code.BackgroundColor != nil {
+		t.Fatalf("inline code background=%q", *style.Code.BackgroundColor)
+	}
+}
+
 func TestPlanCompletionGateAutoFullRejectAndFeedback(t *testing.T) {
 	backend := &fakeBackend{}
 	model := NewModel(backend, Options{NoAnimation: true, NoColor: true})

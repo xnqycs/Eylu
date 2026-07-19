@@ -822,6 +822,9 @@ func applyEvent(snapshot *Snapshot, event Event) {
 	case EventContextUpdated:
 		snapshot.SkillCatalog = event.SkillCatalog
 		snapshot.Summary = event.Summary
+		if event.TodoList != nil {
+			snapshot.TodoList = cloneSessionTodoList(*event.TodoList)
+		}
 		snapshot.OmittedTurnIDs = append([]string(nil), event.OmittedTurnIDs...)
 		if event.Ledger != nil {
 			snapshot.Ledger = *event.Ledger
@@ -834,6 +837,10 @@ func applyEvent(snapshot *Snapshot, event Event) {
 	case EventSessionReopened:
 		snapshot.ClosedAt = nil
 	}
+}
+
+func cloneSessionTodoList(list protocol.TodoList) protocol.TodoList {
+	return protocol.TodoList{Explanation: list.Explanation, Items: append([]protocol.TodoItem(nil), list.Items...)}
 }
 
 func upsertSkill(skills *[]SkillState, skill SkillState) {

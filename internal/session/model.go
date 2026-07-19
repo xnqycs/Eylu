@@ -61,6 +61,7 @@ type Snapshot struct {
 	SkillCatalog   string                    `json:"skill_catalog,omitempty"`
 	Skills         []SkillState              `json:"skills,omitempty"`
 	Summary        string                    `json:"summary,omitempty"`
+	TodoList       protocol.TodoList         `json:"todo_list,omitzero"`
 	OmittedTurnIDs []string                  `json:"omitted_turn_ids,omitempty"`
 	Ledger         contextledger.LedgerState `json:"ledger"`
 	LastError      string                    `json:"last_error,omitempty"`
@@ -81,6 +82,7 @@ type Event struct {
 	Skill          *SkillState                `json:"skill,omitempty"`
 	SkillCatalog   string                     `json:"skill_catalog,omitempty"`
 	Summary        string                     `json:"summary,omitempty"`
+	TodoList       *protocol.TodoList         `json:"todo_list,omitempty"`
 	OmittedTurnIDs []string                   `json:"omitted_turn_ids,omitempty"`
 	Ledger         *contextledger.LedgerState `json:"ledger,omitempty"`
 	Error          string                     `json:"error,omitempty"`

@@ -12,6 +12,8 @@ import (
 	"charm.land/glamour/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+
+	"Eylu/internal/protocol"
 )
 
 type markdownRenderCache struct {
@@ -20,33 +22,41 @@ type markdownRenderCache struct {
 }
 
 const (
-	activityGapRows = 1
-	fixedChromeRows = 5 + activityGapRows
-	minViewportRows = 4
+	activityGapRows   = 1
+	fixedChromeRows   = 5 + activityGapRows
+	minViewportRows   = 4
+	maxTaskPanelItems = 5
 )
 
 type tuiLayout struct {
 	viewportTop     int
 	viewportHeight  int
 	completionRows  int
+	taskRows        int
 	inputContentRow int
 	panelHeight     int
 }
 
 func (m *Model) layout() tuiLayout {
 	layout := tuiLayout{viewportTop: 1}
-	if m.approval != nil || m.planGate != nil {
+	if m.approval != nil || m.ask != nil || m.planGate != nil {
 		layout.panelHeight = m.decisionPanelHeight()
 		layout.viewportHeight = max(minViewportRows, m.height-layout.viewportTop-layout.panelHeight)
 		return layout
 	}
+	layout.taskRows = m.taskPanelRows()
 	layout.completionRows = m.completionHeight()
-	layout.viewportHeight = max(minViewportRows, m.height-m.input.Height()-fixedChromeRows-layout.completionRows)
-	layout.inputContentRow = layout.viewportTop + layout.viewportHeight + layout.completionRows + activityGapRows + 2
+	layout.viewportHeight = max(minViewportRows, m.height-m.input.Height()-fixedChromeRows-layout.completionRows-layout.taskRows)
+	layout.inputContentRow = layout.viewportTop + layout.viewportHeight + layout.completionRows + activityGapRows + 2 + layout.taskRows
 	return layout
 }
 
 func (m *Model) decisionPanelHeight() int {
+	if m.ask != nil {
+		desired := max(8, min(12, m.height/2))
+		maximum := max(1, m.height-1-minViewportRows)
+		return min(desired, maximum)
+	}
 	desired := max(6, m.height/3)
 	maximum := max(1, m.height-1-minViewportRows)
 	return min(desired, maximum)
@@ -62,6 +72,8 @@ func (m *Model) View() tea.View {
 	parts := []string{header, m.renderViewport()}
 	if m.approval != nil {
 		parts = append(parts, m.renderApproval(layout.panelHeight))
+	} else if m.ask != nil {
+		parts = append(parts, m.renderAsk(layout.panelHeight))
 	} else if m.planGate != nil {
 		parts = append(parts, m.renderPlanGate(layout.panelHeight))
 	} else {
@@ -73,7 +85,11 @@ func (m *Model) View() tea.View {
 		if m.screen == screenChat {
 			input = m.renderInputBand()
 		}
-		parts = append(parts, renderBlankRows(m.width, activityGapRows), m.renderLoading(), input, m.renderStatus())
+		parts = append(parts, renderBlankRows(m.width, activityGapRows), m.renderLoading())
+		if layout.taskRows > 0 {
+			parts = append(parts, m.renderTaskPanel(layout.taskRows))
+		}
+		parts = append(parts, input, m.renderStatus())
 	}
 	content := fitRenderedRows(strings.Join(parts, "\n"), m.height)
 	if m.noColor {
@@ -83,7 +99,7 @@ func (m *Model) View() tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
 	view.WindowTitle = "Eylu"
-	if m.screen == screenChat && m.approval == nil && m.planGate == nil {
+	if m.screen == screenChat && m.approval == nil && m.ask == nil && m.planGate == nil {
 		view.Cursor = m.input.Cursor()
 		if view.Cursor != nil {
 			localRow := min(max(0, view.Cursor.Position.Y), max(0, m.input.Height()-1))
@@ -117,6 +133,9 @@ func (m *Model) resize(width, height int) {
 	m.input.SetWidth(m.width)
 	m.modelFilter.SetWidth(max(20, m.viewportContentWidth()-6))
 	m.approvalReason.SetWidth(max(20, m.width-12))
+	if m.ask != nil {
+		m.ask.input.SetWidth(max(20, m.width-8))
+	}
 	if m.planGate != nil {
 		m.planGate.feedback.SetWidth(max(20, m.width-12))
 	}
@@ -131,7 +150,7 @@ func (m *Model) updateViewportHeight() {
 	if m.completion.kind != completionNone {
 		reservedCompletion = 1
 	}
-	inputLimit := min(maxInputRows, max(1, m.height-fixedChromeRows-minViewportRows-reservedCompletion))
+	inputLimit := min(maxInputRows, max(1, m.height-fixedChromeRows-minViewportRows-reservedCompletion-m.taskPanelRows()))
 	if m.input.MaxHeight != inputLimit {
 		m.input.MaxHeight = inputLimit
 		m.input.SetWidth(m.width)
@@ -164,6 +183,8 @@ func (m *Model) refreshViewport() {
 		content = m.renderSkills()
 	case screenContext:
 		content = m.renderContext()
+	case screenTasks:
+		content = m.renderTasks()
 	case screenToolDetail:
 		content = m.renderToolDetail()
 	default:
@@ -313,6 +334,9 @@ func (m *Model) renderTimeline() string {
 				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.Agent.Render("EYLU"), m.renderTimelineMarkdown(item))
 			}
 		case timelineTool:
+			if item.tool != nil && item.tool.name == "todolist" {
+				continue
+			}
 			fmt.Fprintf(&output, "%s\n", m.renderTool(item.tool))
 		case timelineNotice:
 			style := m.styles.Status
@@ -322,7 +346,14 @@ func (m *Model) renderTimeline() string {
 			fmt.Fprintf(&output, "%s\n\n", style.Render(wrapPlain(item.text, max(1, contentWidth-2))))
 		}
 	}
-	return strings.TrimRight(output.String(), "\n")
+	timeline := strings.TrimRight(output.String(), "\n")
+	if m.inlineTaskPanelVisible() {
+		if timeline != "" {
+			timeline += "\n\n"
+		}
+		timeline += m.renderInlineTaskPanel()
+	}
+	return timeline
 }
 
 func (m *Model) renderTimelineMarkdown(item *timelineItem) string {
@@ -375,6 +406,191 @@ func (m *Model) renderTool(tool *toolView) string {
 		}
 	}
 	return m.styles.Tool.Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) taskPanelRows() int {
+	if m.screen != screenChat || !m.busy() || m.approval != nil || m.ask != nil || m.planGate != nil || len(m.snapshot.TodoList.Items) == 0 {
+		return 0
+	}
+	desired := min(len(m.snapshot.TodoList.Items), maxTaskPanelItems)
+	if len(m.snapshot.TodoList.Items) > maxTaskPanelItems {
+		desired++
+	}
+	available := max(0, m.height-m.input.Height()-fixedChromeRows-minViewportRows)
+	return min(desired, available)
+}
+
+func (m *Model) inlineTaskPanelVisible() bool {
+	return m.screen == screenChat && !m.busy() && m.approval == nil && m.ask == nil && m.planGate == nil && len(m.snapshot.TodoList.Items) > 0
+}
+
+func (m *Model) renderInlineTaskPanel() string {
+	items := orderedTodoItems(m.snapshot.TodoList.Items)
+	desired := 1 + min(len(items), maxTaskPanelItems)
+	if len(items) > maxTaskPanelItems {
+		desired++
+	}
+	available := max(minViewportRows, m.height-m.input.Height()-fixedChromeRows-m.completionHeight())
+	rows := min(desired, max(1, available))
+	lines := []string{m.styles.Status.Render(todoSummaryLabel(items))}
+	contentRows := rows - 1
+	if contentRows <= 0 {
+		return lines[0]
+	}
+	visible := min(len(items), min(maxTaskPanelItems, contentRows))
+	showOverflow := visible < len(items)
+	if showOverflow && contentRows > 1 {
+		visible = min(visible, contentRows-1)
+	}
+	for index := 0; index < visible; index++ {
+		lines = append(lines, m.renderTaskPanelItem(items[index], "  ", m.viewportContentWidth()))
+	}
+	if showOverflow && len(lines) < rows {
+		lines = append(lines, m.styles.Muted.Render(truncateColumns("  ... "+todoOverflowLabel(items[visible:]), m.viewportContentWidth())))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func todoSummaryLabel(items []protocol.TodoItem) string {
+	done, inProgress, open, cancelled := 0, 0, 0, 0
+	for _, item := range items {
+		switch item.Status {
+		case protocol.TodoCompleted:
+			done++
+		case protocol.TodoInProgress:
+			inProgress++
+		case protocol.TodoPending:
+			open++
+		case protocol.TodoCancelled:
+			cancelled++
+		}
+	}
+	label := "tasks"
+	if len(items) == 1 {
+		label = "task"
+	}
+	summary := fmt.Sprintf("%d %s (%d done, %d in progress, %d open", len(items), label, done, inProgress, open)
+	if cancelled > 0 {
+		summary += fmt.Sprintf(", %d cancelled", cancelled)
+	}
+	return summary + ")"
+}
+
+func (m *Model) renderTaskPanel(rows int) string {
+	if rows <= 0 {
+		return ""
+	}
+	contentWidth := m.viewportContentWidth()
+	items := orderedTodoItems(m.snapshot.TodoList.Items)
+	visible := min(len(items), min(maxTaskPanelItems, rows))
+	showOverflow := visible < len(items)
+	if showOverflow && rows > 1 {
+		visible = min(visible, rows-1)
+	}
+	lines := make([]string, 0, rows)
+	for index := 0; index < visible; index++ {
+		prefix := "  "
+		if index == 0 {
+			prefix = "└ "
+		}
+		lines = append(lines, m.renderTaskPanelItem(items[index], prefix, contentWidth))
+	}
+	if showOverflow && len(lines) < rows {
+		lines = append(lines, m.styles.Muted.Render(truncateColumns("  ... "+todoOverflowLabel(items[visible:]), contentWidth)))
+	}
+	return indentBlock(strings.Join(lines, "\n"), m.viewportLeftInset())
+}
+
+func (m *Model) renderTaskPanelItem(item protocol.TodoItem, prefix string, width int) string {
+	marker := "[ ]"
+	style := m.styles.Agent
+	switch item.Status {
+	case protocol.TodoInProgress:
+		marker = "[>]"
+		style = m.styles.Accent
+	case protocol.TodoCompleted:
+		marker = "[x]"
+		style = m.styles.Active
+	case protocol.TodoCancelled:
+		marker = "[-]"
+		style = m.styles.Muted
+	}
+	plainPrefix := prefix + marker + " "
+	content := truncateColumns(item.Content, max(1, width-lipgloss.Width(plainPrefix)))
+	return m.styles.Muted.Render(prefix) + style.Render(marker+" "+content)
+}
+
+func orderedTodoItems(items []protocol.TodoItem) []protocol.TodoItem {
+	ordered := make([]protocol.TodoItem, 0, len(items))
+	for _, status := range []protocol.TodoStatus{protocol.TodoInProgress, protocol.TodoPending, protocol.TodoCancelled, protocol.TodoCompleted} {
+		for _, item := range items {
+			if item.Status == status {
+				ordered = append(ordered, item)
+			}
+		}
+	}
+	return ordered
+}
+
+func todoOverflowLabel(items []protocol.TodoItem) string {
+	pending, completed, cancelled := 0, 0, 0
+	for _, item := range items {
+		switch item.Status {
+		case protocol.TodoPending, protocol.TodoInProgress:
+			pending++
+		case protocol.TodoCompleted:
+			completed++
+		case protocol.TodoCancelled:
+			cancelled++
+		}
+	}
+	parts := make([]string, 0, 3)
+	if pending > 0 {
+		parts = append(parts, fmt.Sprintf("+%d pending", pending))
+	}
+	if completed > 0 {
+		parts = append(parts, fmt.Sprintf("+%d completed", completed))
+	}
+	if cancelled > 0 {
+		parts = append(parts, fmt.Sprintf("+%d cancelled", cancelled))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func todoProgress(list protocol.TodoList) (int, int, *protocol.TodoItem, *protocol.TodoItem) {
+	completed, total := 0, 0
+	currentIndex := -1
+	for index := range list.Items {
+		item := &list.Items[index]
+		if item.Status != protocol.TodoCancelled {
+			total++
+		}
+		if item.Status == protocol.TodoCompleted {
+			completed++
+		}
+		if currentIndex < 0 && item.Status == protocol.TodoInProgress {
+			currentIndex = index
+		}
+	}
+	if currentIndex < 0 {
+		for index := range list.Items {
+			if list.Items[index].Status == protocol.TodoPending {
+				currentIndex = index
+				break
+			}
+		}
+	}
+	var current, next *protocol.TodoItem
+	if currentIndex >= 0 {
+		current = &list.Items[currentIndex]
+	}
+	for index := range list.Items {
+		if index != currentIndex && list.Items[index].Status == protocol.TodoPending {
+			next = &list.Items[index]
+			break
+		}
+	}
+	return completed, total, current, next
 }
 
 func FormatDurationMS(milliseconds int64) string {
@@ -504,6 +720,97 @@ func (m *Model) renderContext() string {
 		fmt.Fprintf(&output, "\nProvider usage  %d input  %d output", report.LastUsage.InputTokens, report.LastUsage.OutputTokens)
 	}
 	return output.String()
+}
+
+func (m *Model) renderTasks() string {
+	var output strings.Builder
+	completed, total, _, _ := todoProgress(m.snapshot.TodoList)
+	fmt.Fprintf(&output, "%s\n%d/%d complete\n\n", m.styles.Header.Render("Tasks"), completed, total)
+	if len(m.snapshot.TodoList.Items) == 0 {
+		output.WriteString(m.styles.Muted.Render("No tasks."))
+		return output.String()
+	}
+	for _, item := range orderedTodoItems(m.snapshot.TodoList.Items) {
+		marker := "[ ]"
+		switch item.Status {
+		case protocol.TodoInProgress:
+			marker = "[>]"
+		case protocol.TodoCompleted:
+			marker = "[x]"
+		case protocol.TodoCancelled:
+			marker = "[-]"
+		}
+		fmt.Fprintf(&output, "%s %s\n", marker, wrapLimited(item.Content, max(8, m.viewportContentWidth()-4), 2))
+	}
+	return output.String()
+}
+
+func (m *Model) renderAsk(height int) string {
+	if m.ask == nil || m.ask.request == nil || len(m.ask.request.Questions) == 0 {
+		return ""
+	}
+	question := m.ask.request.Questions[m.ask.question]
+	contentWidth := max(12, m.width-4)
+	meta := fmt.Sprintf("%d/%d", m.ask.question+1, len(m.ask.request.Questions))
+	if m.ask.err != "" {
+		meta = m.ask.err
+	}
+	lines := []string{panelHeader(m.styles.Accent.Bold(true).Render(question.Header), meta, contentWidth, m.styles)}
+	if height <= 7 {
+		lines = append(lines, m.styles.Agent.Render(truncateColumns(question.Question, contentWidth)))
+		label, description := "Other", "Type a custom answer"
+		if m.ask.cursor < len(question.Options) {
+			label = question.Options[m.ask.cursor].Label
+			description = question.Options[m.ask.cursor].Description
+		}
+		lines = append(lines, m.styles.Active.Render("> "+label)+"  "+m.styles.Muted.Render(truncateColumns(description, max(8, contentWidth-lipgloss.Width(label)-4))))
+	} else {
+		lines = append(lines, m.styles.Agent.Render(wrapLimited(question.Question, contentWidth, 2)))
+		selected := m.ask.selections[question.ID]
+		for index, option := range question.Options {
+			marker := "( )"
+			if question.Multiple {
+				marker = "[ ]"
+			}
+			if selected[index] {
+				if question.Multiple {
+					marker = "[x]"
+				} else {
+					marker = "(*)"
+				}
+			}
+			cursor := "  "
+			if index == m.ask.cursor {
+				cursor = "> "
+			}
+			line := cursor + marker + " " + option.Label + "  " + m.styles.Muted.Render(option.Description)
+			lines = append(lines, truncateColumns(line, contentWidth))
+		}
+		otherMarker := "( )"
+		if question.Multiple {
+			otherMarker = "[ ]"
+		}
+		if strings.TrimSpace(m.ask.custom[question.ID]) != "" {
+			if question.Multiple {
+				otherMarker = "[x]"
+			} else {
+				otherMarker = "(*)"
+			}
+		}
+		cursor := "  "
+		if m.ask.cursor == len(question.Options) {
+			cursor = "> "
+		}
+		lines = append(lines, cursor+otherMarker+" Other  "+m.styles.Muted.Render("Type a custom answer"))
+	}
+	if m.ask.editing {
+		lines = append(lines, m.styles.Muted.Render("Custom answer"), m.ask.input.View())
+	}
+	footer := "↑/↓ select  ·  Space toggle  ·  Enter submit  ·  Tab custom  ·  ← previous  ·  Esc cancel"
+	if m.height < 18 {
+		footer = "↑/↓ select  ·  Enter submit  ·  Tab custom  ·  Esc cancel"
+	}
+	return m.renderBottomPanel(lines, footer, height)
 }
 
 func (m *Model) renderApproval(height int) string {
@@ -816,6 +1123,8 @@ func stateLabel(state OperationState) string {
 		return "Executing tool"
 	case StateAwaitingApproval:
 		return "Awaiting approval"
+	case StateAwaitingInput:
+		return "Awaiting input"
 	case StateRetryBackoff:
 		return "Retrying"
 	case StateCancelling:
@@ -845,6 +1154,8 @@ func activityLabel(state OperationState) string {
 		return "Running tool"
 	case StateAwaitingApproval:
 		return "Awaiting approval"
+	case StateAwaitingInput:
+		return "Awaiting input"
 	case StateRetryBackoff:
 		return "Retrying"
 	case StateCancelling:

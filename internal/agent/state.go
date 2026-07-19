@@ -3,7 +3,9 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
+	"unicode/utf8"
 
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
@@ -32,6 +34,7 @@ type ConversationState struct {
 	SkillCatalog    string                    `json:"skill_catalog,omitempty"`
 	ProtectedSkills []ProtectedSkill          `json:"protected_skills,omitempty"`
 	Summary         string                    `json:"summary,omitempty"`
+	TodoList        protocol.TodoList         `json:"todo_list,omitzero"`
 	OmittedTurnIDs  []string                  `json:"omitted_turn_ids,omitempty"`
 	Ledger          contextledger.LedgerState `json:"ledger"`
 }
@@ -43,7 +46,7 @@ func (c *Conversation) ExportState() ConversationState {
 		SessionID: c.sessionID, Turns: cloneTurns(c.turns), DriverState: append(json.RawMessage(nil), c.driverState...),
 		Provider:  ProviderState{Name: c.providerName, Generation: c.providerGeneration, Adapter: c.providerAdapter, BaseURL: c.providerBaseURL, Model: c.providerModel, ContextWindow: c.lastRuntime.Provider.Config.ContextWindow},
 		Workspace: c.lastRuntime.Workspace, Environment: c.environment, PermissionMode: c.permissionMode, SkillCatalog: c.skillCatalog,
-		Summary: c.summary, Ledger: c.ledger.State(),
+		Summary: c.summary, TodoList: cloneTodoList(c.todoList), Ledger: c.ledger.State(),
 	}
 	for _, name := range protectedNamesFromMap(c.protectedSkills) {
 		state.ProtectedSkills = append(state.ProtectedSkills, c.protectedSkills[name])
@@ -60,6 +63,9 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 		return nil, fmt.Errorf("session ID is required")
 	}
 	if err := validateTurns(state.Turns); err != nil {
+		return nil, err
+	}
+	if err := validateTodoListState(state.TodoList); err != nil {
 		return nil, err
 	}
 	conversation := NewConversation()
@@ -86,6 +92,7 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 		}
 	}
 	conversation.summary = state.Summary
+	conversation.todoList = cloneTodoList(state.TodoList)
 	conversation.omittedTurnIDs = make(map[string]struct{}, len(state.OmittedTurnIDs))
 	for _, id := range state.OmittedTurnIDs {
 		conversation.omittedTurnIDs[id] = struct{}{}
@@ -102,6 +109,39 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 		conversation.rebuildLedger(conversation.lastRuntime)
 	}
 	return conversation, nil
+}
+
+func cloneTodoList(list protocol.TodoList) protocol.TodoList {
+	return protocol.TodoList{Explanation: list.Explanation, Items: append([]protocol.TodoItem(nil), list.Items...)}
+}
+
+func validateTodoListState(list protocol.TodoList) error {
+	if len(list.Items) > 20 {
+		return fmt.Errorf("session todo list exceeds 20 items")
+	}
+	seen := make(map[string]struct{}, len(list.Items))
+	inProgress := 0
+	idPattern := regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	for _, item := range list.Items {
+		if !idPattern.MatchString(item.ID) || item.Content == "" || utf8.RuneCountInString(item.Content) > 200 {
+			return fmt.Errorf("session todo list contains an incomplete item")
+		}
+		if _, duplicate := seen[item.ID]; duplicate {
+			return fmt.Errorf("session todo list contains duplicate item %q", item.ID)
+		}
+		seen[item.ID] = struct{}{}
+		switch item.Status {
+		case protocol.TodoPending, protocol.TodoCompleted, protocol.TodoCancelled:
+		case protocol.TodoInProgress:
+			inProgress++
+		default:
+			return fmt.Errorf("session todo item %q has invalid status %q", item.ID, item.Status)
+		}
+	}
+	if inProgress > 1 {
+		return fmt.Errorf("session todo list contains multiple in_progress items")
+	}
+	return nil
 }
 
 func configForState(state ProviderState) config.ProviderConfig {

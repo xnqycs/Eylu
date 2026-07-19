@@ -24,6 +24,12 @@ type ParallelSafe interface {
 	ParallelSafe() bool
 }
 
+// ExecutorTimeoutPolicy lets interactive tools rely on the parent request
+// context instead of the per-tool execution deadline.
+type ExecutorTimeoutPolicy interface {
+	UseExecutorTimeout() bool
+}
+
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool

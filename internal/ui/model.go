@@ -29,6 +29,7 @@ const (
 	screenModels       screenKind = "models"
 	screenSkills       screenKind = "skills"
 	screenContext      screenKind = "context"
+	screenTasks        screenKind = "tasks"
 	screenToolDetail   screenKind = "tool_detail"
 )
 
@@ -73,6 +74,7 @@ type toolView struct {
 	truncated            bool
 	durationMS           int64
 	exitCode             int
+	todoList             *protocol.TodoList
 }
 
 const approvedPlanImplementationPrompt = "Implement the approved plan now. Follow the plan already present in this conversation, inspect current files before editing, and run the relevant verification."
@@ -81,6 +83,28 @@ type planGateState struct {
 	cursor   int
 	feedback textinput.Model
 	editing  bool
+}
+
+type askState struct {
+	request    *AskRequest
+	question   int
+	cursor     int
+	selections map[string]map[int]bool
+	custom     map[string]string
+	input      textinput.Model
+	editing    bool
+	err        string
+}
+
+func newAskState(request *AskRequest, width int) *askState {
+	input := textinput.New()
+	input.Placeholder = "Type a custom answer"
+	input.CharLimit = 1 << 12
+	input.SetVirtualCursor(true)
+	input.SetWidth(max(20, width-8))
+	return &askState{
+		request: request, selections: make(map[string]map[int]bool), custom: make(map[string]string), input: input,
+	}
 }
 
 func newPlanGate(width int) *planGateState {
@@ -123,6 +147,7 @@ type Model struct {
 	approval                   *ApprovalRequest
 	approvalCursor             int
 	approvalEditing            bool
+	ask                        *askState
 	planGate                   *planGateState
 	pendingImplementationMode  string
 	restorePlanGateOnModeError bool
@@ -370,6 +395,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancel = nil
 			m.cancelRequested = false
 			m.eventChannel = nil
+			m.ask = nil
 			if m.state == StateFailed && strings.TrimSpace(m.input.Value()) == "" && m.draft != "" {
 				m.input.SetValue(m.draft)
 				m.input.MoveToEnd()
@@ -438,6 +464,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case interruptRequestMsg:
 		return m.handleInterrupt()
 	case tea.PasteMsg:
+		if m.ask != nil && m.ask.editing {
+			updated, command := m.ask.input.Update(message)
+			m.ask.input = updated
+			return m, command
+		}
 		if m.approval != nil && m.approvalEditing {
 			updated, command := m.approvalReason.Update(message)
 			m.approvalReason = updated
@@ -514,6 +545,9 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		}
 	case EventToolResult:
 		if event.ToolResult != nil {
+			if event.ToolResult.TodoList != nil && !event.ToolResult.IsError {
+				m.snapshot.TodoList = cloneUITodoList(*event.ToolResult.TodoList)
+			}
 			m.completeTool(event.ToolResult)
 			m.state = StateWaitingFirstToken
 			command = m.transitionAfter(m.operationID, StateWaitingFirstToken)
@@ -528,6 +562,9 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		m.approvalEditing = false
 		m.approvalReason.Reset()
 		m.state = StateAwaitingApproval
+	case EventAsk:
+		m.ask = newAskState(event.Ask, m.width)
+		m.state = StateAwaitingInput
 	case EventContext:
 		if event.Context != nil {
 			m.snapshot.Context = *event.Context
@@ -549,7 +586,7 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		m.appendNotice(event.Notice, event.Error)
 	}
 	m.refreshViewport()
-	if m.eventChannel != nil && event.Kind != EventApproval {
+	if m.eventChannel != nil && event.Kind != EventApproval && event.Kind != EventAsk {
 		command = tea.Batch(command, waitEventCmd(m.operationID, m.eventChannel))
 	}
 	return m, command
@@ -560,6 +597,14 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.clearSelection()
 	if key == "ctrl+c" {
 		return m.handleInterrupt()
+	}
+	if m.ask != nil {
+		if m.ask.editing && key != "enter" && key != "esc" && key != "tab" {
+			updated, command := m.ask.input.Update(message)
+			m.ask.input = updated
+			return m, command
+		}
+		return m.handleAskKey(key)
 	}
 	if m.approval != nil {
 		if m.approvalEditing && key != "enter" && key != "esc" && key != "tab" {
@@ -593,6 +638,15 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.contextExpand = !m.contextExpand
 		}
 		return m, nil
+	case screenTasks:
+		if key == "esc" {
+			m.screen = screenChat
+			m.refreshViewport()
+			return m, nil
+		}
+		updated, command := m.viewport.Update(message)
+		m.viewport = updated
+		return m, command
 	case screenToolDetail:
 		if key == "esc" {
 			m.screen = screenChat
@@ -608,6 +662,10 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleInterrupt() (tea.Model, tea.Cmd) {
 	if m.busy() && !m.cancelRequested {
+		var resume tea.Cmd
+		if m.ask != nil {
+			resume = m.sendAskDecision(AskDecision{Cancelled: true})
+		}
 		m.cancelRequested = true
 		m.state = StateCancelling
 		if m.cancel != nil {
@@ -615,7 +673,7 @@ func (m *Model) handleInterrupt() (tea.Model, tea.Cmd) {
 		}
 		m.appendNotice("Cancellation requested.", false)
 		m.refreshViewport()
-		return m, nil
+		return m, resume
 	}
 	return m, tea.Quit
 }
@@ -731,6 +789,10 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 	case "/context":
 		m.screen = screenContext
 		return m, m.loadSnapshotCmd()
+	case "/tasks":
+		m.screen = screenTasks
+		m.refreshViewport()
+		return m, m.loadSnapshotCmd()
 	case "/skills":
 		m.screen = screenSkills
 		return m, m.loadSnapshotCmd()
@@ -759,7 +821,7 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 			return m.requestMode(fields[1])
 		}
 	case "/help":
-		m.appendNotice("/new /context /skills /skill /providers /provider /model /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
+		m.appendNotice("/new /tasks /context /skills /skill /providers /provider /model /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
 		m.refreshViewport()
 		return m, nil
 	}
@@ -859,6 +921,182 @@ func (m *Model) submitApproval(decision ApprovalDecision) tea.Cmd {
 	return waitEventCmd(m.operationID, m.eventChannel)
 }
 
+func (m *Model) handleAskKey(key string) (tea.Model, tea.Cmd) {
+	if m.ask == nil || m.ask.request == nil || len(m.ask.request.Questions) == 0 {
+		return m, nil
+	}
+	question := m.ask.request.Questions[m.ask.question]
+	if m.ask.editing {
+		switch strings.ToLower(key) {
+		case "enter":
+			value := strings.TrimSpace(m.ask.input.Value())
+			if value == "" {
+				m.ask.err = "Custom answer is required."
+				return m, nil
+			}
+			m.ask.custom[question.ID] = value
+			m.ask.editing = false
+			m.ask.input.Blur()
+			return m.advanceAsk()
+		case "tab":
+			m.ask.custom[question.ID] = strings.TrimSpace(m.ask.input.Value())
+			m.ask.editing = false
+			m.ask.input.Blur()
+			return m, nil
+		case "esc":
+			return m.cancelAsk()
+		default:
+			return m, nil
+		}
+	}
+	optionCount := len(question.Options) + 1
+	switch strings.ToLower(key) {
+	case "up":
+		m.ask.cursor = max(0, m.ask.cursor-1)
+	case "down":
+		m.ask.cursor = min(optionCount-1, m.ask.cursor+1)
+	case "left":
+		if m.ask.question > 0 {
+			m.ask.question--
+			m.restoreAskCursor()
+		}
+	case "right":
+		if m.ask.question+1 < len(m.ask.request.Questions) && m.askQuestionAnswered(question) {
+			m.ask.question++
+			m.restoreAskCursor()
+		}
+	case "tab":
+		if !question.Multiple {
+			m.ask.selections[question.ID] = make(map[int]bool)
+		}
+		m.ask.cursor = len(question.Options)
+		m.ask.input.SetValue(m.ask.custom[question.ID])
+		m.ask.input.CursorEnd()
+		m.ask.editing = true
+		m.ask.err = ""
+		return m, m.ask.input.Focus()
+	case "space":
+		if m.ask.cursor == len(question.Options) {
+			m.ask.input.SetValue(m.ask.custom[question.ID])
+			m.ask.input.CursorEnd()
+			m.ask.editing = true
+			m.ask.err = ""
+			return m, m.ask.input.Focus()
+		}
+		if question.Multiple {
+			selected := m.selectionsFor(question.ID)
+			selected[m.ask.cursor] = !selected[m.ask.cursor]
+			m.ask.err = ""
+		}
+	case "enter":
+		if m.ask.cursor == len(question.Options) {
+			m.ask.input.SetValue(m.ask.custom[question.ID])
+			m.ask.input.CursorEnd()
+			m.ask.editing = true
+			m.ask.err = ""
+			return m, m.ask.input.Focus()
+		}
+		selected := m.selectionsFor(question.ID)
+		if question.Multiple {
+			if len(m.askAnswers(question)) == 0 {
+				m.ask.err = "Select at least one answer."
+				return m, nil
+			}
+		} else {
+			clear(selected)
+			selected[m.ask.cursor] = true
+			delete(m.ask.custom, question.ID)
+		}
+		return m.advanceAsk()
+	case "esc":
+		return m.cancelAsk()
+	}
+	return m, nil
+}
+
+func (m *Model) selectionsFor(id string) map[int]bool {
+	selected := m.ask.selections[id]
+	if selected == nil {
+		selected = make(map[int]bool)
+		m.ask.selections[id] = selected
+	}
+	return selected
+}
+
+func (m *Model) askQuestionAnswered(question protocol.AskQuestion) bool {
+	return len(m.askAnswers(question)) > 0
+}
+
+func (m *Model) askAnswers(question protocol.AskQuestion) []string {
+	answers := make([]string, 0, len(question.Options)+1)
+	selected := m.ask.selections[question.ID]
+	for index, option := range question.Options {
+		if selected[index] {
+			answers = append(answers, option.Label)
+		}
+	}
+	if custom := strings.TrimSpace(m.ask.custom[question.ID]); custom != "" {
+		answers = append(answers, custom)
+	}
+	return answers
+}
+
+func (m *Model) advanceAsk() (tea.Model, tea.Cmd) {
+	question := m.ask.request.Questions[m.ask.question]
+	if len(m.askAnswers(question)) == 0 {
+		m.ask.err = "Select at least one answer."
+		return m, nil
+	}
+	if m.ask.question+1 < len(m.ask.request.Questions) {
+		m.ask.question++
+		m.restoreAskCursor()
+		return m, nil
+	}
+	answers := make(map[string][]string, len(m.ask.request.Questions))
+	for _, item := range m.ask.request.Questions {
+		values := m.askAnswers(item)
+		if len(values) == 0 {
+			m.ask.err = "Answer every question before submitting."
+			return m, nil
+		}
+		answers[item.ID] = values
+	}
+	return m, m.sendAskDecision(AskDecision{Answers: answers})
+}
+
+func (m *Model) restoreAskCursor() {
+	question := m.ask.request.Questions[m.ask.question]
+	m.ask.cursor = 0
+	for index := range question.Options {
+		if m.ask.selections[question.ID][index] {
+			m.ask.cursor = index
+			break
+		}
+	}
+	if strings.TrimSpace(m.ask.custom[question.ID]) != "" && len(m.ask.selections[question.ID]) == 0 {
+		m.ask.cursor = len(question.Options)
+	}
+	m.ask.err = ""
+}
+
+func (m *Model) cancelAsk() (tea.Model, tea.Cmd) {
+	return m, m.sendAskDecision(AskDecision{Cancelled: true})
+}
+
+func (m *Model) sendAskDecision(decision AskDecision) tea.Cmd {
+	if m.ask == nil || m.ask.request == nil {
+		return nil
+	}
+	select {
+	case m.ask.request.Response <- decision:
+	default:
+	}
+	m.ask.input.Blur()
+	m.ask = nil
+	m.state = StateExecutingTool
+	return waitEventCmd(m.operationID, m.eventChannel)
+}
+
 func (m *Model) handlePlanGateKey(key string) (tea.Model, tea.Cmd) {
 	if m.planGate == nil {
 		return m, nil
@@ -920,7 +1158,7 @@ func (m *Model) handlePlanGateKey(key string) (tea.Model, tea.Cmd) {
 
 func (m *Model) busy() bool {
 	switch m.state {
-	case StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateAwaitingApproval, StateRetryBackoff, StateCancelling:
+	case StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateAwaitingApproval, StateAwaitingInput, StateRetryBackoff, StateCancelling:
 		return true
 	default:
 		return false
@@ -1030,6 +1268,10 @@ func (m *Model) completeTool(result *protocol.ToolResult) {
 			item.tool.content = result.Content
 			item.tool.isError = result.IsError
 			item.tool.truncated = result.Truncated
+			if result.TodoList != nil {
+				list := cloneUITodoList(*result.TodoList)
+				item.tool.todoList = &list
+			}
 			if path, ok := result.Metadata["path"].(string); ok && item.tool.path == "" {
 				item.tool.path = path
 			}
@@ -1042,6 +1284,10 @@ func (m *Model) completeTool(result *protocol.ToolResult) {
 			return
 		}
 	}
+}
+
+func cloneUITodoList(list protocol.TodoList) protocol.TodoList {
+	return protocol.TodoList{Explanation: list.Explanation, Items: append([]protocol.TodoItem(nil), list.Items...)}
 }
 
 func (m *Model) applyToolCallDelta(update protocol.ToolCallDelta) {

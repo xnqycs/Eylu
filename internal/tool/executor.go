@@ -79,7 +79,7 @@ func (e *Executor) Definitions() []protocol.ToolDefinition {
 	definitions := e.Registry.Definitions()
 	for index := range definitions {
 		item, ok := e.Registry.Get(definitions[index].Name)
-		if ok && item.Risk() != policy.RiskRead {
+		if ok && item.Risk() != policy.RiskRead && item.Risk() != policy.RiskSession {
 			definitions[index] = withApprovalReason(definitions[index])
 		}
 	}
@@ -244,11 +244,19 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 		}
 		record.Confirmed = true
 	}
-	timeout := e.Timeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
+	toolCtx := ctx
+	cancel := func() {}
+	useTimeout := true
+	if timeoutPolicy, ok := item.(ExecutorTimeoutPolicy); ok {
+		useTimeout = timeoutPolicy.UseExecutorTimeout()
 	}
-	toolCtx, cancel := context.WithTimeout(ctx, timeout)
+	if useTimeout {
+		timeout := e.Timeout
+		if timeout <= 0 {
+			timeout = 60 * time.Second
+		}
+		toolCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
 	defer cancel()
 	executionInput := call.Arguments
 	if !schemaHasProperty(item.Definition().InputSchema, "reason") {
@@ -256,7 +264,7 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 	}
 	result = item.Execute(toolCtx, executionInput)
 	result.CallID = call.ID
-	if toolCtx.Err() == context.DeadlineExceeded {
+	if useTimeout && toolCtx.Err() == context.DeadlineExceeded {
 		result.IsError = true
 		result.Content = "tool execution timed out"
 	} else if toolCtx.Err() == context.Canceled {

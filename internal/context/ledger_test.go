@@ -40,7 +40,14 @@ func TestLedgerKnownWindowPercentage(t *testing.T) {
 	if report.Percent != 50 || report.LimitSource != "provider_config" {
 		t.Fatalf("report = %#v", report)
 	}
-	if !report.LimitKnown || report.TotalTokens != 100 || report.Categories[9].Measurement != "estimated" {
+	var userMessages CategoryUsage
+	for _, category := range report.Categories {
+		if category.Category == CategoryUserMessage {
+			userMessages = category
+			break
+		}
+	}
+	if !report.LimitKnown || report.TotalTokens != 100 || userMessages.Measurement != "estimated" {
 		t.Fatalf("stable report fields = %#v", report)
 	}
 }

@@ -14,6 +14,7 @@ type Category string
 
 const (
 	CategorySystemPrompt      Category = "system_prompt"
+	CategoryTaskState         Category = "task_state"
 	CategorySkillCatalog      Category = "skill_catalog"
 	CategorySkillBody         Category = "skill_body"
 	CategorySkillResource     Category = "skill_resource"
@@ -33,6 +34,7 @@ const (
 
 var categoryOrder = []Category{
 	CategorySystemPrompt,
+	CategoryTaskState,
 	CategorySkillCatalog,
 	CategorySkillBody,
 	CategorySkillResource,
@@ -52,6 +54,7 @@ var categoryOrder = []Category{
 
 var categoryLabels = map[Category]string{
 	CategorySystemPrompt:      "System prompt",
+	CategoryTaskState:         "Task state",
 	CategorySkillCatalog:      "Skill catalog",
 	CategorySkillBody:         "Skill body",
 	CategorySkillResource:     "Skill resources",

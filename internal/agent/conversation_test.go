@@ -187,7 +187,7 @@ func TestPlanProfileForksContextFiltersToolsAndAdoptsFinalResult(t *testing.T) {
 	}
 
 	profile := ProfileForMode("plan")
-	if !profile.Isolated || profile.Model != ModelInherit || !profile.AllowsTool("read_file", policy.RiskRead) || !profile.AllowsTool("bash", policy.RiskExec) || profile.AllowsTool("write_file", policy.RiskWrite) {
+	if !profile.Isolated || profile.Model != ModelInherit || !profile.AllowsTool("read_file", policy.RiskRead) || !profile.AllowsTool("bash", policy.RiskExec) || !profile.AllowsTool("ask", policy.RiskSession) || profile.AllowsTool("todolist", policy.RiskSession) || profile.AllowsTool("write_file", policy.RiskWrite) {
 		t.Fatalf("plan profile = %#v", profile)
 	}
 	fork, err := conversation.Fork(profile)

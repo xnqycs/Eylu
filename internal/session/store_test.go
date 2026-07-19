@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -83,6 +84,45 @@ func TestStoreReplaysEnvironmentFromCreationAndRuntimeEvents(t *testing.T) {
 	replayed, _, err = store.Load("environment")
 	if err != nil || replayed.Environment != updated {
 		t.Fatalf("updated environment = %#v, error = %v", replayed.Environment, err)
+	}
+}
+
+func TestStoreReplaysAndClearsTodoListFromContextEvents(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root)
+	createTestSession(t, store, "todos", root)
+	todos := protocol.TodoList{Explanation: "work", Items: []protocol.TodoItem{{ID: "implement", Content: "Implement tools", Status: protocol.TodoInProgress}}}
+	if _, err := store.Append("todos", []Event{{Type: EventContextUpdated, TodoList: &todos}}); err != nil {
+		t.Fatal(err)
+	}
+	replayed, _, err := store.Load("todos")
+	if err != nil || len(replayed.TodoList.Items) != 1 || replayed.TodoList.Items[0].ID != "implement" {
+		t.Fatalf("replayed=%#v err=%v", replayed.TodoList, err)
+	}
+	cleared := protocol.TodoList{Items: []protocol.TodoItem{}}
+	if _, err := store.Append("todos", []Event{{Type: EventContextUpdated, TodoList: &cleared}}); err != nil {
+		t.Fatal(err)
+	}
+	replayed, _, err = store.Load("todos")
+	if err != nil || len(replayed.TodoList.Items) != 0 {
+		t.Fatalf("cleared=%#v err=%v", replayed.TodoList, err)
+	}
+}
+
+func TestSnapshotTodoListIsOptionalForSchemaVersionOne(t *testing.T) {
+	encoded, err := json.Marshal(Snapshot{Version: SchemaVersion, SessionID: "legacy-v1", TodoList: protocol.TodoList{Items: []protocol.TodoItem{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(`"todo_list"`)) {
+		t.Fatalf("empty todo list was serialized: %s", encoded)
+	}
+	var restored Snapshot
+	if err := json.Unmarshal([]byte(`{"version":1,"session_id":"legacy-v1"}`), &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Version != SchemaVersion || len(restored.TodoList.Items) != 0 {
+		t.Fatalf("restored=%#v", restored)
 	}
 }
 

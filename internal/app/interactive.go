@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,9 +18,15 @@ import (
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
+	"Eylu/internal/tool"
 )
 
 var errQuit = errors.New("quit")
+
+type inputLineResult struct {
+	line string
+	err  error
+}
 
 func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 	manager, err := r.prepareManager(ctx, opts)
@@ -39,7 +46,7 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 	fmt.Fprintf(r.stdout, "Eylu session %s\nType /help for commands.\n", conversation.SessionID())
 	for {
 		fmt.Fprint(r.stdout, "> ")
-		line, readErr := reader.ReadString('\n')
+		line, readErr := r.readInteractiveLine(ctx, reader)
 		line = strings.TrimSpace(line)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return readErr
@@ -104,7 +111,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	command := fields[0]
 	switch command {
 	case "/help":
-		fmt.Fprintln(r.stdout, "/new  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /mode manual|plan|auto|full  /quit")
+		fmt.Fprintln(r.stdout, "/new  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /mode manual|plan|auto|full  /quit")
 		return nil
 	case "/quit":
 		return errQuit
@@ -117,6 +124,9 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		return nil
 	case "/context":
 		return contextledger.RenderText(r.stdout, conversation.ContextReport())
+	case "/tasks":
+		renderTodoListText(r.stdout, conversation.TodoList())
+		return nil
 	case "/providers":
 		r.printProviders(manager)
 		return nil
@@ -167,6 +177,133 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		return nil
 	default:
 		return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("unknown command %s", command)}
+	}
+}
+
+func (r *runtime) askUser(ctx context.Context, request protocol.AskRequest) (protocol.AskResponse, error) {
+	reader := r.inputReader
+	if reader == nil {
+		reader = bufio.NewReader(r.stdin)
+	}
+	response := protocol.AskResponse{Answers: make(map[string][]string, len(request.Questions))}
+	for index, question := range request.Questions {
+		fmt.Fprintf(r.stderr, "\n[%d/%d] %s\n%s\n", index+1, len(request.Questions), question.Header, question.Question)
+		for optionIndex, option := range question.Options {
+			fmt.Fprintf(r.stderr, "  %d. %s - %s\n", optionIndex+1, option.Label, option.Description)
+		}
+		fmt.Fprintln(r.stderr, "  o. Other - Enter a custom answer")
+		for {
+			if err := ctx.Err(); err != nil {
+				return protocol.AskResponse{}, err
+			}
+			if question.Multiple {
+				fmt.Fprint(r.stderr, "Select one or more choices (comma-separated): ")
+			} else {
+				fmt.Fprint(r.stderr, "Select one choice: ")
+			}
+			line, err := r.readInteractiveLine(ctx, reader)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return protocol.AskResponse{}, err
+			}
+			answers, custom, valid := parseAskSelection(strings.TrimSpace(line), question)
+			if valid && custom {
+				fmt.Fprint(r.stderr, "Custom answer: ")
+				customValue, customErr := r.readInteractiveLine(ctx, reader)
+				if customErr != nil && !errors.Is(customErr, io.EOF) {
+					return protocol.AskResponse{}, customErr
+				}
+				customValue = strings.TrimSpace(customValue)
+				if customValue == "" {
+					valid = false
+				} else {
+					answers = append(answers, customValue)
+				}
+			}
+			if valid && len(answers) > 0 {
+				response.Answers[question.ID] = answers
+				break
+			}
+			if errors.Is(err, io.EOF) {
+				return protocol.AskResponse{}, tool.ErrAskDismissed
+			}
+			fmt.Fprintln(r.stderr, "Invalid selection. Try again.")
+		}
+	}
+	return response, nil
+}
+
+func (r *runtime) readInteractiveLine(ctx context.Context, reader *bufio.Reader) (string, error) {
+	r.inputMu.Lock()
+	pending := r.inputRead
+	if pending == nil {
+		pending = make(chan inputLineResult, 1)
+		r.inputRead = pending
+		go func() {
+			line, err := reader.ReadString('\n')
+			pending <- inputLineResult{line: line, err: err}
+		}()
+	}
+	r.inputMu.Unlock()
+
+	select {
+	case result := <-pending:
+		r.inputMu.Lock()
+		if r.inputRead == pending {
+			r.inputRead = nil
+		}
+		r.inputMu.Unlock()
+		return result.line, result.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func parseAskSelection(value string, question protocol.AskQuestion) ([]string, bool, bool) {
+	parts := strings.Split(value, ",")
+	if !question.Multiple && len(parts) != 1 {
+		return nil, false, false
+	}
+	answers := make([]string, 0, len(parts))
+	seen := make(map[int]struct{}, len(parts))
+	custom := false
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.EqualFold(part, "o") {
+			if custom {
+				return nil, false, false
+			}
+			custom = true
+			continue
+		}
+		selected, err := strconv.Atoi(part)
+		if err != nil || selected < 1 || selected > len(question.Options) {
+			return nil, false, false
+		}
+		if _, duplicate := seen[selected]; duplicate {
+			return nil, false, false
+		}
+		seen[selected] = struct{}{}
+		answers = append(answers, question.Options[selected-1].Label)
+	}
+	return answers, custom, true
+}
+
+func renderTodoListText(writer io.Writer, list protocol.TodoList) {
+	if len(list.Items) == 0 {
+		fmt.Fprintln(writer, "No tasks.")
+		return
+	}
+	for _, item := range list.Items {
+		marker := "[ ]"
+		switch item.Status {
+		case protocol.TodoInProgress:
+			marker = "[>]"
+		case protocol.TodoCompleted:
+			marker = "[x]"
+		case protocol.TodoCancelled:
+			marker = "[-]"
+		}
+		fmt.Fprintf(writer, "%s %s\n", marker, item.Content)
 	}
 }
 

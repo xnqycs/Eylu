@@ -104,6 +104,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 					interrupted = true
 				}
 				c.captureSkillResult(result)
+				c.captureTodoListResult(result)
 				toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
 				if emit != nil {
 					if err := emit(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &result}); err != nil {
@@ -124,6 +125,13 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 	}
 	return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("agent iteration limit exceeded (%d)", maxTurns)}
+}
+
+func (c *Conversation) captureTodoListResult(result protocol.ToolResult) {
+	if result.IsError || result.TodoList == nil {
+		return
+	}
+	c.todoList = cloneTodoList(*result.TodoList)
 }
 
 func toolCalls(turn protocol.Turn) []protocol.ToolCall {

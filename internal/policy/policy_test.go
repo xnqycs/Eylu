@@ -16,6 +16,7 @@ func TestPermissionModeRiskMatrix(t *testing.T) {
 		class         CommandClass
 	}{
 		{name: "manual read", mode: ModeManual, request: Request{Tool: "read_file", Risk: RiskRead}, decision: DecisionAllow, class: CommandNotApplicable},
+		{name: "manual session", mode: ModeManual, request: Request{Tool: "todolist", Risk: RiskSession}, decision: DecisionAllow, class: CommandNotApplicable},
 		{name: "manual write", mode: ModeManual, request: Request{Tool: "edit_file", Risk: RiskWrite}, decision: DecisionConfirm, confirmations: 1, class: CommandNotApplicable},
 		{name: "manual dangerous", mode: ModeManual, request: bashRequest("git reset --hard HEAD"), decision: DecisionConfirm, confirmations: 2, class: CommandDangerous},
 		{name: "plan write", mode: ModePlan, request: Request{Tool: "write_file", Risk: RiskWrite}, decision: DecisionDeny, class: CommandNotApplicable},

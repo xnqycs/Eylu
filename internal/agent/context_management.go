@@ -135,6 +135,9 @@ func (c *Conversation) buildPromptContext(runtime Runtime, definitions []protoco
 		protected := c.protectedSkills[name]
 		builder.AddTextTurn("skill:"+name+":"+protected.Digest, protocol.RoleSystem, protected.Content, contextledger.CategorySkillBody, name+":"+protected.Digest, true, map[string]any{"name": name, "source": protected.Source, "digest": protected.Digest})
 	}
+	if len(c.todoList.Items) > 0 {
+		builder.AddTextTurn("task-list", protocol.RoleSystem, formatTodoListContext(c.todoList), contextledger.CategoryTaskState, "session", true, nil)
+	}
 	if c.projectMap != "" {
 		builder.AddTextTurn("project-map", protocol.RoleSystem, c.projectMap, contextledger.CategoryProjectContext, runtime.Workspace, true, nil)
 	}
@@ -374,7 +377,14 @@ func (c *Conversation) buildSummary(limit int) string {
 	writeSummaryItems(&output, goals, "No earlier user goal was compressed.")
 	output.WriteString("Completed modifications and decisions:\n")
 	writeSummaryItems(&output, append(completed, notes...), "No completed modification was recorded.")
-	output.WriteString("Unfinished tasks:\n- Continue the latest retained user goal and pending tool workflow.\n")
+	unfinished := make([]string, 0)
+	for _, item := range c.todoList.Items {
+		if item.Status == protocol.TodoPending || item.Status == protocol.TodoInProgress {
+			unfinished = append(unfinished, fmt.Sprintf("[%s] %s", item.Status, item.Content))
+		}
+	}
+	output.WriteString("Unfinished tasks:\n")
+	writeSummaryItems(&output, unfinished, "Continue the latest retained user goal and pending tool workflow.")
 	output.WriteString("Failed attempts:\n")
 	writeSummaryItems(&output, failures, "No failed attempt was recorded.")
 	output.WriteString("Validation results:\n")
@@ -389,6 +399,11 @@ func (c *Conversation) buildSummary(limit int) string {
 	}
 	output.WriteString("</conversation_summary>")
 	return truncateSummary(output.String(), limit)
+}
+
+func formatTodoListContext(list protocol.TodoList) string {
+	encoded, _ := json.Marshal(list)
+	return "Current session task state. Keep it aligned with execution by calling todolist when task status changes.\n<task_list>\n" + string(encoded) + "\n</task_list>"
 }
 
 func appendUnique(items []string, value string, limit int) []string {

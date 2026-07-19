@@ -108,6 +108,7 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 		{label: "/quit", description: "Exit Eylu", insert: "/quit"},
 		{label: "/skill", description: "Activate an Agent Skill", insert: "/skill "},
 		{label: "/skills", description: "Browse Agent Skills", insert: "/skills"},
+		{label: "/tasks", description: "Inspect the current task list", insert: "/tasks"},
 	}
 	lower := strings.ToLower(value)
 	switch {
@@ -297,7 +298,7 @@ func (m *Model) completionHeight() int {
 	if m.completion.kind == completionNone {
 		return 0
 	}
-	available := max(0, m.height-m.input.Height()-fixedChromeRows-minViewportRows)
+	available := max(0, m.height-m.input.Height()-fixedChromeRows-minViewportRows-m.taskPanelRows())
 	return min(len(m.completion.items), min(maxCompletionRows, available))
 }
 

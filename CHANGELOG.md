@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- 增加内置 `todolist`：完整替换并校验 session 任务清单，类型化结果进入 Agent 上下文、受保护的 `Task state` 账本分类、压缩摘要和 schema v1 session 快照；`/new` 清空清单。
+- TUI 增加双态任务树：请求运行时显示在 activity 行下方，完成或恢复后以状态摘要紧接最后一条历史内容并随 viewport 滚动。最多显示 5 个任务并用英文状态计数折叠其余项目；进行中项优先、completed 项后置。`todolist` 卡片从历史区隐藏，`/tasks` 与 `Ctrl-T` 保留全量清单和工具详情。
+- Markdown 内联代码改为仅使用 Eylu 主题强调色文字，移除背景填充。
+- 增加内置 `ask`：TUI 底部工作台支持 1 至 5 题、单选、多选、自定义答案、翻页、paste 与取消；`--no-tui` 文本 TTY 提供编号选择。Plan Agent 可提问，JSON、JSONL 与管道模式保持无阻塞。
+- 工具执行器增加可选超时策略；普通工具继续使用 `tool_timeout_sec`，`ask` 直接跟随父请求 context，用户回答、取消或请求结束后释放等待通道。
 - Provider API Key 改为与 `base_url` 同表的 `api_key` 明文字段；移除凭据引用、系统凭据库实现及对应依赖，配置 Key 继续从 JSON/session 状态中排除并参与日志脱敏。
 - workspace 从配置 schema 迁移为 `--workspace > EYLU_WORKSPACE > cwd` 运行时上下文；新 session 将 OS、日期和 Git 状态快照注入 system prompt 并持久化，旧 session 首次恢复时自动补采并清除旧 DriverState。
 - TUI 历史区增加按显示列拖选、跨 viewport 滚轮扩展、系统剪贴板自动复制与短时状态提示；选区稳定覆盖 ANSI/OSC 与中文宽字符。输入框增加 1 至 8 行动态高度及 `Shift+Enter`/`Ctrl+Enter` 换行，并统一修正原生光标坐标。

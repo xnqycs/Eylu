@@ -54,12 +54,58 @@ type ToolCallDelta struct {
 	Done        bool   `json:"done,omitempty"`
 }
 
+type TodoStatus string
+
+const (
+	TodoPending    TodoStatus = "pending"
+	TodoInProgress TodoStatus = "in_progress"
+	TodoCompleted  TodoStatus = "completed"
+	TodoCancelled  TodoStatus = "cancelled"
+)
+
+type TodoItem struct {
+	ID      string     `json:"id"`
+	Content string     `json:"content"`
+	Status  TodoStatus `json:"status"`
+}
+
+type TodoList struct {
+	Explanation string     `json:"explanation,omitempty"`
+	Items       []TodoItem `json:"items"`
+}
+
+func (list TodoList) IsZero() bool {
+	return list.Explanation == "" && len(list.Items) == 0
+}
+
+type AskOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+type AskQuestion struct {
+	ID       string      `json:"id"`
+	Header   string      `json:"header"`
+	Question string      `json:"question"`
+	Multiple bool        `json:"multiple,omitempty"`
+	Options  []AskOption `json:"options"`
+}
+
+type AskRequest struct {
+	Questions []AskQuestion `json:"questions"`
+}
+
+type AskResponse struct {
+	Answers map[string][]string `json:"answers"`
+}
+
 type ToolResult struct {
 	CallID    string         `json:"call_id"`
 	Content   string         `json:"content"`
 	IsError   bool           `json:"is_error,omitempty"`
 	Truncated bool           `json:"truncated,omitempty"`
 	Metadata  map[string]any `json:"metadata,omitempty"`
+	TodoList  *TodoList      `json:"todo_list,omitempty"`
 }
 
 type ToolDefinition struct {

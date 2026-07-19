@@ -23,6 +23,7 @@ const (
 	StatePreparingTool     OperationState = "preparing_tool"
 	StateExecutingTool     OperationState = "executing_tool"
 	StateAwaitingApproval  OperationState = "awaiting_approval"
+	StateAwaitingInput     OperationState = "awaiting_input"
 	StateRetryBackoff      OperationState = "retry_backoff"
 	StateCancelling        OperationState = "cancelling"
 	StateCancelled         OperationState = "cancelled"
@@ -45,6 +46,7 @@ const (
 	EventToolResult     EventKind = "tool_result"
 	EventToolAudit      EventKind = "tool_audit"
 	EventApproval       EventKind = "approval"
+	EventAsk            EventKind = "ask"
 	EventContext        EventKind = "context"
 	EventUsage          EventKind = "usage"
 	EventNotice         EventKind = "notice"
@@ -69,6 +71,7 @@ type Event struct {
 	ToolResult    *protocol.ToolResult    `json:"tool_result,omitempty"`
 	ToolAudit     *ToolAudit              `json:"tool_audit,omitempty"`
 	Approval      *ApprovalRequest        `json:"-"`
+	Ask           *AskRequest             `json:"-"`
 	Context       *contextledger.Report   `json:"context,omitempty"`
 	Usage         *protocol.Usage         `json:"usage,omitempty"`
 	Notice        string                  `json:"notice,omitempty"`
@@ -99,6 +102,16 @@ type ApprovalRequest struct {
 type ApprovalDecision struct {
 	Approved bool
 	Reason   string
+}
+
+type AskRequest struct {
+	Questions []protocol.AskQuestion
+	Response  chan AskDecision
+}
+
+type AskDecision struct {
+	Answers   map[string][]string
+	Cancelled bool
 }
 
 type ProviderItem struct {
@@ -151,6 +164,7 @@ type Snapshot struct {
 	Context   contextledger.Report `json:"context"`
 	Providers []ProviderItem       `json:"providers"`
 	Skills    []SkillItem          `json:"skills"`
+	TodoList  protocol.TodoList    `json:"todo_list,omitzero"`
 }
 
 type ProviderForm struct {

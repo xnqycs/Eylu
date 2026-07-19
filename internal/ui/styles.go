@@ -18,7 +18,6 @@ const (
 	eyluBorderColor       = "#344A50"
 	eyluSelectionColor    = "#83D6CD"
 	eyluSelectionInkColor = "#071315"
-	eyluCodeSurfaceColor  = "#182529"
 )
 
 type Styles struct {
@@ -81,8 +80,8 @@ func eyluMarkdownStyle() glamouransi.StyleConfig {
 	style.HorizontalRule.Color = stringPointer(eyluBorderColor)
 	style.Link.Color = stringPointer(eyluActivityColor)
 	style.LinkText.Color = stringPointer(eyluAccentColor)
-	style.Code.Color = stringPointer(eyluWarningColor)
-	style.Code.BackgroundColor = stringPointer(eyluCodeSurfaceColor)
+	style.Code.Color = stringPointer(eyluAccentColor)
+	style.Code.BackgroundColor = nil
 	return style
 }
 

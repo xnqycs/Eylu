@@ -78,6 +78,7 @@ type Conversation struct {
 	ledger              *contextledger.Ledger
 	lastRuntime         Runtime
 	summary             string
+	todoList            protocol.TodoList
 	omittedTurnIDs      map[string]struct{}
 	projectMap          string
 	projectMapWorkspace string
@@ -143,6 +144,7 @@ func (c *Conversation) NewSessionWithEnvironment(environmentContext environment.
 	c.skillCatalog = c.lastRuntime.SkillCatalog
 	c.protectedSkills = make(map[string]ProtectedSkill)
 	c.summary = ""
+	c.todoList = protocol.TodoList{}
 	c.omittedTurnIDs = make(map[string]struct{})
 	c.projectMap = ""
 	c.projectMapWorkspace = ""
@@ -285,6 +287,12 @@ func (c *Conversation) ContextReport() contextledger.Report {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.ledger.Report(c.lastRuntime.Provider.Name, c.lastRuntime.Provider.Config.Model, c.lastRuntime.Provider.Config.ContextWindow)
+}
+
+func (c *Conversation) TodoList() protocol.TodoList {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return cloneTodoList(c.todoList)
 }
 
 func (c *Conversation) rebuildLedger(runtime Runtime) {

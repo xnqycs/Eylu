@@ -205,6 +205,111 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	}
 }
 
+func TestTUIBackendAskAnswersCancellationAndContextRelease(t *testing.T) {
+	backend := &tuiBackend{}
+	request := protocol.AskRequest{Questions: []protocol.AskQuestion{{ID: "scope", Header: "Scope", Question: "Choose scope", Options: []protocol.AskOption{{Label: "Small", Description: "Focused"}, {Label: "Full", Description: "Complete"}}}}}
+	ask := backend.askUser("op-ask", func(event ui.Event) {
+		if event.Kind != ui.EventAsk || event.Ask == nil {
+			t.Fatalf("event=%#v", event)
+		}
+		event.Ask.Response <- ui.AskDecision{Answers: map[string][]string{"scope": {"Full"}}}
+	})
+	response, err := ask(context.Background(), request)
+	if err != nil || len(response.Answers["scope"]) != 1 || response.Answers["scope"][0] != "Full" {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+
+	cancelled := backend.askUser("op-ask", func(event ui.Event) {
+		event.Ask.Response <- ui.AskDecision{Cancelled: true}
+	})
+	if _, err := cancelled(context.Background(), request); !errors.Is(err, tool.ErrAskDismissed) {
+		t.Fatalf("cancel error=%v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	released := backend.askUser("op-ask", func(ui.Event) {})
+	done := make(chan error, 1)
+	go func() { _, err := released(ctx, request); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("context error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ask callback did not release after context cancellation")
+	}
+}
+
+func TestTUIAskTodoAndSessionRestoreSmoke(t *testing.T) {
+	isolateUserState(t)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		input := body["input"].([]any)
+		switch requests {
+		case 1:
+			writeResponsesCompleted(w, `{"id":"resp_ask","output":[{"type":"function_call","id":"fc_ask","call_id":"call-ask","name":"ask","arguments":"{\"questions\":[{\"id\":\"scope\",\"header\":\"Scope\",\"question\":\"Choose scope\",\"options\":[{\"label\":\"Small\",\"description\":\"Focused change\"},{\"label\":\"Full\",\"description\":\"Complete change\"}]}]}"}]}`)
+		case 2:
+			if !containsFunctionOutput(input, "call-ask", `"Full"`) {
+				t.Fatalf("ask result missing: %#v", input)
+			}
+			writeResponsesCompleted(w, `{"id":"resp_todo","output":[{"type":"function_call","id":"fc_todo","call_id":"call-todo","name":"todolist","arguments":"{\"items\":[{\"id\":\"implement\",\"content\":\"Implement the full flow\",\"status\":\"in_progress\"}]}"}]}`)
+		case 3:
+			if !containsFunctionOutput(input, "call-todo", `"remaining": 1`) {
+				t.Fatalf("todo result missing: %#v", input)
+			}
+			writeResponsesCompleted(w, `{"id":"resp_done","output":[{"type":"message","content":[{"type":"output_text","text":"Ready"}]}]}`)
+		default:
+			t.Fatalf("unexpected request %d", requests)
+		}
+	}))
+	defer server.Close()
+
+	workspace := t.TempDir()
+	cfg := config.Default()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL, Model: "model"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	appRuntime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, output: "text", workspace: workspace, trustPrompted: make(map[string]bool)}
+	opts := chatOptions{}
+	conversation, err := appRuntime.openConversation(context.Background(), manager, &opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, skillSession, err := appRuntime.loadSkillRuntime(cfg, opts, conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &tuiBackend{runtime: appRuntime, conversation: conversation, manager: manager, opts: opts, skills: registry, skillSession: skillSession}
+	seenTypedTodo := false
+	err = backend.Submit(context.Background(), "op-smoke", ui.Submission{Text: "Implement the selected scope"}, func(event ui.Event) {
+		if event.Kind == ui.EventAsk && event.Ask != nil {
+			event.Ask.Response <- ui.AskDecision{Answers: map[string][]string{"scope": {"Full"}}}
+		}
+		if event.Kind == ui.EventToolResult && event.ToolResult != nil && event.ToolResult.TodoList != nil {
+			seenTypedTodo = true
+		}
+	})
+	if err != nil || requests != 3 || !seenTypedTodo || len(conversation.TodoList().Items) != 1 {
+		t.Fatalf("err=%v requests=%d typed=%t todos=%#v", err, requests, seenTypedTodo, conversation.TodoList())
+	}
+
+	restoredRuntime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, output: "text", workspace: workspace, trustPrompted: make(map[string]bool)}
+	restoredOpts := chatOptions{sessionID: conversation.SessionID()}
+	restored, err := restoredRuntime.openConversation(context.Background(), manager, &restoredOpts)
+	if err != nil || len(restored.TodoList().Items) != 1 || restored.TodoList().Items[0].ID != "implement" {
+		t.Fatalf("restored todos=%#v err=%v", restored.TodoList(), err)
+	}
+}
+
 func TestTUIBackendPreparesGitAwareFileAndSkillReferences(t *testing.T) {
 	workspace := t.TempDir()
 	runAppGit(t, workspace, "init")
@@ -381,7 +486,10 @@ func TestPlanExecutorPublishesOnlyReadToolsAndClassifiedBash(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := config.Default()
 	runtime := &runtime{workspace: workspace}
-	executor, err := runtime.toolExecutorWith(cfg, chatOptions{mode: "plan"}, nil, nil, nil, nil)
+	ask := func(context.Context, protocol.AskRequest) (protocol.AskResponse, error) {
+		return protocol.AskResponse{}, nil
+	}
+	executor, err := runtime.toolExecutorWith(cfg, chatOptions{mode: "plan"}, nil, nil, nil, ask, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,10 +497,10 @@ func TestPlanExecutorPublishesOnlyReadToolsAndClassifiedBash(t *testing.T) {
 	for _, definition := range executor.Definitions() {
 		names[definition.Name] = true
 	}
-	if !names["read_file"] || !names["search_code"] || !names["list_directory"] || !names["bash"] {
+	if !names["read_file"] || !names["search_code"] || !names["list_directory"] || !names["bash"] || !names["ask"] {
 		t.Fatalf("missing plan tools: %v", names)
 	}
-	if names["write_file"] || names["edit_file"] {
+	if names["write_file"] || names["edit_file"] || names["todolist"] {
 		t.Fatalf("write tools leaked into plan profile: %v", names)
 	}
 }

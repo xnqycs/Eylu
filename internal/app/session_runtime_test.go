@@ -18,10 +18,25 @@ import (
 	"Eylu/internal/agent"
 	"Eylu/internal/config"
 	"Eylu/internal/environment"
+	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 	"Eylu/internal/session"
 	"Eylu/internal/skill"
 )
+
+func TestSessionTodoListMappingsCloneItems(t *testing.T) {
+	state := agent.ConversationState{SessionID: "todo-clone", TodoList: protocol.TodoList{Items: []protocol.TodoItem{{ID: "work", Content: "Original", Status: protocol.TodoInProgress}}}}
+	snapshot := snapshotFromAgentState(state, session.Snapshot{})
+	state.TodoList.Items[0].Content = "Changed state"
+	if snapshot.TodoList.Items[0].Content != "Original" {
+		t.Fatalf("snapshot shared todo items: %#v", snapshot.TodoList)
+	}
+	restored := agentStateFromSnapshot(snapshot)
+	snapshot.TodoList.Items[0].Content = "Changed snapshot"
+	if restored.TodoList.Items[0].Content != "Original" {
+		t.Fatalf("restored state shared todo items: %#v", restored.TodoList)
+	}
+}
 
 func TestChatSessionSurvivesRestartWithoutDriverState(t *testing.T) {
 	home := isolateUserState(t)

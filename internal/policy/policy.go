@@ -47,10 +47,11 @@ func ParseMode(value string) (PermissionMode, error) {
 type Risk string
 
 const (
-	RiskRead  Risk = "read"
-	RiskWrite Risk = "write"
-	RiskExec  Risk = "exec"
-	RiskHigh  Risk = "high"
+	RiskRead    Risk = "read"
+	RiskWrite   Risk = "write"
+	RiskExec    Risk = "exec"
+	RiskHigh    Risk = "high"
+	RiskSession Risk = "session"
 )
 
 type Decision string
@@ -163,9 +164,13 @@ func (c *LocalChecker) Check(_ context.Context, request Request) Outcome {
 			return outcome
 		}
 	}
-	if request.Risk == RiskRead {
+	if request.Risk == RiskRead || request.Risk == RiskSession {
 		outcome.Decision = DecisionAllow
-		outcome.Reason = "read-only workspace operation"
+		if request.Risk == RiskSession {
+			outcome.Reason = "session-local operation"
+		} else {
+			outcome.Reason = "read-only workspace operation"
+		}
 		return outcome
 	}
 	switch c.config.Mode {

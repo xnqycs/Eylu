@@ -85,7 +85,7 @@ Explore the repository before deciding. Use only read-only tools and commands, i
 The final response must be a decision-complete plan with a title, summary, implementation changes, important interface or compatibility changes, test scenarios, and explicit assumptions. Mention concrete files only when they disambiguate ownership. Local permission policy is authoritative.`
 		},
 		AllowTool: func(name string, risk policy.Risk) bool {
-			return risk == policy.RiskRead || name == "bash"
+			return risk == policy.RiskRead || name == "bash" || name == "ask"
 		},
 	}
 }

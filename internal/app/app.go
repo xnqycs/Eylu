@@ -53,7 +53,9 @@ type runtime struct {
 	output             string
 	secretMu           sync.RWMutex
 	apiKeys            []string
+	inputMu            sync.Mutex
 	inputReader        *bufio.Reader
+	inputRead          chan inputLineResult
 	trustPrompted      map[string]bool
 	session            *sessionRuntime
 	metrics            *metrics.Collector
@@ -315,7 +317,11 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	if r.output == "jsonl" {
 		audit = &toolAuditWriter{writer: r.stdout, jsonl: true}
 	}
-	executor, err := r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, r.confirmTools(opts.approve), audit)
+	var ask tool.AskFunc
+	if r.output == "text" && isTerminal(r.stdin) {
+		ask = r.askUser
+	}
+	executor, err := r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, r.confirmTools(opts.approve), ask, audit)
 	if err != nil {
 		return err
 	}
@@ -406,7 +412,7 @@ func (r *runtime) reportMetric(jsonlEncoder *json.Encoder, metric metrics.Reques
 	}
 }
 
-func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session, confirm tool.ConfirmFunc, audit tool.AuditSink) (*tool.Executor, error) {
+func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session, confirm tool.ConfirmFunc, ask tool.AskFunc, audit tool.AuditSink) (*tool.Executor, error) {
 	readFile, err := tool.NewReadFile(r.workspace, cfg.MaxReadBytes)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize read_file", Cause: err}
@@ -439,7 +445,10 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	checker := policy.NewChecker(policy.Config{Mode: mode, ReadOnlyCommands: cfg.ReadOnlyCommands, AutoAllowCommands: cfg.AutoAllowCommands, DangerousPatterns: cfg.DangerousCommands, BlockedPatterns: cfg.BlockedCommands})
-	registered := []tool.Tool{readFile, writeFile, bashTool, editFile, searchCode, listDirectory}
+	registered := []tool.Tool{readFile, writeFile, bashTool, editFile, searchCode, listDirectory, tool.NewTodoList()}
+	if ask != nil {
+		registered = append(registered, tool.NewAsk(ask))
+	}
 	if r.mcp != nil {
 		registered = append(registered, r.mcp.Tools()...)
 	}
@@ -483,7 +492,7 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 			label = "DANGER"
 		}
 		fmt.Fprintf(r.stderr, "%s [%d/%d] approve %s tool %s?\nReason: %s\nPolicy: %s\n%s\n[y/N]: ", label, request.ConfirmationStep, request.ConfirmationTotal, outcome.Risk, request.Tool, modelReason, outcome.Reason, preview)
-		answer, err := reader.ReadString('\n')
+		answer, err := r.readInteractiveLine(ctx, reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return tool.Confirmation{}, err
 		}
