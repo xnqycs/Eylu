@@ -69,10 +69,18 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 		Short:         "Eylu terminal programming agent",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			switch r.output {
+			case "text", "json", "jsonl":
+				return nil
+			default:
+				return &protocol.Error{Code: protocol.ErrConfig, Message: "output must be text, json, or jsonl"}
+			}
+		},
 	}
 	root.PersistentFlags().StringVar(&r.configPath, "config", "", "config file path")
 	root.PersistentFlags().StringVar(&r.workspace, "workspace", "", "workspace directory")
-	root.PersistentFlags().StringVar(&r.output, "output", "text", "output format: text or json")
+	root.PersistentFlags().StringVar(&r.output, "output", "text", "output format: text, json, or jsonl")
 	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand())
 	return root
 }
@@ -86,6 +94,8 @@ type chatOptions struct {
 	approve     bool
 	mode        string
 	trustSkills bool
+	noAnimation bool
+	noTUI       bool
 }
 
 func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
@@ -122,6 +132,8 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().BoolVarP(&opts.approve, "yes", "y", false, "approve tools that require confirmation")
 	cmd.Flags().StringVar(&opts.mode, "mode", "", "permission mode: manual, plan, auto, or full")
 	cmd.Flags().BoolVar(&opts.trustSkills, "trust-workspace-skills", false, "trust and load project-level skills for this workspace")
+	cmd.Flags().BoolVar(&opts.noAnimation, "no-animation", false, "disable terminal animations")
+	cmd.Flags().BoolVar(&opts.noTUI, "no-tui", false, "use the line-oriented interactive interface")
 	return cmd
 }
 
@@ -182,7 +194,12 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
 	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
 	modelRuntime.MaxSummaryBytes = cfg.MaxSummaryBytes
+	jsonlEncoder := json.NewEncoder(r.stdout)
 	modelRuntime.ContextEvent = func(event contextledger.Event) {
+		if r.output == "jsonl" {
+			_ = jsonlEncoder.Encode(map[string]any{"type": "context", "context": event})
+			return
+		}
 		switch event.Kind {
 		case contextledger.EventCompression:
 			if event.Compression != nil {
@@ -200,10 +217,13 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
-	stream := r.output == "text"
+	stream := r.output == "text" || r.output == "jsonl"
 	var emit driver.EmitFunc
 	if stream {
 		emit = func(event protocol.ModelEvent) error {
+			if r.output == "jsonl" {
+				return jsonlEncoder.Encode(map[string]any{"type": "model_event", "event": event})
+			}
 			switch event.Kind {
 			case protocol.EventTextDelta:
 				_, err := fmt.Fprint(r.stdout, event.Delta)
@@ -216,13 +236,17 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 			return nil
 		}
 	}
-	executor, err := r.toolExecutor(cfg, opts, skillRegistry, skillSession)
+	audit := tool.AuditSink(&toolAuditWriter{writer: r.stderr})
+	if r.output == "jsonl" {
+		audit = &toolAuditWriter{writer: r.stdout, jsonl: true}
+	}
+	executor, err := r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, r.confirmTools(opts.approve), audit)
 	if err != nil {
 		return err
 	}
 	response, err := conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens}, stream, emit)
 	if err != nil {
-		if stream {
+		if r.output == "text" {
 			fmt.Fprintln(r.stdout)
 		}
 		return err
@@ -230,11 +254,18 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	if r.output == "json" {
 		return json.NewEncoder(r.stdout).Encode(response)
 	}
+	if r.output == "jsonl" {
+		return jsonlEncoder.Encode(map[string]any{"type": "response", "response": response})
+	}
 	fmt.Fprintln(r.stdout)
 	return nil
 }
 
 func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session) (*tool.Executor, error) {
+	return r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, r.confirmTools(opts.approve), &toolAuditWriter{writer: r.stderr})
+}
+
+func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session, confirm tool.ConfirmFunc, audit tool.AuditSink) (*tool.Executor, error) {
 	readFile, err := tool.NewReadFile(cfg.Workspace, cfg.MaxReadBytes)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize read_file", Cause: err}
@@ -273,7 +304,7 @@ func (r *runtime) toolExecutor(cfg config.Config, opts chatOptions, skillRegistr
 	}
 	return &tool.Executor{
 		Registry: tool.NewRegistry(registered...), Policy: checker,
-		Confirm: r.confirmTools(opts.approve), Audit: &toolAuditWriter{writer: r.stderr}, Workspace: cfg.Workspace,
+		Confirm: confirm, Audit: audit, Workspace: cfg.Workspace,
 		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
 	}, nil
 }
@@ -382,8 +413,12 @@ func (r *runtime) printError(err error) {
 		typed = &protocol.Error{Code: protocol.ErrProtocol, Message: err.Error()}
 	}
 	message := logging.Redact(typed.Message, os.Getenv("EYLU_API_KEY"))
-	if r.output == "json" {
-		_ = json.NewEncoder(r.stderr).Encode(map[string]any{"error": map[string]any{"code": typed.Code, "message": message, "retryable": typed.Retryable}})
+	if r.output == "json" || r.output == "jsonl" {
+		payload := map[string]any{"error": map[string]any{"code": typed.Code, "message": message, "retryable": typed.Retryable}}
+		if r.output == "jsonl" {
+			payload["type"] = "error"
+		}
+		_ = json.NewEncoder(r.stderr).Encode(payload)
 		return
 	}
 	fmt.Fprintf(r.stderr, "error [%s]: %s\n", typed.Code, message)

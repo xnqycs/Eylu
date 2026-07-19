@@ -80,7 +80,7 @@ func (r *runtime) skillsListCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if r.output == "json" {
+		if r.output != "text" {
 			return json.NewEncoder(r.stdout).Encode(map[string]any{"skills": skill.SummarizeRecords(registry.Records())})
 		}
 		for _, record := range registry.Records() {
@@ -100,7 +100,7 @@ func (r *runtime) skillsShowCommand() *cobra.Command {
 		if !ok {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("active skill %q was not found", args[0])}
 		}
-		if r.output == "json" {
+		if r.output != "text" {
 			return json.NewEncoder(r.stdout).Encode(item)
 		}
 		fmt.Fprintf(r.stdout, "%s\nsource: %s\ndigest: %s\nentry: %s\n\n%s\n", item.Name, item.Source.String(), item.Digest, item.Entry, item.Body)
@@ -114,7 +114,7 @@ func (r *runtime) skillsValidateCommand() *cobra.Command {
 		if err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 		}
-		if r.output == "json" {
+		if r.output != "text" {
 			return json.NewEncoder(r.stdout).Encode(map[string]any{"valid": true, "skill": item.Summary()})
 		}
 		fmt.Fprintf(r.stdout, "valid skill %s (%s)\n", item.Name, item.Digest)
@@ -129,7 +129,7 @@ func (r *runtime) skillsDiagnoseCommand() *cobra.Command {
 			return err
 		}
 		limits := map[string]int{"entry_bytes": skill.MaxEntryBytes, "resource_bytes": skill.MaxResourceBytes, "scanned_directories": skill.MaxScannedDirectories, "active_skills": skill.MaxActiveSkills, "resources_per_skill": skill.MaxResourcesPerSkill, "resource_depth": skill.MaxResourceDepth}
-		if r.output == "json" {
+		if r.output != "text" {
 			return json.NewEncoder(r.stdout).Encode(map[string]any{"workspace": cfg.Workspace, "roots": registry.Roots(), "records": skill.SummarizeRecords(registry.Records()), "limits": limits})
 		}
 		fmt.Fprintf(r.stdout, "Workspace: %s\nLimits: entry=%d resource=%d directories=%d active_skills=%d resources/skill=%d depth=%d\n", cfg.Workspace, skill.MaxEntryBytes, skill.MaxResourceBytes, skill.MaxScannedDirectories, skill.MaxActiveSkills, skill.MaxResourcesPerSkill, skill.MaxResourceDepth)

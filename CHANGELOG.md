@@ -1,5 +1,15 @@
 # Changelog
 
+## Phase 7 - 终端体验
+
+- 增加 Bubble Tea v2 单写入 TUI、Bubbles v2 textarea/viewport/spinner、Lip Gloss v2 七类样式和 Glamour v2 Markdown。
+- 增加稳定 header/history/loading/input/status 布局、滚动历史、工具摘要与分页详情、确认弹窗和取消状态。
+- 增加 Provider 列表与 password 表单、模型拉取/刷新/筛选/选择/手工 ID、Skill 状态与名称补全、上下文进度及来源展开。
+- 增加全部 operation state、operation ID 迟到事件过滤、150ms 状态过渡、重试倒计时和 resize 处理。
+- 增加 `--no-animation`、`--no-tui`、`NO_COLOR`、`TERM=dumb`/管道降级与 `--output jsonl` 稳定事件流。
+
+依赖：最低 Go 版本更新为 1.25.8；新增 `charm.land/bubbletea/v2`、`bubbles/v2`、`lipgloss/v2` 与 `glamour/v2`。
+
 ## Phase 6 - 上下文管理
 
 - 增加同源 `PromptBuilder` 与全分类 `ContextLedger`，请求内容、工具 schema、DriverState 和 `/context` 使用同一组 blocks。

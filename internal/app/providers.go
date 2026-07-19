@@ -55,7 +55,7 @@ func (r *runtime) providersListCommand() *cobra.Command {
 				return err
 			}
 			items := manager.List()
-			if r.output == "json" {
+			if r.output != "text" {
 				return json.NewEncoder(r.stdout).Encode(map[string]any{"active_provider": loaded.Config.ActiveProvider, "providers": items})
 			}
 			if len(items) == 0 {
@@ -232,7 +232,7 @@ func (r *runtime) providerModelsCommand(ctx context.Context) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if r.output == "json" {
+			if r.output != "text" {
 				return json.NewEncoder(r.stdout).Encode(map[string]any{"models": models})
 			}
 			for _, model := range models {

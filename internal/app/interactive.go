@@ -27,6 +27,9 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 		return err
 	}
 	conversation := agent.NewConversation()
+	if !opts.noTUI && isTerminal(r.stdout) && !strings.EqualFold(os.Getenv("TERM"), "dumb") && r.output == "text" {
+		return r.runTUI(ctx, conversation, manager, opts)
+	}
 	reader := bufio.NewReader(r.stdin)
 	r.inputReader = reader
 	defer func() { r.inputReader = nil }()

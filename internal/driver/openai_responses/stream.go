@@ -160,9 +160,6 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 		if err := emit(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &final.Usage}); err != nil {
 			return protocol.ModelResponse{}, err
 		}
-		if err := emit(protocol.ModelEvent{Kind: protocol.EventResponseDone, Response: final}); err != nil {
-			return protocol.ModelResponse{}, err
-		}
 	}
 	return *final, nil
 }

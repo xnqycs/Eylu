@@ -181,3 +181,40 @@ func TestContextSlashRendersAllCategories(t *testing.T) {
 		}
 	}
 }
+
+func TestJSONLStreamingOutputIsLineDelimitedAndStructured(t *testing.T) {
+	isolateUserState(t)
+	t.Setenv("EYLU_API_KEY", "jsonl-secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"jsonl\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_jsonl\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"jsonl\"}]}]}}\n\n"))
+	}))
+	defer server.Close()
+	workspace := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	code := Execute(context.Background(), []string{"--config", filepath.Join(t.TempDir(), "config.toml"), "--workspace", workspace, "--output", "jsonl", "chat", "hello", "--base-url", server.URL + "/v1", "--model", "test"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	types := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var envelope map[string]any
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			t.Fatalf("invalid JSONL line %q: %v", line, err)
+		}
+		typeName, _ := envelope["type"].(string)
+		types[typeName] = true
+	}
+	if !types["context"] || !types["model_event"] || !types["response"] || strings.Contains(stdout.String(), "\x1b[") {
+		t.Fatalf("types=%#v output=%s", types, stdout.String())
+	}
+}
+
+func TestInvalidOutputFormatIsConfigurationError(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Execute(context.Background(), []string{"--output", "yaml", "skills", "list"}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitConfig || !strings.Contains(stderr.String(), "output must be text, json, or jsonl") {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+}

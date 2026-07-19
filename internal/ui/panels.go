@@ -1,0 +1,191 @@
+package ui
+
+import (
+	"sort"
+	"strings"
+
+	tea "charm.land/bubbletea/v2"
+)
+
+func (m *Model) handleProvidersKey(key string) (tea.Model, tea.Cmd) {
+	providers := m.snapshot.Providers
+	switch key {
+	case "esc":
+		m.screen = screenChat
+	case "up", "k":
+		m.providerCursor = clampCursor(m.providerCursor-1, len(providers))
+	case "down", "j":
+		m.providerCursor = clampCursor(m.providerCursor+1, len(providers))
+	case "a":
+		m.form = newProviderFormModel(ProviderForm{Adapter: "openai_responses"}, m.width)
+		m.screen = screenProviderForm
+	case "e":
+		if len(providers) > 0 {
+			m.openProviderForm(providers[m.providerCursor])
+		}
+	case "d":
+		if len(providers) > 0 {
+			name := providers[m.providerCursor].Name
+			return m, func() tea.Msg { return mutationResultMsg{err: m.backend.DeleteProvider(m.context, name)} }
+		}
+	case "enter":
+		if len(providers) > 0 {
+			name := providers[m.providerCursor].Name
+			return m, func() tea.Msg { return mutationResultMsg{err: m.backend.UseProvider(m.context, name)} }
+		}
+	case "m":
+		if len(providers) > 0 {
+			m.snapshot.Provider = providers[m.providerCursor].Name
+		}
+		m.screen = screenModels
+		return m, tea.Batch(m.modelFilter.Focus(), m.fetchModelsCmd())
+	}
+	return m, nil
+}
+
+func (m *Model) handleProviderFormKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := message.String()
+	switch key {
+	case "esc":
+		m.screen = screenProviders
+		return m, nil
+	case "tab", "enter":
+		if m.form.focus == providerFieldCount-1 {
+			return m.submitProviderForm()
+		}
+		return m, m.form.moveFocus(1)
+	case "shift+tab":
+		return m, m.form.moveFocus(-1)
+	case "ctrl+s":
+		return m.submitProviderForm()
+	}
+	updated, command := m.form.update(message)
+	m.form = updated
+	return m, command
+}
+
+func (m *Model) submitProviderForm() (tea.Model, tea.Cmd) {
+	value, err := m.form.value()
+	if err != nil {
+		m.form.err = err
+		return m, nil
+	}
+	return m, func() tea.Msg { return mutationResultMsg{err: m.backend.UpsertProvider(m.context, value)} }
+}
+
+func (m *Model) handleModelsKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := message.String()
+	filtered := m.filteredModels()
+	switch key {
+	case "esc":
+		m.screen = screenChat
+		m.modelManual = false
+		m.modelFilter.Blur()
+		return m, nil
+	case "up", "ctrl+p":
+		m.modelCursor = clampCursor(m.modelCursor-1, len(filtered))
+		return m, nil
+	case "down", "ctrl+n":
+		m.modelCursor = clampCursor(m.modelCursor+1, len(filtered))
+		return m, nil
+	case "r":
+		m.state = StateFetchingModels
+		return m, m.fetchModelsCmd()
+	case "m":
+		m.modelManual = true
+		m.modelFilter.Placeholder = "Manual model ID"
+		m.modelFilter.Reset()
+		return m, m.modelFilter.Focus()
+	case "enter":
+		modelID := ""
+		if m.modelManual {
+			modelID = strings.TrimSpace(m.modelFilter.Value())
+		} else if len(filtered) > 0 {
+			modelID = filtered[m.modelCursor]
+		}
+		if modelID != "" {
+			m.modelManual = false
+			providerName := m.snapshot.Provider
+			return m, func() tea.Msg {
+				err := m.backend.SetModel(m.context, providerName, modelID)
+				return commandResultMsg{text: "Model: " + modelID, err: err}
+			}
+		}
+		return m, nil
+	}
+	updated, command := m.modelFilter.Update(message)
+	m.modelFilter = updated
+	m.modelCursor = clampCursor(m.modelCursor, len(m.filteredModels()))
+	return m, command
+}
+
+func (m *Model) handleSkillsKey(key string) (tea.Model, tea.Cmd) {
+	skills := m.snapshot.Skills
+	switch key {
+	case "esc":
+		m.screen = screenChat
+	case "up", "k":
+		m.skillCursor = clampCursor(m.skillCursor-1, len(skills))
+	case "down", "j":
+		m.skillCursor = clampCursor(m.skillCursor+1, len(skills))
+	case "enter":
+		if len(skills) > 0 && skills[m.skillCursor].Status == "active" {
+			return m, m.commandCmd("/skill " + skills[m.skillCursor].Name)
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) openProviderForm(item ProviderItem) {
+	m.form = newProviderFormModel(ProviderForm{
+		OriginalName: item.Name, Name: item.Name, BaseURL: item.BaseURL, Model: item.Model,
+		Adapter: item.Adapter, ContextWindow: item.ContextWindow,
+	}, m.width)
+	m.screen = screenProviderForm
+}
+
+func (m *Model) providerByName(name string) (ProviderItem, bool) {
+	for _, item := range m.snapshot.Providers {
+		if item.Name == name {
+			return item, true
+		}
+	}
+	return ProviderItem{}, false
+}
+
+func (m *Model) fetchModelsCmd() tea.Cmd {
+	providerName := m.snapshot.Provider
+	m.state = StateFetchingModels
+	return func() tea.Msg {
+		models, err := m.backend.FetchModels(m.context, providerName)
+		sort.Strings(models)
+		return modelsResultMsg{models: models, err: err}
+	}
+}
+
+func (m *Model) filteredModels() []string {
+	query := strings.ToLower(strings.TrimSpace(m.modelFilter.Value()))
+	if query == "" || m.modelManual {
+		return m.models
+	}
+	result := make([]string, 0)
+	for _, model := range m.models {
+		if strings.Contains(strings.ToLower(model), query) {
+			result = append(result, model)
+		}
+	}
+	return result
+}
+
+func clampCursor(value, count int) int {
+	if count <= 0 {
+		return 0
+	}
+	if value < 0 {
+		return count - 1
+	}
+	if value >= count {
+		return 0
+	}
+	return value
+}

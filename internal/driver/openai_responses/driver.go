@@ -161,6 +161,11 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 			return protocol.ModelResponse{}, streamErr
 		}
 		result.DriverState = encodeRemoteState(result.DriverState, req.Model.Turns, disablePrevious)
+		if emit != nil {
+			if emitErr := emit(protocol.ModelEvent{Kind: protocol.EventResponseDone, Response: &result}); emitErr != nil {
+				return protocol.ModelResponse{}, emitErr
+			}
+		}
 		return result, nil
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))

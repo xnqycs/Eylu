@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,6 +57,19 @@ func TestToolAuditSeparatesSkillActivationAndResourceSummary(t *testing.T) {
 	text := output.String()
 	if !strings.Contains(text, "[skill] name=demo source=user_eylu") || !strings.Contains(text, "[skill-resource] name=demo digest=abc path=references/guide.md bytes=42") {
 		t.Fatalf("audit output = %q", text)
+	}
+}
+
+func TestToolAuditJSONLIsStructured(t *testing.T) {
+	var output bytes.Buffer
+	writer := &toolAuditWriter{writer: &output, jsonl: true}
+	writer.Record(tool.AuditRecord{RequestID: "request", CallID: "call", Tool: "bash", DurationMS: 12})
+	var envelope struct {
+		Type  string           `json:"type"`
+		Audit tool.AuditRecord `json:"audit"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &envelope); err != nil || envelope.Type != "tool_audit" || envelope.Audit.CallID != "call" {
+		t.Fatalf("envelope=%#v err=%v output=%q", envelope, err, output.String())
 	}
 }
 
