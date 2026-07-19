@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,19 +27,28 @@ func (c *fakeClock) Tick(duration time.Duration, fn func(time.Time) tea.Msg) tea
 
 type fakeBackend struct {
 	snapshot Snapshot
-	submit   func(context.Context, string, string, func(Event)) error
+	submit   func(context.Context, string, Submission, func(Event)) error
 	err      error
 	models   []string
+	files    []FileItem
+	mode     string
 }
 
 func (b *fakeBackend) Snapshot(context.Context) (Snapshot, error) { return b.snapshot, b.err }
-func (b *fakeBackend) Submit(ctx context.Context, operationID, prompt string, emit func(Event)) error {
+func (b *fakeBackend) Submit(ctx context.Context, operationID string, submission Submission, emit func(Event)) error {
 	if b.submit != nil {
-		return b.submit(ctx, operationID, prompt, emit)
+		return b.submit(ctx, operationID, submission, emit)
 	}
 	return b.err
 }
-func (b *fakeBackend) Command(context.Context, string) (string, error)    { return "command ok", b.err }
+func (b *fakeBackend) Command(context.Context, string) (string, error) { return "command ok", b.err }
+func (b *fakeBackend) ListFiles(context.Context) ([]FileItem, error) {
+	return append([]FileItem(nil), b.files...), b.err
+}
+func (b *fakeBackend) SetMode(_ context.Context, mode string) error {
+	b.mode = mode
+	return b.err
+}
 func (b *fakeBackend) UpsertProvider(context.Context, ProviderForm) error { return b.err }
 func (b *fakeBackend) DeleteProvider(context.Context, string) error       { return b.err }
 func (b *fakeBackend) UseProvider(context.Context, string) error          { return b.err }
@@ -52,7 +62,7 @@ func TestOperationStatesStaleMessagesApprovalAndCancellation(t *testing.T) {
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Clock: clock, Width: 80, Height: 24})
 	model.operationID = "op-current"
 	model.startedAt = clock.now.Add(-time.Second)
-	for _, state := range []OperationState{StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StateExecutingTool, StateRetryBackoff, StateCancelling, StateCompleted, StateFailed, StateIdle} {
+	for _, state := range []OperationState{StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StateExecutingTool, StateRetryBackoff, StateCancelling, StateCancelled, StateInterrupted, StateCompleted, StateFailed, StateIdle} {
 		retry := time.Duration(0)
 		if state == StateRetryBackoff {
 			retry = 2 * time.Second
@@ -71,13 +81,19 @@ func TestOperationStatesStaleMessagesApprovalAndCancellation(t *testing.T) {
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-current", Kind: EventTextDelta, Delta: "hello"})
 	call := protocol.ToolCall{ID: "call-1", Name: "read_file", Arguments: []byte(`{"path":"main.go"}`)}
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-current", Kind: EventToolStart, ToolCall: &call})
-	response := make(chan bool, 1)
-	_, _ = model.handleBackendEvent(Event{OperationID: "op-current", Kind: EventApproval, Approval: &ApprovalRequest{Tool: "read_file", Risk: "read", Step: 1, Total: 1, Response: response}})
+	response := make(chan ApprovalDecision, 1)
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-current", Kind: EventApproval, Approval: &ApprovalRequest{Tool: "bash", Risk: "exec", Summary: "$ go test ./...", Reason: "Verify the implementation before reporting", PolicyReason: "manual mode requires confirmation", Step: 1, Total: 1, Response: response}})
 	if model.state != StateAwaitingApproval {
 		t.Fatalf("state = %s", model.state)
 	}
+	approvalView := ansi.Strip(model.View().Content)
+	for _, expected := range []string{"Action approval", "Verify the implementation before reporting", "$ go test ./...", "Yes", "No"} {
+		if !strings.Contains(approvalView, expected) {
+			t.Fatalf("approval view missing %q:\n%s", expected, approvalView)
+		}
+	}
 	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: 'y', Text: "y"}))
-	if !<-response || model.approval != nil {
+	if decision := <-response; !decision.Approved || model.approval != nil {
 		t.Fatal("approval response was not delivered")
 	}
 	result := protocol.ToolResult{CallID: "call-1", Content: "package main"}
@@ -92,6 +108,143 @@ func TestOperationStatesStaleMessagesApprovalAndCancellation(t *testing.T) {
 	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: 'c', Mod: tea.ModCtrl}))
 	if !cancelled || model.state != StateCancelling {
 		t.Fatalf("cancelled=%t state=%s", cancelled, model.state)
+	}
+}
+
+func TestApprovalRejectReasonAndImmediateInterruptDecisions(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-approval"
+	model.eventChannel = make(chan Event, 1)
+	response := make(chan ApprovalDecision, 1)
+	model.approval = &ApprovalRequest{Tool: "bash", Reason: "Run focused tests", Response: response}
+	model.state = StateAwaitingApproval
+
+	_, _ = model.handleApprovalKey("tab")
+	if !model.approvalEditing || model.approvalCursor != 1 {
+		t.Fatalf("editing=%t cursor=%d", model.approvalEditing, model.approvalCursor)
+	}
+	_, _ = model.Update(tea.PasteMsg{Content: "Use the existing test target"})
+	if model.approvalReason.Value() != "Use the existing test target" {
+		t.Fatalf("pasted rejection reason = %q", model.approvalReason.Value())
+	}
+	_, _ = model.handleApprovalKey("enter")
+	if decision := <-response; decision.Approved || decision.Reason != "Use the existing test target" {
+		t.Fatalf("decision=%#v", decision)
+	}
+
+	response = make(chan ApprovalDecision, 1)
+	model.approval = &ApprovalRequest{Tool: "bash", Reason: "Run focused tests", Response: response}
+	model.state = StateAwaitingApproval
+	_, _ = model.handleApprovalKey("n")
+	if decision := <-response; decision.Approved || decision.Reason != "" {
+		t.Fatalf("decision=%#v", decision)
+	}
+
+	compact := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 12})
+	compact.approval = &ApprovalRequest{Tool: "bash", Risk: "exec", Summary: "$ go test ./...", Reason: strings.Repeat("Verify safely ", 20), PolicyReason: "manual confirmation", Step: 1, Total: 1}
+	view := ansi.Strip(compact.View().Content)
+	if lipgloss.Height(view) > 12 || !strings.Contains(view, "Why") || !strings.Contains(view, "Yes") || !strings.Contains(view, "No") {
+		t.Fatalf("compact approval height=%d\n%s", lipgloss.Height(view), view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if lipgloss.Width(line) > 40 {
+			t.Fatalf("compact approval width=%d line=%q", lipgloss.Width(line), line)
+		}
+	}
+
+	visible := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	visible.timeline = []timelineItem{{kind: timelineMessage, role: "agent", text: "APPROVAL_HISTORY_SENTINEL"}}
+	visible.approval = &ApprovalRequest{Tool: "bash", Risk: "exec", Summary: "$ go test ./...", Reason: "Verify the change", PolicyReason: "manual confirmation", Step: 1, Total: 1}
+	visible.updateViewportHeight()
+	visible.refreshViewport()
+	approvalView := ansi.Strip(visible.View().Content)
+	approvalRow := -1
+	for row, line := range strings.Split(approvalView, "\n") {
+		if strings.Contains(line, "Action approval") {
+			approvalRow = row
+			break
+		}
+	}
+	if !strings.Contains(approvalView, "APPROVAL_HISTORY_SENTINEL") || approvalRow < visible.height*2/3 || lipgloss.Height(approvalView) != visible.height {
+		t.Fatalf("approval history/layout: row=%d height=%d\n%s", approvalRow, lipgloss.Height(approvalView), approvalView)
+	}
+}
+
+func TestPlanCompletionGateAutoFullRejectAndFeedback(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true})
+	model.snapshot.Mode = "plan"
+	model.operationMode = "plan"
+	model.operationID = "op-plan"
+	model.state = StateCompleted
+	_, _ = model.Update(backendEventClosedMsg{operationID: "op-plan"})
+	if model.planGate == nil || !strings.Contains(ansi.Strip(model.View().Content), "Start implementation") {
+		t.Fatalf("plan gate=%#v view=%s", model.planGate, ansi.Strip(model.View().Content))
+	}
+
+	_, modeCommand := model.handlePlanGateKey("enter")
+	if modeCommand == nil || model.pendingImplementationMode != "auto" {
+		t.Fatalf("pending=%q command=%v", model.pendingImplementationMode, modeCommand)
+	}
+	_, startCommand := model.Update(modeCommand())
+	if model.state != StateConnecting || model.operationMode != "auto" || model.draft != approvedPlanImplementationPrompt || startCommand == nil {
+		t.Fatalf("state=%s mode=%q draft=%q command=%v", model.state, model.operationMode, model.draft, startCommand)
+	}
+
+	model.state = StateCompleted
+	model.planGate = newPlanGate(model.width)
+	model.planGate.cursor = 1
+	_, fullCommand := model.handlePlanGateKey("enter")
+	if fullCommand == nil || model.pendingImplementationMode != "full" {
+		t.Fatalf("pending=%q command=%v", model.pendingImplementationMode, fullCommand)
+	}
+	backend.err = errors.New("persist full failed")
+	_, _ = model.Update(fullCommand())
+	if model.planGate == nil || model.pendingImplementationMode != "" {
+		t.Fatalf("mode failure gate=%#v pending=%q", model.planGate, model.pendingImplementationMode)
+	}
+	backend.err = nil
+
+	model.pendingImplementationMode = ""
+	model.planGate = newPlanGate(model.width)
+	model.planGate.cursor = 2
+	_, rejectCommand := model.handlePlanGateKey("enter")
+	if rejectCommand == nil || model.planGate != nil || model.snapshot.Mode != "manual" {
+		t.Fatalf("gate=%#v mode=%q command=%v", model.planGate, model.snapshot.Mode, rejectCommand)
+	}
+
+	model.snapshot.Mode = "plan"
+	model.planGate = newPlanGate(model.width)
+	_, _ = model.handlePlanGateKey("tab")
+	model.planGate.feedback.SetValue("Keep the public API stable")
+	_, feedbackCommand := model.handlePlanGateKey("enter")
+	if feedbackCommand == nil || model.state != StateConnecting || !strings.Contains(model.draft, "Keep the public API stable") || model.operationMode != "plan" {
+		t.Fatalf("state=%s mode=%q draft=%q command=%v", model.state, model.operationMode, model.draft, feedbackCommand)
+	}
+
+	compact := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 12})
+	compact.planGate = newPlanGate(40)
+	view := ansi.Strip(compact.View().Content)
+	if lipgloss.Height(view) > 12 || !strings.Contains(view, "Auto") || !strings.Contains(view, "Full") || !strings.Contains(view, "Reject") {
+		t.Fatalf("compact plan gate height=%d\n%s", lipgloss.Height(view), view)
+	}
+
+	visible := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	visible.timeline = []timelineItem{{kind: timelineMessage, role: "agent", text: "PLAN_HISTORY_SENTINEL\n\n1. Inspect\n2. Implement\n3. Verify"}}
+	visible.planGate = newPlanGate(80)
+	visible.updateViewportHeight()
+	visible.refreshViewport()
+	planView := ansi.Strip(visible.View().Content)
+	planLines := strings.Split(planView, "\n")
+	gateRow := -1
+	for row, line := range planLines {
+		if strings.Contains(line, "Start implementation") {
+			gateRow = row
+			break
+		}
+	}
+	if !strings.Contains(planView, "PLAN_HISTORY_SENTINEL") || gateRow < visible.height*2/3 || lipgloss.Height(planView) != visible.height {
+		t.Fatalf("plan history/gate layout: gate_row=%d height=%d\n%s", gateRow, lipgloss.Height(planView), planView)
 	}
 }
 
@@ -159,6 +312,31 @@ func TestStreamingActivityShowsEstimatedExactTokensAndThinking(t *testing.T) {
 	}
 }
 
+func TestActivityLineKeepsOneBlankRowBelowLatestMessage(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 19, 12, 0, 1, 0, time.UTC)}
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Clock: clock, Width: 80, Height: 24})
+	model.timeline = []timelineItem{
+		{kind: timelineMessage, role: "agent", text: strings.Repeat("history line\n", 30)},
+		{kind: timelineMessage, role: "user", text: "我喜欢你"},
+	}
+	model.state = StateWaitingFirstToken
+	model.startedAt = clock.now.Add(-time.Second)
+	model.refreshViewport()
+	lines := strings.Split(model.View().Content, "\n")
+	messageRow, activityRow := -1, -1
+	for row, line := range lines {
+		if strings.Contains(line, "我喜欢你") {
+			messageRow = row
+		}
+		if strings.Contains(line, "Thinking...") {
+			activityRow = row
+		}
+	}
+	if messageRow < 0 || activityRow-messageRow != 2 {
+		t.Fatalf("message_row=%d activity_row=%d\n%s", messageRow, activityRow, model.View().Content)
+	}
+}
+
 func TestInterruptRequestCancelsThenQuits(t *testing.T) {
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true})
 	model.operationID = "op-interrupt"
@@ -196,6 +374,10 @@ func TestChatInputBandUsesOnePromptAndNativeCursor(t *testing.T) {
 	}
 	if view.Cursor == nil || view.Cursor.Position.X < 2 || view.Cursor.Position.Y <= model.viewport.Height() {
 		t.Fatalf("cursor = %#v viewport_height=%d", view.Cursor, model.viewport.Height())
+	}
+	viewLines := strings.Split(ansi.Strip(view.Content), "\n")
+	if view.Cursor.Position.Y >= len(viewLines) || !strings.Contains(viewLines[view.Cursor.Position.Y], "html写一个你的自我介绍页面") {
+		t.Fatalf("cursor row=%d does not match input row:\n%s", view.Cursor.Position.Y, ansi.Strip(view.Content))
 	}
 	model.approval = &ApprovalRequest{Tool: "write_file", Risk: "write"}
 	if cursor := model.View().Cursor; cursor != nil {
@@ -277,7 +459,7 @@ func TestLocalMarkdownLinkTargetsContainingWorkspaceDirectory(t *testing.T) {
 func TestCancelledBackendDoesNotBlockOnFullPreviewQueue(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	backend := &fakeBackend{submit: func(ctx context.Context, operationID, _ string, emit func(Event)) error {
+	backend := &fakeBackend{submit: func(ctx context.Context, operationID string, _ Submission, emit func(Event)) error {
 		for index := 0; index < 1024; index++ {
 			emit(Event{OperationID: operationID, Kind: EventToolCallDelta, ToolCallDelta: &protocol.ToolCallDelta{ID: "call", Delta: "x"}})
 		}
@@ -285,7 +467,7 @@ func TestCancelledBackendDoesNotBlockOnFullPreviewQueue(t *testing.T) {
 	}}
 	events := make(chan Event, 1)
 	done := make(chan tea.Msg, 1)
-	go func() { done <- runBackendCmd(ctx, backend, "op-cancel", "prompt", events)() }()
+	go func() { done <- runBackendCmd(ctx, backend, "op-cancel", Submission{Text: "prompt"}, events)() }()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -403,13 +585,13 @@ func TestStaticNarrowViewportPasswordMaskAndContextPanel(t *testing.T) {
 }
 
 func TestBackendCommandEventOrderingAndError(t *testing.T) {
-	backend := &fakeBackend{submit: func(_ context.Context, operationID, _ string, emit func(Event)) error {
+	backend := &fakeBackend{submit: func(_ context.Context, operationID string, _ Submission, emit func(Event)) error {
 		emit(Event{OperationID: operationID, Kind: EventState, State: StateWaitingFirstToken})
 		emit(Event{OperationID: operationID, Kind: EventTextDelta, Delta: "done"})
 		return nil
 	}}
 	events := make(chan Event, 8)
-	message := runBackendCmd(context.Background(), backend, "op-1", "hello", events)()
+	message := runBackendCmd(context.Background(), backend, "op-1", Submission{Text: "hello"}, events)()
 	if _, ok := message.(backendWorkerMsg); !ok {
 		t.Fatalf("worker message = %#v", message)
 	}
@@ -424,13 +606,25 @@ func TestBackendCommandEventOrderingAndError(t *testing.T) {
 	backend.submit = nil
 	backend.err = errors.New("network failed")
 	events = make(chan Event, 4)
-	_ = runBackendCmd(context.Background(), backend, "op-2", "hello", events)()
+	_ = runBackendCmd(context.Background(), backend, "op-2", Submission{Text: "hello"}, events)()
 	foundError := false
 	for event := range events {
 		foundError = foundError || event.Kind == EventNotice && event.Error
 	}
 	if !foundError {
 		t.Fatal("backend error event was not marked")
+	}
+
+	backend.err = ErrRequestInterrupted
+	events = make(chan Event, 4)
+	_ = runBackendCmd(context.Background(), backend, "op-3", Submission{Text: "hello"}, events)()
+	interrupted, errorNotice := false, false
+	for event := range events {
+		interrupted = interrupted || event.Kind == EventState && event.State == StateInterrupted
+		errorNotice = errorNotice || event.Kind == EventNotice && event.Error
+	}
+	if !interrupted || errorNotice {
+		t.Fatalf("interrupted=%t errorNotice=%t", interrupted, errorNotice)
 	}
 }
 
@@ -464,7 +658,7 @@ func TestResizeStormLongWordsAndStaleAnimationTick(t *testing.T) {
 		height := 10 + index%35
 		_, _ = model.Update(tea.WindowSizeMsg{Width: width, Height: height})
 	}
-	if model.width < 40 || model.height < 12 || model.viewport.Width() != model.width || model.viewport.Height() != model.height-6 {
+	if model.width < 40 || model.height < 12 || model.viewport.Width() != model.width || model.viewport.Height() != model.layout().viewportHeight {
 		t.Fatalf("size=%dx%d viewport=%dx%d", model.width, model.height, model.viewport.Width(), model.viewport.Height())
 	}
 	word := strings.Repeat("界", 50)
@@ -491,4 +685,274 @@ func TestResizeStormLongWordsAndStaleAnimationTick(t *testing.T) {
 			t.Fatalf("line width=%d width=%d line=%q", lipgloss.Width(line), model.width, line)
 		}
 	}
+}
+
+func TestDurationFormattingUsesMillisecondsSecondsAndMinutes(t *testing.T) {
+	tests := map[int64]string{
+		0:     "0ms",
+		999:   "999ms",
+		1000:  "1s",
+		18023: "18.023s",
+		62345: "1m2.345s",
+	}
+	for input, expected := range tests {
+		if got := FormatDurationMS(input); got != expected {
+			t.Fatalf("FormatDurationMS(%d) = %q, want %q", input, got, expected)
+		}
+	}
+}
+
+func TestMultilineInputCompletionReferencesAndModeCycle(t *testing.T) {
+	backend := &fakeBackend{files: []FileItem{{Path: "internal/ui/model.go", Size: 1234}, {Path: "space name.go", Size: 12}}}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.snapshot = Snapshot{Mode: "manual", Skills: []SkillItem{{Name: "review", Description: "Review repository changes carefully", Status: "active"}}}
+
+	model.input.SetValue("/")
+	_ = model.refreshCompletion()
+	if labels := completionLabels(model.completion.items); !strings.Contains(labels, "/model") || !strings.Contains(labels, "/review") {
+		t.Fatalf("slash items = %s", labels)
+	}
+	model.input.SetValue("/m")
+	_ = model.refreshCompletion()
+	labels := completionLabels(model.completion.items)
+	if !strings.Contains(labels, "/model") || !strings.Contains(labels, "/mode") {
+		t.Fatalf("/m items = %s", labels)
+	}
+	model.input.SetValue("/unknown")
+	_ = model.refreshCompletion()
+	if handled, _ := model.handleCompletionKey("enter"); handled {
+		t.Fatal("disabled no-match completion swallowed submit")
+	}
+
+	model.files = append([]FileItem(nil), backend.files...)
+	model.filesLoaded = true
+	model.input.SetValue("inspect @")
+	_ = model.refreshCompletion()
+	labels = completionLabels(model.completion.items)
+	if !strings.Contains(labels, "@skill:review") || !strings.Contains(labels, "@file:internal/ui/model.go") {
+		t.Fatalf("reference items = %s", labels)
+	}
+	references := parseReferences("use @skill:review and @file:\"space name.go\" with\u3000@file:\"中文 路径.go\" @file:internal/ui/model.go")
+	if len(references) != 4 || references[0] != (Reference{Kind: ReferenceSkill, Value: "review"}) || references[1].Value != "space name.go" || references[2].Value != "中文 路径.go" {
+		t.Fatalf("references = %#v", references)
+	}
+	largeFiles := make([]FileItem, 1_000)
+	for index := range largeFiles {
+		largeFiles[index] = FileItem{Path: fmt.Sprintf("path/%04d.go", index)}
+	}
+	items, _ := referenceCompletionItems("file:0999", model.snapshot, largeFiles, true, false, "")
+	if len(items) != 1 || items[0].label != "@file:path/0999.go" {
+		t.Fatalf("bounded file matches = %#v", items)
+	}
+	unavailable, retry := referenceCompletionItems("", model.snapshot, nil, false, false, "git index failed")
+	if retry || len(unavailable) == 0 || unavailable[len(unavailable)-1].label != "Files unavailable" {
+		t.Fatalf("unavailable items=%#v retry=%t", unavailable, retry)
+	}
+
+	model.input.Reset()
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter, Mod: tea.ModCtrl}))
+	if model.input.Value() != "\n" {
+		t.Fatalf("ctrl+enter value = %q", model.input.Value())
+	}
+	model.input.Reset()
+	for index := 0; index < 10; index++ {
+		model.input.InsertString("line")
+		_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter, Mod: tea.ModShift}))
+	}
+	if model.input.Height() != 8 || strings.Count(model.input.Value(), "\n") != 10 {
+		t.Fatalf("height=%d value=%q", model.input.Height(), model.input.Value())
+	}
+	model.input.Reset()
+	_ = model.input.Focus()
+	_, _ = model.Update(tea.PasteMsg{Content: "pasted first\npasted second"})
+	if model.input.Value() != "pasted first\npasted second" || model.input.Height() != 2 {
+		t.Fatalf("pasted value=%q height=%d", model.input.Value(), model.input.Height())
+	}
+	_, command := model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab, Mod: tea.ModShift}))
+	if model.snapshot.Mode != "plan" || command == nil {
+		t.Fatalf("mode=%q command=%v", model.snapshot.Mode, command)
+	}
+	message := command()
+	_, _ = model.Update(message)
+	if backend.mode != "plan" {
+		t.Fatalf("backend mode = %q", backend.mode)
+	}
+	for _, size := range []struct{ width, height int }{{40, 12}, {80, 24}, {140, 40}} {
+		model.resize(size.width, size.height)
+		model.input.Reset()
+		_, _ = model.Update(tea.PasteMsg{Content: strings.Repeat("line\n", 10) + "inspect @"})
+		rendered := model.View()
+		view := ansi.Strip(rendered.Content)
+		if height := lipgloss.Height(view); height != size.height {
+			t.Fatalf("%dx%d completion view height=%d\n%s", size.width, size.height, height, view)
+		}
+		lines := strings.Split(view, "\n")
+		if rendered.Cursor == nil || rendered.Cursor.Position.Y >= len(lines) || !strings.Contains(lines[rendered.Cursor.Position.Y], "inspect @") {
+			t.Fatalf("%dx%d cursor=%#v is outside final input row\n%s", size.width, size.height, rendered.Cursor, view)
+		}
+		for _, line := range strings.Split(view, "\n") {
+			if lipgloss.Width(line) > size.width {
+				t.Fatalf("%dx%d completion line width=%d line=%q", size.width, size.height, lipgloss.Width(line), line)
+			}
+		}
+	}
+}
+
+func TestMouseSelectionCopiesPlainWideTextAndShowsToast(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)}
+	copied := ""
+	model := NewModel(&fakeBackend{}, Options{
+		NoAnimation: true, Width: 40, Height: 16, Clock: clock,
+		ClipboardWrite: func(value string) error { copied = value; return nil },
+	})
+	model.viewport.SetContent("alpha\n你好 world")
+	model.viewport.SetHeight(4)
+	_, _ = model.handleMouse(tea.MouseClickMsg{X: 1, Y: 1, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseMotionMsg{X: 4, Y: 2, Button: tea.MouseLeft})
+	_, command := model.handleMouse(tea.MouseReleaseMsg{X: 4, Y: 2, Button: tea.MouseLeft})
+	if command == nil {
+		t.Fatal("selection did not produce clipboard command")
+	}
+	message := command()
+	_, toastCommand := model.Update(message)
+	if copied != "lpha\n你好 " || model.copyToast != "8 chars copied" || toastCommand == nil {
+		t.Fatalf("copied=%q toast=%q command=%v", copied, model.copyToast, toastCommand)
+	}
+	if !strings.Contains(model.View().Content, "8 chars copied") {
+		t.Fatalf("toast missing from view: %q", model.View().Content)
+	}
+	_, _ = model.Update(toastCommand())
+	if model.copyToast != "" {
+		t.Fatalf("toast did not expire: %q", model.copyToast)
+	}
+}
+
+func TestMouseSelectionPreservesHardBreaksAndRemovesSoftWrapAndOSC(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 16})
+	model.viewport.SetWidth(5)
+	model.viewport.SetHeight(2)
+	model.viewport.SetContent("zero\n\x1b]8;;https://example.com\x07abcdefghij\x1b]8;;\x07\nlast")
+	model.viewport.SetYOffset(1)
+	lines := visibleSelectionLines(model.viewport.GetContent(), model.viewport.Width(), model.viewport.Height(), model.viewport.YOffset())
+	selected := selectedText(lines, selectionPoint{row: 0, col: 0}, selectionPoint{row: 1, col: 4})
+	if selected != "abcdefghij" || strings.Contains(selected, "\x1b") {
+		t.Fatalf("selected = %q", selected)
+	}
+
+	hardLines := visibleSelectionLines("first\n第二", 40, 2, 0)
+	hardSelected := selectedText(hardLines, selectionPoint{row: 0, col: 0}, selectionPoint{row: 1, col: 3})
+	if hardSelected != "first\n第二" {
+		t.Fatalf("hard selection = %q", hardSelected)
+	}
+	wideLines := selectionLines("你好", 40)
+	if wideSelected := selectedText(wideLines, selectionPoint{row: 0, col: 1}, selectionPoint{row: 0, col: 1}); wideSelected != "你" {
+		t.Fatalf("wide-cell selection = %q", wideSelected)
+	}
+
+	styled := NewModel(&fakeBackend{}, Options{NoAnimation: true, Width: 40, Height: 16})
+	styled.viewport.SetHeight(1)
+	styled.viewport.SetContent("\x1b[31mred\x1b[0m plain")
+	styled.selection = selectionState{
+		active: true,
+		anchor: selectionPoint{row: 0, col: 0},
+		focus:  selectionPoint{row: 0, col: 8},
+		lines:  selectionLines(styled.viewport.GetContent(), styled.viewport.Width()),
+	}
+	if rendered := styled.renderViewport(); !strings.Contains(rendered, styled.styles.Selection.Render("red plain")) {
+		t.Fatalf("selection background was interrupted by nested ANSI: %q", rendered)
+	}
+}
+
+func TestMouseSelectionScrollsBeyondViewportAndCopiesFullHistory(t *testing.T) {
+	copied := ""
+	model := NewModel(&fakeBackend{}, Options{
+		NoAnimation: true, NoColor: true, Width: 40, Height: 16,
+		ClipboardWrite: func(value string) error { copied = value; return nil },
+	})
+	model.viewport.SetWidth(40)
+	model.viewport.SetHeight(3)
+	model.viewport.SetContent("line-00\nline-01\nline-02\nline-03\nline-04\nline-05\nline-06")
+	_, _ = model.handleMouse(tea.MouseClickMsg{X: 0, Y: 1, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseMotionMsg{X: 6, Y: 3, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseWheelMsg{X: 6, Y: 3, Button: tea.MouseWheelDown})
+	_, command := model.handleMouse(tea.MouseReleaseMsg{X: 6, Y: 3, Button: tea.MouseLeft})
+	if command == nil {
+		t.Fatal("scrolling selection did not produce clipboard command")
+	}
+	_ = command()
+	if copied != "line-00\nline-01\nline-02\nline-03\nline-04\nline-05" {
+		t.Fatalf("copied across viewport = %q", copied)
+	}
+}
+
+func TestClipboardFailureShowsEnglishToast(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{
+		NoAnimation: true, NoColor: true,
+		ClipboardWrite: func(string) error { return errors.New("clipboard unavailable") },
+	})
+	model.copyToastSequence = 1
+	command := model.handleClipboardResult(clipboardResultMsg{sequence: 1, err: errors.New("clipboard unavailable")})
+	if model.copyToast != "Copy failed" || command == nil {
+		t.Fatalf("toast=%q command=%v", model.copyToast, command)
+	}
+}
+
+func TestModeCycleQueuesDuringActiveRequestAndSkillAliasExecutes(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true})
+	model.snapshot = Snapshot{Mode: "manual", Skills: []SkillItem{{Name: "review", Status: "active"}}}
+	model.state = StateStreaming
+	_, command := model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab, Mod: tea.ModShift}))
+	if command != nil || model.queuedMode != "plan" || model.snapshot.Mode != "manual" {
+		t.Fatalf("command=%v queued=%q mode=%q", command, model.queuedMode, model.snapshot.Mode)
+	}
+	queued := model.queuedMode
+	model.state = StateCompleted
+	model.operationID = "op-mode"
+	_, command = model.Update(backendEventClosedMsg{operationID: "op-mode"})
+	if command == nil {
+		t.Fatal("queued mode did not produce a command")
+	}
+	// Batch commands execute independently; exercising SetMode directly verifies
+	// the queued target while the model-level test covers queue ownership.
+	if err := backend.SetMode(context.Background(), queued); err != nil {
+		t.Fatal(err)
+	}
+	if backend.mode != "plan" {
+		t.Fatalf("backend mode = %q", backend.mode)
+	}
+
+	model.state = StateIdle
+	_, aliasCommand := model.executeSlash("/review")
+	if aliasCommand == nil {
+		t.Fatal("top-level skill alias did not map to a backend command")
+	}
+
+	backend.err = errors.New("persist mode failed")
+	model.snapshot.Mode = "manual"
+	_, rollbackCommand := model.requestMode("plan")
+	if rollbackCommand == nil || model.snapshot.Mode != "plan" {
+		t.Fatalf("optimistic mode=%q command=%v", model.snapshot.Mode, rollbackCommand)
+	}
+	_, _ = model.Update(rollbackCommand())
+	if model.snapshot.Mode != "manual" {
+		t.Fatalf("mode after persistence failure = %q", model.snapshot.Mode)
+	}
+
+	model.operationID = "op-reference-error"
+	model.state = StateFailed
+	model.draft = `inspect @file:"missing.go"`
+	model.input.Reset()
+	_, _ = model.Update(backendEventClosedMsg{operationID: model.operationID})
+	if model.input.Value() != model.draft {
+		t.Fatalf("restored draft = %q", model.input.Value())
+	}
+}
+
+func completionLabels(items []completionItem) string {
+	labels := make([]string, len(items))
+	for index, item := range items {
+		labels[index] = item.label
+	}
+	return strings.Join(labels, " ")
 }

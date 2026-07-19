@@ -29,7 +29,7 @@ func (w *WriteFile) Definition() protocol.ToolDefinition {
 	return protocol.ToolDefinition{
 		Name:        "write_file",
 		Description: "Atomically create or replace a UTF-8 file inside the workspace. For a requested standalone file, call this directly once the target path and content are clear. Use for complete file content after inspecting relevant related code. Parent directories are created only when create_parent_dirs is true. Existing file permissions are preserved.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"create_parent_dirs":{"type":"boolean","default":false}},"required":["path","content"],"additionalProperties":false}`),
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"create_parent_dirs":{"type":"boolean","default":false},"reason":{"type":"string","minLength":1,"description":"User-facing reason"}},"required":["path","content","reason"],"additionalProperties":false}`),
 	}
 }
 
@@ -40,6 +40,7 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 		Path             string `json:"path"`
 		Content          string `json:"content"`
 		CreateParentDirs bool   `json:"create_parent_dirs"`
+		Reason           string `json:"reason"`
 	}
 	if err := decodeStrict(raw, &input); err != nil {
 		return toolError("invalid write_file input: " + err.Error())

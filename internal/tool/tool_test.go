@@ -64,7 +64,9 @@ func TestRegistryAndExecutor(t *testing.T) {
 	if !result.IsError || !strings.Contains(result.Content, "confirmation required") || write.calls != 0 {
 		t.Fatalf("unconfirmed write = %#v", result)
 	}
-	executor.Confirm = func(context.Context, policy.Request, policy.Outcome) (bool, error) { return true, nil }
+	executor.Confirm = func(context.Context, policy.Request, policy.Outcome) (Confirmation, error) {
+		return Confirmation{Approved: true}, nil
+	}
 	result = executor.Execute(context.Background(), "request", protocol.ToolCall{ID: "3", Name: "write", Arguments: json.RawMessage(`{}`)})
 	if result.IsError || !result.Truncated || !strings.Contains(result.Content, "[output truncated]") || len([]byte(result.Content)) > 20 {
 		t.Fatalf("confirmed write = %#v", result)

@@ -19,21 +19,63 @@ type markdownRenderCache struct {
 	width    int
 }
 
+const (
+	activityGapRows = 1
+	fixedChromeRows = 5 + activityGapRows
+	minViewportRows = 4
+)
+
+type tuiLayout struct {
+	viewportTop     int
+	viewportHeight  int
+	completionRows  int
+	inputContentRow int
+	panelHeight     int
+}
+
+func (m *Model) layout() tuiLayout {
+	layout := tuiLayout{viewportTop: 1}
+	if m.approval != nil || m.planGate != nil {
+		layout.panelHeight = m.decisionPanelHeight()
+		layout.viewportHeight = max(minViewportRows, m.height-layout.viewportTop-layout.panelHeight)
+		return layout
+	}
+	layout.completionRows = m.completionHeight()
+	layout.viewportHeight = max(minViewportRows, m.height-m.input.Height()-fixedChromeRows-layout.completionRows)
+	layout.inputContentRow = layout.viewportTop + layout.viewportHeight + layout.completionRows + activityGapRows + 2
+	return layout
+}
+
+func (m *Model) decisionPanelHeight() int {
+	desired := max(6, m.height/3)
+	maximum := max(1, m.height-1-minViewportRows)
+	return min(desired, maximum)
+}
+
 func (m *Model) View() tea.View {
 	if m.screen != screenChat {
 		m.refreshViewport()
 	}
+	layout := m.layout()
+	m.setViewportHeight(layout.viewportHeight)
 	header := m.renderHeader()
-	loading := m.renderLoading()
-	status := m.renderStatus()
-	input := strings.Repeat("\n", 2)
-	if m.screen == screenChat {
-		input = m.renderInputBand()
-	}
-	content := strings.Join([]string{header, m.viewport.View(), loading, input, status}, "\n")
+	parts := []string{header, m.renderViewport()}
 	if m.approval != nil {
-		content = m.renderApproval(content)
+		parts = append(parts, m.renderApproval(layout.panelHeight))
+	} else if m.planGate != nil {
+		parts = append(parts, m.renderPlanGate(layout.panelHeight))
+	} else {
+		completion := m.renderCompletion()
+		if completion != "" {
+			parts = append(parts, completion)
+		}
+		input := strings.Repeat("\n", 2)
+		if m.screen == screenChat {
+			input = m.renderInputBand()
+		}
+		parts = append(parts, renderBlankRows(m.width, activityGapRows), m.renderLoading(), input, m.renderStatus())
 	}
+	content := fitRenderedRows(strings.Join(parts, "\n"), m.height)
 	if m.noColor {
 		content = ansi.Strip(content)
 	}
@@ -41,10 +83,11 @@ func (m *Model) View() tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
 	view.WindowTitle = "Eylu"
-	if m.screen == screenChat && m.approval == nil {
+	if m.screen == screenChat && m.approval == nil && m.planGate == nil {
 		view.Cursor = m.input.Cursor()
 		if view.Cursor != nil {
-			view.Cursor.Position.Y += lipgloss.Height(header) + m.viewport.Height() + lipgloss.Height(loading) + 1
+			localRow := min(max(0, view.Cursor.Position.Y), max(0, m.input.Height()-1))
+			view.Cursor.Position.Y = layout.inputContentRow + localRow
 		}
 	}
 	return view
@@ -56,16 +99,55 @@ func (m *Model) renderInputBand() string {
 	return strings.Join([]string{rule, input, rule}, "\n")
 }
 
+func renderBlankRows(width, rows int) string {
+	if rows <= 0 {
+		return ""
+	}
+	line := strings.Repeat(" ", max(0, width))
+	lines := make([]string, rows)
+	for index := range lines {
+		lines[index] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (m *Model) resize(width, height int) {
 	m.width = max(40, width)
 	m.height = max(12, height)
 	m.input.SetWidth(m.width)
-	m.input.SetHeight(1)
 	m.modelFilter.SetWidth(max(20, m.width-6))
+	m.approvalReason.SetWidth(max(20, m.width-12))
+	if m.planGate != nil {
+		m.planGate.feedback.SetWidth(max(20, m.width-12))
+	}
 	m.form.setWidth(m.width)
 	m.viewport.SetWidth(m.width)
-	m.viewport.SetHeight(max(4, m.height-6))
+	m.updateViewportHeight()
 	m.refreshViewport()
+}
+
+func (m *Model) updateViewportHeight() {
+	reservedCompletion := 0
+	if m.completion.kind != completionNone {
+		reservedCompletion = 1
+	}
+	inputLimit := min(maxInputRows, max(1, m.height-fixedChromeRows-minViewportRows-reservedCompletion))
+	if m.input.MaxHeight != inputLimit {
+		m.input.MaxHeight = inputLimit
+		m.input.SetWidth(m.width)
+	}
+	m.setViewportHeight(m.layout().viewportHeight)
+}
+
+func (m *Model) setViewportHeight(height int) {
+	if m.viewport.Height() == height {
+		return
+	}
+	wasBottom := m.viewport.AtBottom() || m.followOutput
+	m.viewport.SetHeight(height)
+	if wasBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m *Model) refreshViewport() {
@@ -110,9 +192,24 @@ func (m *Model) renderHeader() string {
 }
 
 func (m *Model) renderLoading() string {
-	if !m.busy() {
-		return strings.Repeat(" ", max(1, m.width))
+	left := ""
+	if m.busy() {
+		left = m.renderActivityLine()
 	}
+	toast := ""
+	if m.copyToast != "" {
+		toast = m.styles.Active.Render(m.copyToast)
+	}
+	if toast == "" {
+		return padWidth(ansi.Truncate(left, m.width, "..."), m.width)
+	}
+	available := max(0, m.width-lipgloss.Width(toast)-1)
+	left = ansi.Truncate(left, available, "...")
+	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(toast))
+	return left + strings.Repeat(" ", space) + toast
+}
+
+func (m *Model) renderActivityLine() string {
 	prefix := "*"
 	if m.animation {
 		prefix = m.spinner.View()
@@ -131,8 +228,7 @@ func (m *Model) renderLoading() string {
 	}
 	lead := m.styles.Loading.Render(fmt.Sprintf("%s %s...", prefix, activityLabel(m.state)))
 	metadata := m.styles.Status.Render(fmt.Sprintf("(%s)", strings.Join(details, " · ")))
-	rendered := ansi.Truncate(lead+"  "+metadata, m.width, "...")
-	return padWidth(rendered, m.width)
+	return lead + "  " + metadata
 }
 
 func (m *Model) renderInputActivity() string {
@@ -189,14 +285,18 @@ func (m *Model) renderStatus() string {
 	if mode == "" {
 		mode = "manual"
 	}
+	if m.queuedMode != "" {
+		mode += " -> " + m.queuedMode
+	}
 	report := m.snapshot.Context
 	contextText := fmt.Sprintf("%d tokens", report.TotalTokens)
 	if report.LimitKnown {
 		contextText = fmt.Sprintf("%.1f%% context", report.Percent)
 	}
 	left := fmt.Sprintf("%s  %s", mode, contextText)
-	right := string(m.state)
-	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
+	right := truncateColumns(string(m.state), max(0, m.width-1))
+	left = truncateColumns(left, max(0, m.width-lipgloss.Width(right)-1))
+	space := max(0, m.width-lipgloss.Width(left)-lipgloss.Width(right))
 	return m.styles.Status.Render(left + strings.Repeat(" ", space) + right)
 }
 
@@ -256,7 +356,7 @@ func (m *Model) renderTool(tool *toolView) string {
 	}
 	duration := ""
 	if tool.durationMS > 0 {
-		duration = fmt.Sprintf("  %dms", tool.durationMS)
+		duration = "  " + FormatDurationMS(tool.durationMS)
 	}
 	detail := summarizeLine(tool.arguments, max(20, m.width-30))
 	if tool.path != "" {
@@ -272,6 +372,17 @@ func (m *Model) renderTool(tool *toolView) string {
 		}
 	}
 	return m.styles.Tool.Render(strings.Join(lines, "\n"))
+}
+
+func FormatDurationMS(milliseconds int64) string {
+	if milliseconds < 0 {
+		milliseconds = 0
+	}
+	duration := time.Duration(milliseconds) * time.Millisecond
+	if duration < time.Second {
+		return fmt.Sprintf("%dms", milliseconds)
+	}
+	return duration.String()
 }
 
 func (m *Model) renderFileLocationLink(path string) string {
@@ -392,18 +503,147 @@ func (m *Model) renderContext() string {
 	return output.String()
 }
 
-func (m *Model) renderApproval(base string) string {
+func (m *Model) renderApproval(height int) string {
 	approval := m.approval
 	if approval == nil {
-		return base
+		return ""
 	}
-	style := m.styles.Warning
+	accent := m.styles.Warning
 	if approval.Warning {
-		style = m.styles.Error
+		accent = m.styles.Error
 	}
-	content := fmt.Sprintf("Approval %d/%d\n%s  %s\n%s\n%s", approval.Step, approval.Total, approval.Tool, approval.Risk, approval.Reason, approval.Summary)
-	modal := m.styles.Border.Width(min(m.width-8, 72)).Render(style.Render(content))
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, modal)
+	contentWidth := max(12, m.width-4)
+	header := panelHeader(accent.Bold(true).Render("Action approval"), fmt.Sprintf("%d/%d  %s", approval.Step, approval.Total, strings.ToUpper(approval.Risk)), contentWidth, m.styles)
+	lines := []string{header}
+	if height <= 7 {
+		lines = append(lines,
+			m.styles.Tool.Bold(true).Render(approval.Tool)+"  "+truncateColumns(approval.Summary, max(8, contentWidth-lipgloss.Width(approval.Tool)-2)),
+			m.styles.Muted.Render("Why  ")+truncateColumns(approval.Reason, max(8, contentWidth-5)),
+			renderChoiceRow([]string{"Yes", "No"}, m.approvalCursor, contentWidth, m.styles),
+		)
+	} else {
+		lines = append(lines,
+			m.styles.Tool.Bold(true).Render(approval.Tool),
+			m.styles.Agent.Render(wrapLimited(approval.Summary, contentWidth, 1)),
+			m.styles.Muted.Render("Why  ")+wrapLimited(approval.Reason, max(8, contentWidth-5), 1),
+			m.styles.Muted.Render("Policy  "+truncateColumns(approval.PolicyReason, max(8, contentWidth-8))),
+			renderChoiceRow([]string{"Yes, run once", "No, reject"}, m.approvalCursor, contentWidth, m.styles),
+		)
+	}
+	if m.approvalEditing || strings.TrimSpace(m.approvalReason.Value()) != "" {
+		lines = append(lines, "", m.styles.Muted.Render("Rejection feedback"), m.approvalReason.View())
+	}
+	footer := "↑/↓ select  ·  Enter confirm  ·  Tab add rejection reason  ·  Esc reject"
+	if m.height < 18 {
+		footer = "Enter confirm  ·  Tab reason  ·  Esc reject"
+	}
+	return m.renderBottomPanel(lines, footer, height)
+}
+
+func (m *Model) renderPlanGate(height int) string {
+	if m.planGate == nil {
+		return ""
+	}
+	contentWidth := max(12, m.width-4)
+	meta := "PLAN READY"
+	if m.copyToast != "" {
+		meta = m.copyToast
+	}
+	lines := []string{panelHeader(m.styles.Accent.Render("Start implementation"), meta, contentWidth, m.styles)}
+	if height <= 7 {
+		lines = append(lines,
+			m.styles.Muted.Render("Choose the implementation permission mode."),
+			renderChoiceRow([]string{"Auto", "Full", "Reject"}, m.planGate.cursor, contentWidth, m.styles),
+		)
+	} else {
+		lines = append(lines,
+			m.styles.Agent.Render("The final plan remains visible in the history above."),
+			m.styles.Muted.Render("Choose the permission mode for implementation."),
+			renderChoiceRow([]string{"Auto", "Full", "Reject"}, m.planGate.cursor, contentWidth, m.styles),
+		)
+	}
+	if m.planGate.editing || strings.TrimSpace(m.planGate.feedback.Value()) != "" {
+		lines = append(lines, "", m.styles.Muted.Render("Plan feedback"), m.planGate.feedback.View())
+	}
+	footer := "←/→ select  ·  Enter confirm  ·  Tab revise plan  ·  Esc exit plan"
+	if m.height < 18 {
+		footer = "Enter confirm  ·  Tab revise  ·  Esc exit"
+	}
+	return m.renderBottomPanel(lines, footer, height)
+}
+
+func renderChoiceRow(labels []string, selected, width int, styles Styles) string {
+	choices := make([]string, len(labels))
+	for index, label := range labels {
+		text := "  " + label + "  "
+		if index == selected {
+			text = styles.Accent.Reverse(true).Render(text)
+		} else {
+			text = styles.Status.Render(text)
+		}
+		choices[index] = text
+	}
+	return ansi.Truncate(strings.Join(choices, "  "), width, "...")
+}
+
+func panelHeader(title, meta string, width int, styles Styles) string {
+	meta = styles.Status.Render(truncateColumns(meta, max(0, width-lipgloss.Width(title)-1)))
+	gap := max(1, width-lipgloss.Width(title)-lipgloss.Width(meta))
+	return truncateColumns(title+strings.Repeat(" ", gap)+meta, width)
+}
+
+func (m *Model) renderBottomPanel(lines []string, footer string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	result := []string{m.styles.InputBorder.Render(strings.Repeat("─", m.width))}
+	contentRows := max(0, height-2)
+	if len(lines) > contentRows {
+		lines = lines[:contentRows]
+	}
+	for _, line := range lines {
+		result = append(result, padPanelLine(line, m.width))
+	}
+	for len(result) < height-1 {
+		result = append(result, strings.Repeat(" ", m.width))
+	}
+	if height > 1 {
+		result = append(result, padPanelLine(m.styles.Muted.Render(truncateColumns(footer, max(0, m.width-4))), m.width))
+	}
+	return strings.Join(result[:min(height, len(result))], "\n")
+}
+
+func padPanelLine(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	left := min(2, max(0, width-1))
+	line := strings.Repeat(" ", left) + value
+	return padWidth(truncateColumns(line, width), width)
+}
+
+func fitRenderedRows(value string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(value, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func wrapLimited(value string, width, maxLines int) string {
+	lines := strings.Split(wrapPlain(value, width), "\n")
+	if len(lines) <= maxLines {
+		return strings.Join(lines, "\n")
+	}
+	lines = lines[:maxLines]
+	lines[maxLines-1] = truncateColumns(lines[maxLines-1], max(1, width-3)) + "..."
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) renderMarkdown(value string) string {
@@ -412,7 +652,7 @@ func (m *Model) renderMarkdown(value string) string {
 	}
 	width := max(20, m.width-2)
 	if m.markdown.renderer == nil || m.markdown.width != width {
-		renderer, err := glamour.NewTermRenderer(glamour.WithStandardStyle("dark"), glamour.WithWordWrap(width))
+		renderer, err := glamour.NewTermRenderer(glamour.WithStyles(eyluMarkdownStyle()), glamour.WithWordWrap(width))
 		if err != nil {
 			return wrapPlain(value, m.width-2)
 		}
@@ -556,6 +796,8 @@ func stateLabel(state OperationState) string {
 		return "Cancelling"
 	case StateCancelled:
 		return "Cancelled"
+	case StateInterrupted:
+		return "Interrupted"
 	default:
 		return string(state)
 	}
@@ -670,8 +912,14 @@ func splitWordColumns(word string, width int) []string {
 }
 
 func truncateColumns(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	if lipgloss.Width(value) <= width {
 		return value
+	}
+	if width <= 3 {
+		return strings.Repeat(".", width)
 	}
 	runes := []rune(value)
 	for len(runes) > 0 && lipgloss.Width(string(runes))+3 > width {

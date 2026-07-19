@@ -35,9 +35,11 @@ const (
 type timelineKind string
 
 const (
-	timelineMessage timelineKind = "message"
-	timelineTool    timelineKind = "tool"
-	timelineNotice  timelineKind = "notice"
+	timelineMessage     timelineKind = "message"
+	timelineTool        timelineKind = "tool"
+	timelineNotice      timelineKind = "notice"
+	maxInputRows                     = 8
+	maxInputContentRows              = 10_000
 )
 
 type timelineItem struct {
@@ -73,35 +75,70 @@ type toolView struct {
 	exitCode             int
 }
 
+const approvedPlanImplementationPrompt = "Implement the approved plan now. Follow the plan already present in this conversation, inspect current files before editing, and run the relevant verification."
+
+type planGateState struct {
+	cursor   int
+	feedback textinput.Model
+	editing  bool
+}
+
+func newPlanGate(width int) *planGateState {
+	feedback := textinput.New()
+	feedback.Placeholder = "What should the next plan change?"
+	feedback.CharLimit = 1 << 12
+	feedback.SetVirtualCursor(true)
+	feedback.SetWidth(max(20, width-12))
+	return &planGateState{feedback: feedback}
+}
+
 type Model struct {
 	backend Backend
 	context context.Context
 	clock   Clock
 	styles  Styles
 
-	input       textarea.Model
-	viewport    viewport.Model
-	spinner     spinner.Model
-	modelFilter textinput.Model
-	form        providerFormModel
+	input          textarea.Model
+	viewport       viewport.Model
+	spinner        spinner.Model
+	modelFilter    textinput.Model
+	form           providerFormModel
+	completion     completionState
+	approvalReason textinput.Model
 
 	width  int
 	height int
 	screen screenKind
 	state  OperationState
 
-	snapshot       Snapshot
-	timeline       []timelineItem
-	providerCursor int
-	skillCursor    int
-	modelCursor    int
-	toolCursor     int
-	models         []string
-	modelManual    bool
-	contextExpand  bool
-	approval       *ApprovalRequest
+	snapshot                   Snapshot
+	timeline                   []timelineItem
+	providerCursor             int
+	skillCursor                int
+	modelCursor                int
+	toolCursor                 int
+	models                     []string
+	modelManual                bool
+	contextExpand              bool
+	approval                   *ApprovalRequest
+	approvalCursor             int
+	approvalEditing            bool
+	planGate                   *planGateState
+	pendingImplementationMode  string
+	restorePlanGateOnModeError bool
+	files                      []FileItem
+	filesLoaded                bool
+	filesLoading               bool
+	filesDiagnostic            string
+	queuedMode                 string
+	draft                      string
+	selection                  selectionState
+	clipboardWrite             func(string) error
+	copyToast                  string
+	copyToastSequence          uint64
 
 	operationID          string
+	operationMode        string
 	eventChannel         chan Event
 	cancel               context.CancelFunc
 	startedAt            time.Time
@@ -144,6 +181,12 @@ type modelsResultMsg struct {
 	err    error
 }
 
+type modeResultMsg struct {
+	previous string
+	next     string
+	err      error
+}
+
 type operationSpinnerMsg struct {
 	operationID string
 	message     tea.Msg
@@ -172,29 +215,50 @@ func NewModel(backend Backend, options Options) *Model {
 	if baseContext == nil {
 		baseContext = context.Background()
 	}
+	styles := DefaultStyles(options.NoColor)
 	input := textarea.New()
 	input.Placeholder = "Message Eylu"
 	input.Prompt = "> "
 	input.ShowLineNumbers = false
-	input.DynamicHeight = false
+	input.DynamicHeight = true
+	input.MinHeight = 1
+	input.MaxHeight = maxInputRows
+	input.MaxContentHeight = maxInputContentRows
 	input.SetHeight(1)
 	input.CharLimit = 1 << 20
 	input.SetVirtualCursor(false)
 	inputStyles := input.Styles()
 	inputStyles.Cursor.Shape = tea.CursorBar
 	inputStyles.Cursor.Blink = true
+	inputStyles.Focused.Text = styles.Agent
+	inputStyles.Focused.Prompt = styles.Accent
+	inputStyles.Focused.Placeholder = styles.Muted
+	inputStyles.Focused.EndOfBuffer = styles.Muted
+	inputStyles.Blurred.Text = styles.Agent
+	inputStyles.Blurred.Prompt = styles.Muted
+	inputStyles.Blurred.Placeholder = styles.Muted
+	inputStyles.Blurred.EndOfBuffer = styles.Muted
 	input.SetStyles(inputStyles)
 	input.SetWidth(width)
 	filter := textinput.New()
 	filter.Placeholder = "Filter models"
 	filter.SetVirtualCursor(true)
 	filter.SetWidth(max(20, width-6))
+	approvalReason := textinput.New()
+	approvalReason.Placeholder = "Reason for rejection"
+	approvalReason.CharLimit = 1 << 12
+	approvalReason.SetVirtualCursor(true)
+	approvalReason.SetWidth(max(20, width-12))
+	clipboardWrite := options.ClipboardWrite
+	if clipboardWrite == nil {
+		clipboardWrite = defaultClipboardWrite
+	}
 	model := &Model{
-		backend: backend, context: baseContext, clock: clock, styles: DefaultStyles(options.NoColor), input: input,
+		backend: backend, context: baseContext, clock: clock, styles: styles, input: input,
 		viewport: viewport.New(viewport.WithWidth(width), viewport.WithHeight(max(5, height-8))),
-		spinner:  spinner.New(spinner.WithSpinner(spinner.Dot)), modelFilter: filter,
+		spinner:  spinner.New(spinner.WithSpinner(spinner.Dot)), modelFilter: filter, approvalReason: approvalReason,
 		width: width, height: height, screen: screenChat, state: StateIdle, followOutput: true,
-		animation: !options.NoAnimation, noColor: options.NoColor,
+		animation: !options.NoAnimation, noColor: options.NoColor, clipboardWrite: clipboardWrite,
 	}
 	model.viewport.SoftWrap = true
 	model.resize(width, height)
@@ -246,24 +310,85 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if typed.err != nil {
 			m.appendNotice(typed.err.Error(), true)
 		} else {
+			if m.snapshot.Workspace != typed.snapshot.Workspace {
+				m.files = nil
+				m.filesLoaded = false
+				m.filesLoading = false
+				m.filesDiagnostic = ""
+			}
 			m.snapshot = typed.snapshot
 		}
 		m.refreshViewport()
 		return m, nil
+	case filesResultMsg:
+		m.filesLoading = false
+		if typed.err != nil {
+			m.filesLoaded = false
+			m.filesDiagnostic = typed.err.Error()
+			m.appendNotice(typed.err.Error(), true)
+		} else {
+			m.files = append(m.files[:0], typed.files...)
+			m.filesLoaded = true
+			m.filesDiagnostic = ""
+		}
+		return m, m.refreshCompletion()
+	case clipboardResultMsg:
+		return m, m.handleClipboardResult(typed)
+	case copyToastExpiredMsg:
+		if typed.sequence == m.copyToastSequence {
+			m.copyToast = ""
+		}
+		return m, nil
+	case modeResultMsg:
+		if typed.err != nil {
+			m.snapshot.Mode = typed.previous
+			m.pendingImplementationMode = ""
+			if m.restorePlanGateOnModeError {
+				m.planGate = newPlanGate(m.width)
+			}
+			m.restorePlanGateOnModeError = false
+			m.appendNotice(typed.err.Error(), true)
+		} else {
+			m.snapshot.Mode = typed.next
+			m.restorePlanGateOnModeError = false
+			if m.pendingImplementationMode == typed.next {
+				m.pendingImplementationMode = ""
+				_, startCommand := m.startRequest(Submission{Text: approvedPlanImplementationPrompt})
+				return m, tea.Batch(m.loadSnapshotCmd(), startCommand)
+			}
+		}
+		return m, m.loadSnapshotCmd()
 	case backendEventMsg:
 		return m.handleBackendEvent(typed.event)
 	case backendEventClosedMsg:
 		if typed.operationID == m.operationID {
 			if m.state == StateCancelling {
 				m.state = StateCancelled
-			} else if m.state != StateFailed && m.state != StateCancelled {
+			} else if m.state != StateFailed && m.state != StateCancelled && m.state != StateInterrupted {
 				m.state = StateCompleted
 			}
 			m.cancel = nil
 			m.cancelRequested = false
 			m.eventChannel = nil
+			if m.state == StateFailed && strings.TrimSpace(m.input.Value()) == "" && m.draft != "" {
+				m.input.SetValue(m.draft)
+				m.input.MoveToEnd()
+				m.updateViewportHeight()
+			} else if m.state == StateCompleted {
+				m.draft = ""
+				if m.operationMode == "plan" {
+					m.queuedMode = ""
+					m.planGate = newPlanGate(m.width)
+				}
+			}
 		}
-		return m, m.loadSnapshotCmd()
+		commands := []tea.Cmd{m.loadSnapshotCmd()}
+		if m.queuedMode != "" && m.planGate == nil {
+			next := m.queuedMode
+			m.queuedMode = ""
+			commands = append(commands, m.setModeCmd(next))
+		}
+		return m, tea.Batch(commands...)
 	case backendWorkerMsg:
 		return m, nil
 	case commandResultMsg:
@@ -308,19 +433,34 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyPressMsg:
 		return m.handleKey(typed)
+	case tea.MouseMsg:
+		return m.handleMouse(typed)
 	case interruptRequestMsg:
 		return m.handleInterrupt()
 	case tea.PasteMsg:
+		if m.approval != nil && m.approvalEditing {
+			updated, command := m.approvalReason.Update(message)
+			m.approvalReason = updated
+			return m, command
+		}
+		if m.planGate != nil && m.planGate.editing {
+			updated, command := m.planGate.feedback.Update(message)
+			m.planGate.feedback = updated
+			return m, command
+		}
 		if m.screen == screenChat {
+			m.clearSelection()
 			updated, command := m.input.Update(message)
 			m.input = updated
-			return m, command
+			completionCommand := m.refreshCompletion()
+			return m, tea.Batch(command, completionCommand)
 		}
 	}
 	if m.screen == screenChat {
 		updated, command := m.input.Update(message)
 		m.input = updated
-		return m, command
+		completionCommand := m.refreshCompletion()
+		return m, tea.Batch(command, completionCommand)
 	}
 	return m, nil
 }
@@ -384,6 +524,9 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		}
 	case EventApproval:
 		m.approval = event.Approval
+		m.approvalCursor = 0
+		m.approvalEditing = false
+		m.approvalReason.Reset()
 		m.state = StateAwaitingApproval
 	case EventContext:
 		if event.Context != nil {
@@ -414,11 +557,25 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := message.String()
+	m.clearSelection()
 	if key == "ctrl+c" {
 		return m.handleInterrupt()
 	}
 	if m.approval != nil {
+		if m.approvalEditing && key != "enter" && key != "esc" && key != "tab" {
+			updated, command := m.approvalReason.Update(message)
+			m.approvalReason = updated
+			return m, command
+		}
 		return m.handleApprovalKey(key)
+	}
+	if m.planGate != nil {
+		if m.planGate.editing && key != "enter" && key != "esc" && key != "tab" {
+			updated, command := m.planGate.feedback.Update(message)
+			m.planGate.feedback = updated
+			return m, command
+		}
+		return m.handlePlanGateKey(key)
 	}
 	switch m.screen {
 	case screenProviders:
@@ -465,6 +622,11 @@ func (m *Model) handleInterrupt() (tea.Model, tea.Cmd) {
 
 func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := message.String()
+	if key != "shift+enter" && key != "ctrl+enter" {
+		if handled, command := m.handleCompletionKey(key); handled {
+			return m, command
+		}
+	}
 	switch key {
 	case "enter":
 		value := strings.TrimSpace(m.input.Value())
@@ -473,6 +635,8 @@ func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if strings.HasPrefix(value, "/") {
 			m.input.Reset()
+			m.completion = completionState{}
+			m.updateViewportHeight()
 			return m.executeSlash(value)
 		}
 		if m.busy() {
@@ -480,19 +644,23 @@ func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.refreshViewport()
 			return m, nil
 		}
-		m.input.Reset()
-		return m.startRequest(value)
-	case "tab":
-		if completed := m.completeSkillInput(); completed {
-			return m, nil
-		}
+		return m.startRequest(Submission{Text: value, References: parseReferences(value)})
+	case "shift+enter", "ctrl+enter":
+		m.input.InsertString("\n")
+		return m, m.refreshCompletion()
+	case "shift+tab":
+		return m.cycleMode()
 	case "pgup":
+		m.completion = completionState{}
 		m.followOutput = false
 		m.viewport.PageUp()
+		m.updateViewportHeight()
 		return m, nil
 	case "pgdown":
+		m.completion = completionState{}
 		m.viewport.PageDown()
 		m.followOutput = m.viewport.AtBottom()
+		m.updateViewportHeight()
 		return m, nil
 	case "ctrl+t":
 		if index := m.lastToolIndex(); index >= 0 {
@@ -504,10 +672,11 @@ func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	updated, command := m.input.Update(message)
 	m.input = updated
-	return m, command
+	completionCommand := m.refreshCompletion()
+	return m, tea.Batch(command, completionCommand)
 }
 
-func (m *Model) startRequest(prompt string) (tea.Model, tea.Cmd) {
+func (m *Model) startRequest(submission Submission) (tea.Model, tea.Cmd) {
 	if m.busy() {
 		m.appendNotice("A request is already running.", true)
 		m.refreshViewport()
@@ -515,6 +684,10 @@ func (m *Model) startRequest(prompt string) (tea.Model, tea.Cmd) {
 	}
 	sequence := atomic.AddUint64(&m.operationSeq, 1)
 	m.operationID = fmt.Sprintf("op-%d", sequence)
+	m.operationMode = m.snapshot.Mode
+	if m.operationMode == "" {
+		m.operationMode = "manual"
+	}
 	m.eventChannel = make(chan Event, 256)
 	requestContext, cancel := context.WithCancel(m.context)
 	m.cancel = cancel
@@ -527,10 +700,14 @@ func (m *Model) startRequest(prompt string) (tea.Model, tea.Cmd) {
 	m.roundReasoningTokens = 0
 	m.roundReasoningExact = false
 	m.state = StateConnecting
-	m.timeline = append(m.timeline, timelineItem{kind: timelineMessage, role: "user", text: prompt})
+	m.draft = submission.Text
+	m.input.Reset()
+	m.completion = completionState{}
+	m.updateViewportHeight()
+	m.timeline = append(m.timeline, timelineItem{kind: timelineMessage, role: "user", text: submission.Text})
 	m.followOutput = true
 	m.refreshViewport()
-	commands := []tea.Cmd{runBackendCmd(requestContext, m.backend, m.operationID, prompt, m.eventChannel), waitEventCmd(m.operationID, m.eventChannel)}
+	commands := []tea.Cmd{runBackendCmd(requestContext, m.backend, m.operationID, submission, m.eventChannel), waitEventCmd(m.operationID, m.eventChannel)}
 	if m.animation {
 		commands = append(commands, wrapOperationCmd(m.operationID, func() tea.Msg { return m.spinner.Tick() }))
 	}
@@ -540,6 +717,14 @@ func (m *Model) startRequest(prompt string) (tea.Model, tea.Cmd) {
 func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(line)
 	command := fields[0]
+	for _, item := range m.snapshot.Skills {
+		if item.Status == "active" && command == "/"+item.Name {
+			line = "/skill " + item.Name
+			fields = strings.Fields(line)
+			command = fields[0]
+			break
+		}
+	}
 	switch command {
 	case "/quit":
 		return m, tea.Quit
@@ -569,30 +754,168 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 			m.screen = screenModels
 			return m, tea.Batch(m.modelFilter.Focus(), m.fetchModelsCmd())
 		}
+	case "/mode":
+		if len(fields) == 2 {
+			return m.requestMode(fields[1])
+		}
 	case "/help":
-		m.appendNotice("/new /context /skills /skill /providers /provider /model /mode /quit", false)
+		m.appendNotice("/new /context /skills /skill /providers /provider /model /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
 		m.refreshViewport()
 		return m, nil
 	}
 	return m, m.commandCmd(line)
 }
 
+func (m *Model) cycleMode() (tea.Model, tea.Cmd) {
+	current := m.snapshot.Mode
+	if m.queuedMode != "" {
+		current = m.queuedMode
+	}
+	modes := []string{"manual", "plan", "auto", "full"}
+	next := modes[0]
+	for index, mode := range modes {
+		if mode == current {
+			next = modes[(index+1)%len(modes)]
+			break
+		}
+	}
+	return m.requestMode(next)
+}
+
+func (m *Model) requestMode(next string) (tea.Model, tea.Cmd) {
+	switch next {
+	case "manual", "plan", "auto", "full":
+	default:
+		m.appendNotice("unknown permission mode "+next, true)
+		return m, nil
+	}
+	if m.busy() {
+		m.queuedMode = next
+		return m, nil
+	}
+	return m, m.setModeCmd(next)
+}
+
+func (m *Model) setModeCmd(next string) tea.Cmd {
+	previous := m.snapshot.Mode
+	if previous == "" {
+		previous = "manual"
+	}
+	m.snapshot.Mode = next
+	return func() tea.Msg {
+		err := m.backend.SetMode(m.context, next)
+		return modeResultMsg{previous: previous, next: next, err: err}
+	}
+}
+
 func (m *Model) handleApprovalKey(key string) (tea.Model, tea.Cmd) {
-	approved := false
+	if m.approvalEditing {
+		switch strings.ToLower(key) {
+		case "enter":
+			return m, m.submitApproval(ApprovalDecision{Reason: strings.TrimSpace(m.approvalReason.Value())})
+		case "esc", "tab":
+			m.approvalEditing = false
+			m.approvalReason.Blur()
+			return m, nil
+		default:
+			return m, nil
+		}
+	}
 	switch strings.ToLower(key) {
-	case "y", "enter":
-		approved = true
+	case "up", "left":
+		m.approvalCursor = max(0, m.approvalCursor-1)
+		return m, nil
+	case "down", "right":
+		m.approvalCursor = min(1, m.approvalCursor+1)
+		return m, nil
+	case "tab":
+		m.approvalCursor = 1
+		m.approvalEditing = true
+		return m, m.approvalReason.Focus()
+	case "y":
+		return m, m.submitApproval(ApprovalDecision{Approved: true})
 	case "n", "esc":
+		return m, m.submitApproval(ApprovalDecision{})
+	case "enter":
+		if m.approvalCursor == 0 {
+			return m, m.submitApproval(ApprovalDecision{Approved: true})
+		}
+		return m, m.submitApproval(ApprovalDecision{Reason: strings.TrimSpace(m.approvalReason.Value())})
 	default:
 		return m, nil
 	}
+}
+
+func (m *Model) submitApproval(decision ApprovalDecision) tea.Cmd {
 	select {
-	case m.approval.Response <- approved:
+	case m.approval.Response <- decision:
 	default:
 	}
 	m.approval = nil
+	m.approvalEditing = false
+	m.approvalReason.Blur()
+	m.approvalReason.Reset()
 	m.state = StateExecutingTool
-	return m, waitEventCmd(m.operationID, m.eventChannel)
+	return waitEventCmd(m.operationID, m.eventChannel)
+}
+
+func (m *Model) handlePlanGateKey(key string) (tea.Model, tea.Cmd) {
+	if m.planGate == nil {
+		return m, nil
+	}
+	if m.planGate.editing {
+		switch strings.ToLower(key) {
+		case "enter":
+			feedback := strings.TrimSpace(m.planGate.feedback.Value())
+			if feedback == "" {
+				return m, nil
+			}
+			m.planGate = nil
+			prompt := "Revise the current implementation plan using this user feedback:\n\n" + feedback
+			return m.startRequest(Submission{Text: prompt})
+		case "esc", "tab":
+			m.planGate.editing = false
+			m.planGate.feedback.Blur()
+			return m, nil
+		default:
+			return m, nil
+		}
+	}
+	switch strings.ToLower(key) {
+	case "left", "up":
+		m.planGate.cursor = max(0, m.planGate.cursor-1)
+		return m, nil
+	case "right", "down":
+		m.planGate.cursor = min(2, m.planGate.cursor+1)
+		return m, nil
+	case "tab":
+		m.planGate.cursor = 2
+		m.planGate.editing = true
+		return m, m.planGate.feedback.Focus()
+	case "enter":
+		switch m.planGate.cursor {
+		case 0:
+			m.planGate = nil
+			m.pendingImplementationMode = "auto"
+			m.restorePlanGateOnModeError = true
+			return m.requestMode("auto")
+		case 1:
+			m.planGate = nil
+			m.pendingImplementationMode = "full"
+			m.restorePlanGateOnModeError = true
+			return m.requestMode("full")
+		default:
+			m.planGate = nil
+			m.restorePlanGateOnModeError = true
+			return m.requestMode("manual")
+		}
+	case "esc":
+		m.planGate = nil
+		m.restorePlanGateOnModeError = true
+		return m.requestMode("manual")
+	default:
+		return m, nil
+	}
 }
 
 func (m *Model) busy() bool {
@@ -604,7 +927,7 @@ func (m *Model) busy() bool {
 	}
 }
 
-func runBackendCmd(ctx context.Context, backend Backend, operationID, prompt string, events chan Event) tea.Cmd {
+func runBackendCmd(ctx context.Context, backend Backend, operationID string, submission Submission, events chan Event) tea.Cmd {
 	return func() tea.Msg {
 		enqueue := func(event Event, lossy bool) {
 			if lossy {
@@ -623,7 +946,7 @@ func runBackendCmd(ctx context.Context, backend Backend, operationID, prompt str
 				}
 			}
 		}
-		err := backend.Submit(ctx, operationID, prompt, func(event Event) {
+		err := backend.Submit(ctx, operationID, submission, func(event Event) {
 			if event.OperationID == "" {
 				event.OperationID = operationID
 			}
@@ -633,6 +956,8 @@ func runBackendCmd(ctx context.Context, backend Backend, operationID, prompt str
 			if errors.Is(err, context.Canceled) {
 				enqueue(Event{OperationID: operationID, Kind: EventNotice, Notice: "Request cancelled."}, false)
 				enqueue(Event{OperationID: operationID, Kind: EventState, State: StateCancelled}, false)
+			} else if errors.Is(err, ErrRequestInterrupted) {
+				enqueue(Event{OperationID: operationID, Kind: EventState, State: StateInterrupted}, false)
 			} else {
 				enqueue(Event{OperationID: operationID, Kind: EventNotice, Notice: err.Error(), Error: true}, false)
 				enqueue(Event{OperationID: operationID, Kind: EventState, State: StateFailed}, false)
@@ -889,22 +1214,6 @@ func (m *Model) applyToolAudit(audit ToolAudit) {
 			item.tool.exitCode = audit.ExitCode
 		}
 	}
-}
-
-func (m *Model) completeSkillInput() bool {
-	value := m.input.Value()
-	if !strings.HasPrefix(value, "/skill ") {
-		return false
-	}
-	prefix := strings.TrimSpace(strings.TrimPrefix(value, "/skill "))
-	for _, item := range m.snapshot.Skills {
-		if strings.HasPrefix(item.Name, prefix) {
-			m.input.SetValue("/skill " + item.Name)
-			m.input.MoveToEnd()
-			return true
-		}
-	}
-	return false
 }
 
 func (m *Model) lastToolIndex() int {

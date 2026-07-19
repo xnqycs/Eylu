@@ -34,7 +34,7 @@ func (e *EditFile) Definition() protocol.ToolDefinition {
 	return protocol.ToolDefinition{
 		Name:        "edit_file",
 		Description: "Replace an exact string in one UTF-8 workspace file after reading it. By default old_string must occur exactly once; expected_replacements can request another positive count. Matching failures leave the file unchanged and require a fresh read. Existing permissions and line-ending style are preserved. Returns a unified diff and line statistics.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"expected_replacements":{"type":"integer","minimum":1,"default":1}},"required":["path","old_string","new_string"],"additionalProperties":false}`),
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"expected_replacements":{"type":"integer","minimum":1,"default":1},"reason":{"type":"string","minLength":1,"description":"User-facing reason"}},"required":["path","old_string","new_string","reason"],"additionalProperties":false}`),
 	}
 }
 
@@ -46,6 +46,7 @@ func (e *EditFile) Execute(_ context.Context, raw json.RawMessage) protocol.Tool
 		OldString            string `json:"old_string"`
 		NewString            string `json:"new_string"`
 		ExpectedReplacements *int   `json:"expected_replacements"`
+		Reason               string `json:"reason"`
 	}
 	if err := decodeStrict(raw, &input); err != nil {
 		return toolError("invalid edit_file input: " + err.Error())

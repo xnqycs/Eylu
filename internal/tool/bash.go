@@ -64,7 +64,7 @@ func (b *Bash) Definition() protocol.ToolDefinition {
 	return protocol.ToolDefinition{
 		Name:        "bash",
 		Description: "Run a shell command inside the workspace to build, test, format, or diagnose the repository. The command has a timeout, a minimal inherited environment, separate stdout/stderr capture, exit-code reporting, and bounded output. The active platform shell is reported in the result.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Command executed by the platform shell"},"working_directory":{"type":"string","description":"Optional workspace-relative directory"}},"required":["command"],"additionalProperties":false}`),
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string","description":"Command executed by the platform shell"},"working_directory":{"type":"string","description":"Optional workspace-relative directory"},"reason":{"type":"string","minLength":1,"description":"User-facing reason"}},"required":["command","reason"],"additionalProperties":false}`),
 	}
 }
 
@@ -74,6 +74,7 @@ func (b *Bash) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolRe
 	var input struct {
 		Command          string `json:"command"`
 		WorkingDirectory string `json:"working_directory"`
+		Reason           string `json:"reason"`
 	}
 	if err := decodeStrict(raw, &input); err != nil {
 		return toolError("invalid bash input: " + err.Error())

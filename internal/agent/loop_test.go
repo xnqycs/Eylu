@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -98,6 +99,56 @@ func TestAgentLoopTranscriptAndToolResultPairing(t *testing.T) {
 	}
 	if len(events) != 2 || events[0] != protocol.EventToolStart || events[1] != protocol.EventToolResult {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+type approvalEchoTool struct{ calls int }
+
+func (t *approvalEchoTool) Definition() protocol.ToolDefinition {
+	return protocol.ToolDefinition{Name: "echo", InputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+func (t *approvalEchoTool) Risk() policy.Risk { return policy.RiskWrite }
+func (t *approvalEchoTool) Execute(context.Context, json.RawMessage) protocol.ToolResult {
+	t.calls++
+	return protocol.ToolResult{Content: "executed"}
+}
+
+func TestAgentLoopInterruptsOnRejectionWithoutReason(t *testing.T) {
+	model := &loopDriver{}
+	item := &approvalEchoTool{}
+	executor := &tool.Executor{
+		Registry: tool.NewRegistry(item), Policy: policy.NewChecker(policy.DefaultConfig(policy.ModeManual)),
+		Confirm: func(context.Context, policy.Request, policy.Outcome) (tool.Confirmation, error) {
+			return tool.Confirmation{}, nil
+		},
+	}
+	conversation := NewConversation()
+	_, err := conversation.Run(context.Background(), "approval", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3}, false, nil)
+	if !errors.Is(err, ErrRequestInterrupted) || item.calls != 0 || len(model.requests) != 1 {
+		t.Fatalf("error=%v calls=%d requests=%d", err, item.calls, len(model.requests))
+	}
+	turns := conversation.Transcript()
+	if len(turns) != 3 || turns[2].Role != protocol.RoleTool || len(conversation.ExportState().DriverState) != 0 {
+		t.Fatalf("turns=%#v state=%#v", turns, conversation.ExportState())
+	}
+}
+
+func TestAgentLoopContinuesAfterRejectionWithReason(t *testing.T) {
+	model := &loopDriver{}
+	item := &approvalEchoTool{}
+	executor := &tool.Executor{
+		Registry: tool.NewRegistry(item), Policy: policy.NewChecker(policy.DefaultConfig(policy.ModeManual)),
+		Confirm: func(context.Context, policy.Request, policy.Outcome) (tool.Confirmation, error) {
+			return tool.Confirmation{RejectionReason: "Use the existing helper"}, nil
+		},
+	}
+	conversation := NewConversation()
+	response, err := conversation.Run(context.Background(), "approval", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3}, false, nil)
+	if err != nil || response.Turn.ID != "final" || item.calls != 0 || len(model.requests) != 2 {
+		t.Fatalf("response=%#v error=%v calls=%d requests=%d", response, err, item.calls, len(model.requests))
+	}
+	if text := requestText(model.requests[1].Model.Turns); !strings.Contains(text, "Use the existing helper") {
+		t.Fatalf("second request = %q", text)
 	}
 }
 

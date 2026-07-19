@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 
@@ -25,9 +26,12 @@ const (
 	StateRetryBackoff      OperationState = "retry_backoff"
 	StateCancelling        OperationState = "cancelling"
 	StateCancelled         OperationState = "cancelled"
+	StateInterrupted       OperationState = "interrupted"
 	StateCompleted         OperationState = "completed"
 	StateFailed            OperationState = "failed"
 )
+
+var ErrRequestInterrupted = errors.New("request interrupted by user")
 
 type EventKind string
 
@@ -81,14 +85,20 @@ type ToolAudit struct {
 }
 
 type ApprovalRequest struct {
-	Tool     string
-	Risk     string
-	Summary  string
+	Tool         string
+	Risk         string
+	Summary      string
+	Reason       string
+	PolicyReason string
+	Warning      bool
+	Step         int
+	Total        int
+	Response     chan ApprovalDecision
+}
+
+type ApprovalDecision struct {
+	Approved bool
 	Reason   string
-	Warning  bool
-	Step     int
-	Total    int
-	Response chan bool
 }
 
 type ProviderItem struct {
@@ -108,6 +118,28 @@ type SkillItem struct {
 	ShadowedBy  string `json:"shadowed_by,omitempty"`
 	Reason      string `json:"reason,omitempty"`
 	Activated   bool   `json:"activated"`
+}
+
+type ReferenceKind string
+
+const (
+	ReferenceSkill ReferenceKind = "skill"
+	ReferenceFile  ReferenceKind = "file"
+)
+
+type Reference struct {
+	Kind  ReferenceKind `json:"kind"`
+	Value string        `json:"value"`
+}
+
+type Submission struct {
+	Text       string      `json:"text"`
+	References []Reference `json:"references,omitempty"`
+}
+
+type FileItem struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
 }
 
 type Snapshot struct {
@@ -133,8 +165,10 @@ type ProviderForm struct {
 
 type Backend interface {
 	Snapshot(context.Context) (Snapshot, error)
-	Submit(context.Context, string, string, func(Event)) error
+	Submit(context.Context, string, Submission, func(Event)) error
 	Command(context.Context, string) (string, error)
+	ListFiles(context.Context) ([]FileItem, error)
+	SetMode(context.Context, string) error
 	UpsertProvider(context.Context, ProviderForm) error
 	DeleteProvider(context.Context, string) error
 	UseProvider(context.Context, string) error
@@ -155,12 +189,13 @@ func (realClock) Tick(duration time.Duration, fn func(time.Time) tea.Msg) tea.Cm
 }
 
 type Options struct {
-	Context     context.Context
-	Input       io.Reader
-	Output      io.Writer
-	NoAnimation bool
-	NoColor     bool
-	Clock       Clock
-	Width       int
-	Height      int
+	Context        context.Context
+	Input          io.Reader
+	Output         io.Writer
+	NoAnimation    bool
+	NoColor        bool
+	Clock          Clock
+	Width          int
+	Height         int
+	ClipboardWrite func(string) error
 }

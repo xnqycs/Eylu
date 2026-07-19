@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -17,6 +18,8 @@ type LoopOptions struct {
 	MaxTotalTokens int
 	RequestID      string
 }
+
+var ErrRequestInterrupted = errors.New("request interrupted by user")
 
 func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, executor *tool.Executor, options LoopOptions, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	c.mu.Lock()
@@ -62,6 +65,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model stopped for tool use without tool calls"}
 		}
 		toolTurn := protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleTool, CreatedAt: time.Now().UTC()}
+		interrupted := false
 		for _, call := range calls {
 			if call.ID == "" {
 				return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned a tool call without an ID"}
@@ -96,6 +100,9 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			}
 			for index := range results {
 				result := results[index]
+				if result.Metadata != nil && result.Metadata["interrupt_request"] == true {
+					interrupted = true
+				}
 				c.captureSkillResult(result)
 				toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
 				if emit != nil {
@@ -108,7 +115,13 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 		c.turns = append(c.turns, toolTurn)
 		c.projectMapDirty = true
+		if interrupted {
+			c.driverState = nil
+		}
 		c.rebuildLedger(runtime)
+		if interrupted {
+			return last, ErrRequestInterrupted
+		}
 	}
 	return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("agent iteration limit exceeded (%d)", maxTurns)}
 }

@@ -10,6 +10,7 @@ import (
 
 	"Eylu/internal/config"
 	"Eylu/internal/driver"
+	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 )
@@ -123,7 +124,7 @@ func TestConversationModeChangesPromptAndClearsDriverState(t *testing.T) {
 	if _, err := conversation.Send(context.Background(), "plan it", runtime, false, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := fake.requests[0].Model.Turns[0].Parts[0].Text; !strings.Contains(got, "Current permission mode: plan") || !strings.Contains(got, "modification plan") {
+	if got := fake.requests[0].Model.Turns[0].Parts[0].Text; !strings.Contains(got, "software architecture planner") || !strings.Contains(got, "decision-complete plan") {
 		t.Fatalf("plan prompt = %q", got)
 	}
 	runtime.PermissionMode = "auto"
@@ -138,6 +139,46 @@ func TestConversationModeChangesPromptAndClearsDriverState(t *testing.T) {
 	}
 	if got := fake.requests[1].Model.Turns[0].Parts[0].Text; !strings.Contains(got, "Act through tools early") || !strings.Contains(got, "Inspect only files relevant") {
 		t.Fatalf("execution guidance missing from prompt = %q", got)
+	}
+}
+
+func TestPlanProfileForksContextFiltersToolsAndAdoptsFinalResult(t *testing.T) {
+	fake := &scriptedDriver{}
+	conversation := NewConversation()
+	runtime := testRuntime(fake, 1)
+	if _, err := conversation.Send(context.Background(), "remember the parent context", runtime, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	parentState := conversation.ExportState()
+	if len(parentState.DriverState) == 0 {
+		t.Fatal("expected parent driver state")
+	}
+
+	profile := ProfileForMode("plan")
+	if !profile.Isolated || profile.Model != ModelInherit || !profile.AllowsTool("read_file", policy.RiskRead) || !profile.AllowsTool("bash", policy.RiskExec) || profile.AllowsTool("write_file", policy.RiskWrite) {
+		t.Fatalf("plan profile = %#v", profile)
+	}
+	fork, err := conversation.Fork(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forkState := fork.ExportState()
+	if forkState.SessionID == parentState.SessionID || len(forkState.Turns) != len(parentState.Turns) || len(forkState.DriverState) != 0 || forkState.PermissionMode != "plan" {
+		t.Fatalf("fork state = %#v parent = %#v", forkState, parentState)
+	}
+	if !strings.Contains(fork.systemPrompt, "software architecture planner") || !strings.Contains(fork.systemPrompt, "read-only") {
+		t.Fatalf("fork prompt = %q", fork.systemPrompt)
+	}
+
+	planTurn := protocol.Turn{ID: "plan-final", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "implementation plan"}}}
+	planResponse := protocol.ModelResponse{Turn: planTurn, Stop: protocol.StopCompleted, Usage: protocol.Usage{InputTokens: 10, OutputTokens: 5, Exact: true}}
+	runtime.PermissionMode = "plan"
+	if err := conversation.Adopt("design the change", runtime, &planResponse); err != nil {
+		t.Fatal(err)
+	}
+	adopted := conversation.ExportState()
+	if len(adopted.Turns) != len(parentState.Turns)+2 || adopted.Turns[len(adopted.Turns)-1].ID != "plan-final" || len(adopted.DriverState) != 0 {
+		t.Fatalf("adopted state = %#v", adopted)
 	}
 }
 

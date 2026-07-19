@@ -47,7 +47,11 @@ go run . "审查并测试这个项目" --route auto --task review --require-reas
 
 兼容入口 `go run . chat [prompt]` 继续可用。prompt 与子命令同名时，可使用 `go run . -- "sessions"` 将其作为对话内容发送。
 
-TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、单行命令带、Markdown、工具状态/详情、确认弹窗、Provider 表单、模型筛选、Skill 状态与上下文进度。命令带使用原生终端光标，支持中文输入与横向视口。流式活动行展示阶段、耗时、每回合发送 token、实时接收 token 和 thinking 状态；Responses reasoning summary delta 与 Chat `reasoning_content` 用于实时估算，Provider usage 到达后校正为精确累计值。TUI 会把 provider 发出的极小文本与工具参数 delta 合并成小批次，并缓存已完成的 Markdown 渲染，减少长会话重绘。模型生成 `write_file` 或 `edit_file` 参数时，时间线会实时显示目标路径、内容增量、字节数和行数，完整参数通过后再执行权限检查与原子写入；已存在的本地文件路径可点击并打开所在目录。Provider 表单的 API Key 使用 password input；模型面板支持刷新、筛选、选择和手工 ID。`Ctrl-C` 在请求期间第一次取消，第二次退出；`Ctrl-T` 打开最近工具详情。
+TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、1 至 8 行动态输入框、Markdown、工具状态/详情、底部审批工作台、Provider 表单、模型筛选、Skill 状态与上下文进度。历史区支持鼠标拖选并自动复制纯文本，拖选期间可用滚轮跨越当前 viewport，复制状态在输入框上方显示 2 秒；ANSI、OSC 链接、中文宽字符、软换行和滚动偏移均按显示列处理。界面采用 Eylu Signal 语义色板，焦点、工具活动、确认、风险与选区使用独立颜色。`Enter` 提交，`Shift+Enter` 或 `Ctrl+Enter` 换行，超过 8 行后输入框内部滚动。
+
+输入 `/` 会在输入框上方显示命令与英文说明，继续输入可按前缀筛选；`/mode`、`/provider`、`/skill` 提供上下文子选项，活跃 Skill 也可作为顶层命令使用。输入 `@` 可引用活跃 Skill 或仓库文件，文件列表使用 Git 标准 ignore/exclude 语义；提交时 Skill 自动激活，UTF-8 文件快照按配置预算注入请求。方向键、`Tab`、`Enter` 和 `Esc` 用于操作补全面板。
+
+流式活动行展示阶段、自动换算后的耗时、每回合发送 token、实时接收 token 和 thinking 状态；Responses reasoning summary delta 与 Chat `reasoning_content` 用于实时估算，Provider usage 到达后校正为精确累计值。TUI 会把 provider 发出的极小文本与工具参数 delta 合并成小批次，并缓存已完成的 Markdown 渲染，减少长会话重绘。模型生成 `bash`、`write_file`、`edit_file` 或其他需审批的工具参数时，必须提供面向用户的 `reason`；审批工作台同时展示动作摘要、申请理由和策略依据，仅提供单次同意与拒绝。拒绝时按 `Tab` 可填写反馈并回传模型继续当前请求；直接拒绝会中断请求并显示 `Interrupted after <duration>` 指标。Provider 表单的 API Key 使用 password input；模型面板支持刷新、筛选、选择和手工 ID。`Shift+Tab` 按 `manual → plan → auto → full` 循环模式；运行期间的切换在下一轮生效。`Ctrl-C` 在请求期间第一次取消，第二次退出；`Ctrl-T` 打开最近工具详情。
 
 ```powershell
 go run . --no-animation
@@ -96,11 +100,13 @@ go run . "读取 go.mod 并执行 go test ./..." --provider work --yes
 | 模式 | 行为 |
 |---|---|
 | `manual` | 读取自动执行；写入和命令确认；高危操作确认两次。 |
-| `plan` | 读取与已分类的只读命令执行；写入和其他命令拒绝；最终生成实施计划。 |
+| `plan` | 在继承当前模型、主会话、Skill、项目地图与 MCP 上下文的隔离规划 Agent 中执行；开放读取工具和已分类的只读命令，仅将最终计划回写主会话。 |
 | `auto` | 写入与命令白名单自动执行；未知命令确认；高危操作确认两次。 |
 | `full` | 普通操作自动执行；高危操作显示警告并确认。 |
 
 命令分类会检查链式命令、重定向、命令替换、阻止规则和高危模式。`read_only_commands`、`auto_allow_commands`、`dangerous_commands`、`blocked_commands` 与 `shell_environment` 可在 TOML 中配置。
+
+TUI 与 `--no-tui --mode plan` 使用同一 Plan runner。规划过程的 reasoning 与工具事件实时输出，中间 turns 保存在临时侧链；成功后主会话记录用户请求和最终计划并清除旧 DriverState，取消或失败时保持父会话 transcript 不变。TUI 随后在底部约三分之一高度的工作台显示执行入口，历史区继续展示完整计划：`Auto` 使用自动审批策略开始实现，`Full` 使用完整权限策略开始实现，`Reject` 退出 Plan 并回到 `manual`；按 `Tab` 可提交修改理由，由 Plan Agent 基于主会话中的现有计划重新规划并再次显示入口。
 
 ## Agent Skills
 
@@ -122,7 +128,7 @@ go run . skills validate ".agents/skills/code-review"
 go run . skills diagnose --output json
 ```
 
-交互会话支持 `/skills` 和 `/skill <name>`。Skill 的 `allowed-tools` 仅作为提示和审计信息，工具执行继续服从当前权限模式。
+交互会话支持 `/skills`、`/skill <name>`、顶层 `/<skill-name>` 和 `@skill:<name>`。Skill 的 `allowed-tools` 仅作为提示和审计信息，工具执行继续服从当前权限模式。
 
 签名 Skill 仓库使用 Ed25519 公钥建立信任。索引和包地址接受 HTTPS，测试环境可使用 loopback HTTP；私有仓库的 Bearer token 通过环境变量名称引用：
 

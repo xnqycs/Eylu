@@ -153,6 +153,53 @@ func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime,
 	return c.generate(ctx, runtime, nil, stream, emit)
 }
 
+func (c *Conversation) Fork(profile Profile) (*Conversation, error) {
+	state := c.ExportState()
+	state.SessionID = uuid.NewString()
+	state.DriverState = nil
+	state.PermissionMode = profile.PermissionMode
+	state.Ledger = contextledger.LedgerState{}
+	fork, err := RestoreConversation(state)
+	if err != nil {
+		return nil, err
+	}
+	fork.mu.Lock()
+	fork.systemPrompt = profile.SystemPrompt()
+	fork.driverState = nil
+	fork.mu.Unlock()
+	return fork, nil
+}
+
+// Adopt records only a detached run's user request and final answer in the parent.
+func (c *Conversation) Adopt(prompt string, runtime Runtime, response *protocol.ModelResponse, protectedSkills ...ProtectedSkill) error {
+	if response != nil && len(response.Turn.Parts) == 0 {
+		return &protocol.Error{Code: protocol.ErrProtocol, Message: "detached agent returned an empty turn"}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.prepareRuntime(prompt, runtime); err != nil {
+		return err
+	}
+	c.appendUser(prompt)
+	if response != nil {
+		c.turns = append(c.turns, cloneTurns([]protocol.Turn{response.Turn})[0])
+	}
+	for _, item := range protectedSkills {
+		if item.Name != "" && item.Digest != "" && item.Content != "" {
+			c.protectedSkills[item.Name] = item
+		}
+	}
+	// The remote response state belongs to the parent prefix and cannot include
+	// the detached turn. The next request must rebuild from the local transcript.
+	c.driverState = nil
+	c.lastRuntime = runtime
+	c.rebuildLedger(runtime)
+	if response != nil {
+		c.ledger.SetLastUsage(response.Usage)
+	}
+	return nil
+}
+
 func (c *Conversation) prepareRuntime(prompt string, runtime Runtime) error {
 	if prompt == "" {
 		return errors.New("prompt is empty")
@@ -235,19 +282,7 @@ func (c *Conversation) rebuildLedger(runtime Runtime) {
 }
 
 func promptForRuntime(mode string) string {
-	base := SystemPrompt + "\nCurrent permission mode: " + mode + ". Local policy decisions are final."
-	modePrompt := ""
-	switch mode {
-	case "plan":
-		modePrompt = " You may read, search, list files, and run commands classified as read-only. Finish with a concrete modification plan, file list, risks, and validation commands."
-	case "auto":
-		modePrompt = " Workspace edits run automatically. Allowlisted commands run automatically; other commands request confirmation."
-	case "full":
-		modePrompt = " Ordinary workspace tools and commands run automatically. Dangerous operations always request a prominent confirmation."
-	default:
-		modePrompt = " Reads run automatically. Writes and commands request confirmation; dangerous operations require two confirmations."
-	}
-	return base + modePrompt
+	return ProfileForMode(mode).SystemPrompt()
 }
 
 func (c *Conversation) ActivatedSkillDigests() map[string]string {

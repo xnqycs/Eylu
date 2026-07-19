@@ -337,7 +337,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		}
 		return nil
 	}
-	response, err := conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, stream, emit)
+	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, stream, emit)
 	metric := observation.Finish(response.Usage, err)
 	r.reportMetric(jsonlEncoder, metric)
 	syncErr := error(nil)
@@ -361,6 +361,27 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	}
 	fmt.Fprintln(r.stdout)
 	return nil
+}
+
+func runConversationWithProfile(ctx context.Context, conversation *agent.Conversation, prompt string, runtime agent.Runtime, executor *tool.Executor, options agent.LoopOptions, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
+	profile := agent.ProfileForMode(runtime.PermissionMode)
+	options.MaxTurns = profile.LimitTurns(options.MaxTurns)
+	if !profile.Isolated {
+		return conversation.Run(ctx, prompt, runtime, executor, options, stream, emit)
+	}
+	fork, err := conversation.Fork(profile)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	response, runErr := fork.Run(ctx, prompt, runtime, executor, options, stream, emit)
+	if runErr != nil {
+		return response, runErr
+	}
+	forkState := fork.ExportState()
+	if adoptErr := conversation.Adopt(prompt, runtime, &response, forkState.ProtectedSkills...); adoptErr != nil {
+		return response, adoptErr
+	}
+	return response, nil
 }
 
 func (r *runtime) metricCollector() *metrics.Collector {
@@ -421,6 +442,14 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	if skillRegistry != nil && len(skillRegistry.Active()) > 0 {
 		registered = append(registered, tool.NewActivateSkill(skillRegistry, skillSession), tool.NewReadSkillResource(skillSession))
 	}
+	profile := agent.ProfileForMode(mode.String())
+	filtered := registered[:0]
+	for _, item := range registered {
+		if profile.AllowsTool(item.Definition().Name, item.Risk()) {
+			filtered = append(filtered, item)
+		}
+	}
+	registered = filtered
 	return &tool.Executor{
 		Registry: tool.NewRegistry(registered...), Policy: checker,
 		Confirm: confirm, Audit: audit, Workspace: cfg.Workspace,
@@ -429,18 +458,19 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 }
 
 func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
-	return func(ctx context.Context, request policy.Request, outcome policy.Outcome) (bool, error) {
+	return func(ctx context.Context, request policy.Request, outcome policy.Outcome) (tool.Confirmation, error) {
 		if approve {
-			return true, nil
+			return tool.Confirmation{Approved: true}, nil
 		}
 		if !isTerminal(r.stdin) {
-			return false, nil
+			return tool.Confirmation{}, nil
 		}
 		reader := r.inputReader
 		if reader == nil {
 			reader = bufio.NewReader(r.stdin)
 		}
-		preview := logging.Redact(string(request.Input), os.Getenv("EYLU_API_KEY"))
+		modelReason, preview := approvalRequestDetails(request.Tool, request.Input)
+		preview = logging.Redact(preview, os.Getenv("EYLU_API_KEY"))
 		if len(preview) > 512 {
 			preview = preview[:512] + "..."
 		}
@@ -448,12 +478,12 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 		if outcome.Warning {
 			label = "DANGER"
 		}
-		fmt.Fprintf(r.stderr, "%s [%d/%d] approve %s tool %s? %s\n%s\n[y/N]: ", label, request.ConfirmationStep, request.ConfirmationTotal, outcome.Risk, request.Tool, outcome.Reason, preview)
+		fmt.Fprintf(r.stderr, "%s [%d/%d] approve %s tool %s?\nReason: %s\nPolicy: %s\n%s\n[y/N]: ", label, request.ConfirmationStep, request.ConfirmationTotal, outcome.Risk, request.Tool, modelReason, outcome.Reason, preview)
 		answer, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
-			return false, err
+			return tool.Confirmation{}, err
 		}
-		return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes"), nil
+		return tool.Confirmation{Approved: strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")}, nil
 	}
 }
 

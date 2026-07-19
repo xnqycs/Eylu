@@ -2,10 +2,19 @@
 
 ## Unreleased
 
+- TUI 历史区增加按显示列拖选、跨 viewport 滚轮扩展、系统剪贴板自动复制与短时状态提示；选区稳定覆盖 ANSI/OSC 与中文宽字符。输入框增加 1 至 8 行动态高度及 `Shift+Enter`/`Ctrl+Enter` 换行，并统一修正原生光标坐标。
+- 增加统一 `/` 与 `@` 补全面板、顶层 Skill 命令、Git-aware 文件候选，以及带边界校验和上下文预算的 Skill/文件引用注入。
+- `Shift+Tab` 支持四模式循环与运行期排队；耗时按毫秒、秒、分钟自动格式化。
+- `plan` 升级为继承当前模型与父上下文的隔离规划 Agent，只开放读取类工具和受分类器约束的 shell，仅将最终计划回写主会话并清除 DriverState；TUI 与静态入口共用同一 runner。
+- Plan 完成后在保留历史可见的底部三分之一工作台增加 `Auto`、`Full`、`Reject` 执行入口与 `Tab` 修改意见循环，确认后切换权限模式并由主会话直接开始实现。
+- 权限审批升级为 Eylu 底部工作台，展示工具动作、模型申请理由与策略依据；拒绝可附带反馈供模型调整，空理由拒绝会中断请求并输出带耗时的 `Interrupted after` 指标。
+- Bubble Tea 界面采用 Eylu Signal 语义色板，统一输入、Markdown、工具活动、选择、高危提示与底部工作台的视觉层级。
 - 根命令默认进入多轮 Chat，并支持直接传入 prompt 和全部 Chat 参数；`eylu chat` 保持兼容。
 - 项目采用 Apache License 2.0，版权主体为 xnqycs。
 - 发布归档增加项目 NOTICE、许可证和覆盖六个目标平台的第三方许可证全文。
 - 增加可复现的第三方声明生成器及 CI 漂移检查。
+
+兼容性：protocol v1 与 session schema v1 保持不变。依赖：新增 `github.com/atotto/clipboard`。
 
 ## Phase 9 - 扩展生态与发布
 

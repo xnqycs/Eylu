@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -12,7 +13,12 @@ import (
 	"Eylu/internal/protocol"
 )
 
-type ConfirmFunc func(context.Context, policy.Request, policy.Outcome) (bool, error)
+type Confirmation struct {
+	Approved        bool
+	RejectionReason string
+}
+
+type ConfirmFunc func(context.Context, policy.Request, policy.Outcome) (Confirmation, error)
 
 type AuditRecord struct {
 	Timestamp          time.Time           `json:"timestamp"`
@@ -70,7 +76,14 @@ func (e *Executor) Definitions() []protocol.ToolDefinition {
 	if e == nil || e.Registry == nil {
 		return nil
 	}
-	return e.Registry.Definitions()
+	definitions := e.Registry.Definitions()
+	for index := range definitions {
+		item, ok := e.Registry.Get(definitions[index].Name)
+		if ok && item.Risk() != policy.RiskRead {
+			definitions[index] = withApprovalReason(definitions[index])
+		}
+	}
+	return definitions
 }
 
 func (e *Executor) CanExecuteConcurrently(call protocol.ToolCall) bool {
@@ -209,15 +222,22 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 		for step := 1; step <= confirmations; step++ {
 			policyRequest.ConfirmationStep = step
 			policyRequest.ConfirmationTotal = confirmations
-			allowed, err := e.Confirm(ctx, policyRequest, outcome)
+			confirmation, err := e.Confirm(ctx, policyRequest, outcome)
 			if err != nil {
 				result.IsError = true
 				result.Content = "confirmation failed: " + err.Error()
 				return result
 			}
-			if !allowed {
+			if !confirmation.Approved {
 				result.IsError = true
-				result.Content = fmt.Sprintf("confirmation rejected at step %d of %d", step, confirmations)
+				result.Content = "approval rejected"
+				result.Metadata = map[string]any{"approval_rejected": true}
+				if reason := strings.TrimSpace(confirmation.RejectionReason); reason != "" {
+					result.Content += ": " + reason
+					result.Metadata["rejection_reason"] = reason
+				} else {
+					result.Metadata["interrupt_request"] = true
+				}
 				return result
 			}
 			record.Confirmations++
@@ -230,7 +250,11 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 	}
 	toolCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	result = item.Execute(toolCtx, call.Arguments)
+	executionInput := call.Arguments
+	if !schemaHasProperty(item.Definition().InputSchema, "reason") {
+		executionInput = withoutJSONField(executionInput, "reason")
+	}
+	result = item.Execute(toolCtx, executionInput)
 	result.CallID = call.ID
 	if toolCtx.Err() == context.DeadlineExceeded {
 		result.IsError = true
@@ -247,6 +271,56 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 	result.Content = content
 	result.Truncated = result.Truncated || truncated
 	return result
+}
+
+func withApprovalReason(definition protocol.ToolDefinition) protocol.ToolDefinition {
+	if schemaHasProperty(definition.InputSchema, "reason") {
+		return definition
+	}
+	var schema map[string]any
+	if json.Unmarshal(definition.InputSchema, &schema) != nil || schema["type"] != "object" {
+		return definition
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	if properties == nil {
+		properties = make(map[string]any)
+		schema["properties"] = properties
+	}
+	properties["reason"] = map[string]any{"type": "string", "minLength": 1, "description": "User-facing reason"}
+	required, _ := schema["required"].([]any)
+	schema["required"] = append(required, "reason")
+	encoded, err := json.Marshal(schema)
+	if err == nil {
+		definition.InputSchema = encoded
+	}
+	return definition
+}
+
+func schemaHasProperty(schema json.RawMessage, name string) bool {
+	var decoded struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if json.Unmarshal(schema, &decoded) != nil {
+		return false
+	}
+	_, exists := decoded.Properties[name]
+	return exists
+}
+
+func withoutJSONField(input json.RawMessage, name string) json.RawMessage {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(input, &fields) != nil {
+		return input
+	}
+	if _, exists := fields[name]; !exists {
+		return input
+	}
+	delete(fields, name)
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return input
+	}
+	return encoded
 }
 
 func truncateUTF8(value string, limit int) (string, bool) {
