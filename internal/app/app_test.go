@@ -141,6 +141,11 @@ func TestProvidersAddPersistsAPIKeyInConfig(t *testing.T) {
 	if bytes.Contains(data, []byte("credential")) {
 		t.Fatalf("legacy credential configuration remains: %s", data)
 	}
+	for _, unexpected := range [][]byte{[]byte("timeout_seconds"), []byte("context_window"), []byte("model_metadata"), []byte("max_turns")} {
+		if bytes.Contains(data, unexpected) {
+			t.Fatalf("provider command expanded default %q: %s", unexpected, data)
+		}
+	}
 }
 
 func TestRuntimeRedactsConfiguredAPIKeys(t *testing.T) {
@@ -388,6 +393,7 @@ func isolateUserState(t *testing.T) string {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("EYLU_STATE_DIR", filepath.Join(home, "state"))
+	t.Setenv("EYLU_MODEL_METADATA_ENABLED", "false")
 	return home
 }
 

@@ -36,7 +36,7 @@ func optionsForRuntime(runtime Runtime) contextOptions {
 	if options.outputReserve <= 0 {
 		options.outputReserve = 8192
 	}
-	if window := runtime.Provider.Config.ContextWindow; window > 0 && options.outputReserve >= window {
+	if window := runtime.Provider.ContextWindowLimit(); window > 0 && options.outputReserve >= window {
 		options.outputReserve = max(1, window/4)
 	}
 	if options.recentRounds <= 0 {
@@ -62,14 +62,14 @@ func (c *Conversation) prepareRequestContext(runtime Runtime, definitions []prot
 	c.ledger.SetEstimator(options.estimator)
 	c.refreshProjectMap(runtime)
 	prepared := c.buildPromptContext(runtime, definitions)
-	window := runtime.Provider.Config.ContextWindow
+	window := runtime.Provider.ContextWindowLimit()
 	before := prepared.InputTokens()
 	omittedBefore := len(c.omittedTurnIDs)
 	for window > 0 && prepared.InputTokens()+options.outputReserve > window {
 		candidates := c.compressionCandidates(options.recentRounds)
 		if len(candidates) == 0 {
 			prepared = c.finalizeCompression(runtime, definitions, options, prepared, before, omittedBefore)
-			return contextledger.PromptResult{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("context budget exceeded: %d input + %d reserved > %d", prepared.InputTokens(), options.outputReserve, window)}
+			return contextledger.PromptResult{}, &protocol.Error{Code: protocol.ErrContextWindow, Message: fmt.Sprintf("context budget exceeded: %d input + %d reserved > %d", prepared.InputTokens(), options.outputReserve, window), ContextLimit: window}
 		}
 		for _, id := range candidates[0] {
 			c.omittedTurnIDs[id] = struct{}{}
@@ -97,7 +97,7 @@ func (c *Conversation) finalizeCompression(runtime Runtime, definitions []protoc
 		}
 		c.ledger.RecordCompression(event)
 		if runtime.ContextEvent != nil {
-			runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompression, InputTokens: prepared.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: runtime.Provider.Config.ContextWindow, Compression: &event})
+			runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompression, InputTokens: prepared.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: runtime.Provider.ContextWindowLimit(), Compression: &event})
 		}
 	}
 	c.ledger.ReplaceBlocks(prepared.Blocks)

@@ -174,3 +174,22 @@ func TestGenerateFallsBackWhenHTTPGatewayRejectsPreviousResponse(t *testing.T) {
 		t.Fatalf("response=%#v requests=%d err=%v", response, requests, err)
 	}
 }
+
+func TestContextErrorBypassesResponsesFallbackAndStart(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"context_length_exceeded: maximum context length is 64000"}}`))
+	}))
+	defer server.Close()
+	events := 0
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "large"}}}}}}, func(protocol.ModelEvent) error {
+		events++
+		return nil
+	})
+	typed, ok := err.(*protocol.Error)
+	if !ok || typed.Code != protocol.ErrContextWindow || typed.ContextLimit != 64000 || requests != 1 || events != 0 {
+		t.Fatalf("error=%#v requests=%d events=%d", err, requests, events)
+	}
+}

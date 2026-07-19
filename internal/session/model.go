@@ -26,12 +26,20 @@ const (
 )
 
 type ProviderState struct {
-	Name          string `json:"name"`
-	Generation    uint64 `json:"generation"`
-	Adapter       string `json:"adapter"`
-	BaseURL       string `json:"base_url"`
-	Model         string `json:"model"`
-	ContextWindow int    `json:"context_window,omitempty"`
+	Name                   string    `json:"name"`
+	Generation             uint64    `json:"generation"`
+	Adapter                string    `json:"adapter"`
+	BaseURL                string    `json:"base_url"`
+	Model                  string    `json:"model"`
+	CatalogProvider        string    `json:"catalog_provider,omitempty"`
+	ContextWindow          int       `json:"context_window,omitempty"`
+	DetectedContextWindow  int       `json:"detected_context_window,omitempty"`
+	EffectiveContextWindow int       `json:"effective_context_window,omitempty"`
+	LimitSource            string    `json:"limit_source,omitempty"`
+	LimitObservedAt        time.Time `json:"limit_observed_at,omitzero"`
+	LimitCached            bool      `json:"limit_cached,omitempty"`
+	LimitAssumed           bool      `json:"limit_assumed,omitempty"`
+	LimitDegradations      int       `json:"limit_degradations,omitempty"`
 }
 
 type SkillState struct {

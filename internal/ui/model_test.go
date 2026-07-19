@@ -893,10 +893,18 @@ func TestProviderFormValidationAndModelFiltering(t *testing.T) {
 	form.inputs[providerFieldName].SetValue("work")
 	form.inputs[providerFieldURL].SetValue("https://example.com/v1")
 	form.inputs[providerFieldModel].SetValue("manual-model")
+	form.inputs[providerFieldCatalog].SetValue("openai")
 	form.inputs[providerFieldContext].SetValue("32000")
 	value, err := form.value()
-	if err != nil || value.ContextWindow != 32000 || value.Model != "manual-model" {
+	if err != nil || value.ContextWindow != 32000 || !value.ContextWindowSet || value.CatalogProvider != "openai" || !value.CatalogProviderSet || value.Model != "manual-model" {
 		t.Fatalf("value=%#v err=%v", value, err)
+	}
+	edit := newProviderFormModel(ProviderForm{OriginalName: "work", Name: "work", BaseURL: "https://example.com/v1", Model: "model", Adapter: "openai_chat", CatalogProvider: "openai", ContextWindow: 32000}, 80)
+	edit.inputs[providerFieldCatalog].SetValue("")
+	edit.inputs[providerFieldContext].SetValue("0")
+	edited, err := edit.value()
+	if err != nil || !edited.CatalogProviderRemove || !edited.ContextWindowSet || edited.ContextWindow != 0 || edited.ContextWindowRemove {
+		t.Fatalf("edited=%#v err=%v", edited, err)
 	}
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true})
 	model.models = []string{"alpha", "beta-code", "beta-chat"}

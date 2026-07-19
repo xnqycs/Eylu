@@ -13,21 +13,34 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/pelletier/go-toml/v2"
 )
 
 const SchemaVersion = 1
 
 type ProviderConfig struct {
-	Adapter        string            `toml:"adapter" json:"adapter"`
-	BaseURL        string            `toml:"base_url" json:"base_url"`
-	APIKey         string            `toml:"api_key,omitempty" json:"-"`
-	Model          string            `toml:"model" json:"model"`
-	ContextWindow  int               `toml:"context_window,omitempty" json:"context_window,omitempty"`
-	TimeoutSeconds int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
-	Headers        map[string]string `toml:"headers,omitempty" json:"headers,omitempty"`
-	Routing        ProviderRouting   `toml:"routing,omitempty" json:"routing,omitempty"`
+	Adapter         string            `toml:"adapter" json:"adapter"`
+	BaseURL         string            `toml:"base_url" json:"base_url"`
+	APIKey          string            `toml:"api_key,omitempty" json:"-"`
+	Model           string            `toml:"model" json:"model"`
+	CatalogProvider string            `toml:"catalog_provider,omitempty" json:"catalog_provider,omitempty"`
+	ContextWindow   int               `toml:"context_window,omitempty" json:"context_window,omitempty"`
+	TimeoutSeconds  int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	Headers         map[string]string `toml:"headers,omitempty" json:"headers,omitempty"`
+	Routing         ProviderRouting   `toml:"routing,omitempty" json:"routing,omitempty"`
+}
+
+type ModelMetadataConfig struct {
+	Enabled               bool   `toml:"enabled" json:"enabled"`
+	CatalogURL            string `toml:"catalog_url" json:"catalog_url"`
+	RequestTimeoutSeconds int    `toml:"request_timeout_seconds" json:"request_timeout_seconds"`
+	EndpointTTLHours      int    `toml:"endpoint_ttl_hours" json:"endpoint_ttl_hours"`
+	CatalogTTLHours       int    `toml:"catalog_ttl_hours" json:"catalog_ttl_hours"`
+	StaleTTLHours         int    `toml:"stale_ttl_hours" json:"stale_ttl_hours"`
+	NegativeTTLMinutes    int    `toml:"negative_ttl_minutes" json:"negative_ttl_minutes"`
+	LearnedTTLHours       int    `toml:"learned_ttl_hours" json:"learned_ttl_hours"`
+	MaxResponseBytes      int    `toml:"max_response_bytes" json:"max_response_bytes"`
+	MaxCacheEntries       int    `toml:"max_cache_entries" json:"max_cache_entries"`
+	ProbeTiers            []int  `toml:"probe_tiers" json:"probe_tiers"`
 }
 
 type ProviderRouting struct {
@@ -91,6 +104,7 @@ type Config struct {
 	MaxSummaryBytes       int                            `toml:"max_summary_bytes,omitempty" json:"max_summary_bytes,omitempty"`
 	MaxSessions           int                            `toml:"max_sessions,omitempty" json:"max_sessions,omitempty"`
 	MaxSessionBytes       int64                          `toml:"max_session_bytes,omitempty" json:"max_session_bytes,omitempty"`
+	ModelMetadata         ModelMetadataConfig            `toml:"model_metadata,omitempty" json:"model_metadata"`
 }
 
 func Default() Config {
@@ -120,6 +134,13 @@ func Default() Config {
 		MaxSummaryBytes:       16 << 10,
 		MaxSessions:           100,
 		MaxSessionBytes:       512 << 20,
+		ModelMetadata: ModelMetadataConfig{
+			Enabled: true, CatalogURL: "https://models.dev/api.json", RequestTimeoutSeconds: 5,
+			EndpointTTLHours: 24, CatalogTTLHours: 24, StaleTTLHours: 7 * 24,
+			NegativeTTLMinutes: 60, LearnedTTLHours: 30 * 24,
+			MaxResponseBytes: 16 << 20, MaxCacheEntries: 1000,
+			ProbeTiers: []int{256_000, 128_000, 64_000, 32_000, 16_000, 8_000},
+		},
 	}
 }
 
@@ -130,6 +151,7 @@ func (c Config) Clone() Config {
 	clone.DangerousCommands = append([]string(nil), c.DangerousCommands...)
 	clone.BlockedCommands = append([]string(nil), c.BlockedCommands...)
 	clone.ShellEnvironment = append([]string(nil), c.ShellEnvironment...)
+	clone.ModelMetadata.ProbeTiers = append([]int(nil), c.ModelMetadata.ProbeTiers...)
 	clone.Providers = make(map[string]ProviderConfig, len(c.Providers))
 	for name, provider := range c.Providers {
 		provider.Headers = cloneStringMap(provider.Headers)
@@ -198,10 +220,37 @@ func (c Config) Validate() error {
 	if c.MaxSessions <= 0 || c.MaxSessionBytes <= 0 {
 		return errors.New("session limits must be greater than zero")
 	}
+	if err := validateModelMetadata(c.ModelMetadata); err != nil {
+		return err
+	}
 	switch c.PermissionMode {
 	case "manual", "plan", "auto", "full":
 	default:
 		return fmt.Errorf("invalid permission_mode %q", c.PermissionMode)
+	}
+	return nil
+}
+
+func validateModelMetadata(metadata ModelMetadataConfig) error {
+	if strings.TrimSpace(metadata.CatalogURL) == "" {
+		return errors.New("model metadata catalog_url is required")
+	}
+	parsed, err := url.Parse(metadata.CatalogURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New("model metadata catalog_url must be an absolute HTTP(S) URL")
+	}
+	if metadata.RequestTimeoutSeconds <= 0 || metadata.EndpointTTLHours <= 0 || metadata.CatalogTTLHours <= 0 || metadata.StaleTTLHours <= 0 || metadata.NegativeTTLMinutes <= 0 || metadata.LearnedTTLHours <= 0 || metadata.MaxResponseBytes <= 0 || metadata.MaxCacheEntries <= 0 {
+		return errors.New("model metadata limits must be greater than zero")
+	}
+	if len(metadata.ProbeTiers) == 0 {
+		return errors.New("model metadata probe_tiers is required")
+	}
+	previous := int(^uint(0) >> 1)
+	for _, tier := range metadata.ProbeTiers {
+		if tier <= 0 || tier >= previous {
+			return errors.New("model metadata probe_tiers must be positive and strictly descending")
+		}
+		previous = tier
 	}
 	return nil
 }
@@ -324,39 +373,15 @@ type Loaded struct {
 	Config    Config
 	Path      string
 	Workspace string
+	Store     *Store
 }
 
 func Load(opts LoadOptions) (Loaded, error) {
-	workspace, err := filepath.Abs(opts.Workspace)
+	store, err := openStore(opts)
 	if err != nil {
-		return Loaded{}, fmt.Errorf("resolve workspace: %w", err)
-	}
-	result := Default()
-	paths := configPaths(opts.ExplicitPath, workspace)
-	writePath := opts.ExplicitPath
-	for _, path := range paths {
-		data, readErr := os.ReadFile(path)
-		if errors.Is(readErr, os.ErrNotExist) {
-			continue
-		}
-		if readErr != nil {
-			return Loaded{}, fmt.Errorf("read config %s: %w", path, readErr)
-		}
-		var overlay Config
-		if err := toml.Unmarshal(data, &overlay); err != nil {
-			return Loaded{}, fmt.Errorf("parse config %s: %w", path, err)
-		}
-		merge(&result, overlay)
-		writePath = path
-	}
-	if writePath == "" {
-		writePath = defaultUserConfigPath()
-	}
-	applyEnvironment(&result, opts.Environ)
-	if err := result.Validate(); err != nil {
 		return Loaded{}, err
 	}
-	return Loaded{Config: result, Path: writePath, Workspace: workspace}, nil
+	return Loaded{Config: store.Config(), Path: store.Path(), Workspace: store.Workspace(), Store: store}, nil
 }
 
 func configPaths(explicit, workspace string) []string {
@@ -378,10 +403,10 @@ func Save(path string, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	data, err := toml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("encode config: %w", err)
-	}
+	return saveFileConfig(path, fileConfigFromResolved(cfg))
+}
+
+func saveConfigBytes(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
@@ -527,6 +552,11 @@ func applyEnvironment(cfg *Config, environ []string) {
 	}
 	if value := env["EYLU_ROUTING_MODE"]; value != "" {
 		cfg.RoutingMode = value
+	}
+	if value := env["EYLU_MODEL_METADATA_ENABLED"]; value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			cfg.ModelMetadata.Enabled = parsed
+		}
 	}
 	for key, target := range map[string]*int{
 		"EYLU_MAX_TURNS":                &cfg.MaxTurns,

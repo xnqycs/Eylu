@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -131,11 +130,6 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	for key, value := range req.Headers {
 		httpReq.Header.Set(key, value)
 	}
-	if emit != nil {
-		if err := emit(protocol.ModelEvent{Kind: protocol.EventResponseStart}); err != nil {
-			return protocol.ModelResponse{}, err
-		}
-	}
 	client := d.client
 	if req.Stream {
 		client = driver.StreamingHTTPClient(client)
@@ -149,6 +143,11 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
 	}
+	if emit != nil {
+		if err := emit(protocol.ModelEvent{Kind: protocol.EventResponseStart}); err != nil {
+			return protocol.ModelResponse{}, err
+		}
+	}
 	if req.Stream {
 		return d.readStream(ctx, resp.Body, emit)
 	}
@@ -161,7 +160,7 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "decode chat response", Cause: err}
 	}
 	if decoded.Error != nil {
-		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProvider, Message: decoded.Error.Message}
+		return protocol.ModelResponse{}, protocol.ClassifyProviderMessage(decoded.Error.Message)
 	}
 	result := convertResponse(decoded)
 	if len(result.Turn.Parts) == 0 {
@@ -233,7 +232,7 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "decode chat stream chunk", Cause: err}
 		}
 		if chunk.Error != nil {
-			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProvider, Message: chunk.Error.Message}
+			return protocol.ModelResponse{}, protocol.ClassifyProviderMessage(chunk.Error.Message)
 		}
 		if chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0 {
 			result.Usage = usageFromChat(chunk)
@@ -375,12 +374,5 @@ func mapHTTPError(status int, body []byte) error {
 	if len(message) > 512 {
 		message = message[:512]
 	}
-	code, retryable := protocol.ErrProvider, status >= 500
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		code = protocol.ErrAuth
-	}
-	if status == http.StatusTooManyRequests {
-		code, retryable = protocol.ErrRateLimit, true
-	}
-	return &protocol.Error{Code: code, Message: fmt.Sprintf("provider HTTP %d: %s", status, message), StatusCode: status, Retryable: retryable}
+	return protocol.ClassifyProviderHTTPError(status, message)
 }

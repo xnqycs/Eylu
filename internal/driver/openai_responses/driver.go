@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -130,9 +131,6 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "encode model request", Cause: err}
 	}
 	endpoint := strings.TrimRight(req.BaseURL, "/") + "/responses"
-	if emit != nil {
-		_ = emit(protocol.ModelEvent{Kind: protocol.EventResponseStart})
-	}
 	disablePrevious := state.DisablePrevious
 	resp, err := d.send(ctx, endpoint, req, payload)
 	if err != nil {
@@ -141,6 +139,11 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	for resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		mapped := mapHTTPError(resp.StatusCode, raw)
+		var providerError *protocol.Error
+		if errors.As(mapped, &providerError) && providerError.Code == protocol.ErrContextWindow {
+			return protocol.ModelResponse{}, mapped
+		}
 		if body.PreviousResponseID != "" && resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(string(raw)), "previous_response_id") {
 			disablePrevious = true
 			body.PreviousResponseID = ""
@@ -161,6 +164,11 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		}
 	}
 	defer resp.Body.Close()
+	if emit != nil {
+		if err := emit(protocol.ModelEvent{Kind: protocol.EventResponseStart}); err != nil {
+			return protocol.ModelResponse{}, err
+		}
+	}
 	if req.Stream {
 		result, streamErr := d.readStream(ctx, resp.Body, emit)
 		if streamErr != nil {
@@ -183,7 +191,7 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "decode model response", Cause: err}
 	}
 	if decoded.Error != nil {
-		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProvider, Message: decoded.Error.Message}
+		return protocol.ModelResponse{}, protocol.ClassifyProviderMessage(decoded.Error.Message)
 	}
 	result := convertResponse(decoded)
 	if len(result.Turn.Parts) == 0 {
@@ -364,12 +372,5 @@ func mapHTTPError(status int, body []byte) error {
 	if len(message) > 512 {
 		message = message[:512]
 	}
-	code, retry := protocol.ErrProvider, status >= 500
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		code = protocol.ErrAuth
-	}
-	if status == http.StatusTooManyRequests {
-		code, retry = protocol.ErrRateLimit, true
-	}
-	return &protocol.Error{Code: code, Message: fmt.Sprintf("provider HTTP %d: %s", status, message), Retryable: retry, StatusCode: status}
+	return protocol.ClassifyProviderHTTPError(status, message)
 }

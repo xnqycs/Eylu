@@ -15,22 +15,25 @@ const (
 	providerFieldURL
 	providerFieldModel
 	providerFieldAdapter
+	providerFieldCatalog
 	providerFieldContext
 	providerFieldKey
 	providerFieldCount
 )
 
 type providerFormModel struct {
-	inputs       []textinput.Model
-	focus        int
-	originalName string
-	err          error
+	inputs          []textinput.Model
+	focus           int
+	originalName    string
+	originalCatalog string
+	originalContext int
+	err             error
 }
 
 func newProviderFormModel(item ProviderForm, width int) providerFormModel {
 	inputs := make([]textinput.Model, providerFieldCount)
-	placeholders := []string{"Provider name", "https://api.example.com/v1", "Model ID", "openai_responses", "Context window", "API key"}
-	values := []string{item.Name, item.BaseURL, item.Model, item.Adapter, "", ""}
+	placeholders := []string{"Provider name", "https://api.example.com/v1", "Model ID", "openai_responses", "models.dev provider", "Context window", "API key"}
+	values := []string{item.Name, item.BaseURL, item.Model, item.Adapter, item.CatalogProvider, "", ""}
 	if item.ContextWindow > 0 {
 		values[providerFieldContext] = strconv.Itoa(item.ContextWindow)
 	}
@@ -46,7 +49,7 @@ func newProviderFormModel(item ProviderForm, width int) providerFormModel {
 	inputs[providerFieldAdapter].SetSuggestions([]string{"openai_responses", "openai_chat"})
 	inputs[providerFieldAdapter].ShowSuggestions = true
 	_ = inputs[0].Focus()
-	return providerFormModel{inputs: inputs, originalName: item.OriginalName}
+	return providerFormModel{inputs: inputs, originalName: item.OriginalName, originalCatalog: item.CatalogProvider, originalContext: item.ContextWindow}
 }
 
 func (m providerFormModel) update(msg tea.Msg) (providerFormModel, tea.Cmd) {
@@ -69,17 +72,23 @@ func (m *providerFormModel) setWidth(width int) {
 
 func (m providerFormModel) value() (ProviderForm, error) {
 	contextWindow := 0
+	contextWindowSet := false
+	contextWindowRemove := false
 	if raw := strings.TrimSpace(m.inputs[providerFieldContext].Value()); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil || parsed < 0 {
 			return ProviderForm{}, fmt.Errorf("context window must be a non-negative integer")
 		}
 		contextWindow = parsed
+		contextWindowSet = true
+	} else if m.originalName != "" && m.originalContext != 0 {
+		contextWindowRemove = true
 	}
 	name := strings.TrimSpace(m.inputs[providerFieldName].Value())
 	baseURL := strings.TrimSpace(m.inputs[providerFieldURL].Value())
 	model := strings.TrimSpace(m.inputs[providerFieldModel].Value())
 	adapter := strings.TrimSpace(m.inputs[providerFieldAdapter].Value())
+	catalogProvider := strings.TrimSpace(m.inputs[providerFieldCatalog].Value())
 	if name == "" || baseURL == "" || model == "" || adapter == "" {
 		return ProviderForm{}, fmt.Errorf("name, base URL, model, and adapter are required")
 	}
@@ -89,12 +98,14 @@ func (m providerFormModel) value() (ProviderForm, error) {
 	}
 	return ProviderForm{
 		OriginalName: m.originalName, Name: name, BaseURL: baseURL, Model: model, Adapter: adapter,
-		APIKey: m.inputs[providerFieldKey].Value(), ContextWindow: contextWindow,
+		APIKey: m.inputs[providerFieldKey].Value(), CatalogProvider: catalogProvider, ContextWindow: contextWindow,
+		ContextWindowSet: contextWindowSet, ContextWindowRemove: contextWindowRemove,
+		CatalogProviderSet: catalogProvider != m.originalCatalog, CatalogProviderRemove: catalogProvider == "" && m.originalCatalog != "",
 	}, nil
 }
 
 func (m providerFormModel) view(styles Styles) string {
-	labels := []string{"Name", "Base URL", "Model", "Adapter", "Context", "API key"}
+	labels := []string{"Name", "Base URL", "Model", "Adapter", "Catalog", "Context", "API key"}
 	var output strings.Builder
 	for index, input := range m.inputs {
 		label := styles.Status.Render(fmt.Sprintf("%-10s", labels[index]))

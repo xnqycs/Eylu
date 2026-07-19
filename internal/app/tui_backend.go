@@ -101,7 +101,7 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 	for _, item := range b.manager.List() {
 		snapshot.Providers = append(snapshot.Providers, ui.ProviderItem{
 			Name: item.Name, Adapter: item.Config.Adapter, BaseURL: item.Config.BaseURL, Model: item.Config.Model,
-			ContextWindow: item.Config.ContextWindow, Active: item.Name == managerActive.Name,
+			CatalogProvider: item.Config.CatalogProvider, ContextWindow: item.Config.ContextWindow, Active: item.Name == managerActive.Name,
 		})
 	}
 	activated := b.conversation.ActivatedSkillDigests()
@@ -126,7 +126,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	contextReport := b.conversation.ContextReport()
 	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
 	estimatedInput := contextReport.InputTokens + estimator.Estimate(prompt)
-	modelRuntime, routeDecision, err := b.runtime.resolveRuntimeForPrompt(b.manager, opts, submission.Text, estimatedInput+cfg.ReservedOutputTokens, estimatedInput, cfg.ReservedOutputTokens, true)
+	modelRuntime, routeDecision, err := b.runtime.resolveRuntimeForPrompt(ctx, b.manager, opts, submission.Text, estimatedInput+cfg.ReservedOutputTokens, estimatedInput, cfg.ReservedOutputTokens, true)
 	if err != nil {
 		return err
 	}
@@ -634,22 +634,39 @@ func (b *tuiBackend) SetMode(_ context.Context, value string) error {
 }
 
 func (b *tuiBackend) UpsertProvider(_ context.Context, form ui.ProviderForm) error {
-	candidate := config.ProviderConfig{
-		Adapter: form.Adapter, BaseURL: form.BaseURL, Model: form.Model, ContextWindow: form.ContextWindow,
-		TimeoutSeconds: 60,
-	}
-	if form.OriginalName != "" {
-		if current, ok := b.manager.Get(form.OriginalName); ok {
-			candidate.APIKey = current.APIKey
-			candidate.Headers = current.Headers
-			candidate.TimeoutSeconds = current.TimeoutSeconds
-			candidate.Routing = current.Routing
+	patch := config.ProviderPatch{}
+	if form.OriginalName == "" {
+		patch.Adapter = config.SetValue(form.Adapter)
+		patch.BaseURL = config.SetValue(form.BaseURL)
+		patch.Model = config.SetValue(form.Model)
+	} else if current, ok := b.manager.Get(form.OriginalName); ok {
+		if form.OriginalName != form.Name {
+			patch = config.SparseProviderPatch(current)
+		}
+		if form.Adapter != current.Adapter {
+			patch.Adapter = config.SetValue(form.Adapter)
+		}
+		if form.BaseURL != current.BaseURL {
+			patch.BaseURL = config.SetValue(form.BaseURL)
+		}
+		if form.Model != current.Model {
+			patch.Model = config.SetValue(form.Model)
 		}
 	}
 	if form.APIKey != "" {
-		candidate.APIKey = form.APIKey
+		patch.APIKey = config.SetValue(form.APIKey)
 	}
-	if err := b.manager.Upsert(form.Name, candidate, true); err != nil {
+	if form.CatalogProviderRemove {
+		patch.CatalogProvider = config.RemoveValue[string]()
+	} else if form.CatalogProviderSet || form.CatalogProvider != "" {
+		patch.CatalogProvider = config.SetValue(form.CatalogProvider)
+	}
+	if form.ContextWindowRemove {
+		patch.ContextWindow = config.RemoveValue[int]()
+	} else if form.ContextWindowSet || form.ContextWindow != 0 {
+		patch.ContextWindow = config.SetValue(form.ContextWindow)
+	}
+	if err := b.manager.UpsertPatch(form.Name, patch, true); err != nil {
 		return err
 	}
 	if form.OriginalName != "" && form.OriginalName != form.Name {
@@ -693,13 +710,12 @@ func (b *tuiBackend) UseProvider(_ context.Context, name string) error {
 }
 
 func (b *tuiBackend) SetModel(_ context.Context, providerName, modelID string) error {
-	candidate, ok := b.manager.Get(providerName)
+	_, ok := b.manager.Get(providerName)
 	if !ok {
 		return fmt.Errorf("provider %q does not exist", providerName)
 	}
-	candidate.Model = modelID
 	active, _ := b.manager.Active()
-	return b.manager.Upsert(providerName, candidate, active.Name == providerName)
+	return b.manager.UpsertPatch(providerName, config.ProviderPatch{Model: config.SetValue(modelID)}, active.Name == providerName)
 }
 
 func (b *tuiBackend) FetchModels(ctx context.Context, name string) ([]string, error) {

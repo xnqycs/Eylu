@@ -706,7 +706,11 @@ func (m *Model) renderContext() string {
 	if report.LimitKnown {
 		limit = fmt.Sprintf("%d", report.ContextWindow)
 	}
-	fmt.Fprintf(&output, "%s\n%d input + %d reserved / %s\n\n", m.styles.Header.Render("Context"), report.InputTokens, report.OutputReserve, limit)
+	fmt.Fprintf(&output, "%s\n%d input + %d reserved / %s\n", m.styles.Header.Render("Context"), report.InputTokens, report.OutputReserve, limit)
+	if report.ConfiguredContextWindow > 0 || report.DetectedContextWindow > 0 {
+		fmt.Fprintf(&output, "configured %d  detected %d  effective %d\nsource %s  cached %t  assumed %t  degradations %d\n", report.ConfiguredContextWindow, report.DetectedContextWindow, report.ContextWindow, report.LimitSource, report.LimitCached, report.LimitAssumed, report.LimitDegradations)
+	}
+	output.WriteByte('\n')
 	for _, category := range report.Categories {
 		bar := progressBar(category.Percent, 18)
 		fmt.Fprintf(&output, "%-22s %6d  %s %5.1f%%  %s\n", category.Label, category.Tokens, bar, category.Percent, category.Measurement)

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"Eylu/internal/agent"
+	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
@@ -352,10 +353,11 @@ func (r *runtime) handleProviderSlash(ctx context.Context, reader *bufio.Reader,
 		if !ok {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", fields[2])}
 		}
-		current.BaseURL = promptLine(reader, r.stdout, "API base URL", current.BaseURL)
-		current.Model = promptLine(reader, r.stdout, "Model ID", current.Model)
-		current.Adapter = promptLine(reader, r.stdout, "Adapter", current.Adapter)
-		if err := manager.Upsert(fields[2], current, true); err != nil {
+		baseURL := promptLine(reader, r.stdout, "API base URL", current.BaseURL)
+		model := promptLine(reader, r.stdout, "Model ID", current.Model)
+		adapter := promptLine(reader, r.stdout, "Adapter", current.Adapter)
+		patch := config.ProviderPatch{BaseURL: config.SetValue(baseURL), Model: config.SetValue(model), Adapter: config.SetValue(adapter)}
+		if err := manager.UpsertPatch(fields[2], patch, true); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
 		fmt.Fprintf(r.stdout, "Provider %s updated.\n", fields[2])
@@ -371,9 +373,7 @@ func (r *runtime) handleModelSlash(ctx context.Context, fields []string, manager
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	if len(fields) == 2 {
-		candidate := snapshot.Config
-		candidate.Model = fields[1]
-		if err := manager.Upsert(snapshot.Name, candidate, true); err != nil {
+		if err := manager.UpsertPatch(snapshot.Name, config.ProviderPatch{Model: config.SetValue(fields[1])}, true); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
 		fmt.Fprintf(r.stdout, "Model: %s\n", fields[1])

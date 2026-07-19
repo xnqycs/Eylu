@@ -134,3 +134,20 @@ func TestChatMapsToolHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestChatContextErrorPrecedesResponseStart(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"maximum context length is 32,000 tokens"}}`))
+	}))
+	defer server.Close()
+	events := 0
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "large"}}}}}}, func(protocol.ModelEvent) error {
+		events++
+		return nil
+	})
+	typed, ok := err.(*protocol.Error)
+	if !ok || typed.Code != protocol.ErrContextWindow || typed.ContextLimit != 32000 || events != 0 {
+		t.Fatalf("error=%#v events=%d", err, events)
+	}
+}

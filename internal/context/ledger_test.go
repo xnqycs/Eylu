@@ -52,6 +52,22 @@ func TestLedgerKnownWindowPercentage(t *testing.T) {
 	}
 }
 
+func TestLedgerReportsConfiguredDetectedAndEffectiveLimits(t *testing.T) {
+	ledger := New(ApproxEstimator{BytesPerToken: 1})
+	ledger.ReplaceBlocks([]Block{{ID: "input", Category: CategoryUserMessage, Bytes: 100, Tokens: 100}})
+	report := ledger.ReportWithLimits("work", "model", LimitDetails{Configured: 64000, Detected: 128000, Effective: 64000, Source: "user_cap", Cached: true, Degradations: 2})
+	if report.ConfiguredContextWindow != 64000 || report.DetectedContextWindow != 128000 || report.ContextWindow != 64000 || report.LimitSource != "user_cap" || !report.LimitCached || report.LimitDegradations != 2 {
+		t.Fatalf("report = %#v", report)
+	}
+	var output bytes.Buffer
+	if err := RenderText(&output, report); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Configured 64000 · detected 128000 · effective 64000") {
+		t.Fatalf("render = %s", output.String())
+	}
+}
+
 func TestLedgerSourceBreakdownAndCompression(t *testing.T) {
 	ledger := New(ApproxEstimator{BytesPerToken: 1})
 	ledger.AddText("catalog-1", CategorySkillCatalog, "page:1/2", "abc", true)

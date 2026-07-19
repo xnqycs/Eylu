@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"Eylu/internal/protocol"
 )
@@ -125,20 +126,37 @@ type CategoryUsage struct {
 }
 
 type Report struct {
-	Provider         string            `json:"provider"`
-	Model            string            `json:"model"`
-	ContextWindow    int               `json:"context_window,omitempty"`
-	LimitSource      string            `json:"limit_source"`
-	InputTokens      int               `json:"input_tokens"`
-	OutputReserve    int               `json:"output_reserve"`
-	TotalTokens      int               `json:"total_tokens"`
-	Percent          float64           `json:"percent,omitempty"`
-	LimitKnown       bool              `json:"limit_known"`
-	Categories       []CategoryUsage   `json:"categories"`
-	LastUsage        protocol.Usage    `json:"last_provider_usage"`
-	MeasurementKind  string            `json:"measurement_kind"`
-	CompressionCount int               `json:"compression_count"`
-	LastCompression  *CompressionEvent `json:"last_compression,omitempty"`
+	Provider                string            `json:"provider"`
+	Model                   string            `json:"model"`
+	ConfiguredContextWindow int               `json:"configured_context_window,omitempty"`
+	DetectedContextWindow   int               `json:"detected_context_window,omitempty"`
+	ContextWindow           int               `json:"context_window,omitempty"`
+	LimitSource             string            `json:"limit_source"`
+	LimitCached             bool              `json:"limit_cached,omitempty"`
+	LimitAssumed            bool              `json:"limit_assumed,omitempty"`
+	LimitObservedAt         time.Time         `json:"limit_observed_at,omitzero"`
+	LimitDegradations       int               `json:"limit_degradations,omitempty"`
+	InputTokens             int               `json:"input_tokens"`
+	OutputReserve           int               `json:"output_reserve"`
+	TotalTokens             int               `json:"total_tokens"`
+	Percent                 float64           `json:"percent,omitempty"`
+	LimitKnown              bool              `json:"limit_known"`
+	Categories              []CategoryUsage   `json:"categories"`
+	LastUsage               protocol.Usage    `json:"last_provider_usage"`
+	MeasurementKind         string            `json:"measurement_kind"`
+	CompressionCount        int               `json:"compression_count"`
+	LastCompression         *CompressionEvent `json:"last_compression,omitempty"`
+}
+
+type LimitDetails struct {
+	Configured   int
+	Detected     int
+	Effective    int
+	Source       string
+	Cached       bool
+	Assumed      bool
+	ObservedAt   time.Time
+	Degradations int
 }
 
 type Ledger struct {
@@ -259,6 +277,10 @@ func cloneBlocks(blocks []Block) []Block {
 }
 
 func (l *Ledger) Report(providerName, model string, contextWindow int) Report {
+	return l.ReportWithLimits(providerName, model, LimitDetails{Configured: contextWindow, Effective: contextWindow})
+}
+
+func (l *Ledger) ReportWithLimits(providerName, model string, limits LimitDetails) Report {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	usage := make(map[Category]*CategoryUsage, len(categoryOrder))
@@ -289,7 +311,12 @@ func (l *Ledger) Report(providerName, model string, contextWindow int) Report {
 		source.Tokens += block.Tokens
 		source.Exact = source.Exact && block.Exact
 	}
-	report := Report{Provider: providerName, Model: model, ContextWindow: contextWindow, LastUsage: l.lastUsage, MeasurementKind: "estimated", CompressionCount: l.compressionCount}
+	report := Report{
+		Provider: providerName, Model: model, ConfiguredContextWindow: limits.Configured, DetectedContextWindow: limits.Detected,
+		ContextWindow: limits.Effective, LimitSource: limits.Source, LimitCached: limits.Cached, LimitAssumed: limits.Assumed,
+		LimitObservedAt: limits.ObservedAt, LimitDegradations: limits.Degradations,
+		LastUsage: l.lastUsage, MeasurementKind: "estimated", CompressionCount: l.compressionCount,
+	}
 	if l.lastCompression != nil {
 		copy := *l.lastCompression
 		report.LastCompression = &copy
@@ -346,10 +373,12 @@ func (l *Ledger) Report(providerName, model string, contextWindow int) Report {
 			}
 		}
 	}
-	if contextWindow > 0 {
-		report.LimitSource = "provider_config"
+	if limits.Effective > 0 {
+		if report.LimitSource == "" || report.LimitSource == "unknown" {
+			report.LimitSource = "provider_config"
+		}
 		report.LimitKnown = true
-		report.Percent = float64(report.TotalTokens) / float64(contextWindow) * 100
+		report.Percent = float64(report.TotalTokens) / float64(limits.Effective) * 100
 	} else {
 		report.LimitSource = "unknown"
 	}
@@ -368,6 +397,11 @@ func RenderText(w io.Writer, report Report) error {
 	}
 	if _, err := fmt.Fprintf(w, "Provider %s · model %s · limit %s\n\n", report.Provider, report.Model, report.LimitSource); err != nil {
 		return err
+	}
+	if report.ConfiguredContextWindow > 0 || report.DetectedContextWindow > 0 {
+		if _, err := fmt.Fprintf(w, "Configured %d · detected %d · effective %d · cached=%t · assumed=%t · degradations=%d\n\n", report.ConfiguredContextWindow, report.DetectedContextWindow, report.ContextWindow, report.LimitCached, report.LimitAssumed, report.LimitDegradations); err != nil {
+			return err
+		}
 	}
 	if _, err := fmt.Fprintln(w, "Category                 Blocks    Tokens   Input"); err != nil {
 		return err

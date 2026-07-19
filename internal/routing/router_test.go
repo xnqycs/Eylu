@@ -58,6 +58,22 @@ func TestSelectUsesPriorityCostContextAndNameDeterministically(t *testing.T) {
 	}
 }
 
+func TestSelectPrefersConfirmedLimitOverAssumedTier(t *testing.T) {
+	confirmed := providerSnapshot("confirmed", "responses", 0, config.ProviderRouting{})
+	confirmed.Limits = provider.ModelLimits{ContextWindow: 64000, Source: provider.LimitSourceModelsDev}
+	confirmed.EffectiveContextWindow = 64000
+	assumed := providerSnapshot("assumed", "responses", 0, config.ProviderRouting{})
+	assumed.Limits = provider.ModelLimits{ContextWindow: 256000, Source: provider.LimitSourceFallback, Assumed: true}
+	assumed.EffectiveContextWindow = 256000
+	decision, err := Select([]provider.Snapshot{assumed, confirmed}, Request{Task: TaskGeneral, RequiredContext: 32000}, testCapabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Provider != "confirmed" || decision.Candidates[0].LimitSource != string(provider.LimitSourceModelsDev) {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
 func TestClassify(t *testing.T) {
 	for prompt, expected := range map[string]string{
 		"review this diff": TaskReview, "修复这个报错": TaskDebugging, "increase test coverage": TaskTesting,

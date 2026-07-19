@@ -149,13 +149,13 @@ func TestValidatePermissionModeAndClonePolicyLists(t *testing.T) {
 func TestContextLimitEnvironmentOverrides(t *testing.T) {
 	workspace := t.TempDir()
 	loaded, err := Load(LoadOptions{ExplicitPath: filepath.Join(t.TempDir(), "missing.toml"), Workspace: workspace, Environ: []string{
-		"EYLU_TOKEN_BYTES_PER_TOKEN=3", "EYLU_RESERVED_OUTPUT_TOKENS=1024", "EYLU_CONTEXT_RECENT_ROUNDS=2", "EYLU_MAX_PROJECT_MAP_BYTES=4096", "EYLU_MAX_TOOL_CONTEXT_BYTES=2048", "EYLU_SKILL_CATALOG_PAGE_BYTES=1024", "EYLU_MAX_SUMMARY_BYTES=3072", "EYLU_MAX_SESSIONS=7", "EYLU_MAX_SESSION_BYTES=123456", "EYLU_ROUTING_MODE=auto", "EYLU_MAX_PARALLEL_TOOLS=6",
+		"EYLU_TOKEN_BYTES_PER_TOKEN=3", "EYLU_RESERVED_OUTPUT_TOKENS=1024", "EYLU_CONTEXT_RECENT_ROUNDS=2", "EYLU_MAX_PROJECT_MAP_BYTES=4096", "EYLU_MAX_TOOL_CONTEXT_BYTES=2048", "EYLU_SKILL_CATALOG_PAGE_BYTES=1024", "EYLU_MAX_SUMMARY_BYTES=3072", "EYLU_MAX_SESSIONS=7", "EYLU_MAX_SESSION_BYTES=123456", "EYLU_ROUTING_MODE=auto", "EYLU_MAX_PARALLEL_TOOLS=6", "EYLU_MODEL_METADATA_ENABLED=false",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := loaded.Config
-	if cfg.TokenBytesPerToken != 3 || cfg.ReservedOutputTokens != 1024 || cfg.ContextRecentRounds != 2 || cfg.MaxProjectMapBytes != 4096 || cfg.MaxToolContextBytes != 2048 || cfg.SkillCatalogPageBytes != 1024 || cfg.MaxSummaryBytes != 3072 || cfg.MaxSessions != 7 || cfg.MaxSessionBytes != 123456 || cfg.RoutingMode != "auto" || cfg.MaxParallelTools != 6 {
+	if cfg.TokenBytesPerToken != 3 || cfg.ReservedOutputTokens != 1024 || cfg.ContextRecentRounds != 2 || cfg.MaxProjectMapBytes != 4096 || cfg.MaxToolContextBytes != 2048 || cfg.SkillCatalogPageBytes != 1024 || cfg.MaxSummaryBytes != 3072 || cfg.MaxSessions != 7 || cfg.MaxSessionBytes != 123456 || cfg.RoutingMode != "auto" || cfg.MaxParallelTools != 6 || cfg.ModelMetadata.Enabled {
 		t.Fatalf("context config = %#v", cfg)
 	}
 }
@@ -249,5 +249,173 @@ func TestSkillRegistryValidationAndClone(t *testing.T) {
 func validProvider(baseURL, model string) ProviderConfig {
 	return ProviderConfig{
 		Adapter: "openai_responses", BaseURL: baseURL, APIKey: "sk-test-secret", Model: model, TimeoutSeconds: 30,
+	}
+}
+
+func TestSaveOmitsBuiltInDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := Save(path, Default()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.TrimSpace(text) != "version = 1" {
+		t.Fatalf("default config was expanded: %s", text)
+	}
+}
+
+func TestSaveProviderOmitsOptionalDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := Default()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = ProviderConfig{Adapter: "openai_chat", BaseURL: "https://example.com/v1", Model: "model"}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, unexpected := range []string{"model_metadata", "timeout_seconds", "context_window", "api_key", "max_turns"} {
+		if strings.Contains(text, unexpected) {
+			t.Fatalf("optional default %q was persisted: %s", unexpected, text)
+		}
+	}
+}
+
+func TestStorePreservesExplicitValuesEqualToDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("version = 1\nmax_turns = 20\n\n[model_metadata]\nenabled = true\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loaded.Store.SetActiveProvider(""); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(saved)
+	for _, expected := range []string{"max_turns = 20", "[model_metadata]", "enabled = true"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("explicit field %q was lost: %s", expected, text)
+		}
+	}
+}
+
+func TestStorePreservesExplicitFalseZeroAndEmptyList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("version = 1\nactive_provider = 'work'\nblocked_commands = []\n\n[model_metadata]\nenabled = false\n\n[providers.work]\nadapter = 'openai_chat'\nbase_url = 'https://example.com/v1'\nmodel = 'model'\ncontext_window = 0\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.ModelMetadata.Enabled || loaded.Config.Providers["work"].ContextWindow != 0 || len(loaded.Config.BlockedCommands) != 0 {
+		t.Fatalf("effective config = %#v", loaded.Config)
+	}
+	if _, err := loaded.Store.SetActiveProvider("work"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(saved)
+	for _, expected := range []string{"blocked_commands = []", "enabled = false", "context_window = 0"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("explicit field %q was lost: %s", expected, text)
+		}
+	}
+}
+
+func TestStoreUpdatesOnlyCurrentLayer(t *testing.T) {
+	workspace := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	userPath := filepath.Join(home, ".eylu", "config.toml")
+	projectPath := filepath.Join(workspace, ".eylu", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	user := "version = 1\nactive_provider = 'work'\n\n[providers.work]\nadapter = 'openai_responses'\nbase_url = 'https://example.com/v1'\napi_key = 'secret'\nmodel = 'base-model'\n"
+	if err := os.WriteFile(userPath, []byte(user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(projectPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectPath, []byte("version = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loaded.Store.UpdateProvider("work", ProviderPatch{Model: SetValue("project-model")}, false); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(saved)
+	if !strings.Contains(text, "model = 'project-model'") || strings.Contains(text, "base_url") || strings.Contains(text, "api_key") {
+		t.Fatalf("project layer was flattened: %s", text)
+	}
+	reloaded, err := Load(LoadOptions{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := reloaded.Config.Providers["work"]
+	if provider.Model != "project-model" || provider.BaseURL != "https://example.com/v1" || provider.APIKey != "secret" {
+		t.Fatalf("layered provider = %#v", provider)
+	}
+	if _, err := reloaded.Store.DeleteProvider("work", ""); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err = Load(LoadOptions{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := reloaded.Config.Providers["work"]; exists {
+		t.Fatal("removed provider resurfaced from the user layer")
+	}
+}
+
+func TestStoreDoesNotPersistEnvironmentOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := "version = 1\nactive_provider = 'work'\n\n[providers.work]\nadapter = 'openai_responses'\nbase_url = 'https://example.com/v1'\nmodel = 'file-model'\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir(), Environ: []string{"EYLU_MODEL=env-model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.Providers["work"].Model != "env-model" {
+		t.Fatal("environment override was not applied")
+	}
+	if _, err := loaded.Store.SetActiveProvider("work"); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), "env-model") {
+		t.Fatalf("environment override was persisted: %s", saved)
 	}
 }

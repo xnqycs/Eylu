@@ -140,8 +140,10 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			message := "Responses stream failed"
 			if event.Error != nil && event.Error.Message != "" {
 				message = event.Error.Message
+			} else if event.Response.Error != nil && event.Response.Error.Message != "" {
+				message = event.Response.Error.Message
 			}
-			return &protocol.Error{Code: protocol.ErrProvider, Message: message}
+			return protocol.ClassifyProviderMessage(message)
 		}
 		return nil
 	}

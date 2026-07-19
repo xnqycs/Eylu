@@ -33,6 +33,8 @@ type Candidate struct {
 	Priority      int     `json:"priority"`
 	ContextRank   int     `json:"context_rank"`
 	ContextWindow int     `json:"context_window"`
+	LimitSource   string  `json:"limit_source"`
+	AssumedLimit  bool    `json:"assumed_limit,omitempty"`
 	EstimatedCost float64 `json:"estimated_cost"`
 	Reason        string  `json:"reason"`
 }
@@ -64,8 +66,9 @@ func Select(providers []provider.Snapshot, request Request, lookup CapabilityLoo
 			decision.Rejected[snapshot.Name] = "missing capabilities: " + missing
 			continue
 		}
-		if snapshot.Config.ContextWindow > 0 && request.RequiredContext > snapshot.Config.ContextWindow {
-			decision.Rejected[snapshot.Name] = fmt.Sprintf("context window %d is below required %d", snapshot.Config.ContextWindow, request.RequiredContext)
+		contextWindow := snapshot.ContextWindowLimit()
+		if contextWindow > 0 && request.RequiredContext > contextWindow {
+			decision.Rejected[snapshot.Name] = fmt.Sprintf("context window %d is below required %d", contextWindow, request.RequiredContext)
 			continue
 		}
 		taskRank, accepted := taskRank(snapshot.Config.Routing.Tasks, request.Task)
@@ -74,15 +77,18 @@ func Select(providers []provider.Snapshot, request Request, lookup CapabilityLoo
 			continue
 		}
 		contextRank := 1
-		if snapshot.Config.ContextWindow > 0 {
+		if contextWindow > 0 {
 			contextRank = 2
+		}
+		if contextWindow > 0 && snapshot.Limits.Source != provider.LimitSourceUnknown && snapshot.Limits.Source != provider.LimitSourceFallback && !snapshot.Limits.Assumed {
+			contextRank = 3
 		}
 		cost := float64(request.EstimatedInput)*snapshot.Config.Routing.InputCostPerMillion/1_000_000 +
 			float64(request.EstimatedOutput)*snapshot.Config.Routing.OutputCostPerMillion/1_000_000
 		decision.Candidates = append(decision.Candidates, Candidate{
 			Provider: snapshot.Name, TaskRank: taskRank, Priority: snapshot.Config.Routing.Priority,
-			ContextRank: contextRank, ContextWindow: snapshot.Config.ContextWindow, EstimatedCost: cost,
-			Reason: fmt.Sprintf("task_rank=%d priority=%d context=%d estimated_cost=%.8f", taskRank, snapshot.Config.Routing.Priority, snapshot.Config.ContextWindow, cost),
+			ContextRank: contextRank, ContextWindow: contextWindow, LimitSource: string(snapshot.Limits.Source), AssumedLimit: snapshot.Limits.Assumed, EstimatedCost: cost,
+			Reason: fmt.Sprintf("task_rank=%d priority=%d context=%d source=%s estimated_cost=%.8f", taskRank, snapshot.Config.Routing.Priority, contextWindow, snapshot.Limits.Source, cost),
 		})
 	}
 	if len(decision.Candidates) == 0 {

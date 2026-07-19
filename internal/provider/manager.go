@@ -13,18 +13,34 @@ import (
 type SaveFunc func(string, config.Config) error
 
 type Snapshot struct {
-	Name       string
-	Config     config.ProviderConfig
-	Generation uint64
+	Name                   string                `json:"name"`
+	Config                 config.ProviderConfig `json:"config"`
+	Generation             uint64                `json:"generation"`
+	Limits                 ModelLimits           `json:"limits,omitzero"`
+	EffectiveContextWindow int                   `json:"effective_context_window,omitempty"`
 }
 
 type Manager struct {
 	mu         sync.Mutex
 	path       string
 	save       SaveFunc
+	store      *config.Store
 	cfg        config.Config
 	generation uint64
 	active     atomic.Pointer[Snapshot]
+}
+
+func NewManagerWithStore(store *config.Store) (*Manager, error) {
+	if store == nil {
+		return nil, errors.New("config store is required")
+	}
+	cfg := store.Config()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	m := &Manager{path: store.Path(), store: store, cfg: cfg, generation: 1}
+	m.publishActive()
+	return m, nil
 }
 
 func NewManager(path string, cfg config.Config, save SaveFunc) (*Manager, error) {
@@ -82,11 +98,26 @@ func (m *Manager) List() []Snapshot {
 }
 
 func (m *Manager) Upsert(name string, provider config.ProviderConfig, activate bool) error {
+	return m.UpsertPatch(name, config.CompleteProviderPatch(provider), activate)
+}
+
+func (m *Manager) UpsertPatch(name string, patch config.ProviderPatch, activate bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	provider := config.ApplyProviderPatch(m.cfg.Providers[name], patch)
 	if err := config.ValidateProvider(name, provider); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.store != nil {
+		updated, err := m.store.UpdateProvider(name, patch, activate || m.cfg.ActiveProvider == "")
+		if err != nil {
+			return err
+		}
+		m.cfg = updated
+		m.generation++
+		m.publishActive()
+		return nil
+	}
 	candidate := m.cfg.Clone()
 	candidate.Providers[name] = provider
 	if activate || candidate.ActiveProvider == "" {
@@ -100,6 +131,16 @@ func (m *Manager) Use(name string) error {
 	defer m.mu.Unlock()
 	if _, ok := m.cfg.Providers[name]; !ok {
 		return fmt.Errorf("provider %q does not exist", name)
+	}
+	if m.store != nil {
+		updated, err := m.store.SetActiveProvider(name)
+		if err != nil {
+			return err
+		}
+		m.cfg = updated
+		m.generation++
+		m.publishActive()
+		return nil
 	}
 	candidate := m.cfg.Clone()
 	candidate.ActiveProvider = name
@@ -134,6 +175,16 @@ func (m *Manager) Delete(name, replacement string) error {
 			sort.Strings(names)
 			return fmt.Errorf("active provider requires a replacement; available: %v", names)
 		}
+	}
+	if m.store != nil {
+		updated, err := m.store.DeleteProvider(name, candidate.ActiveProvider)
+		if err != nil {
+			return err
+		}
+		m.cfg = updated
+		m.generation++
+		m.publishActive()
+		return nil
 	}
 	return m.commit(candidate)
 }

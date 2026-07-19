@@ -26,6 +26,7 @@ type providerOptions struct {
 	baseURL         string
 	model           string
 	apiKey          string
+	catalogProvider string
 	contextWindow   int
 	timeout         time.Duration
 	activate        bool
@@ -95,40 +96,49 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 				}
 				candidate = current
 			}
+			patch := config.ProviderPatch{}
 			if cmd.Flags().Changed("adapter") || !editing {
-				candidate.Adapter = opts.adapter
+				patch.Adapter = config.SetValue(opts.adapter)
 			}
 			if cmd.Flags().Changed("base-url") || !editing {
-				candidate.BaseURL = opts.baseURL
+				patch.BaseURL = config.SetValue(opts.baseURL)
 			}
 			if cmd.Flags().Changed("model") || !editing {
-				candidate.Model = opts.model
+				patch.Model = config.SetValue(opts.model)
 			}
-			if cmd.Flags().Changed("context-window") || !editing {
-				candidate.ContextWindow = opts.contextWindow
+			if cmd.Flags().Changed("api-key") {
+				patch.APIKey = config.SetValue(opts.apiKey)
 			}
-			if cmd.Flags().Changed("timeout") || !editing {
-				candidate.TimeoutSeconds = int(opts.timeout / time.Second)
+			if cmd.Flags().Changed("catalog-provider") {
+				if opts.catalogProvider == "" {
+					patch.CatalogProvider = config.RemoveValue[string]()
+				} else {
+					patch.CatalogProvider = config.SetValue(opts.catalogProvider)
+				}
 			}
-			if cmd.Flags().Changed("routing-task") || !editing {
-				candidate.Routing.Tasks = append([]string(nil), opts.routingTasks...)
+			if cmd.Flags().Changed("context-window") {
+				patch.ContextWindow = config.SetValue(opts.contextWindow)
 			}
-			if cmd.Flags().Changed("routing-priority") || !editing {
-				candidate.Routing.Priority = opts.routingPriority
+			if cmd.Flags().Changed("timeout") {
+				patch.TimeoutSeconds = config.SetValue(int(opts.timeout / time.Second))
 			}
-			if cmd.Flags().Changed("input-cost") || !editing {
-				candidate.Routing.InputCostPerMillion = opts.inputCost
+			if cmd.Flags().Changed("routing-task") {
+				patch.RoutingTasks = config.SetValue(append([]string(nil), opts.routingTasks...))
 			}
-			if cmd.Flags().Changed("output-cost") || !editing {
-				candidate.Routing.OutputCostPerMillion = opts.outputCost
+			if cmd.Flags().Changed("routing-priority") {
+				patch.RoutingPriority = config.SetValue(opts.routingPriority)
 			}
-			if cmd.Flags().Changed("api-key") || !editing {
-				candidate.APIKey = opts.apiKey
+			if cmd.Flags().Changed("input-cost") {
+				patch.InputCost = config.SetValue(opts.inputCost)
 			}
+			if cmd.Flags().Changed("output-cost") {
+				patch.OutputCost = config.SetValue(opts.outputCost)
+			}
+			candidate = config.ApplyProviderPatch(candidate, patch)
 			if err := config.ValidateProvider(name, candidate); err != nil {
 				return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 			}
-			if err := manager.Upsert(name, candidate, opts.activate); err != nil {
+			if err := manager.UpsertPatch(name, patch, opts.activate); err != nil {
 				return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 			}
 			r.rememberProviderAPIKeys(manager.Config())
@@ -140,6 +150,7 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "API base URL")
 	cmd.Flags().StringVar(&opts.model, "model", "", "model ID")
 	cmd.Flags().StringVar(&opts.apiKey, "api-key", "", "API key to store in the provider configuration")
+	cmd.Flags().StringVar(&opts.catalogProvider, "catalog-provider", "", "models.dev provider ID")
 	cmd.Flags().IntVar(&opts.contextWindow, "context-window", 0, "model context window")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 60*time.Second, "request timeout")
 	cmd.Flags().BoolVar(&opts.activate, "activate", true, "make provider active")
@@ -271,8 +282,8 @@ func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error 
 	if model == "" {
 		return &protocol.Error{Code: protocol.ErrConfig, Message: "model ID is required"}
 	}
-	candidate := config.ProviderConfig{Adapter: openai_responses.Name, BaseURL: baseURL, APIKey: secret, Model: model, TimeoutSeconds: 60}
-	if err := manager.Upsert(name, candidate, true); err != nil {
+	patch := config.ProviderPatch{Adapter: config.SetValue(openai_responses.Name), BaseURL: config.SetValue(baseURL), APIKey: config.SetValue(secret), Model: config.SetValue(model)}
+	if err := manager.UpsertPatch(name, patch, true); err != nil {
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
 	r.rememberProviderAPIKeys(manager.Config())

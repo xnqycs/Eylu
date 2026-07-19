@@ -139,6 +139,13 @@ func TestSkillRegistryCLIConfiguration(t *testing.T) {
 	if registry.IndexURL != "https://registry.example/index.json" || registry.TokenEnvironment != "TEAM_TOKEN" || registry.PublicKeys["release"] != publicKey {
 		t.Fatalf("registry = %#v", registry)
 	}
+	rawConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawConfig), "timeout_seconds") || strings.Contains(string(rawConfig), "model_metadata") || strings.Contains(string(rawConfig), "max_turns") {
+		t.Fatalf("registry command expanded defaults: %s", rawConfig)
+	}
 	stdout.Reset()
 	stderr.Reset()
 	if code := Execute(context.Background(), []string{"--config", configPath, "--workspace", workspace, "skills", "registries", "delete", "team"}, strings.NewReader(""), &stdout, &stderr); code != 0 {

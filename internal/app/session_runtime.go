@@ -149,16 +149,13 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	if len(state.Turns) < s.persistedTurns {
 		return fmt.Errorf("session transcript shrank from %d to %d turns", s.persistedTurns, len(state.Turns))
 	}
-	providerState := session.ProviderState{
-		Name: state.Provider.Name, Generation: state.Provider.Generation, Adapter: state.Provider.Adapter,
-		BaseURL: state.Provider.BaseURL, Model: state.Provider.Model, ContextWindow: state.Provider.ContextWindow,
+	providerState := sessionProviderState(state.Provider)
+	selectedProvider, selectedErr := selectedSessionProvider(manager, opts)
+	if selectedErr != nil {
+		return selectedErr
 	}
-	if providerState.Name == "" {
-		var err error
-		providerState, err = selectedSessionProvider(manager, opts)
-		if err != nil {
-			return err
-		}
+	if providerState.Name == "" || !sameSessionProvider(providerState, selectedProvider) {
+		providerState = selectedProvider
 	}
 	state.Provider = agentProviderState(providerState)
 	state.Workspace = s.workspace
@@ -312,7 +309,10 @@ func (s *sessionRuntime) RevalidateSkills(registry *skill.Registry, skillSession
 func snapshotFromConversation(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, previous session.Snapshot, workspace string) session.Snapshot {
 	state := conversation.ExportState()
 	providerState, _ := selectedSessionProvider(manager, opts)
-	state.Provider = agentProviderState(providerState)
+	current := sessionProviderState(state.Provider)
+	if state.Provider.Name == "" || !sameSessionProvider(current, providerState) {
+		state.Provider = agentProviderState(providerState)
+	}
 	state.Workspace = workspace
 	state.PermissionMode = selectedMode(manager, opts)
 	return snapshotFromAgentState(state, previous)
@@ -323,11 +323,8 @@ func snapshotFromAgentState(state agent.ConversationState, previous session.Snap
 		Version: session.SchemaVersion, Sequence: previous.Sequence, SessionID: state.SessionID,
 		CreatedAt: previous.CreatedAt, UpdatedAt: time.Now().UTC(), ClosedAt: previous.ClosedAt,
 		Workspace: state.Workspace, Environment: state.Environment, PermissionMode: state.PermissionMode,
-		Provider: session.ProviderState{
-			Name: state.Provider.Name, Generation: state.Provider.Generation, Adapter: state.Provider.Adapter,
-			BaseURL: state.Provider.BaseURL, Model: state.Provider.Model, ContextWindow: state.Provider.ContextWindow,
-		},
-		Turns: state.Turns, DriverState: append(json.RawMessage(nil), state.DriverState...), SkillCatalog: state.SkillCatalog,
+		Provider: sessionProviderState(state.Provider),
+		Turns:    state.Turns, DriverState: append(json.RawMessage(nil), state.DriverState...), SkillCatalog: state.SkillCatalog,
 		Summary: state.Summary, TodoList: cloneProtocolTodoList(state.TodoList), OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: state.Ledger,
 	}
 	if snapshot.CreatedAt.IsZero() {
@@ -344,7 +341,10 @@ func agentStateFromSnapshot(snapshot session.Snapshot) agent.ConversationState {
 		SessionID: snapshot.SessionID, Turns: snapshot.Turns, DriverState: append(json.RawMessage(nil), snapshot.DriverState...),
 		Provider: agent.ProviderState{
 			Name: snapshot.Provider.Name, Generation: snapshot.Provider.Generation, Adapter: snapshot.Provider.Adapter,
-			BaseURL: snapshot.Provider.BaseURL, Model: snapshot.Provider.Model, ContextWindow: snapshot.Provider.ContextWindow,
+			BaseURL: snapshot.Provider.BaseURL, Model: snapshot.Provider.Model, CatalogProvider: snapshot.Provider.CatalogProvider, ContextWindow: snapshot.Provider.ContextWindow,
+			DetectedContextWindow: snapshot.Provider.DetectedContextWindow, EffectiveContextWindow: snapshot.Provider.EffectiveContextWindow,
+			LimitSource: snapshot.Provider.LimitSource, LimitObservedAt: snapshot.Provider.LimitObservedAt,
+			LimitCached: snapshot.Provider.LimitCached, LimitAssumed: snapshot.Provider.LimitAssumed, LimitDegradations: snapshot.Provider.LimitDegradations,
 		},
 		Workspace: snapshot.Workspace, Environment: snapshot.Environment, PermissionMode: snapshot.PermissionMode, SkillCatalog: snapshot.SkillCatalog,
 		Summary: snapshot.Summary, TodoList: cloneProtocolTodoList(snapshot.TodoList), OmittedTurnIDs: snapshot.OmittedTurnIDs, Ledger: snapshot.Ledger,
@@ -396,15 +396,32 @@ func selectedSessionProvider(manager *provider.Manager, opts chatOptions) (sessi
 	}
 	return session.ProviderState{
 		Name: selected.Name, Generation: selected.Generation, Adapter: providerConfig.Adapter, BaseURL: providerConfig.BaseURL,
-		Model: providerConfig.Model, ContextWindow: providerConfig.ContextWindow,
+		Model: providerConfig.Model, CatalogProvider: providerConfig.CatalogProvider, ContextWindow: providerConfig.ContextWindow,
 	}, nil
 }
 
 func agentProviderState(state session.ProviderState) agent.ProviderState {
 	return agent.ProviderState{
 		Name: state.Name, Generation: state.Generation, Adapter: state.Adapter, BaseURL: state.BaseURL,
-		Model: state.Model, ContextWindow: state.ContextWindow,
+		Model: state.Model, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow,
+		DetectedContextWindow: state.DetectedContextWindow, EffectiveContextWindow: state.EffectiveContextWindow,
+		LimitSource: state.LimitSource, LimitObservedAt: state.LimitObservedAt,
+		LimitCached: state.LimitCached, LimitAssumed: state.LimitAssumed, LimitDegradations: state.LimitDegradations,
 	}
+}
+
+func sessionProviderState(state agent.ProviderState) session.ProviderState {
+	return session.ProviderState{
+		Name: state.Name, Generation: state.Generation, Adapter: state.Adapter, BaseURL: state.BaseURL,
+		Model: state.Model, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow,
+		DetectedContextWindow: state.DetectedContextWindow, EffectiveContextWindow: state.EffectiveContextWindow,
+		LimitSource: state.LimitSource, LimitObservedAt: state.LimitObservedAt,
+		LimitCached: state.LimitCached, LimitAssumed: state.LimitAssumed, LimitDegradations: state.LimitDegradations,
+	}
+}
+
+func sameSessionProvider(left, right session.ProviderState) bool {
+	return left.Name == right.Name && left.Generation == right.Generation && left.Adapter == right.Adapter && left.BaseURL == right.BaseURL && left.Model == right.Model && left.CatalogProvider == right.CatalogProvider && left.ContextWindow == right.ContextWindow
 }
 
 func selectedMode(manager *provider.Manager, opts chatOptions) string {

@@ -39,6 +39,8 @@ go run . "审查并测试这个项目" --route auto --task review --require-reas
 
 `routing_mode = "fixed"` 保持活动 Provider；`routing_mode = "auto"` 允许每个请求选择 Provider。显式 `--provider` 固定本次请求。文本模式在 stderr 输出路由决策与请求指标；JSONL 模式输出 `routing` 和 `metrics` 事件，指标包含 request ID、首 token/总耗时、工具成功率、压缩次数、usage 与估算成本。
 
+模型上下文窗口默认自动解析。Eylu 依次使用服务端模型元数据、Ollama `/api/ps`/`/api/show`、llama.cpp `/props`、models.dev 和内置 `256K → 8K` 阶梯；上下文溢出会触发最多三轮压缩重试并缓存服务确认的限制。`--context-window` 是用户上限，`--catalog-provider` 可显式指定 models.dev Provider ID。解析缓存位于 `~/.eylu/state/model-metadata.json`，`/context` 展示配置值、探测值、有效值和来源。
+
 兼容端点可在 Provider 中选择两种 adapter：
 
 - `openai_responses`：使用 `/v1/responses` 和类型化 SSE 事件。
@@ -194,9 +196,9 @@ max_parallel_tools = 4
 
 项目地图稳定登记受限文件树、语言统计、入口、配置和最近修改文件。Responses 驱动在端点支持时使用远端 response state 减少重复传输；HTTP 网关拒绝该能力时会自动记忆并切换到完整上下文请求。
 
-常规配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。workspace 使用独立的运行时优先级 `--workspace > EYLU_WORKSPACE > cwd`。Provider 的 `api_key` 与 `base_url` 位于同一个 TOML 表并以明文保存；应限制配置文件仅供当前系统用户读取。`EYLU_API_KEY` 可临时覆盖所有 Provider 的配置值。
+常规配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。所有默认值由代码提供，TOML 只保存用户显式字段；显式的默认值、`false`、`0` 和空数组会稳定保留。命令只更新当前配置层，继承值与环境变量保持在来源层。`[model_metadata]` 默认省略，用户可按字段覆盖探测超时、TTL、目录 URL、缓存限制和阶梯。workspace 使用独立的运行时优先级 `--workspace > EYLU_WORKSPACE > cwd`。Provider 的 `api_key` 与 `base_url` 位于同一个 TOML 表并以明文保存；应限制配置文件仅供当前系统用户读取。`EYLU_API_KEY` 可临时覆盖所有 Provider 的配置值。
 
-session 保存完整 Eylu transcript、环境快照、上下文账本、权限模式、Provider generation、模型引用和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。旧 session 补采环境时会清除原 DriverState，并使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
+session 保存完整 Eylu transcript、环境快照、上下文账本、权限模式、Provider generation、模型引用、最近一次探测限制和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。恢复请求会重新解析模型限制。旧 session 补采环境时会清除原 DriverState，并使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
 
 ## 发布
 

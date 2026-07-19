@@ -23,6 +23,7 @@ type Runtime struct {
 	Provider              provider.Snapshot
 	APIKey                string
 	Driver                driver.ModelDriver
+	LimitResolver         *provider.LimitResolver
 	Timeout               time.Duration
 	PermissionMode        string
 	SkillCatalog          string
@@ -249,44 +250,87 @@ func (c *Conversation) appendUser(prompt string) {
 }
 
 func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
-	prepared, err := c.prepareRequestContext(runtime, definitions)
-	if err != nil {
-		return protocol.ModelResponse{}, err
+	if runtime.LimitResolver != nil {
+		resolved, err := runtime.LimitResolver.Resolve(ctx, runtime.Provider, runtime.APIKey)
+		if err != nil {
+			return protocol.ModelResponse{}, err
+		}
+		runtime.Provider = resolved
 	}
-	request := driver.Request{
-		BaseURL: runtime.Provider.Config.BaseURL,
-		APIKey:  runtime.APIKey,
-		Headers: runtime.Provider.Config.Headers,
-		Stream:  stream,
-		Model: protocol.ModelRequest{
-			ProtocolVersion: protocol.Version,
-			Model:           runtime.Provider.Config.Model,
-			Turns:           prepared.Turns,
-			Tools:           prepared.Tools,
-			DriverState:     append(json.RawMessage(nil), c.driverState...),
-		},
-	}
-	response, err := runtime.Driver.Generate(ctx, request, emit)
-	if err != nil {
+	responseStarted := false
+	for attempt := 0; attempt <= 3; attempt++ {
+		prepared, err := c.prepareRequestContext(runtime, definitions)
+		if err != nil {
+			return protocol.ModelResponse{}, err
+		}
+		request := driver.Request{
+			BaseURL: runtime.Provider.Config.BaseURL,
+			APIKey:  runtime.APIKey,
+			Headers: runtime.Provider.Config.Headers,
+			Stream:  stream,
+			Model: protocol.ModelRequest{
+				ProtocolVersion: protocol.Version,
+				Model:           runtime.Provider.Config.Model,
+				Turns:           prepared.Turns,
+				Tools:           prepared.Tools,
+				DriverState:     append(json.RawMessage(nil), c.driverState...),
+			},
+		}
+		visible := false
+		wrappedEmit := emit
+		if emit != nil {
+			wrappedEmit = func(event protocol.ModelEvent) error {
+				switch event.Kind {
+				case protocol.EventTextDelta, protocol.EventReasoningDelta, protocol.EventToolCallDelta:
+					visible = true
+				case protocol.EventResponseStart:
+					if responseStarted {
+						return nil
+					}
+					responseStarted = true
+				}
+				return emit(event)
+			}
+		}
+		response, err := runtime.Driver.Generate(ctx, request, wrappedEmit)
+		if err != nil {
+			var providerError *protocol.Error
+			if errors.As(err, &providerError) && providerError.Code == protocol.ErrContextWindow && !visible && runtime.LimitResolver != nil && attempt < 3 {
+				runtime.Provider = runtime.LimitResolver.LearnOverflow(runtime.Provider, providerError.ContextLimit)
+				c.driverState = nil
+				continue
+			}
+			c.lastRuntime = runtime
+			c.rebuildLedger(runtime)
+			return protocol.ModelResponse{}, err
+		}
+		if len(response.Turn.Parts) == 0 {
+			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned an empty turn"}
+		}
+		c.turns = append(c.turns, response.Turn)
+		c.driverState = append(c.driverState[:0], response.DriverState...)
 		c.lastRuntime = runtime
 		c.rebuildLedger(runtime)
-		return protocol.ModelResponse{}, err
+		c.ledger.SetLastUsage(response.Usage)
+		return response, nil
 	}
-	if len(response.Turn.Parts) == 0 {
-		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned an empty turn"}
-	}
-	c.turns = append(c.turns, response.Turn)
-	c.driverState = append(c.driverState[:0], response.DriverState...)
-	c.lastRuntime = runtime
-	c.rebuildLedger(runtime)
-	c.ledger.SetLastUsage(response.Usage)
-	return response, nil
+	return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrContextWindow, Message: "context recovery attempts exhausted"}
 }
 
 func (c *Conversation) ContextReport() contextledger.Report {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.ledger.Report(c.lastRuntime.Provider.Name, c.lastRuntime.Provider.Config.Model, c.lastRuntime.Provider.Config.ContextWindow)
+	snapshot := c.lastRuntime.Provider
+	source := snapshot.Limits.Source
+	effective := snapshot.ContextWindowLimit()
+	if cap := snapshot.Config.ContextWindow; cap > 0 && effective == cap && (snapshot.Limits.ContextWindow == 0 || cap < snapshot.Limits.ContextWindow) {
+		source = provider.LimitSourceUserCap
+	}
+	return c.ledger.ReportWithLimits(snapshot.Name, snapshot.Config.Model, contextledger.LimitDetails{
+		Configured: snapshot.Config.ContextWindow, Detected: snapshot.Limits.ContextWindow, Effective: effective,
+		Source: string(source), Cached: snapshot.Limits.Cached, Assumed: snapshot.Limits.Assumed,
+		ObservedAt: snapshot.Limits.ObservedAt, Degradations: snapshot.Limits.Degradations,
+	})
 }
 
 func (c *Conversation) TodoList() protocol.TodoList {

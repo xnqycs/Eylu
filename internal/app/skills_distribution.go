@@ -39,19 +39,21 @@ func (r *runtime) skillRegistriesCommand() *cobra.Command {
 	var indexURL, tokenEnvironment string
 	var timeout time.Duration
 	var publicKeys map[string]string
-	add := &cobra.Command{Use: "add <name>", Short: "add or replace a signed Skill registry", Args: cobra.ExactArgs(1), RunE: func(_ *cobra.Command, args []string) error {
+	add := &cobra.Command{Use: "add <name>", Short: "add or replace a signed Skill registry", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		loaded, _, err := r.loadManager()
 		if err != nil {
 			return err
 		}
-		candidate := loaded.Config.Clone()
-		candidate.SkillRegistries[args[0]] = config.SkillRegistryConfig{
-			IndexURL: indexURL, PublicKeys: publicKeys, TokenEnvironment: tokenEnvironment, TimeoutSeconds: int(timeout / time.Second),
+		candidate := config.SkillRegistryConfig{IndexURL: indexURL, PublicKeys: publicKeys, TokenEnvironment: tokenEnvironment}
+		if cmd.Flags().Changed("timeout") {
+			candidate.TimeoutSeconds = int(timeout / time.Second)
 		}
-		if err := candidate.Validate(); err != nil {
+		validation := loaded.Config.Clone()
+		validation.SkillRegistries[args[0]] = candidate
+		if err := validation.Validate(); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
-		if err := config.Save(loaded.Path, candidate); err != nil {
+		if _, err := loaded.Store.SetSkillRegistry(args[0], candidate); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: "save Skill registry: " + err.Error(), Cause: err}
 		}
 		fmt.Fprintf(r.stdout, "Skill registry %s saved.\n", args[0])
@@ -67,12 +69,10 @@ func (r *runtime) skillRegistriesCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		candidate := loaded.Config.Clone()
-		if _, exists := candidate.SkillRegistries[args[0]]; !exists {
+		if _, exists := loaded.Config.SkillRegistries[args[0]]; !exists {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("Skill registry %q does not exist", args[0])}
 		}
-		delete(candidate.SkillRegistries, args[0])
-		if err := config.Save(loaded.Path, candidate); err != nil {
+		if _, err := loaded.Store.DeleteSkillRegistry(args[0]); err != nil {
 			return err
 		}
 		fmt.Fprintf(r.stdout, "Skill registry %s deleted.\n", args[0])

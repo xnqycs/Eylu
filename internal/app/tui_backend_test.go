@@ -56,7 +56,7 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 	}))
 	defer server.Close()
 	workspace := t.TempDir()
-	cfg := config.Default()
+	cfg := testAppConfig()
 	cfg.ActiveProvider = "work"
 	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test"}
 	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
@@ -118,7 +118,7 @@ func TestTUIBackendStreamsFileToolArgumentsBeforeExecution(t *testing.T) {
 	defer server.Close()
 
 	workspace := t.TempDir()
-	cfg := config.Default()
+	cfg := testAppConfig()
 	cfg.PermissionMode = "full"
 	cfg.ActiveProvider = "work"
 	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test"}
@@ -157,7 +157,7 @@ func TestTUIBackendStreamsFileToolArgumentsBeforeExecution(t *testing.T) {
 
 func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	workspace := t.TempDir()
-	cfg := config.Default()
+	cfg := testAppConfig()
 	cfg.ActiveProvider = "work"
 	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "model"}
 	configPath := filepath.Join(t.TempDir(), "config.toml")
@@ -202,6 +202,13 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	snapshot, err := backend.Snapshot(context.Background())
 	if err != nil || snapshot.Workspace != workspace || snapshot.Provider != "new" || snapshot.Model != "new-model" {
 		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
+	}
+	if err := backend.UpsertProvider(context.Background(), ui.ProviderForm{OriginalName: "new", Name: "renamed", BaseURL: "https://new.example/v1", Model: "new-model", Adapter: "openai_responses", ContextWindow: 64000}); err != nil {
+		t.Fatal(err)
+	}
+	renamed, exists := manager.Get("renamed")
+	if _, oldExists := manager.Get("new"); !exists || oldExists || renamed.APIKey != "provider-secret" || renamed.ContextWindow != 64000 {
+		t.Fatalf("renamed=%#v exists=%t old=%t", renamed, exists, oldExists)
 	}
 }
 
@@ -271,7 +278,7 @@ func TestTUIAskTodoAndSessionRestoreSmoke(t *testing.T) {
 	defer server.Close()
 
 	workspace := t.TempDir()
-	cfg := config.Default()
+	cfg := testAppConfig()
 	cfg.ActiveProvider = "work"
 	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL, Model: "model"}
 	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
@@ -335,7 +342,7 @@ func TestTUIBackendPreparesGitAwareFileAndSkillReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := config.Default()
+	cfg := testAppConfig()
 	cfg.ActiveProvider = "work"
 	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "test"}
 	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
@@ -484,7 +491,7 @@ func TestCancelledPlanDoesNotMutateParentTranscript(t *testing.T) {
 
 func TestPlanExecutorPublishesOnlyReadToolsAndClassifiedBash(t *testing.T) {
 	workspace := t.TempDir()
-	cfg := config.Default()
+	cfg := testAppConfig()
 	runtime := &runtime{workspace: workspace}
 	ask := func(context.Context, protocol.AskRequest) (protocol.AskResponse, error) {
 		return protocol.AskResponse{}, nil
@@ -503,6 +510,12 @@ func TestPlanExecutorPublishesOnlyReadToolsAndClassifiedBash(t *testing.T) {
 	if names["write_file"] || names["edit_file"] || names["todolist"] {
 		t.Fatalf("write tools leaked into plan profile: %v", names)
 	}
+}
+
+func testAppConfig() config.Config {
+	cfg := config.Default()
+	cfg.ModelMetadata.Enabled = false
+	return cfg
 }
 
 func runAppGit(t *testing.T, directory string, args ...string) {

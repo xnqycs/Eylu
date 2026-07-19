@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 func TestResolveRuntimeAutomaticAndFixedRouting(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := config.Default()
+	cfg.ModelMetadata.Enabled = false
 	cfg.RoutingMode = "auto"
 	cfg.ActiveProvider = "reasoning"
 	cfg.Providers["reasoning"] = config.ProviderConfig{
@@ -29,25 +31,36 @@ func TestResolveRuntimeAutomaticAndFixedRouting(t *testing.T) {
 	}
 	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
 
-	selected, decision, err := runtime.resolveRuntimeForPrompt(manager, chatOptions{}, "implement this", 10_000, 8_000, 2_000, true)
+	selected, decision, err := runtime.resolveRuntimeForPrompt(context.Background(), manager, chatOptions{}, "implement this", 10_000, 8_000, 2_000, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if selected.Provider.Name != "cheap" || decision == nil || decision.Task != "coding" {
 		t.Fatalf("selected=%s decision=%#v", selected.Provider.Name, decision)
 	}
-	selected, decision, err = runtime.resolveRuntimeForPrompt(manager, chatOptions{requireReasoning: true}, "implement this", 10_000, 8_000, 2_000, true)
+	selected, decision, err = runtime.resolveRuntimeForPrompt(context.Background(), manager, chatOptions{requireReasoning: true}, "implement this", 10_000, 8_000, 2_000, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if selected.Provider.Name != "reasoning" || decision == nil {
 		t.Fatalf("selected=%s decision=%#v", selected.Provider.Name, decision)
 	}
-	selected, decision, err = runtime.resolveRuntimeForPrompt(manager, chatOptions{provider: "reasoning"}, "implement this", 10_000, 8_000, 2_000, true)
+	selected, decision, err = runtime.resolveRuntimeForPrompt(context.Background(), manager, chatOptions{provider: "reasoning"}, "implement this", 10_000, 8_000, 2_000, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if selected.Provider.Name != "reasoning" || decision != nil {
 		t.Fatalf("fixed selection=%s decision=%#v", selected.Provider.Name, decision)
+	}
+}
+
+func TestContextLimitWarningIsEmittedOnce(t *testing.T) {
+	var stderr bytes.Buffer
+	runtime := &runtime{stderr: &stderr}
+	snapshot := provider.Snapshot{Name: "work", Config: config.ProviderConfig{Model: "model", ContextWindow: 128000}, Limits: provider.ModelLimits{ContextWindow: 64000, Source: provider.LimitSourceModelsDev}, EffectiveContextWindow: 64000}
+	runtime.warnContextLimit(snapshot)
+	runtime.warnContextLimit(snapshot)
+	if strings.Count(stderr.String(), "configured cap=128000 exceeds detected limit=64000") != 1 {
+		t.Fatalf("warning = %q", stderr.String())
 	}
 }

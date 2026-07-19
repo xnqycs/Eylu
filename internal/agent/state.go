@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"time"
 	"unicode/utf8"
 
 	"Eylu/internal/config"
@@ -15,12 +16,20 @@ import (
 )
 
 type ProviderState struct {
-	Name          string `json:"name"`
-	Generation    uint64 `json:"generation"`
-	Adapter       string `json:"adapter"`
-	BaseURL       string `json:"base_url"`
-	Model         string `json:"model"`
-	ContextWindow int    `json:"context_window,omitempty"`
+	Name                   string    `json:"name"`
+	Generation             uint64    `json:"generation"`
+	Adapter                string    `json:"adapter"`
+	BaseURL                string    `json:"base_url"`
+	Model                  string    `json:"model"`
+	CatalogProvider        string    `json:"catalog_provider,omitempty"`
+	ContextWindow          int       `json:"context_window,omitempty"`
+	DetectedContextWindow  int       `json:"detected_context_window,omitempty"`
+	EffectiveContextWindow int       `json:"effective_context_window,omitempty"`
+	LimitSource            string    `json:"limit_source,omitempty"`
+	LimitObservedAt        time.Time `json:"limit_observed_at,omitzero"`
+	LimitCached            bool      `json:"limit_cached,omitempty"`
+	LimitAssumed           bool      `json:"limit_assumed,omitempty"`
+	LimitDegradations      int       `json:"limit_degradations,omitempty"`
 }
 
 type ConversationState struct {
@@ -44,7 +53,13 @@ func (c *Conversation) ExportState() ConversationState {
 	defer c.mu.Unlock()
 	state := ConversationState{
 		SessionID: c.sessionID, Turns: cloneTurns(c.turns), DriverState: append(json.RawMessage(nil), c.driverState...),
-		Provider:  ProviderState{Name: c.providerName, Generation: c.providerGeneration, Adapter: c.providerAdapter, BaseURL: c.providerBaseURL, Model: c.providerModel, ContextWindow: c.lastRuntime.Provider.Config.ContextWindow},
+		Provider: ProviderState{
+			Name: c.providerName, Generation: c.providerGeneration, Adapter: c.providerAdapter, BaseURL: c.providerBaseURL, Model: c.providerModel, CatalogProvider: c.lastRuntime.Provider.Config.CatalogProvider,
+			ContextWindow: c.lastRuntime.Provider.Config.ContextWindow, DetectedContextWindow: c.lastRuntime.Provider.Limits.ContextWindow,
+			EffectiveContextWindow: c.lastRuntime.Provider.ContextWindowLimit(), LimitSource: string(c.lastRuntime.Provider.Limits.Source),
+			LimitObservedAt: c.lastRuntime.Provider.Limits.ObservedAt, LimitCached: c.lastRuntime.Provider.Limits.Cached,
+			LimitAssumed: c.lastRuntime.Provider.Limits.Assumed, LimitDegradations: c.lastRuntime.Provider.Limits.Degradations,
+		},
 		Workspace: c.lastRuntime.Workspace, Environment: c.environment, PermissionMode: c.permissionMode, SkillCatalog: c.skillCatalog,
 		Summary: c.summary, TodoList: cloneTodoList(c.todoList), Ledger: c.ledger.State(),
 	}
@@ -99,7 +114,10 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 	}
 	conversation.systemPrompt = promptForRuntime(conversation.permissionMode)
 	conversation.lastRuntime = Runtime{
-		Provider:  provider.Snapshot{Name: state.Provider.Name, Generation: state.Provider.Generation, Config: configForState(state.Provider)},
+		Provider: provider.Snapshot{
+			Name: state.Provider.Name, Generation: state.Provider.Generation, Config: configForState(state.Provider), EffectiveContextWindow: state.Provider.EffectiveContextWindow,
+			Limits: provider.ModelLimits{ContextWindow: state.Provider.DetectedContextWindow, Source: provider.LimitSource(state.Provider.LimitSource), ObservedAt: state.Provider.LimitObservedAt, Cached: state.Provider.LimitCached, Assumed: state.Provider.LimitAssumed, Degradations: state.Provider.LimitDegradations},
+		},
 		Workspace: state.Workspace, PermissionMode: conversation.permissionMode, SkillCatalog: state.SkillCatalog,
 	}
 	conversation.projectMapDirty = true
@@ -145,7 +163,7 @@ func validateTodoListState(list protocol.TodoList) error {
 }
 
 func configForState(state ProviderState) config.ProviderConfig {
-	return config.ProviderConfig{Adapter: state.Adapter, BaseURL: state.BaseURL, Model: state.Model, ContextWindow: state.ContextWindow}
+	return config.ProviderConfig{Adapter: state.Adapter, BaseURL: state.BaseURL, Model: state.Model, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow}
 }
 
 func validateTurns(turns []protocol.Turn) error {

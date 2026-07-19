@@ -115,12 +115,13 @@ type AskDecision struct {
 }
 
 type ProviderItem struct {
-	Name          string `json:"name"`
-	Adapter       string `json:"adapter"`
-	BaseURL       string `json:"base_url"`
-	Model         string `json:"model"`
-	ContextWindow int    `json:"context_window,omitempty"`
-	Active        bool   `json:"active"`
+	Name            string `json:"name"`
+	Adapter         string `json:"adapter"`
+	BaseURL         string `json:"base_url"`
+	Model           string `json:"model"`
+	CatalogProvider string `json:"catalog_provider,omitempty"`
+	ContextWindow   int    `json:"context_window,omitempty"`
+	Active          bool   `json:"active"`
 }
 
 type SkillItem struct {
@@ -168,13 +169,18 @@ type Snapshot struct {
 }
 
 type ProviderForm struct {
-	OriginalName  string `json:"original_name,omitempty"`
-	Name          string `json:"name"`
-	BaseURL       string `json:"base_url"`
-	Model         string `json:"model"`
-	Adapter       string `json:"adapter"`
-	APIKey        string `json:"-"`
-	ContextWindow int    `json:"context_window,omitempty"`
+	OriginalName          string `json:"original_name,omitempty"`
+	Name                  string `json:"name"`
+	BaseURL               string `json:"base_url"`
+	Model                 string `json:"model"`
+	Adapter               string `json:"adapter"`
+	APIKey                string `json:"-"`
+	CatalogProvider       string `json:"catalog_provider,omitempty"`
+	ContextWindow         int    `json:"context_window,omitempty"`
+	ContextWindowSet      bool   `json:"-"`
+	ContextWindowRemove   bool   `json:"-"`
+	CatalogProviderSet    bool   `json:"-"`
+	CatalogProviderRemove bool   `json:"-"`
 }
 
 type Backend interface {

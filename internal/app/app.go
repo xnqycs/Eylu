@@ -62,6 +62,10 @@ type runtime struct {
 	mcp                *mcpclient.Manager
 	mcpKey             string
 	environmentCapture func(context.Context, string) environment.Context
+	limitMu            sync.Mutex
+	limitResolver      *provider.LimitResolver
+	metadataCachePath  string
+	limitWarnings      map[string]bool
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -237,10 +241,11 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	report := conversation.ContextReport()
 	estimatedInput := report.InputTokens + estimator.Estimate(prompt)
 	stream := r.output == "text" || r.output == "jsonl"
-	modelRuntime, routeDecision, err := r.resolveRuntimeForPrompt(manager, opts, prompt, estimatedInput+cfg.ReservedOutputTokens, estimatedInput, cfg.ReservedOutputTokens, stream)
+	modelRuntime, routeDecision, err := r.resolveRuntimeForPrompt(ctx, manager, opts, prompt, estimatedInput+cfg.ReservedOutputTokens, estimatedInput, cfg.ReservedOutputTokens, stream)
 	if err != nil {
 		return err
 	}
+	r.warnContextLimit(modelRuntime.Provider)
 	jsonlEncoder := json.NewEncoder(r.stdout)
 	if routeDecision != nil {
 		if r.output == "jsonl" {
@@ -261,6 +266,9 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	modelRuntime.Workspace = r.workspace
 	modelRuntime.TokenEstimator = contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
 	modelRuntime.OutputReserveTokens = cfg.ReservedOutputTokens
+	if maximum := modelRuntime.Provider.Limits.MaxOutputTokens; maximum > 0 && maximum < modelRuntime.OutputReserveTokens {
+		modelRuntime.OutputReserveTokens = maximum
+	}
 	modelRuntime.ContextRecentRounds = cfg.ContextRecentRounds
 	modelRuntime.MaxProjectMapBytes = cfg.MaxProjectMapBytes
 	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
@@ -500,16 +508,39 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 	}
 }
 
-func (r *runtime) resolveRuntimeForPrompt(manager *provider.Manager, opts chatOptions, prompt string, requiredContext, estimatedInput, estimatedOutput int, stream bool) (agent.Runtime, *routing.Decision, error) {
+func (r *runtime) resolveRuntimeForPrompt(ctx context.Context, manager *provider.Manager, opts chatOptions, prompt string, requiredContext, estimatedInput, estimatedOutput int, stream bool) (agent.Runtime, *routing.Decision, error) {
 	var snapshot provider.Snapshot
 	var decision *routing.Decision
 	var err error
+	metadata := manager.Config().ModelMetadata
+	resolver := r.modelLimitResolver(metadata)
+	applyOverrides := func(snapshot provider.Snapshot) provider.Snapshot {
+		if opts.model != "" {
+			snapshot.Config.Model = opts.model
+		}
+		if opts.baseURL != "" {
+			snapshot.Config.BaseURL = opts.baseURL
+		}
+		if opts.adapter != "" && opts.adapter != openai_responses.Name {
+			snapshot.Config.Adapter = opts.adapter
+		}
+		return snapshot
+	}
+	resolveOne := func(candidate provider.Snapshot) (provider.Snapshot, error) {
+		candidate = applyOverrides(candidate)
+		resolved, resolveErr := resolver.Resolve(ctx, candidate, providerAPIKey(candidate.Config))
+		if resolveErr != nil {
+			return provider.Snapshot{}, resolveErr
+		}
+		return resolved, nil
+	}
 	if opts.provider != "" {
 		var ok bool
 		snapshot, ok = manager.Snapshot(opts.provider)
 		if !ok {
 			return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", opts.provider)}
 		}
+		snapshot, err = resolveOne(snapshot)
 	} else {
 		routeMode := opts.routeMode
 		if routeMode == "" {
@@ -518,6 +549,9 @@ func (r *runtime) resolveRuntimeForPrompt(manager *provider.Manager, opts chatOp
 		switch routeMode {
 		case "fixed":
 			snapshot, err = manager.Active()
+			if err == nil {
+				snapshot, err = resolveOne(snapshot)
+			}
 		case "auto":
 			task := opts.task
 			if task == "" {
@@ -526,7 +560,14 @@ func (r *runtime) resolveRuntimeForPrompt(manager *provider.Manager, opts chatOp
 			if !routing.ValidTask(task) {
 				return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("invalid routing task %q", task)}
 			}
-			routeDecision, routeErr := routing.Select(manager.List(), routing.Request{
+			candidates := manager.List()
+			for index := range candidates {
+				candidates[index] = applyOverrides(candidates[index])
+			}
+			resolveCtx, cancel := context.WithTimeout(ctx, time.Duration(metadata.RequestTimeoutSeconds)*time.Second)
+			candidates = resolver.ResolveMany(resolveCtx, candidates, providerAPIKey, 4)
+			cancel()
+			routeDecision, routeErr := routing.Select(candidates, routing.Request{
 				Task: task, RequiredContext: requiredContext, EstimatedInput: estimatedInput, EstimatedOutput: estimatedOutput,
 				Capabilities: driver.Capabilities{TextStreaming: stream, ToolCalling: true, Reasoning: opts.requireReasoning},
 			}, knownDriverCapabilities)
@@ -542,16 +583,10 @@ func (r *runtime) resolveRuntimeForPrompt(manager *provider.Manager, opts chatOp
 			return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
 	}
+	if err != nil {
+		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
+	}
 	providerConfig := snapshot.Config
-	if opts.model != "" {
-		providerConfig.Model = opts.model
-	}
-	if opts.baseURL != "" {
-		providerConfig.BaseURL = opts.baseURL
-	}
-	if opts.adapter != "" && opts.adapter != openai_responses.Name {
-		providerConfig.Adapter = opts.adapter
-	}
 	if err := config.ValidateProvider(snapshot.Name, providerConfig); err != nil {
 		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
@@ -567,7 +602,35 @@ func (r *runtime) resolveRuntimeForPrompt(manager *provider.Manager, opts chatOp
 	if err != nil {
 		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
-	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, Timeout: requestTimeout}, decision, nil
+	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, LimitResolver: resolver, Timeout: requestTimeout}, decision, nil
+}
+
+func (r *runtime) modelLimitResolver(metadata config.ModelMetadataConfig) *provider.LimitResolver {
+	r.limitMu.Lock()
+	defer r.limitMu.Unlock()
+	if r.limitResolver == nil {
+		r.limitResolver = provider.NewLimitResolver(metadata, r.metadataCachePath, nil)
+	}
+	return r.limitResolver
+}
+
+func (r *runtime) warnContextLimit(snapshot provider.Snapshot) {
+	configured, detected := snapshot.Config.ContextWindow, snapshot.Limits.ContextWindow
+	if r.stderr == nil || configured <= 0 || detected <= 0 || configured <= detected {
+		return
+	}
+	key := fmt.Sprintf("%s\x00%s\x00%d", snapshot.Name, snapshot.Config.Model, detected)
+	r.limitMu.Lock()
+	if r.limitWarnings == nil {
+		r.limitWarnings = make(map[string]bool)
+	}
+	if r.limitWarnings[key] {
+		r.limitMu.Unlock()
+		return
+	}
+	r.limitWarnings[key] = true
+	r.limitMu.Unlock()
+	fmt.Fprintf(r.stderr, "[context] configured cap=%d exceeds detected limit=%d; effective=%d source=%s\n", configured, detected, snapshot.ContextWindowLimit(), snapshot.Limits.Source)
 }
 
 func knownDriverCapabilities(adapter string) (driver.Capabilities, bool) {
@@ -596,7 +659,7 @@ func (r *runtime) loadManager() (config.Loaded, *provider.Manager, error) {
 	}
 	r.rememberProviderAPIKeys(loaded.Config)
 	r.workspace = loaded.Workspace
-	manager, err := provider.NewManager(loaded.Path, loaded.Config, nil)
+	manager, err := provider.NewManagerWithStore(loaded.Store)
 	if err != nil {
 		return config.Loaded{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
@@ -676,7 +739,7 @@ func exitCode(err error) int {
 		return exitConfig
 	case protocol.ErrNetwork, protocol.ErrTimeout, protocol.ErrCancelled:
 		return exitNetwork
-	case protocol.ErrAuth, protocol.ErrRateLimit, protocol.ErrProvider:
+	case protocol.ErrAuth, protocol.ErrRateLimit, protocol.ErrProvider, protocol.ErrContextWindow:
 		return exitProvider
 	default:
 		return exitInternal
