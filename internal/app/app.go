@@ -77,11 +77,16 @@ func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 }
 
 func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
+	var opts chatOptions
 	root := &cobra.Command{
-		Use:           "eylu",
+		Use:           "eylu [prompt]",
 		Short:         "Eylu terminal programming agent",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return r.executeChatCommand(ctx, args, opts)
+		},
 		PersistentPreRunE: func(*cobra.Command, []string) error {
 			switch r.output {
 			case "text", "json", "jsonl":
@@ -95,6 +100,7 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 	root.PersistentFlags().StringVar(&r.configPath, "config", "", "config file path")
 	root.PersistentFlags().StringVar(&r.workspace, "workspace", "", "workspace directory")
 	root.PersistentFlags().StringVar(&r.output, "output", "text", "output format: text, json, or jsonl")
+	bindChatFlags(root, &opts)
 	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand(ctx), r.sessionsCommand(), r.mcpCommand(ctx), r.versionCommand())
 	return root
 }
@@ -134,26 +140,36 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 		Use:   "chat [prompt]",
 		Short: "send a prompt to the active model",
 		Args:  cobra.MaximumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 && isTerminal(r.stdin) {
-				return r.runInteractive(ctx, opts)
-			}
-			prompt := ""
-			if len(args) == 1 {
-				prompt = args[0]
-			} else if !isTerminal(r.stdin) {
-				raw, err := io.ReadAll(io.LimitReader(r.stdin, 1<<20))
-				if err != nil {
-					return err
-				}
-				prompt = strings.TrimSpace(string(raw))
-			}
-			if prompt == "" {
-				return &protocol.Error{Code: protocol.ErrConfig, Message: "prompt is required; use eylu chat \"your request\""}
-			}
-			return r.runChat(ctx, prompt, opts)
+		RunE: func(_ *cobra.Command, args []string) error {
+			return r.executeChatCommand(ctx, args, opts)
 		},
 	}
+	bindChatFlags(cmd, &opts)
+	return cmd
+}
+
+func (r *runtime) executeChatCommand(ctx context.Context, args []string, opts chatOptions) error {
+	terminal := isTerminal(r.stdin)
+	if len(args) == 0 && terminal {
+		return r.runInteractive(ctx, opts)
+	}
+	prompt := ""
+	if len(args) == 1 {
+		prompt = args[0]
+	} else if !terminal {
+		raw, err := io.ReadAll(io.LimitReader(r.stdin, 1<<20))
+		if err != nil {
+			return err
+		}
+		prompt = strings.TrimSpace(string(raw))
+	}
+	if prompt == "" {
+		return &protocol.Error{Code: protocol.ErrConfig, Message: "prompt is required; use eylu \"your request\" or run eylu in a terminal"}
+	}
+	return r.runChat(ctx, prompt, opts)
+}
+
+func bindChatFlags(cmd *cobra.Command, opts *chatOptions) {
 	cmd.Flags().StringVar(&opts.provider, "provider", "", "provider name")
 	cmd.Flags().StringVar(&opts.model, "model", "", "model ID override")
 	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "API base URL override")
@@ -170,7 +186,6 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 	cmd.Flags().StringVar(&opts.task, "task", "", "routing task: general, coding, review, debugging, testing, or documentation")
 	cmd.Flags().BoolVar(&opts.requireReasoning, "require-reasoning", false, "require a driver with reasoning support")
 	cmd.MarkFlagsMutuallyExclusive("session", "resume")
-	return cmd
 }
 
 func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) error {

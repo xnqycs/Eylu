@@ -58,6 +58,144 @@ func TestChatEndToEnd(t *testing.T) {
 	}
 }
 
+func TestRootChatEntryPoints(t *testing.T) {
+	testCases := []struct {
+		name           string
+		expectedPrompt string
+		stdin          string
+		arguments      func([]string) []string
+	}{
+		{
+			name:           "positional prompt",
+			expectedPrompt: "hello from root",
+			arguments: func(base []string) []string {
+				return append(base, "hello from root")
+			},
+		},
+		{
+			name:           "piped prompt",
+			expectedPrompt: "hello from pipe",
+			stdin:          "hello from pipe\n",
+			arguments: func(base []string) []string {
+				return base
+			},
+		},
+		{
+			name:           "reserved prompt after double dash",
+			expectedPrompt: "sessions",
+			arguments: func(base []string) []string {
+				return append(base, "--", "sessions")
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			isolateUserState(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				input, ok := body["input"].([]any)
+				if !ok || len(input) == 0 {
+					t.Fatalf("input = %#v", body["input"])
+				}
+				var prompt any
+				for _, raw := range input {
+					item, itemOK := raw.(map[string]any)
+					if itemOK && item["role"] == "user" {
+						prompt = item["content"]
+						break
+					}
+				}
+				if prompt != testCase.expectedPrompt || body["model"] != "root-model" {
+					t.Fatalf("request body = %#v", body)
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"root chat works\"}\n\n"))
+				_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_root\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"root chat works\"}]}]}}\n\n"))
+			}))
+			defer server.Close()
+			t.Setenv("EYLU_API_KEY", "root-secret")
+			workspace := t.TempDir()
+			base := []string{
+				"--config", filepath.Join(workspace, "config.toml"),
+				"--workspace", workspace,
+				"--base-url", server.URL + "/v1",
+				"--model", "root-model",
+			}
+			var stdout, stderr bytes.Buffer
+			code := Execute(context.Background(), testCase.arguments(base), strings.NewReader(testCase.stdin), &stdout, &stderr)
+			if code != 0 || stdout.String() != "root chat works\n" {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestRootAndChatExposeSameChatFlags(t *testing.T) {
+	runtime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool)}
+	root := runtime.rootCommand(context.Background())
+	var chatCommandFound bool
+	for _, command := range root.Commands() {
+		if command.Name() != "chat" {
+			continue
+		}
+		chatCommandFound = true
+		for _, name := range []string{"provider", "model", "base-url", "adapter", "timeout", "yes", "mode", "trust-workspace-skills", "no-animation", "no-tui", "session", "resume", "route", "task", "require-reasoning"} {
+			if root.Flags().Lookup(name) == nil || command.Flags().Lookup(name) == nil {
+				t.Errorf("chat flag %q is not registered on both entry points", name)
+			}
+		}
+	}
+	if !chatCommandFound {
+		t.Fatal("chat compatibility command is missing")
+	}
+}
+
+func TestRootChatValidationAndSubcommandDispatch(t *testing.T) {
+	t.Run("empty pipe points to direct syntax", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := Execute(context.Background(), nil, strings.NewReader(""), &stdout, &stderr)
+		if code != exitConfig || !strings.Contains(stderr.String(), `use eylu "your request"`) {
+			t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+		}
+	})
+
+	t.Run("maximum one prompt", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := Execute(context.Background(), []string{"first", "second"}, strings.NewReader(""), &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "accepts at most 1 arg") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+		}
+	})
+
+	t.Run("session and resume are mutually exclusive", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := Execute(context.Background(), []string{"--session", "test", "--resume"}, strings.NewReader(""), &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "none of the others can be") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+		}
+	})
+
+	t.Run("help remains help", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := Execute(context.Background(), []string{"--help"}, strings.NewReader(""), &stdout, &stderr)
+		if code != 0 || !strings.Contains(stdout.String(), "eylu [prompt] [flags]") || !strings.Contains(stdout.String(), "--model") {
+			t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+	})
+
+	t.Run("version remains a subcommand", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := Execute(context.Background(), []string{"version"}, strings.NewReader(""), &stdout, &stderr)
+		if code != 0 || strings.TrimSpace(stdout.String()) == "" || stderr.Len() != 0 {
+			t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+	})
+}
+
 func TestChatToolLoopReadsAndBuilds(t *testing.T) {
 	isolateUserState(t)
 	workspace := t.TempDir()

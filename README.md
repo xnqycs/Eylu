@@ -17,7 +17,7 @@ go test ./...
 
 ```powershell
 $env:EYLU_API_KEY="your-key"
-go run . chat "你好" --base-url "https://api.openai.com/v1" --model "your-model"
+go run . "你好" --base-url "https://api.openai.com/v1" --model "your-model"
 ```
 
 持久化 Provider 配置：
@@ -26,14 +26,14 @@ go run . chat "你好" --base-url "https://api.openai.com/v1" --model "your-mode
 $env:EYLU_API_KEY="your-key"
 go run . providers add work --base-url "https://api.openai.com/v1" --model "your-model" --credential-type env --credential-env EYLU_API_KEY
 go run . providers models --provider work
-go run . chat "检查当前项目" --provider work
+go run . "检查当前项目" --provider work
 ```
 
 Provider 可声明适用任务、优先级和每百万 token 成本。自动路由会先过滤 Driver 能力与上下文窗口，再按任务匹配、优先级、已知上下文标记、估算成本、上下文窗口和名称稳定排序：
 
 ```powershell
 go run . providers add coding --base-url "https://api.openai.com/v1" --model "your-model" --credential-type env --credential-env EYLU_API_KEY --routing-task coding,debugging,testing --routing-priority 20 --input-cost 1.25 --output-cost 10
-go run . chat "审查并测试这个项目" --route auto --task review --require-reasoning
+go run . "审查并测试这个项目" --route auto --task review --require-reasoning
 ```
 
 `routing_mode = "fixed"` 保持活动 Provider；`routing_mode = "auto"` 允许每个请求选择 Provider。显式 `--provider` 固定本次请求。文本模式在 stderr 输出路由决策与请求指标；JSONL 模式输出 `routing` 和 `metrics` 事件，指标包含 request ID、首 token/总耗时、工具成功率、压缩次数、usage 与估算成本。
@@ -43,14 +43,16 @@ go run . chat "审查并测试这个项目" --route auto --task review --require
 - `openai_responses`：使用 `/v1/responses` 和类型化 SSE 事件。
 - `openai_chat`：使用 `/v1/chat/completions` 和 Chat Completions 流。
 
-在终端直接运行 `go run . chat` 会进入多轮交互会话。可用命令包括 `/help`、`/new`、`/context`、`/skills`、`/skill`、`/providers`、`/provider add|edit|delete|use`、`/model`、`/mode` 与 `/quit`。文本输出实时呈现模型增量；`--output json` 输出完整响应对象。
+在终端直接运行 `go run .` 会进入多轮交互会话。可用命令包括 `/help`、`/new`、`/context`、`/skills`、`/skill`、`/providers`、`/provider add|edit|delete|use`、`/model`、`/mode` 与 `/quit`。文本输出实时呈现模型增量；`--output json` 输出完整响应对象。
+
+兼容入口 `go run . chat [prompt]` 继续可用。prompt 与子命令同名时，可使用 `go run . -- "sessions"` 将其作为对话内容发送。
 
 TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、多行输入、Markdown、工具状态/详情、确认弹窗、Provider 表单、模型筛选、Skill 状态与上下文进度。Provider 表单的 API Key 使用 password input；模型面板支持刷新、筛选、选择和手工 ID。`Ctrl-C` 在请求期间先取消，第二次退出；`Ctrl-T` 打开最近工具详情。
 
 ```powershell
-go run . chat --no-animation
-go run . chat --no-tui
-go run . chat "检查项目" --provider work --output jsonl
+go run . --no-animation
+go run . --no-tui
+go run . "检查项目" --provider work --output jsonl
 ```
 
 `--no-animation` 保留静态状态与耗时；`TERM=dumb`、管道和结构化输出使用静态路径；`NO_COLOR` 会移除 ANSI 颜色。`--output jsonl` 逐行输出 context、模型事件、工具审计和最终响应，便于脚本消费。
@@ -60,8 +62,8 @@ go run . chat "检查项目" --provider work --output jsonl
 每次 chat 都会创建持久化 session。可以指定稳定 ID，或恢复当前工作区最近使用的 session：
 
 ```powershell
-go run . chat "检查项目" --session review-1 --provider work
-go run . chat "继续处理" --resume --provider work
+go run . "检查项目" --session review-1 --provider work
+go run . "继续处理" --resume --provider work
 go run . sessions list
 go run . sessions show review-1 --output json
 go run . sessions delete review-1
@@ -86,7 +88,7 @@ Driver 声明并行工具能力时，连续的 `read_file`、`search_code`、`li
 只读工具直接执行；写入与命令工具会在 TTY 中确认。脚本化运行可使用 `--yes` 明确授权本次请求中的确认项：
 
 ```powershell
-go run . chat "读取 go.mod 并执行 go test ./..." --provider work --yes
+go run . "读取 go.mod 并执行 go test ./..." --provider work --yes
 ```
 
 权限模式可通过 `--mode` 或交互命令 `/mode` 切换：
@@ -151,7 +153,7 @@ timeout_seconds = 30
 ```powershell
 go run . mcp list
 go run . mcp inspect repository --output json
-go run . chat "使用 repository 工具检查项目"
+go run . "使用 repository 工具检查项目"
 ```
 
 MCP instructions、tool schema、resource 内容和 tool result 分别进入 `ContextLedger`；server 配置或能力指纹变化会清除不再兼容的 DriverState。命令直接启动且不经过 shell，关闭 session、`/new` 和程序退出时会关闭子进程。

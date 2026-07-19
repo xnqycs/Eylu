@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 根命令默认进入多轮 Chat，并支持直接传入 prompt 和全部 Chat 参数；`eylu chat` 保持兼容。
 - 项目采用 Apache License 2.0，版权主体为 xnqycs。
 - 发布归档增加项目 NOTICE、许可证和覆盖六个目标平台的第三方许可证全文。
 - 增加可复现的第三方声明生成器及 CI 漂移检查。
