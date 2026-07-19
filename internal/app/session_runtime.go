@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"Eylu/internal/agent"
+	"Eylu/internal/environment"
 	"Eylu/internal/logging"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
@@ -29,17 +30,18 @@ type sessionRuntime struct {
 	persistedTurns  int
 	persistedSkills map[string]string
 	revalidated     bool
+	workspace       string
 }
 
-func (r *runtime) openConversation(manager *provider.Manager, opts *chatOptions) (*agent.Conversation, error) {
+func (r *runtime) openConversation(ctx context.Context, manager *provider.Manager, opts *chatOptions) (*agent.Conversation, error) {
 	store, err := session.Open("")
 	if err != nil {
 		return nil, sessionProtocolError("open session store", err)
 	}
-	cfg := manager.Config()
+	workspace := r.workspace
 	id := opts.sessionID
 	if opts.resume {
-		latest, found, latestErr := store.Latest(cfg.Workspace)
+		latest, found, latestErr := store.Latest(workspace)
 		if latestErr != nil {
 			return nil, sessionProtocolError("find recent session", latestErr)
 		}
@@ -55,15 +57,31 @@ func (r *runtime) openConversation(manager *provider.Manager, opts *chatOptions)
 	if id != "" {
 		stored, diagnostics, loadErr := store.Load(id)
 		if loadErr == nil {
-			if stored.Workspace != "" && !sameWorkspace(stored.Workspace, cfg.Workspace) {
+			if stored.Workspace != "" && !sameWorkspace(stored.Workspace, workspace) {
 				return nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("session %s belongs to workspace %s; select it with --workspace", id, stored.Workspace)}
+			}
+			if stored.Environment.Empty() {
+				captured := r.captureEnvironment(ctx, workspace)
+				stored.Environment = captured
+				events, captureErr := store.Append(id, []session.Event{
+					{Type: session.EventRuntimeUpdated, Environment: &captured},
+					{Type: session.EventDriverState},
+				})
+				if captureErr != nil {
+					return nil, sessionProtocolError("persist restored session environment", captureErr)
+				}
+				stored.Sequence = events[len(events)-1].Sequence
+				stored.DriverState = nil
+				if saveErr := store.Save(stored); saveErr != nil {
+					return nil, sessionProtocolError("save restored session environment", saveErr)
+				}
 			}
 			applyStoredRuntimeOptions(manager, stored, opts, r.stderr)
 			conversation, restoreErr := agent.RestoreConversation(agentStateFromSnapshot(stored))
 			if restoreErr != nil {
 				return nil, sessionProtocolError("restore session", restoreErr)
 			}
-			controller := newSessionRuntime(store, stored)
+			controller := newSessionRuntime(store, stored, workspace)
 			if stored.ClosedAt != nil {
 				events, reopenErr := store.Append(id, []session.Event{{Type: session.EventSessionReopened}})
 				if reopenErr != nil {
@@ -87,7 +105,8 @@ func (r *runtime) openConversation(manager *provider.Manager, opts *chatOptions)
 		}
 	}
 
-	conversation := agent.NewConversation()
+	environmentContext := r.captureEnvironment(ctx, workspace)
+	conversation := agent.NewConversationWithEnvironment(environmentContext)
 	if id != "" {
 		providerState, providerErr := selectedSessionProvider(manager, *opts)
 		if providerErr != nil {
@@ -95,26 +114,26 @@ func (r *runtime) openConversation(manager *provider.Manager, opts *chatOptions)
 		}
 		mode := selectedMode(manager, *opts)
 		conversation, err = agent.RestoreConversation(agent.ConversationState{
-			SessionID: id, Provider: agentProviderState(providerState), Workspace: cfg.Workspace, PermissionMode: mode,
+			SessionID: id, Provider: agentProviderState(providerState), Workspace: workspace, Environment: environmentContext, PermissionMode: mode,
 		})
 		if err != nil {
 			return nil, sessionProtocolError("initialize named session", err)
 		}
 	}
-	stored, err := store.Create(snapshotFromConversation(conversation, manager, *opts, session.Snapshot{}))
+	stored, err := store.Create(snapshotFromConversation(conversation, manager, *opts, session.Snapshot{}, workspace))
 	if err != nil {
 		return nil, sessionProtocolError("create session", err)
 	}
-	r.session = newSessionRuntime(store, stored)
+	r.session = newSessionRuntime(store, stored, workspace)
 	return conversation, nil
 }
 
-func newSessionRuntime(store *session.Store, snapshot session.Snapshot) *sessionRuntime {
+func newSessionRuntime(store *session.Store, snapshot session.Snapshot, workspace string) *sessionRuntime {
 	digests := make(map[string]string, len(snapshot.Skills))
 	for _, item := range snapshot.Skills {
 		digests[item.Name] = item.Digest
 	}
-	return &sessionRuntime{store: store, snapshot: snapshot, persistedTurns: len(snapshot.Turns), persistedSkills: digests}
+	return &sessionRuntime{store: store, snapshot: snapshot, persistedTurns: len(snapshot.Turns), persistedSkills: digests, workspace: workspace}
 }
 
 func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, runErr error) error {
@@ -142,7 +161,7 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 		}
 	}
 	state.Provider = agentProviderState(providerState)
-	state.Workspace = manager.Config().Workspace
+	state.Workspace = s.workspace
 	state.PermissionMode = selectedMode(manager, opts)
 
 	events := make([]session.Event, 0, len(state.Turns)-s.persistedTurns+4)
@@ -218,10 +237,11 @@ func (s *sessionRuntime) Close(conversation *agent.Conversation, manager *provid
 	return nil
 }
 
-func (r *runtime) rotateSession(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions) (string, string, error) {
+func (r *runtime) rotateSession(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions) (string, string, error) {
 	oldID := conversation.SessionID()
+	environmentContext := r.captureEnvironment(ctx, r.workspace)
 	if r.session == nil {
-		conversation.NewSession()
+		conversation.NewSessionWithEnvironment(environmentContext)
 		return oldID, conversation.SessionID(), nil
 	}
 	if err := r.session.Close(conversation, manager, opts); err != nil {
@@ -230,12 +250,12 @@ func (r *runtime) rotateSession(conversation *agent.Conversation, manager *provi
 	if err := r.closeMCP(); err != nil {
 		return oldID, "", sessionProtocolError("close MCP sessions", err)
 	}
-	conversation.NewSession()
-	stored, err := r.session.store.Create(snapshotFromConversation(conversation, manager, opts, session.Snapshot{}))
+	conversation.NewSessionWithEnvironment(environmentContext)
+	stored, err := r.session.store.Create(snapshotFromConversation(conversation, manager, opts, session.Snapshot{}, r.workspace))
 	if err != nil {
 		return oldID, "", sessionProtocolError("create replacement session", err)
 	}
-	r.session = newSessionRuntime(r.session.store, stored)
+	r.session = newSessionRuntime(r.session.store, stored, r.workspace)
 	return oldID, conversation.SessionID(), nil
 }
 
@@ -285,11 +305,11 @@ func (s *sessionRuntime) RevalidateSkills(registry *skill.Registry, skillSession
 	return diagnostics
 }
 
-func snapshotFromConversation(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, previous session.Snapshot) session.Snapshot {
+func snapshotFromConversation(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, previous session.Snapshot, workspace string) session.Snapshot {
 	state := conversation.ExportState()
 	providerState, _ := selectedSessionProvider(manager, opts)
 	state.Provider = agentProviderState(providerState)
-	state.Workspace = manager.Config().Workspace
+	state.Workspace = workspace
 	state.PermissionMode = selectedMode(manager, opts)
 	return snapshotFromAgentState(state, previous)
 }
@@ -298,7 +318,7 @@ func snapshotFromAgentState(state agent.ConversationState, previous session.Snap
 	snapshot := session.Snapshot{
 		Version: session.SchemaVersion, Sequence: previous.Sequence, SessionID: state.SessionID,
 		CreatedAt: previous.CreatedAt, UpdatedAt: time.Now().UTC(), ClosedAt: previous.ClosedAt,
-		Workspace: state.Workspace, PermissionMode: state.PermissionMode,
+		Workspace: state.Workspace, Environment: state.Environment, PermissionMode: state.PermissionMode,
 		Provider: session.ProviderState{
 			Name: state.Provider.Name, Generation: state.Provider.Generation, Adapter: state.Provider.Adapter,
 			BaseURL: state.Provider.BaseURL, Model: state.Provider.Model, ContextWindow: state.Provider.ContextWindow,
@@ -322,9 +342,16 @@ func agentStateFromSnapshot(snapshot session.Snapshot) agent.ConversationState {
 			Name: snapshot.Provider.Name, Generation: snapshot.Provider.Generation, Adapter: snapshot.Provider.Adapter,
 			BaseURL: snapshot.Provider.BaseURL, Model: snapshot.Provider.Model, ContextWindow: snapshot.Provider.ContextWindow,
 		},
-		Workspace: snapshot.Workspace, PermissionMode: snapshot.PermissionMode, SkillCatalog: snapshot.SkillCatalog,
+		Workspace: snapshot.Workspace, Environment: snapshot.Environment, PermissionMode: snapshot.PermissionMode, SkillCatalog: snapshot.SkillCatalog,
 		Summary: snapshot.Summary, OmittedTurnIDs: snapshot.OmittedTurnIDs, Ledger: snapshot.Ledger,
 	}
+}
+
+func (r *runtime) captureEnvironment(ctx context.Context, workspace string) environment.Context {
+	if r.environmentCapture != nil {
+		return r.environmentCapture(ctx, workspace)
+	}
+	return environment.Capture(ctx, workspace)
 }
 
 func skillStateFromProtected(item agent.ProtectedSkill) session.SkillState {

@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
 )
 
@@ -75,8 +76,13 @@ func (s *Store) Create(snapshot Snapshot) (Snapshot, error) {
 	snapshot.UpdatedAt = snapshot.CreatedAt
 	snapshot.Version = SchemaVersion
 	provider := snapshot.Provider
+	var environmentContext *environment.Context
+	if !snapshot.Environment.Empty() {
+		captured := snapshot.Environment
+		environmentContext = &captured
+	}
 	events, err := s.Append(snapshot.SessionID, []Event{{
-		Type: EventSessionCreated, Workspace: snapshot.Workspace, PermissionMode: snapshot.PermissionMode, Provider: &provider,
+		Type: EventSessionCreated, Workspace: snapshot.Workspace, Environment: environmentContext, PermissionMode: snapshot.PermissionMode, Provider: &provider,
 	}})
 	if err != nil {
 		return Snapshot{}, err
@@ -783,6 +789,9 @@ func applyEvent(snapshot *Snapshot, event Event) {
 			snapshot.CreatedAt = event.At
 		}
 		snapshot.Workspace = event.Workspace
+		if event.Environment != nil {
+			snapshot.Environment = *event.Environment
+		}
 		snapshot.PermissionMode = event.PermissionMode
 		if event.Provider != nil {
 			snapshot.Provider = *event.Provider
@@ -794,6 +803,9 @@ func applyEvent(snapshot *Snapshot, event Event) {
 	case EventRuntimeUpdated:
 		if event.Workspace != "" {
 			snapshot.Workspace = event.Workspace
+		}
+		if event.Environment != nil {
+			snapshot.Environment = *event.Environment
 		}
 		if event.PermissionMode != "" {
 			snapshot.PermissionMode = event.PermissionMode

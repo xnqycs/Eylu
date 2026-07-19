@@ -134,7 +134,7 @@ func (r *runtime) skillsInstallCommand(ctx context.Context) *cobra.Command {
 		if err != nil {
 			return &protocol.Error{Code: protocol.ErrNetwork, Message: err.Error(), Cause: err}
 		}
-		installation, err := skilldist.Install(ctx, registry, entry, skilldist.InstallOptions{Scope: scope, Workspace: loaded.Config.Workspace, Force: force})
+		installation, err := skilldist.Install(ctx, registry, entry, skilldist.InstallOptions{Scope: scope, Workspace: loaded.Workspace, Force: force})
 		if err != nil {
 			return &protocol.Error{Code: protocol.ErrTool, Message: "install Skill: " + err.Error(), Cause: err}
 		}
@@ -153,7 +153,7 @@ func (r *runtime) skillsUpdateCommand(ctx context.Context) *cobra.Command {
 		if err != nil {
 			return err
 		}
-		target, err := skilldist.Target(scope, loaded.Config.Workspace, "", args[0])
+		target, err := skilldist.Target(scope, loaded.Workspace, "", args[0])
 		if err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
@@ -173,7 +173,7 @@ func (r *runtime) skillsUpdateCommand(ctx context.Context) *cobra.Command {
 			fmt.Fprintf(r.stdout, "Skill %s is current at %s.\n", args[0], manifest.Entry.Version)
 			return nil
 		}
-		installation, err := skilldist.Install(ctx, registry, entry, skilldist.InstallOptions{Scope: scope, Workspace: loaded.Config.Workspace})
+		installation, err := skilldist.Install(ctx, registry, entry, skilldist.InstallOptions{Scope: scope, Workspace: loaded.Workspace})
 		if err != nil {
 			return &protocol.Error{Code: protocol.ErrTool, Message: "update Skill: " + err.Error(), Cause: err}
 		}
@@ -190,7 +190,7 @@ func (r *runtime) skillsVerifyInstalledCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		target, err := skilldist.Target(scope, loaded.Config.Workspace, "", args[0])
+		target, err := skilldist.Target(scope, loaded.Workspace, "", args[0])
 		if err != nil {
 			return err
 		}

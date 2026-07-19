@@ -7,6 +7,7 @@ import (
 
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
+	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 )
@@ -26,6 +27,7 @@ type ConversationState struct {
 	DriverState     json.RawMessage           `json:"driver_state,omitempty"`
 	Provider        ProviderState             `json:"provider"`
 	Workspace       string                    `json:"workspace"`
+	Environment     environment.Context       `json:"environment,omitzero"`
 	PermissionMode  string                    `json:"permission_mode"`
 	SkillCatalog    string                    `json:"skill_catalog,omitempty"`
 	ProtectedSkills []ProtectedSkill          `json:"protected_skills,omitempty"`
@@ -40,7 +42,7 @@ func (c *Conversation) ExportState() ConversationState {
 	state := ConversationState{
 		SessionID: c.sessionID, Turns: cloneTurns(c.turns), DriverState: append(json.RawMessage(nil), c.driverState...),
 		Provider:  ProviderState{Name: c.providerName, Generation: c.providerGeneration, Adapter: c.providerAdapter, BaseURL: c.providerBaseURL, Model: c.providerModel, ContextWindow: c.lastRuntime.Provider.Config.ContextWindow},
-		Workspace: c.lastRuntime.Workspace, PermissionMode: c.permissionMode, SkillCatalog: c.skillCatalog,
+		Workspace: c.lastRuntime.Workspace, Environment: c.environment, PermissionMode: c.permissionMode, SkillCatalog: c.skillCatalog,
 		Summary: c.summary, Ledger: c.ledger.State(),
 	}
 	for _, name := range protectedNamesFromMap(c.protectedSkills) {
@@ -72,6 +74,7 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 	conversation.providerBaseURL = state.Provider.BaseURL
 	conversation.providerModel = state.Provider.Model
 	conversation.permissionMode = state.PermissionMode
+	conversation.environment = state.Environment
 	if conversation.permissionMode == "" {
 		conversation.permissionMode = "manual"
 	}

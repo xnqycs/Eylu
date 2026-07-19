@@ -12,6 +12,7 @@ import (
 
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
+	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 )
@@ -70,6 +71,7 @@ type Conversation struct {
 	providerModel       string
 	permissionMode      string
 	systemPrompt        string
+	environment         environment.Context
 	skillCatalog        string
 	protectedSkills     map[string]ProtectedSkill
 	toolDefinitions     []protocol.ToolDefinition
@@ -85,7 +87,12 @@ type Conversation struct {
 }
 
 func NewConversation() *Conversation {
+	return NewConversationWithEnvironment(environment.Context{})
+}
+
+func NewConversationWithEnvironment(environmentContext environment.Context) *Conversation {
 	conversation := &Conversation{sessionID: uuid.NewString(), closed: make(map[string][]protocol.Turn), ledger: contextledger.New(nil), permissionMode: "manual", protectedSkills: make(map[string]ProtectedSkill), omittedTurnIDs: make(map[string]struct{}), projectMapDirty: true}
+	conversation.environment = environmentContext
 	conversation.systemPrompt = promptForRuntime("manual")
 	conversation.rebuildLedger(Runtime{})
 	return conversation
@@ -111,6 +118,10 @@ func (c *Conversation) ClosedTranscript(sessionID string) ([]protocol.Turn, bool
 }
 
 func (c *Conversation) NewSession() string {
+	return c.NewSessionWithEnvironment(environment.Context{})
+}
+
+func (c *Conversation) NewSessionWithEnvironment(environmentContext environment.Context) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	old := c.sessionID
@@ -125,6 +136,7 @@ func (c *Conversation) NewSession() string {
 	c.providerModel = ""
 	c.mcpFingerprint = ""
 	c.permissionMode = c.lastRuntime.PermissionMode
+	c.environment = environmentContext
 	if c.permissionMode == "" {
 		c.permissionMode = "manual"
 	}

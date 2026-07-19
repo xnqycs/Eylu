@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -23,7 +22,7 @@ func (r *runtime) loadSkillRuntime(cfg config.Config, opts chatOptions, conversa
 	if err != nil {
 		return nil, nil, &protocol.Error{Code: protocol.ErrConfig, Message: "open workspace trust store", Cause: err}
 	}
-	registry, err := skill.Discover(skill.DiscoveryOptions{Workspace: cfg.Workspace, Trust: trustStore})
+	registry, err := skill.Discover(skill.DiscoveryOptions{Workspace: r.workspace, Trust: trustStore})
 	if err != nil {
 		return nil, nil, &protocol.Error{Code: protocol.ErrConfig, Message: "discover skills", Cause: err}
 	}
@@ -36,15 +35,15 @@ func (r *runtime) loadSkillRuntime(cfg config.Config, opts chatOptions, conversa
 	}
 	if hasUntrusted {
 		trusted := opts.trustSkills
-		if !trusted && isTerminal(r.stdin) && !r.trustPrompted[cfg.Workspace] {
-			r.trustPrompted[cfg.Workspace] = true
-			trusted = r.confirmSkillTrust(cfg.Workspace)
+		if !trusted && isTerminal(r.stdin) && !r.trustPrompted[r.workspace] {
+			r.trustPrompted[r.workspace] = true
+			trusted = r.confirmSkillTrust(r.workspace)
 		}
 		if trusted {
-			if err := trustStore.Trust(cfg.Workspace); err != nil {
+			if err := trustStore.Trust(r.workspace); err != nil {
 				return nil, nil, &protocol.Error{Code: protocol.ErrConfig, Message: "persist workspace skill trust", Cause: err}
 			}
-			registry, err = skill.Discover(skill.DiscoveryOptions{Workspace: cfg.Workspace, Trust: trustStore})
+			registry, err = skill.Discover(skill.DiscoveryOptions{Workspace: r.workspace, Trust: trustStore})
 			if err != nil {
 				return nil, nil, err
 			}
@@ -131,15 +130,15 @@ func (r *runtime) skillsValidateCommand() *cobra.Command {
 
 func (r *runtime) skillsDiagnoseCommand() *cobra.Command {
 	return &cobra.Command{Use: "diagnose", Args: cobra.NoArgs, RunE: func(*cobra.Command, []string) error {
-		cfg, registry, err := r.discoverForCommand()
+		_, registry, err := r.discoverForCommand()
 		if err != nil {
 			return err
 		}
 		limits := map[string]int{"entry_bytes": skill.MaxEntryBytes, "resource_bytes": skill.MaxResourceBytes, "scanned_directories": skill.MaxScannedDirectories, "active_skills": skill.MaxActiveSkills, "resources_per_skill": skill.MaxResourcesPerSkill, "resource_depth": skill.MaxResourceDepth}
 		if r.output != "text" {
-			return json.NewEncoder(r.stdout).Encode(map[string]any{"workspace": cfg.Workspace, "roots": registry.Roots(), "records": skill.SummarizeRecords(registry.Records()), "limits": limits})
+			return json.NewEncoder(r.stdout).Encode(map[string]any{"workspace": r.workspace, "roots": registry.Roots(), "records": skill.SummarizeRecords(registry.Records()), "limits": limits})
 		}
-		fmt.Fprintf(r.stdout, "Workspace: %s\nLimits: entry=%d resource=%d directories=%d active_skills=%d resources/skill=%d depth=%d\n", cfg.Workspace, skill.MaxEntryBytes, skill.MaxResourceBytes, skill.MaxScannedDirectories, skill.MaxActiveSkills, skill.MaxResourcesPerSkill, skill.MaxResourceDepth)
+		fmt.Fprintf(r.stdout, "Workspace: %s\nLimits: entry=%d resource=%d directories=%d active_skills=%d resources/skill=%d depth=%d\n", r.workspace, skill.MaxEntryBytes, skill.MaxResourceBytes, skill.MaxScannedDirectories, skill.MaxActiveSkills, skill.MaxResourcesPerSkill, skill.MaxResourceDepth)
 		for _, root := range registry.Roots() {
 			fmt.Fprintf(r.stdout, "root %s source=%s exists=%t trusted=%t\n", root.Path, root.Source.String(), root.Exists, root.Trusted)
 		}
@@ -156,9 +155,9 @@ func (r *runtime) skillsTrustCommand(trust bool) *cobra.Command {
 		verb = "revoke"
 	}
 	return &cobra.Command{Use: verb, Args: cobra.NoArgs, RunE: func(*cobra.Command, []string) error {
-		workspace := r.workspace
-		if workspace == "" {
-			workspace, _ = os.Getwd()
+		workspace, err := r.resolveWorkspace()
+		if err != nil {
+			return err
 		}
 		store, err := skill.OpenTrustStore("")
 		if err != nil {
@@ -186,7 +185,7 @@ func (r *runtime) discoverForCommand() (config.Config, *skill.Registry, error) {
 	if err != nil {
 		return config.Config{}, nil, err
 	}
-	registry, err := skill.Discover(skill.DiscoveryOptions{Workspace: loaded.Config.Workspace, Trust: store})
+	registry, err := skill.Discover(skill.DiscoveryOptions{Workspace: loaded.Workspace, Trust: store})
 	return loaded.Config, registry, err
 }
 

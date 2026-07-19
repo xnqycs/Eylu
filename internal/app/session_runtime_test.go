@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"Eylu/internal/agent"
 	"Eylu/internal/config"
+	"Eylu/internal/environment"
 	"Eylu/internal/provider"
 	"Eylu/internal/session"
 	"Eylu/internal/skill"
@@ -79,7 +81,7 @@ func TestChatSessionSurvivesRestartWithoutDriverState(t *testing.T) {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 	mu.Lock()
-	if len(requests) != 2 || !bytes.Contains(requests[1], []byte("remember-me")) || !bytes.Contains(requests[1], []byte("first-answer")) {
+	if len(requests) != 2 || !bytes.Contains(requests[0], []byte("Here is useful information about the environment")) || !bytes.Contains(requests[0], []byte("Your model ID is test-model.")) || !bytes.Contains(requests[1], []byte("remember-me")) || !bytes.Contains(requests[1], []byte("first-answer")) {
 		t.Fatalf("restored request = %s", requests[1])
 	}
 	mu.Unlock()
@@ -104,7 +106,7 @@ func TestChatSessionSurvivesRestartWithoutDriverState(t *testing.T) {
 func TestNewClosesOldSessionAndCreatesIsolatedSession(t *testing.T) {
 	isolateUserState(t)
 	workspace := t.TempDir()
-	cfg := config.Default(workspace)
+	cfg := config.Default()
 	cfg.ActiveProvider = "test"
 	cfg.Providers["test"] = config.ProviderConfig{
 		Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "model",
@@ -115,9 +117,17 @@ func TestNewClosesOldSessionAndCreatesIsolatedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	runtime := &runtime{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool)}
+	captures := 0
+	runtime := &runtime{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, workspace: workspace,
+		credentials: provider.NewCredentialStore(), trustPrompted: make(map[string]bool),
+		environmentCapture: func(context.Context, string) environment.Context {
+			captures++
+			return environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: fmt.Sprintf("capture-%d", captures)}
+		},
+	}
 	opts := chatOptions{}
-	conversation, err := runtime.openConversation(manager, &opts)
+	conversation, err := runtime.openConversation(context.Background(), manager, &opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,9 +148,57 @@ func TestNewClosesOldSessionAndCreatesIsolatedSession(t *testing.T) {
 	if err != nil || newSnapshot.ClosedAt != nil || len(newSnapshot.Turns) != 0 {
 		t.Fatalf("new snapshot=%#v error=%v", newSnapshot, err)
 	}
+	if oldSnapshot.Environment.Today != "capture-1" || newSnapshot.Environment.Today != "capture-2" {
+		t.Fatalf("environment snapshots: old=%#v new=%#v", oldSnapshot.Environment, newSnapshot.Environment)
+	}
 	items, err := store.List()
 	if err != nil || len(items) != 2 {
 		t.Fatalf("sessions=%#v error=%v", items, err)
+	}
+}
+
+func TestOpenConversationCapturesLegacyEnvironmentOnce(t *testing.T) {
+	isolateUserState(t)
+	workspace := t.TempDir()
+	store, err := session.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Create(session.Snapshot{SessionID: "legacy-environment", Workspace: workspace, PermissionMode: "manual", Provider: session.ProviderState{Name: "test", Model: "model"}, DriverState: json.RawMessage(`{"previous_response_id":"old"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ActiveProvider = "test"
+	cfg.Providers["test"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "model", Credential: config.CredentialRef{Type: "none"}}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	captures := 0
+	capture := func(context.Context, string) environment.Context {
+		captures++
+		return environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: "2026-07-19"}
+	}
+	open := func() *agent.Conversation {
+		runtime := &runtime{workspace: workspace, stderr: &bytes.Buffer{}, environmentCapture: capture}
+		opts := chatOptions{sessionID: "legacy-environment"}
+		conversation, openErr := runtime.openConversation(context.Background(), manager, &opts)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		return conversation
+	}
+	first := open()
+	if first.ExportState().Environment.Today != "2026-07-19" || len(first.ExportState().DriverState) != 0 || captures != 1 {
+		t.Fatalf("first restore state=%#v captures=%d", first.ExportState().Environment, captures)
+	}
+	stored, _, err := store.Load("legacy-environment")
+	if err != nil || stored.Environment.Today != "2026-07-19" || len(stored.DriverState) != 0 || stored.Sequence != 3 {
+		t.Fatalf("persisted environment=%#v sequence=%d error=%v", stored.Environment, stored.Sequence, err)
+	}
+	second := open()
+	if second.ExportState().Environment.Today != "2026-07-19" || captures != 1 {
+		t.Fatalf("second restore state=%#v captures=%d", second.ExportState().Environment, captures)
 	}
 }
 

@@ -148,6 +148,8 @@ internal/agent     会话循环、状态机、预算、上下文压缩
 命令行参数 > EYLU_* 环境变量 > .eylu/config.toml > ~/.eylu/config.toml > 默认值
 ```
 
+workspace 作为运行时上下文独立解析：`--workspace > EYLU_WORKSPACE > cwd`。配置 schema 不包含 workspace；该路径仅用于发现项目配置、限制工具边界、加载 Skill/MCP 和关联 session。
+
 建议的配置项：
 
 | 配置项 | 默认值 | 说明 |
@@ -157,7 +159,7 @@ internal/agent     会话循环、状态机、预算、上下文压缩
 | `EYLU_API_KEY` | 可选 | Eylu 通用凭据覆盖，日志中永久脱敏 |
 | `EYLU_MODEL` | 读取 Provider | 临时覆盖模型 ID |
 | `EYLU_BASE_URL` | 读取 Provider | 临时覆盖 Provider API Base URL |
-| `EYLU_WORKSPACE` | 当前目录 | 所有文件工具和命令默认受工作区限制 |
+| `EYLU_WORKSPACE` | 当前目录 | 运行时工作区，优先级低于 `--workspace`；所有文件工具和命令受其限制 |
 | `EYLU_PERMISSION_MODE` | `manual` | `manual`、`plan`、`auto`、`full` |
 | `EYLU_MAX_TURNS` | 20 | 一次用户请求允许的模型-工具往返上限 |
 | `EYLU_TOOL_TIMEOUT` | 60s | 单个工具执行超时 |

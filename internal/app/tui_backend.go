@@ -57,7 +57,7 @@ func (r *runtime) runTUI(ctx context.Context, conversation *agent.Conversation, 
 	if err != nil {
 		return err
 	}
-	repositoryIndex, err := tool.NewRepositoryIndex(cfg.Workspace)
+	repositoryIndex, err := tool.NewRepositoryIndex(r.workspace)
 	if err != nil {
 		return &protocol.Error{Code: protocol.ErrConfig, Message: "initialize TUI repository index", Cause: err}
 	}
@@ -95,7 +95,7 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		}
 	}
 	snapshot := ui.Snapshot{
-		SessionID: b.conversation.SessionID(), Workspace: cfg.Workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
+		SessionID: b.conversation.SessionID(), Workspace: b.runtime.workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
 		Context: b.conversation.ContextReport(),
 	}
 	managerActive, _ := b.manager.Active()
@@ -147,7 +147,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	if err := b.runtime.configureMCPRuntime(ctx, cfg, &modelRuntime); err != nil {
 		return err
 	}
-	configureTUIContextRuntime(&modelRuntime, cfg, operationID, emit)
+	configureTUIContextRuntime(&modelRuntime, b.runtime.workspace, cfg, operationID, emit)
 	task := routing.Classify(submission.Text)
 	if routeDecision != nil {
 		task = routeDecision.Task
@@ -267,13 +267,13 @@ func (b *tuiBackend) prepareSubmission(ctx context.Context, submission ui.Submis
 	}
 	attachments := make([]attachment, 0)
 	if hasReferenceKind(references, ui.ReferenceFile) {
-		index, err := b.ensureRepositoryIndex(cfg.Workspace)
+		index, err := b.ensureRepositoryIndex(b.runtime.workspace)
 		if err != nil {
 			return "", err
 		}
 		snapshot := index.Refresh(ctx)
 		if snapshot.Diagnostic != "" {
-			if _, statErr := os.Stat(filepath.Join(cfg.Workspace, ".git")); statErr == nil {
+			if _, statErr := os.Stat(filepath.Join(b.runtime.workspace, ".git")); statErr == nil {
 				return "", fmt.Errorf("git file index unavailable: %s", snapshot.Diagnostic)
 			}
 		}
@@ -281,7 +281,7 @@ func (b *tuiBackend) prepareSubmission(ctx context.Context, submission ui.Submis
 		for _, item := range snapshot.Files {
 			indexed[filepath.ToSlash(item.Relative)] = struct{}{}
 		}
-		reader, err := tool.NewReadFile(cfg.Workspace, cfg.MaxReadBytes)
+		reader, err := tool.NewReadFile(b.runtime.workspace, cfg.MaxReadBytes)
 		if err != nil {
 			return "", err
 		}
@@ -418,14 +418,13 @@ func (b *tuiBackend) ensureRepositoryIndex(workspace string) (*tool.RepositoryIn
 }
 
 func (b *tuiBackend) ListFiles(ctx context.Context) ([]ui.FileItem, error) {
-	cfg := b.manager.Config()
-	index, err := b.ensureRepositoryIndex(cfg.Workspace)
+	index, err := b.ensureRepositoryIndex(b.runtime.workspace)
 	if err != nil {
 		return nil, err
 	}
 	snapshot := index.Refresh(ctx)
 	if snapshot.Diagnostic != "" {
-		if _, statErr := os.Stat(filepath.Join(cfg.Workspace, ".git")); statErr == nil {
+		if _, statErr := os.Stat(filepath.Join(b.runtime.workspace, ".git")); statErr == nil {
 			return nil, fmt.Errorf("git file index unavailable: %s", snapshot.Diagnostic)
 		}
 	}
@@ -436,8 +435,8 @@ func (b *tuiBackend) ListFiles(ctx context.Context) ([]ui.FileItem, error) {
 	return result, nil
 }
 
-func configureTUIContextRuntime(modelRuntime *agent.Runtime, cfg config.Config, operationID string, emit func(ui.Event)) {
-	modelRuntime.Workspace = cfg.Workspace
+func configureTUIContextRuntime(modelRuntime *agent.Runtime, workspace string, cfg config.Config, operationID string, emit func(ui.Event)) {
+	modelRuntime.Workspace = workspace
 	modelRuntime.TokenEstimator = contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
 	modelRuntime.OutputReserveTokens = cfg.ReservedOutputTokens
 	modelRuntime.ContextRecentRounds = cfg.ContextRecentRounds
@@ -524,7 +523,7 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 		b.mu.Lock()
 		opts := b.opts
 		b.mu.Unlock()
-		old, current, err := b.runtime.rotateSession(b.conversation, b.manager, opts)
+		old, current, err := b.runtime.rotateSession(ctx, b.conversation, b.manager, opts)
 		if err != nil {
 			return "", err
 		}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
 )
 
@@ -53,6 +54,35 @@ func TestStoreReplaysEventsAndHydratesAttachments(t *testing.T) {
 	}
 	if len(replayed.Turns) != 2 || replayed.Turns[1].ID != "turn-user" || replayed.Sequence != 3 {
 		t.Fatalf("replayed snapshot = %#v", replayed)
+	}
+}
+
+func TestStoreReplaysEnvironmentFromCreationAndRuntimeEvents(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root)
+	created := environment.Context{WorkingDirectory: filepath.Join(root, "workspace"), Platform: "windows", Today: "2026-07-19"}
+	snapshot, err := store.Create(Snapshot{SessionID: "environment", Workspace: created.WorkingDirectory, Environment: created, PermissionMode: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Sequence = 0
+	snapshot.Environment = environment.Context{}
+	if err := store.Save(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	replayed, _, err := store.Load("environment")
+	if err != nil || replayed.Environment != created {
+		t.Fatalf("creation environment = %#v, error = %v", replayed.Environment, err)
+	}
+
+	updated := created
+	updated.Today = "2026-07-20"
+	if _, err := store.Append("environment", []Event{{Type: EventRuntimeUpdated, Environment: &updated}}); err != nil {
+		t.Fatal(err)
+	}
+	replayed, _, err = store.Load("environment")
+	if err != nil || replayed.Environment != updated {
+		t.Fatalf("updated environment = %#v, error = %v", replayed.Environment, err)
 	}
 }
 

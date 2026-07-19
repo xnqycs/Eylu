@@ -10,6 +10,7 @@ import (
 
 	"Eylu/internal/config"
 	"Eylu/internal/driver"
+	"Eylu/internal/environment"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
@@ -142,9 +143,40 @@ func TestConversationModeChangesPromptAndClearsDriverState(t *testing.T) {
 	}
 }
 
+func TestConversationEnvironmentSnapshotUsesCurrentRequestModel(t *testing.T) {
+	fake := &scriptedDriver{}
+	snapshot := environment.Context{
+		WorkingDirectory: "C:/workspace", Platform: "windows", OSVersion: "Windows 11", Today: "2026-07-19",
+		IsGitRepo: true, CurrentBranch: "feature", MainBranch: "main", Status: "(clean)", RecentCommits: "abc1234 change",
+	}
+	conversation := NewConversationWithEnvironment(snapshot)
+	runtime := testRuntime(fake, 1)
+	runtime.Provider.Config.Model = "model-one"
+	if _, err := conversation.Send(context.Background(), "first", runtime, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Provider.Generation++
+	runtime.Provider.Config.Model = "model-two"
+	if _, err := conversation.Send(context.Background(), "second", runtime, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	firstPrompt := fake.requests[0].Model.Turns[0].Parts[0].Text
+	secondPrompt := fake.requests[1].Model.Turns[0].Parts[0].Text
+	if !strings.Contains(firstPrompt, "Your model ID is model-one.") || strings.Contains(firstPrompt, "model-two") {
+		t.Fatalf("first prompt = %q", firstPrompt)
+	}
+	if !strings.Contains(secondPrompt, "Your model ID is model-two.") || !strings.Contains(secondPrompt, "abc1234 change") {
+		t.Fatalf("second prompt = %q", secondPrompt)
+	}
+	if state := conversation.ExportState(); state.Environment != snapshot {
+		t.Fatalf("environment changed with model: %#v", state.Environment)
+	}
+}
+
 func TestPlanProfileForksContextFiltersToolsAndAdoptsFinalResult(t *testing.T) {
 	fake := &scriptedDriver{}
-	conversation := NewConversation()
+	environmentContext := environment.Context{WorkingDirectory: "C:/workspace", Platform: "windows", Today: "2026-07-19"}
+	conversation := NewConversationWithEnvironment(environmentContext)
 	runtime := testRuntime(fake, 1)
 	if _, err := conversation.Send(context.Background(), "remember the parent context", runtime, false, nil); err != nil {
 		t.Fatal(err)
@@ -163,7 +195,7 @@ func TestPlanProfileForksContextFiltersToolsAndAdoptsFinalResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	forkState := fork.ExportState()
-	if forkState.SessionID == parentState.SessionID || len(forkState.Turns) != len(parentState.Turns) || len(forkState.DriverState) != 0 || forkState.PermissionMode != "plan" {
+	if forkState.SessionID == parentState.SessionID || len(forkState.Turns) != len(parentState.Turns) || len(forkState.DriverState) != 0 || forkState.PermissionMode != "plan" || forkState.Environment != environmentContext {
 		t.Fatalf("fork state = %#v parent = %#v", forkState, parentState)
 	}
 	if !strings.Contains(fork.systemPrompt, "software architecture planner") || !strings.Contains(fork.systemPrompt, "read-only") {

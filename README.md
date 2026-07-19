@@ -61,6 +61,8 @@ go run . "检查项目" --provider work --output jsonl
 
 `--no-animation` 保留静态状态与耗时；`TERM=dumb`、管道和结构化输出使用静态路径；`NO_COLOR` 会移除 ANSI 颜色。`--output jsonl` 逐行输出 context、模型事件、工具审计和最终响应，便于脚本消费。
 
+工作区属于运行时上下文，按 `--workspace`、`EYLU_WORKSPACE`、当前目录的顺序解析。TOML 配置中的遗留 `workspace` 键会被忽略，并在下一次配置保存时移除。
+
 ## 会话恢复
 
 每次 chat 都会创建持久化 session。可以指定稳定 ID，或恢复当前工作区最近使用的 session：
@@ -74,7 +76,7 @@ go run . sessions delete review-1
 go run . sessions migrate review-1
 ```
 
-`/new` 会先刷新当前快照并追加关闭事件，再创建空 session；历史记录仍可通过 `--session <id>` 恢复。删除操作在终端中确认，脚本环境使用 `sessions delete <id> --yes`。
+`/new` 会先刷新当前快照并追加关闭事件，再创建空 session；历史记录仍可通过 `--session <id>` 恢复。每个新 session 会采集工作目录、平台、OS 版本、日期以及 Git 分支、状态和最近五条提交，并将其作为会话快照保存。恢复时复用原快照；旧 session 首次恢复时补采一次。删除操作在终端中确认，脚本环境使用 `sessions delete <id> --yes`。
 
 默认状态目录为 `~/.eylu/state/sessions`，`EYLU_STATE_DIR` 可修改其父目录。每个 session 使用 `events.jsonl` 作为事实日志，`snapshot.json` 加速恢复；超过 16 KiB 的工具输出按 SHA-256 保存为附件并在加载时校验。恢复 Skill 时会重新读取正文并复核保存的 digest。schema 版本不兼容时需显式运行迁移命令，迁移前会保留 v0 备份。
 
@@ -166,7 +168,7 @@ MCP instructions、tool schema、resource 内容和 tool result 分别进入 `Co
 
 ## 上下文管理
 
-Eylu 使用同一个 `PromptBuilder` 生成模型请求和 `ContextLedger`，`/context` 会在一张表中列出 system prompt、Skill catalog/正文/资源、MCP、工具 schema、user/agent 消息、工具结果、项目地图、摘要、DriverState 与输出预留。Skill 和 MCP 类别会按来源展开；最近一次 Provider usage 独立显示。
+Eylu 使用同一个 `PromptBuilder` 生成模型请求和 `ContextLedger`，`/context` 会在一张表中列出 system prompt、Skill catalog/正文/资源、MCP、工具 schema、user/agent 消息、工具结果、项目地图、摘要、DriverState 与输出预留。system prompt 包含保存的会话环境和 Git 快照，model ID 按实际请求模型渲染。Skill 和 MCP 类别会按来源展开；最近一次 Provider usage 独立显示。
 
 已知上下文窗口达到上限时，Eylu 保留 system prompt、项目地图、当前用户目标、最近完整轮次和已激活 Skill，按完整的 tool call/result 原子组压缩较早内容。结构化摘要持续记录目标、完成修改、未完成任务、失败尝试、验证结果与 Skill digest；完整 transcript 仍保留在会话中。大工具结果进入模型前使用有头尾的受限片段，原始会话结果保持不变。
 
@@ -187,9 +189,9 @@ max_parallel_tools = 4
 
 项目地图稳定登记受限文件树、语言统计、入口、配置和最近修改文件。Responses 驱动在端点支持时使用远端 response state 减少重复传输；HTTP 网关拒绝该能力时会自动记忆并切换到完整上下文请求。
 
-配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。配置文件仅保存凭据引用；交互式首次引导会优先保存到系统 keyring。
+常规配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。workspace 使用独立的运行时优先级 `--workspace > EYLU_WORKSPACE > cwd`，配置文件仅保存持久化设置和凭据引用；交互式首次引导会优先保存到系统 keyring。
 
-session 保存完整 Eylu transcript、上下文账本、权限模式、Provider generation、模型引用和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。清除 DriverState 后仍可使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
+session 保存完整 Eylu transcript、环境快照、上下文账本、权限模式、Provider generation、模型引用和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。旧 session 补采环境时会清除原 DriverState，并使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
 
 ## 发布
 

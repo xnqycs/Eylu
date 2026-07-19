@@ -75,7 +75,6 @@ type Config struct {
 	Providers             map[string]ProviderConfig      `toml:"providers" json:"providers"`
 	MCPServers            map[string]MCPServerConfig     `toml:"mcp_servers,omitempty" json:"mcp_servers,omitempty"`
 	SkillRegistries       map[string]SkillRegistryConfig `toml:"skill_registries,omitempty" json:"skill_registries,omitempty"`
-	Workspace             string                         `toml:"workspace,omitempty" json:"workspace,omitempty"`
 	PermissionMode        string                         `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
 	RoutingMode           string                         `toml:"routing_mode,omitempty" json:"routing_mode,omitempty"`
 	MaxTurns              int                            `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
@@ -101,13 +100,12 @@ type Config struct {
 	MaxSessionBytes       int64                          `toml:"max_session_bytes,omitempty" json:"max_session_bytes,omitempty"`
 }
 
-func Default(workspace string) Config {
+func Default() Config {
 	return Config{
 		Version:               SchemaVersion,
 		Providers:             make(map[string]ProviderConfig),
 		MCPServers:            make(map[string]MCPServerConfig),
 		SkillRegistries:       make(map[string]SkillRegistryConfig),
-		Workspace:             workspace,
 		PermissionMode:        "manual",
 		RoutingMode:           "fixed",
 		MaxTurns:              20,
@@ -338,8 +336,9 @@ type LoadOptions struct {
 }
 
 type Loaded struct {
-	Config Config
-	Path   string
+	Config    Config
+	Path      string
+	Workspace string
 }
 
 func Load(opts LoadOptions) (Loaded, error) {
@@ -347,7 +346,7 @@ func Load(opts LoadOptions) (Loaded, error) {
 	if err != nil {
 		return Loaded{}, fmt.Errorf("resolve workspace: %w", err)
 	}
-	result := Default(workspace)
+	result := Default()
 	paths := configPaths(opts.ExplicitPath, workspace)
 	writePath := opts.ExplicitPath
 	for _, path := range paths {
@@ -369,13 +368,10 @@ func Load(opts LoadOptions) (Loaded, error) {
 		writePath = defaultUserConfigPath()
 	}
 	applyEnvironment(&result, opts.Environ)
-	if result.Workspace == "" {
-		result.Workspace = workspace
-	}
 	if err := result.Validate(); err != nil {
 		return Loaded{}, err
 	}
-	return Loaded{Config: result, Path: writePath}, nil
+	return Loaded{Config: result, Path: writePath, Workspace: workspace}, nil
 }
 
 func configPaths(explicit, workspace string) []string {
@@ -460,9 +456,6 @@ func merge(dst *Config, src Config) {
 			dst.SkillRegistries[name] = registry
 		}
 	}
-	if src.Workspace != "" {
-		dst.Workspace = src.Workspace
-	}
 	if src.PermissionMode != "" {
 		dst.PermissionMode = src.PermissionMode
 	}
@@ -543,9 +536,6 @@ func applyEnvironment(cfg *Config, environ []string) {
 	}
 	if value := env["EYLU_PROVIDER"]; value != "" {
 		cfg.ActiveProvider = value
-	}
-	if value := env["EYLU_WORKSPACE"]; value != "" {
-		cfg.Workspace = value
 	}
 	if value := env["EYLU_PERMISSION_MODE"]; value != "" {
 		cfg.PermissionMode = value

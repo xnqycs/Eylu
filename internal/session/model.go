@@ -5,6 +5,7 @@ import (
 	"time"
 
 	contextledger "Eylu/internal/context"
+	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
 )
 
@@ -52,6 +53,7 @@ type Snapshot struct {
 	UpdatedAt      time.Time                 `json:"updated_at"`
 	ClosedAt       *time.Time                `json:"closed_at,omitempty"`
 	Workspace      string                    `json:"workspace"`
+	Environment    environment.Context       `json:"environment,omitzero"`
 	PermissionMode string                    `json:"permission_mode"`
 	Provider       ProviderState             `json:"provider"`
 	Turns          []protocol.Turn           `json:"turns"`
@@ -71,6 +73,7 @@ type Event struct {
 	SessionID      string                     `json:"session_id"`
 	At             time.Time                  `json:"at"`
 	Workspace      string                     `json:"workspace,omitempty"`
+	Environment    *environment.Context       `json:"environment,omitempty"`
 	PermissionMode string                     `json:"permission_mode,omitempty"`
 	Provider       *ProviderState             `json:"provider,omitempty"`
 	Turn           *protocol.Turn             `json:"turn,omitempty"`

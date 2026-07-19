@@ -31,6 +31,10 @@ func TestChatEndToEnd(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
+		encoded, _ := json.Marshal(body)
+		if !bytes.Contains(encoded, []byte("Here is useful information about the environment")) || !bytes.Contains(encoded, []byte("Your model ID is test-model.")) {
+			t.Fatalf("environment prompt missing from request: %s", encoded)
+		}
 		if body["stream"] == true {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"phase zero \"}\n\n"))
@@ -55,6 +59,44 @@ func TestChatEndToEnd(t *testing.T) {
 	}
 	if stdout.String() != "phase zero works\n" {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestResolveWorkspacePrecedence(t *testing.T) {
+	environmentWorkspace := t.TempDir()
+	t.Setenv("EYLU_WORKSPACE", environmentWorkspace)
+	explicitWorkspace := t.TempDir()
+
+	appRuntime := &runtime{workspace: explicitWorkspace}
+	resolved, err := appRuntime.resolveWorkspace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitAbsolute, _ := filepath.Abs(explicitWorkspace)
+	if resolved != explicitAbsolute {
+		t.Fatalf("explicit workspace = %s, want %s", resolved, explicitAbsolute)
+	}
+
+	appRuntime = &runtime{}
+	resolved, err = appRuntime.resolveWorkspace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	environmentAbsolute, _ := filepath.Abs(environmentWorkspace)
+	if resolved != environmentAbsolute {
+		t.Fatalf("environment workspace = %s, want %s", resolved, environmentAbsolute)
+	}
+
+	t.Setenv("EYLU_WORKSPACE", "")
+	appRuntime = &runtime{}
+	resolved, err = appRuntime.resolveWorkspace()
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _ := os.Getwd()
+	current, _ = filepath.Abs(current)
+	if resolved != filepath.Clean(current) {
+		t.Fatalf("current workspace = %s, want %s", resolved, current)
 	}
 }
 
@@ -286,7 +328,7 @@ func isolateUserState(t *testing.T) string {
 
 func TestModeSlashCommand(t *testing.T) {
 	workspace := t.TempDir()
-	cfg := config.Default(workspace)
+	cfg := config.Default()
 	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
 	if err != nil {
 		t.Fatal(err)

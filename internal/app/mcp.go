@@ -37,7 +37,7 @@ func (r *runtime) loadMCP(ctx context.Context, cfg config.Config) (*mcpclient.Ma
 	encoded, err := json.Marshal(struct {
 		Workspace string                            `json:"workspace"`
 		Servers   map[string]config.MCPServerConfig `json:"servers"`
-	}{Workspace: cfg.Workspace, Servers: cfg.MCPServers})
+	}{Workspace: r.workspace, Servers: cfg.MCPServers})
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +49,7 @@ func (r *runtime) loadMCP(ctx context.Context, cfg config.Config) (*mcpclient.Ma
 	if err := r.closeMCP(); err != nil {
 		return nil, err
 	}
-	manager, diagnostics, err := mcpclient.Open(ctx, cfg.MCPServers, cfg.Workspace)
+	manager, diagnostics, err := mcpclient.Open(ctx, cfg.MCPServers, r.workspace)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize MCP runtime: " + err.Error(), Cause: err}
 	}

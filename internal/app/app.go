@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"Eylu/internal/driver"
 	"Eylu/internal/driver/openai_chat"
 	"Eylu/internal/driver/openai_responses"
+	"Eylu/internal/environment"
 	"Eylu/internal/logging"
 	"Eylu/internal/mcpclient"
 	"Eylu/internal/metrics"
@@ -42,19 +44,20 @@ const (
 )
 
 type runtime struct {
-	stdin         io.Reader
-	stdout        io.Writer
-	stderr        io.Writer
-	configPath    string
-	workspace     string
-	output        string
-	credentials   *provider.CredentialStore
-	inputReader   *bufio.Reader
-	trustPrompted map[string]bool
-	session       *sessionRuntime
-	metrics       *metrics.Collector
-	mcp           *mcpclient.Manager
-	mcpKey        string
+	stdin              io.Reader
+	stdout             io.Writer
+	stderr             io.Writer
+	configPath         string
+	workspace          string
+	output             string
+	credentials        *provider.CredentialStore
+	inputReader        *bufio.Reader
+	trustPrompted      map[string]bool
+	session            *sessionRuntime
+	metrics            *metrics.Collector
+	mcp                *mcpclient.Manager
+	mcpKey             string
+	environmentCapture func(context.Context, string) environment.Context
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -193,7 +196,7 @@ func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) 
 	if err != nil {
 		return err
 	}
-	conversation, err := r.openConversation(manager, &opts)
+	conversation, err := r.openConversation(ctx, manager, &opts)
 	if err != nil {
 		return err
 	}
@@ -252,7 +255,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	modelRuntime.PermissionMode = mode.String()
-	modelRuntime.Workspace = cfg.Workspace
+	modelRuntime.Workspace = r.workspace
 	modelRuntime.TokenEstimator = contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
 	modelRuntime.OutputReserveTokens = cfg.ReservedOutputTokens
 	modelRuntime.ContextRecentRounds = cfg.ContextRecentRounds
@@ -403,24 +406,24 @@ func (r *runtime) reportMetric(jsonlEncoder *json.Encoder, metric metrics.Reques
 }
 
 func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session, confirm tool.ConfirmFunc, audit tool.AuditSink) (*tool.Executor, error) {
-	readFile, err := tool.NewReadFile(cfg.Workspace, cfg.MaxReadBytes)
+	readFile, err := tool.NewReadFile(r.workspace, cfg.MaxReadBytes)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize read_file", Cause: err}
 	}
-	writeFile, err := tool.NewWriteFile(cfg.Workspace)
+	writeFile, err := tool.NewWriteFile(r.workspace)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize write_file", Cause: err}
 	}
-	bashTool, err := tool.NewBash(cfg.Workspace, cfg.MaxOutputBytes, nil)
+	bashTool, err := tool.NewBash(r.workspace, cfg.MaxOutputBytes, nil)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize bash", Cause: err}
 	}
 	bashTool.AllowEnvironment(cfg.ShellEnvironment)
-	editFile, err := tool.NewEditFile(cfg.Workspace, int64(cfg.MaxReadBytes))
+	editFile, err := tool.NewEditFile(r.workspace, int64(cfg.MaxReadBytes))
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize edit_file", Cause: err}
 	}
-	index, err := tool.NewRepositoryIndex(cfg.Workspace)
+	index, err := tool.NewRepositoryIndex(r.workspace)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize repository index", Cause: err}
 	}
@@ -452,7 +455,7 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	registered = filtered
 	return &tool.Executor{
 		Registry: tool.NewRegistry(registered...), Policy: checker,
-		Confirm: confirm, Audit: audit, Workspace: cfg.Workspace,
+		Confirm: confirm, Audit: audit, Workspace: r.workspace,
 		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes, MaxParallelTools: cfg.MaxParallelTools,
 	}, nil
 }
@@ -575,9 +578,9 @@ func knownDriverCapabilities(adapter string) (driver.Capabilities, bool) {
 }
 
 func (r *runtime) loadManager() (config.Loaded, *provider.Manager, error) {
-	workspace := r.workspace
-	if workspace == "" {
-		workspace, _ = os.Getwd()
+	workspace, err := r.resolveWorkspace()
+	if err != nil {
+		return config.Loaded{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
 	configPath := r.configPath
 	if configPath == "" {
@@ -587,11 +590,31 @@ func (r *runtime) loadManager() (config.Loaded, *provider.Manager, error) {
 	if err != nil {
 		return config.Loaded{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
+	r.workspace = loaded.Workspace
 	manager, err := provider.NewManager(loaded.Path, loaded.Config, nil)
 	if err != nil {
 		return config.Loaded{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
 	return loaded, manager, nil
+}
+
+func (r *runtime) resolveWorkspace() (string, error) {
+	workspace := strings.TrimSpace(r.workspace)
+	if workspace == "" {
+		workspace = strings.TrimSpace(os.Getenv("EYLU_WORKSPACE"))
+	}
+	if workspace == "" {
+		var err error
+		workspace, err = os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("resolve current workspace: %w", err)
+		}
+	}
+	absolute, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace: %w", err)
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func (r *runtime) printError(err error) {

@@ -8,7 +8,7 @@ import (
 )
 
 func TestManagerPublishesAfterSaveAndRollsBack(t *testing.T) {
-	cfg := config.Default(t.TempDir())
+	cfg := config.Default()
 	failed := false
 	manager, err := NewManager("unused", cfg, func(_ string, _ config.Config) error {
 		if failed {
@@ -39,7 +39,7 @@ func TestManagerPublishesAfterSaveAndRollsBack(t *testing.T) {
 }
 
 func TestManagerInFlightSnapshotAndNextGeneration(t *testing.T) {
-	cfg := config.Default(t.TempDir())
+	cfg := config.Default()
 	cfg.ActiveProvider = "work"
 	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://one.example/v1", Model: "one", Credential: config.CredentialRef{Type: "none"}}
 	manager, err := NewManager("unused", cfg, func(string, config.Config) error { return nil })

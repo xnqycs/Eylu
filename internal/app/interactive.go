@@ -26,7 +26,7 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 	if err != nil {
 		return err
 	}
-	conversation, err := r.openConversation(manager, &opts)
+	conversation, err := r.openConversation(ctx, manager, &opts)
 	if err != nil {
 		return err
 	}
@@ -109,7 +109,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	case "/quit":
 		return errQuit
 	case "/new":
-		old, current, err := r.rotateSession(conversation, manager, *opts)
+		old, current, err := r.rotateSession(ctx, conversation, manager, *opts)
 		if err != nil {
 			return err
 		}

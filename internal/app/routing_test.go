@@ -12,7 +12,7 @@ import (
 
 func TestResolveRuntimeAutomaticAndFixedRouting(t *testing.T) {
 	workspace := t.TempDir()
-	cfg := config.Default(workspace)
+	cfg := config.Default()
 	cfg.RoutingMode = "auto"
 	cfg.ActiveProvider = "reasoning"
 	cfg.Providers["reasoning"] = config.ProviderConfig{

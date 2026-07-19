@@ -7,12 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
 )
 
 func TestConversationStateRoundTripAndDeepClone(t *testing.T) {
 	model := &scriptedDriver{}
-	conversation := NewConversation()
+	environmentContext := environment.Context{WorkingDirectory: "C:/workspace", Platform: "windows", Today: "2026-07-19"}
+	conversation := NewConversationWithEnvironment(environmentContext)
 	runtime := testRuntime(model, 7)
 	runtime.Workspace = t.TempDir()
 	if _, err := conversation.Send(context.Background(), "remember state", runtime, false, nil); err != nil {
@@ -24,7 +26,7 @@ func TestConversationStateRoundTripAndDeepClone(t *testing.T) {
 	conversation.protectedSkills["demo"] = ProtectedSkill{Name: "demo", Source: "user_eylu", Entry: "SKILL.md", Root: "skills/demo", Digest: "digest", Content: "body", Trigger: "model", ActivatedAt: time.Now().UTC()}
 	conversation.mu.Unlock()
 	state := conversation.ExportState()
-	if state.Provider.Generation != 7 || state.Provider.Model != "test-model" || state.Summary != "summary-marker" || len(state.ProtectedSkills) != 1 || len(state.DriverState) == 0 {
+	if state.Provider.Generation != 7 || state.Provider.Model != "test-model" || state.Environment != environmentContext || state.Summary != "summary-marker" || len(state.ProtectedSkills) != 1 || len(state.DriverState) == 0 {
 		t.Fatalf("state = %#v", state)
 	}
 	state.Turns[0].Parts[0].Text = "mutated"
@@ -37,7 +39,7 @@ func TestConversationStateRoundTripAndDeepClone(t *testing.T) {
 		t.Fatal(err)
 	}
 	restoredState := restored.ExportState()
-	if restored.SessionID() != conversation.SessionID() || len(restored.Transcript()) != 2 || restoredState.Summary != "summary-marker" || restoredState.ProtectedSkills[0].Digest != "digest" || !json.Valid(restoredState.DriverState) {
+	if restored.SessionID() != conversation.SessionID() || len(restored.Transcript()) != 2 || restoredState.Environment != environmentContext || restoredState.Summary != "summary-marker" || restoredState.ProtectedSkills[0].Digest != "digest" || !json.Valid(restoredState.DriverState) {
 		t.Fatalf("restored = %#v", restoredState)
 	}
 	if report := restored.ContextReport(); report.LastUsage.InputTokens != conversation.ContextReport().LastUsage.InputTokens {

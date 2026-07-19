@@ -107,7 +107,11 @@ func (c *Conversation) finalizeCompression(runtime Runtime, definitions []protoc
 func (c *Conversation) buildPromptContext(runtime Runtime, definitions []protocol.ToolDefinition) contextledger.PromptResult {
 	options := optionsForRuntime(runtime)
 	builder := contextledger.NewPromptBuilder(options.estimator)
-	builder.AddTextTurn("system", protocol.RoleSystem, c.systemPrompt, contextledger.CategorySystemPrompt, "eylu", true, nil)
+	systemPrompt := c.systemPrompt
+	if environmentPrompt := c.environment.Prompt(runtime.Provider.Config.Model); environmentPrompt != "" {
+		systemPrompt += "\n\n" + environmentPrompt
+	}
+	builder.AddTextTurn("system", protocol.RoleSystem, systemPrompt, contextledger.CategorySystemPrompt, "eylu", true, nil)
 	for _, server := range runtime.MCPContexts {
 		if server.Instructions != "" {
 			content := fmt.Sprintf("<mcp_instructions server=%q>\n%s\n</mcp_instructions>", server.Server, server.Instructions)

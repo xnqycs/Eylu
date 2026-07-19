@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- workspace 从配置 schema 迁移为 `--workspace > EYLU_WORKSPACE > cwd` 运行时上下文；新 session 将 OS、日期和 Git 状态快照注入 system prompt 并持久化，旧 session 首次恢复时自动补采并清除旧 DriverState。
 - TUI 历史区增加按显示列拖选、跨 viewport 滚轮扩展、系统剪贴板自动复制与短时状态提示；选区稳定覆盖 ANSI/OSC 与中文宽字符。输入框增加 1 至 8 行动态高度及 `Shift+Enter`/`Ctrl+Enter` 换行，并统一修正原生光标坐标。
 - 增加统一 `/` 与 `@` 补全面板、顶层 Skill 命令、Git-aware 文件候选，以及带边界校验和上下文预算的 Skill/文件引用注入。
 - `Shift+Tab` 支持四模式循环与运行期排队；耗时按毫秒、秒、分钟自动格式化。

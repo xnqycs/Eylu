@@ -15,14 +15,14 @@ func TestLoadPrecedenceAndSave(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	userPath := filepath.Join(home, ".eylu", "config.toml")
-	user := Default(workspace)
+	user := Default()
 	user.ActiveProvider = "work"
 	user.Providers["work"] = validProvider("https://user.example/v1", "user-model")
 	if err := Save(userPath, user); err != nil {
 		t.Fatal(err)
 	}
 	projectPath := filepath.Join(workspace, ".eylu", "config.toml")
-	project := Default(workspace)
+	project := Default()
 	project.ActiveProvider = "work"
 	project.Providers["work"] = validProvider("https://project.example/v1", "project-model")
 	if err := Save(projectPath, project); err != nil {
@@ -46,11 +46,15 @@ func TestLoadPrecedenceAndSave(t *testing.T) {
 	if loaded.Path != projectPath {
 		t.Fatalf("write path = %s, want %s", loaded.Path, projectPath)
 	}
+	absoluteWorkspace, _ := filepath.Abs(workspace)
+	if loaded.Workspace != absoluteWorkspace {
+		t.Fatalf("workspace = %s, want %s", loaded.Workspace, absoluteWorkspace)
+	}
 }
 
 func TestConfigNeverContainsSecret(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
-	cfg := Default(t.TempDir())
+	cfg := Default()
 	cfg.ActiveProvider = "work"
 	cfg.Providers["work"] = validProvider("https://example.com/v1", "model")
 	if err := Save(path, cfg); err != nil {
@@ -62,6 +66,36 @@ func TestConfigNeverContainsSecret(t *testing.T) {
 	}
 	if strings.Contains(string(data), "sk-test-secret") {
 		t.Fatal("config persisted a credential value")
+	}
+	if strings.Contains(string(data), "workspace") {
+		t.Fatalf("config persisted runtime workspace: %s", data)
+	}
+}
+
+func TestLegacyWorkspaceIsIgnored(t *testing.T) {
+	workspace := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	data := []byte("version = 1\nworkspace = \"C:/legacy\"\n")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: configPath, Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	absoluteWorkspace, _ := filepath.Abs(workspace)
+	if loaded.Workspace != absoluteWorkspace {
+		t.Fatalf("legacy workspace changed runtime workspace: %s", loaded.Workspace)
+	}
+	if err := Save(configPath, loaded.Config); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), "workspace") {
+		t.Fatalf("legacy workspace survived save: %s", saved)
 	}
 }
 
@@ -85,7 +119,7 @@ func TestValidateProvider(t *testing.T) {
 }
 
 func TestValidatePermissionModeAndClonePolicyLists(t *testing.T) {
-	cfg := Default(t.TempDir())
+	cfg := Default()
 	clone := cfg.Clone()
 	clone.AutoAllowCommands[0] = "changed"
 	if cfg.AutoAllowCommands[0] == "changed" {
@@ -112,7 +146,7 @@ func TestContextLimitEnvironmentOverrides(t *testing.T) {
 }
 
 func TestProviderRoutingValidationAndClone(t *testing.T) {
-	cfg := Default(t.TempDir())
+	cfg := Default()
 	cfg.ActiveProvider = "routed"
 	cfg.RoutingMode = "auto"
 	cfg.Providers["routed"] = ProviderConfig{
@@ -143,7 +177,7 @@ func TestProviderRoutingValidationAndClone(t *testing.T) {
 }
 
 func TestMCPServerValidationAndClone(t *testing.T) {
-	cfg := Default(t.TempDir())
+	cfg := Default()
 	cfg.MCPServers["workspace"] = MCPServerConfig{
 		Command: "mcp-server", Args: []string{"--stdio"}, Environment: []string{"MCP_TOKEN"},
 		WorkingDirectory: ".", ReadOnlyTools: []string{"search"}, TimeoutSeconds: 15,
@@ -162,7 +196,7 @@ func TestMCPServerValidationAndClone(t *testing.T) {
 		"missing":      {},
 		"secret":       {Command: "server", Environment: []string{"TOKEN=value"}},
 	} {
-		invalid := Default(t.TempDir())
+		invalid := Default()
 		invalid.MCPServers[name] = candidate
 		if err := invalid.Validate(); err == nil {
 			t.Fatalf("server %q passed validation", name)
@@ -172,7 +206,7 @@ func TestMCPServerValidationAndClone(t *testing.T) {
 
 func TestSkillRegistryValidationAndClone(t *testing.T) {
 	publicKey := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
-	cfg := Default(t.TempDir())
+	cfg := Default()
 	cfg.SkillRegistries["team"] = SkillRegistryConfig{
 		IndexURL: "https://registry.example/index.json", PublicKeys: map[string]string{"release": publicKey},
 		TokenEnvironment: "REGISTRY_TOKEN", TimeoutSeconds: 30,
@@ -190,7 +224,7 @@ func TestSkillRegistryValidationAndClone(t *testing.T) {
 		"secret":   {IndexURL: "https://example.com/index.json", PublicKeys: map[string]string{"release": publicKey}, TokenEnvironment: "TOKEN=value"},
 		"key":      {IndexURL: "https://example.com/index.json", PublicKeys: map[string]string{"release": "invalid"}},
 	} {
-		invalid := Default(t.TempDir())
+		invalid := Default()
 		invalid.SkillRegistries[name] = candidate
 		if err := invalid.Validate(); err == nil {
 			t.Fatalf("registry %s passed validation", name)
