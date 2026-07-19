@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- 项目采用 Apache License 2.0，版权主体为 xnqycs。
+- 发布归档增加项目 NOTICE、许可证和覆盖六个目标平台的第三方许可证全文。
+- 增加可复现的第三方声明生成器及 CI 漂移检查。
+
 ## Phase 9 - 扩展生态与发布
 
 - 增加按任务、能力、上下文窗口、优先级和估算成本选择 Provider 的确定性自动路由；支持 `--route`、`--task` 与 `--require-reasoning`。

@@ -44,6 +44,9 @@ archives:
     files:
       - README.md
       - CHANGELOG.md
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
       - docs/go-terminal-agent-development-plan.md
 
 checksum:

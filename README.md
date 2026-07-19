@@ -185,14 +185,18 @@ session 保存完整 Eylu transcript、上下文账本、权限模式、Provider
 
 ## 发布
 
-`eylu version` 显示 version、commit、date 与构建器。GoReleaser 为 Linux、Windows、macOS 的 amd64/arm64 生成归档和 `Eylu_<version>_checksums.txt`；tag 工作流使用 Sigstore keyless 对 checksum 文件生成 `.sigstore.json` bundle。
+`eylu version` 显示 version、commit、date 与构建器。GoReleaser 为 Linux、Windows、macOS 的 amd64/arm64 生成归档和 `Eylu_<version>_checksums.txt`；归档包含项目许可证、NOTICE 和第三方许可证全文；tag 工作流使用 Sigstore keyless 对 checksum 文件生成 `.sigstore.json` bundle。
 
 ```bash
 goreleaser check
 goreleaser release --snapshot --clean --skip=sign
 ```
 
-CI 在 Linux、Windows、macOS 执行测试、vet、原生构建和 smoke test；Linux 质量任务额外执行 race detector、格式检查与 Staticcheck。发布 tag 使用 `v*` 格式。
+CI 在 Linux、Windows、macOS 执行测试、vet、原生构建和 smoke test；Linux 质量任务额外执行 race detector、格式检查、第三方声明漂移检查与 Staticcheck。发布 tag 使用 `v*` 格式。
+
+## 许可证
+
+Eylu 由 xnqycs 以 [Apache License 2.0](LICENSE) 发布。第三方组件及其适用条款见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## 开发质量门槛
 
@@ -202,6 +206,7 @@ go mod verify
 go vet ./...
 go test ./...
 go test -race ./...
+go run ./scripts/generate-third-party-notices -check
 staticcheck ./...
 actionlint
 ```
