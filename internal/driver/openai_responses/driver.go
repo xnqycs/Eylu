@@ -231,7 +231,11 @@ func (d *Driver) send(ctx context.Context, endpoint string, req driver.Request, 
 	for k, v := range req.Headers {
 		httpReq.Header.Set(k, v)
 	}
-	return d.client.Do(httpReq)
+	client := d.client
+	if req.Stream {
+		client = driver.StreamingHTTPClient(client)
+	}
+	return client.Do(httpReq)
 }
 
 func decodeRemoteState(raw json.RawMessage) remoteState {

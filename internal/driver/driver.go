@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"Eylu/internal/protocol"
 )
@@ -27,6 +29,44 @@ type Request struct {
 }
 
 type EmitFunc func(protocol.ModelEvent) error
+
+const (
+	toolCallDeltaMinBatchBytes = 24
+	toolCallDeltaMaxBatchBytes = 256
+	toolCallDeltaMaxDelay      = 250 * time.Millisecond
+)
+
+type StreamDeltaBuffer struct {
+	pending strings.Builder
+	started time.Time
+}
+
+func (b *StreamDeltaBuffer) Push(delta string, now time.Time) (string, bool) {
+	if delta == "" {
+		return "", false
+	}
+	if b.pending.Len() == 0 {
+		b.started = now
+	}
+	b.pending.WriteString(delta)
+	size := b.pending.Len()
+	ready := size >= toolCallDeltaMaxBatchBytes ||
+		(size >= toolCallDeltaMinBatchBytes && (now.Sub(b.started) >= toolCallDeltaMaxDelay || strings.Contains(delta, `\n`)))
+	if !ready {
+		return "", false
+	}
+	return b.Flush(), true
+}
+
+func (b *StreamDeltaBuffer) Flush() string {
+	if b.pending.Len() == 0 {
+		return ""
+	}
+	batch := strings.Clone(b.pending.String())
+	b.pending.Reset()
+	b.started = time.Time{}
+	return batch
+}
 
 type ModelDriver interface {
 	Name() string
@@ -65,4 +105,18 @@ func (r *Registry) Get(name string) (ModelDriver, error) {
 
 func DefaultHTTPClient(timeoutSeconds int) *http.Client {
 	return &http.Client{Timeout: durationSeconds(timeoutSeconds)}
+}
+
+// StreamingHTTPClient preserves the shared transport and client policies while
+// removing the total timeout that would otherwise interrupt response body reads.
+func StreamingHTTPClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if client.Timeout == 0 {
+		return client
+	}
+	streamClient := *client
+	streamClient.Timeout = 0
+	return &streamClient
 }

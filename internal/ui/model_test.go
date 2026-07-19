@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +92,207 @@ func TestOperationStatesStaleMessagesApprovalAndCancellation(t *testing.T) {
 	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: 'c', Mod: tea.ModCtrl}))
 	if !cancelled || model.state != StateCancelling {
 		t.Fatalf("cancelled=%t state=%s", cancelled, model.state)
+	}
+}
+
+func TestInterruptRequestCancelsThenQuits(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true})
+	model.operationID = "op-interrupt"
+	model.state = StatePreparingTool
+	cancelled := false
+	model.cancel = func() { cancelled = true }
+
+	_, command := model.Update(interruptRequestMsg{})
+	if !cancelled || !model.cancelRequested || model.state != StateCancelling || command != nil {
+		t.Fatalf("cancelled=%t requested=%t state=%s command=%v", cancelled, model.cancelRequested, model.state, command)
+	}
+	_, command = model.Update(interruptRequestMsg{})
+	if command == nil {
+		t.Fatal("second interrupt did not request exit")
+	}
+	if _, ok := command().(tea.QuitMsg); !ok {
+		t.Fatalf("second interrupt message = %#v", command())
+	}
+}
+
+func TestChatInputBandUsesOnePromptAndNativeCursor(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	_ = model.input.Focus()
+	model.input.SetValue("html写一个你的自我介绍页面")
+
+	view := model.View()
+	if model.input.Height() != 1 || model.input.VirtualCursor() {
+		t.Fatalf("height=%d virtual_cursor=%t", model.input.Height(), model.input.VirtualCursor())
+	}
+	if strings.Count(view.Content, "> ") != 1 || !strings.Contains(view.Content, "html写一个你的自我介绍页面") {
+		t.Fatalf("input view = %q", view.Content)
+	}
+	if strings.Count(view.Content, strings.Repeat("─", model.width)) != 2 {
+		t.Fatalf("input rules missing: %q", view.Content)
+	}
+	if view.Cursor == nil || view.Cursor.Position.X < 2 || view.Cursor.Position.Y <= model.viewport.Height() {
+		t.Fatalf("cursor = %#v viewport_height=%d", view.Cursor, model.viewport.Height())
+	}
+	model.approval = &ApprovalRequest{Tool: "write_file", Risk: "write"}
+	if cursor := model.View().Cursor; cursor != nil {
+		t.Fatalf("approval cursor = %#v", cursor)
+	}
+}
+
+func TestTimelineMarkdownCacheInvalidatesOnTextAndWidth(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, Width: 80, Height: 24})
+	model.timeline = []timelineItem{{kind: timelineMessage, role: "agent", text: "**cached response**"}}
+	model.refreshViewport()
+	if model.timeline[0].renderedText == "" {
+		t.Fatal("markdown was not cached")
+	}
+
+	model.timeline[0].renderedText = "CACHE_SENTINEL"
+	model.refreshViewport()
+	if !strings.Contains(model.viewport.GetContent(), "CACHE_SENTINEL") {
+		t.Fatal("unchanged markdown missed cache")
+	}
+
+	model.timeline[0].text += " updated"
+	model.refreshViewport()
+	if strings.Contains(model.viewport.GetContent(), "CACHE_SENTINEL") {
+		t.Fatal("text change did not invalidate markdown cache")
+	}
+	model.timeline[0].renderedText = "WIDTH_SENTINEL"
+	model.resize(72, 24)
+	if strings.Contains(model.viewport.GetContent(), "WIDTH_SENTINEL") {
+		t.Fatal("width change did not invalidate markdown cache")
+	}
+}
+
+func TestLocalMarkdownLinkTargetsContainingWorkspaceDirectory(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "build")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(workspace, "index.html")
+	if err := os.WriteFile(file, []byte("<main>Eylu</main>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, Width: 100, Height: 24})
+	model.snapshot.Workspace = workspace
+
+	rendered := model.renderMarkdown("已完成：[index.html](/build/index.html) [docs](https://example.com/docs)")
+	directoryURL := directoryFileURL(workspace)
+	if !strings.Contains(rendered, ";"+directoryURL+"\x07") {
+		t.Fatalf("local directory hyperlink missing: %q want=%q", rendered, directoryURL)
+	}
+	if !strings.Contains(rendered, ";https://example.com/docs\x07") {
+		t.Fatalf("external hyperlink changed: %q", rendered)
+	}
+	toolRendered := model.renderTool(&toolView{name: "write_file", path: "index.html", generatedBytes: 17, generatedLines: 1})
+	if !strings.Contains(toolRendered, ";"+directoryURL+"\x07") {
+		t.Fatalf("tool file hyperlink missing: %q", toolRendered)
+	}
+	longDirectory := strings.Repeat("nested-", 10)
+	longRelativePath := filepath.Join(longDirectory, "a-very-long-generated-file-name.html")
+	if err := os.MkdirAll(filepath.Join(workspace, longDirectory), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, longRelativePath), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	model.resize(40, 24)
+	longToolRendered := model.renderTool(&toolView{name: "write_file", path: longRelativePath, generatedBytes: 2, generatedLines: 1})
+	if strings.Count(longToolRendered, "\x1b]8;") != 2 {
+		t.Fatalf("truncated hyperlink sequence is unbalanced: %q", longToolRendered)
+	}
+	for _, line := range strings.Split(ansi.Strip(longToolRendered), "\n") {
+		if lipgloss.Width(line) > model.width {
+			t.Fatalf("long tool line width=%d line=%q", lipgloss.Width(line), line)
+		}
+	}
+}
+
+func TestCancelledBackendDoesNotBlockOnFullPreviewQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	backend := &fakeBackend{submit: func(ctx context.Context, operationID, _ string, emit func(Event)) error {
+		for index := 0; index < 1024; index++ {
+			emit(Event{OperationID: operationID, Kind: EventToolCallDelta, ToolCallDelta: &protocol.ToolCallDelta{ID: "call", Delta: "x"}})
+		}
+		return ctx.Err()
+	}}
+	events := make(chan Event, 1)
+	done := make(chan tea.Msg, 1)
+	go func() { done <- runBackendCmd(ctx, backend, "op-cancel", "prompt", events)() }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled backend remained blocked on preview events")
+	}
+}
+
+func TestToolCallDeltaRendersLiveFileChangeWithoutDuplicateTool(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-live"
+	model.eventChannel = make(chan Event, 8)
+	updates := []protocol.ToolCallDelta{
+		{ID: "call-write", Name: "write_file", Delta: `{"path":"index.html","content":"<main>\n`},
+		{ID: "call-write", Name: "write_file", Delta: `Hello</main>"}`},
+		{ID: "call-write", Name: "write_file", Arguments: `{"path":"index.html","content":"<main>\nHello</main>"}`, Done: true},
+	}
+	for index := range updates {
+		_, _ = model.handleBackendEvent(Event{OperationID: "op-live", Kind: EventToolCallDelta, ToolCallDelta: &updates[index]})
+	}
+	if len(model.timeline) != 1 || model.state != StatePreparingTool {
+		t.Fatalf("timeline=%#v state=%s", model.timeline, model.state)
+	}
+	tool := model.timeline[0].tool
+	if tool.path != "index.html" || tool.generatedBytes == 0 || !strings.Contains(tool.preview, "+ Hello</main>") {
+		t.Fatalf("tool = %#v", tool)
+	}
+	view := model.viewport.GetContent()
+	if !strings.Contains(view, "write_file") || !strings.Contains(view, "generating") || !strings.Contains(view, "index.html") {
+		t.Fatalf("view = %q", view)
+	}
+
+	call := protocol.ToolCall{ID: "call-write", Name: "write_file", Arguments: []byte(updates[2].Arguments)}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-live", Kind: EventToolStart, ToolCall: &call})
+	if len(model.timeline) != 1 || model.timeline[0].tool.preparing || !model.timeline[0].tool.running {
+		t.Fatalf("tool start duplicated or lost state: %#v", model.timeline)
+	}
+	result := protocol.ToolResult{CallID: "call-write", Content: "wrote 25 bytes to index.html", Metadata: map[string]any{"path": "index.html", "bytes": 25}}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-live", Kind: EventToolResult, ToolResult: &result})
+	if model.timeline[0].tool.running || model.timeline[0].tool.isError {
+		t.Fatalf("tool result = %#v", model.timeline[0].tool)
+	}
+}
+
+func TestPartialJSONStringFieldAndLargePreviewStayBounded(t *testing.T) {
+	arguments := `{"path":"index.html","content":"<h1>你好<\/h1>\n\"quoted\""}`
+	path, pathStarted := partialJSONStringField(arguments, "path")
+	content, contentStarted := partialJSONStringField(arguments, "content")
+	if !pathStarted || path != "index.html" || !contentStarted || content != "<h1>你好</h1>\n\"quoted\"" {
+		t.Fatalf("path=%q pathStarted=%t content=%q contentStarted=%t", path, pathStarted, content, contentStarted)
+	}
+	partial, started := partialJSONStringField(`{"content":"line 1\nline 2\u4f`, "content")
+	if !started || partial != "line 1\nline 2" {
+		t.Fatalf("partial=%q started=%t", partial, started)
+	}
+
+	view := &toolView{name: "write_file", arguments: `{"path":"large.txt","content":"` + strings.Repeat(`line\n`, 100)}
+	updateFileToolPreview(view)
+	if view.generatedLines != 101 || len(strings.Split(view.preview, "\n")) > 6 || len(view.preview) > 128 {
+		t.Fatalf("lines=%d preview=%q", view.generatedLines, view.preview)
+	}
+
+	streamed := &toolView{name: "write_file"}
+	streamed.appendArguments(`{"path":"streamed.txt","content":"`)
+	for index := 0; index < 1000; index++ {
+		streamed.appendArguments(strings.Repeat("x", 64))
+		if len(streamed.arguments)-streamed.previewArgumentBytes >= 256 {
+			updateFileToolPreview(streamed)
+		}
+	}
+	if len(streamed.arguments) != len(`{"path":"streamed.txt","content":"`)+64_000 || len(streamed.preview) > 2048 {
+		t.Fatalf("arguments=%d preview=%d", len(streamed.arguments), len(streamed.preview))
 	}
 }
 
@@ -197,7 +400,7 @@ func TestResizeStormLongWordsAndStaleAnimationTick(t *testing.T) {
 		height := 10 + index%35
 		_, _ = model.Update(tea.WindowSizeMsg{Width: width, Height: height})
 	}
-	if model.width < 40 || model.height < 12 || model.viewport.Width() != model.width || model.viewport.Height() != model.height-8 {
+	if model.width < 40 || model.height < 12 || model.viewport.Width() != model.width || model.viewport.Height() != model.height-6 {
 		t.Fatalf("size=%dx%d viewport=%dx%d", model.width, model.height, model.viewport.Width(), model.viewport.Height())
 	}
 	word := strings.Repeat("界", 50)

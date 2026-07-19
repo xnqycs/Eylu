@@ -45,6 +45,15 @@ type ToolCall struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+type ToolCallDelta struct {
+	OutputIndex int    `json:"output_index"`
+	ID          string `json:"id,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Delta       string `json:"delta,omitempty"`
+	Arguments   string `json:"arguments,omitempty"`
+	Done        bool   `json:"done,omitempty"`
+}
+
 type ToolResult struct {
 	CallID    string         `json:"call_id"`
 	Content   string         `json:"content"`
@@ -105,11 +114,12 @@ const (
 )
 
 type ModelEvent struct {
-	Kind       EventKind      `json:"kind"`
-	Delta      string         `json:"delta,omitempty"`
-	ToolCall   *ToolCall      `json:"tool_call,omitempty"`
-	ToolResult *ToolResult    `json:"tool_result,omitempty"`
-	Usage      *Usage         `json:"usage,omitempty"`
-	Response   *ModelResponse `json:"response,omitempty"`
-	Error      *Error         `json:"error,omitempty"`
+	Kind          EventKind      `json:"kind"`
+	Delta         string         `json:"delta,omitempty"`
+	ToolCallDelta *ToolCallDelta `json:"tool_call_delta,omitempty"`
+	ToolCall      *ToolCall      `json:"tool_call,omitempty"`
+	ToolResult    *ToolResult    `json:"tool_result,omitempty"`
+	Usage         *Usage         `json:"usage,omitempty"`
+	Response      *ModelResponse `json:"response,omitempty"`
+	Error         *Error         `json:"error,omitempty"`
 }

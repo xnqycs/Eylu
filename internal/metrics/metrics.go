@@ -89,6 +89,10 @@ func (o *Observation) ObserveModelEvent(event protocol.ModelEvent) {
 		if event.Delta != "" && o.firstToken.IsZero() {
 			o.firstToken = time.Now()
 		}
+	case protocol.EventToolCallDelta:
+		if event.ToolCallDelta != nil && o.firstToken.IsZero() {
+			o.firstToken = time.Now()
+		}
 	case protocol.EventToolStart:
 		o.toolCalls++
 	case protocol.EventToolResult:

@@ -37,3 +37,13 @@ func TestObservationRecordsErrorAndFallbackUsage(t *testing.T) {
 		t.Fatalf("metric = %#v", metric)
 	}
 }
+
+func TestToolCallDeltaMarksFirstToken(t *testing.T) {
+	observation := (&Collector{}).Begin(Metadata{})
+	time.Sleep(time.Millisecond)
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventToolCallDelta, ToolCallDelta: &protocol.ToolCallDelta{Name: "write_file"}})
+	metric := observation.Finish(protocol.Usage{}, nil)
+	if metric.FirstTokenMS < 1 {
+		t.Fatalf("metric = %#v", metric)
+	}
+}

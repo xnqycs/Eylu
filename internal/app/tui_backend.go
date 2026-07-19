@@ -13,6 +13,7 @@ import (
 	"Eylu/internal/agent"
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
+	"Eylu/internal/driver"
 	"Eylu/internal/logging"
 	"Eylu/internal/metrics"
 	"Eylu/internal/policy"
@@ -85,7 +86,7 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		}
 	}
 	snapshot := ui.Snapshot{
-		SessionID: b.conversation.SessionID(), Mode: mode, Provider: active.Name, Model: active.Config.Model,
+		SessionID: b.conversation.SessionID(), Workspace: cfg.Workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
 		Context: b.conversation.ContextReport(),
 	}
 	managerActive, _ := b.manager.Active()
@@ -161,13 +162,26 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 	executor.SessionID, executor.ProviderName = b.conversation.SessionID(), modelRuntime.Provider.Name
 	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateConnecting})
+	var textDeltas driver.StreamDeltaBuffer
+	flushText := func() {
+		if batch := textDeltas.Flush(); batch != "" {
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventTextDelta, Delta: batch})
+		}
+	}
 	modelEvents := func(event protocol.ModelEvent) error {
 		observation.ObserveModelEvent(event)
+		if event.Kind != protocol.EventTextDelta {
+			flushText()
+		}
 		switch event.Kind {
 		case protocol.EventResponseStart:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateWaitingFirstToken})
 		case protocol.EventTextDelta:
-			emit(ui.Event{OperationID: operationID, Kind: ui.EventTextDelta, Delta: event.Delta})
+			if batch, ready := textDeltas.Push(event.Delta, time.Now()); ready {
+				emit(ui.Event{OperationID: operationID, Kind: ui.EventTextDelta, Delta: batch})
+			}
+		case protocol.EventToolCallDelta:
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventToolCallDelta, ToolCallDelta: event.ToolCallDelta})
 		case protocol.EventToolStart:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventToolStart, ToolCall: event.ToolCall})
 		case protocol.EventToolResult:
@@ -179,6 +193,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID, prompt string, emi
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
 	response, err := b.conversation.Run(requestCtx, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, true, modelEvents)
+	flushText()
 	metric := observation.Finish(response.Usage, err)
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: fmt.Sprintf("Completed in %d ms; first token %d ms; tool success %.0f%%.", metric.DurationMS, metric.FirstTokenMS, metric.ToolSuccessRate*100)})
 	if b.runtime.session != nil {

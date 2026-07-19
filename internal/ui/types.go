@@ -19,10 +19,12 @@ const (
 	StateFetchingModels    OperationState = "fetching_models"
 	StateWaitingFirstToken OperationState = "waiting_first_token"
 	StateStreaming         OperationState = "streaming"
+	StatePreparingTool     OperationState = "preparing_tool"
 	StateExecutingTool     OperationState = "executing_tool"
 	StateAwaitingApproval  OperationState = "awaiting_approval"
 	StateRetryBackoff      OperationState = "retry_backoff"
 	StateCancelling        OperationState = "cancelling"
+	StateCancelled         OperationState = "cancelled"
 	StateCompleted         OperationState = "completed"
 	StateFailed            OperationState = "failed"
 )
@@ -30,29 +32,31 @@ const (
 type EventKind string
 
 const (
-	EventState      EventKind = "state"
-	EventTextDelta  EventKind = "text_delta"
-	EventToolStart  EventKind = "tool_start"
-	EventToolResult EventKind = "tool_result"
-	EventToolAudit  EventKind = "tool_audit"
-	EventApproval   EventKind = "approval"
-	EventContext    EventKind = "context"
-	EventNotice     EventKind = "notice"
+	EventState         EventKind = "state"
+	EventTextDelta     EventKind = "text_delta"
+	EventToolCallDelta EventKind = "tool_call_delta"
+	EventToolStart     EventKind = "tool_start"
+	EventToolResult    EventKind = "tool_result"
+	EventToolAudit     EventKind = "tool_audit"
+	EventApproval      EventKind = "approval"
+	EventContext       EventKind = "context"
+	EventNotice        EventKind = "notice"
 )
 
 type Event struct {
-	OperationID string                `json:"operation_id"`
-	Kind        EventKind             `json:"kind"`
-	State       OperationState        `json:"state,omitempty"`
-	Delta       string                `json:"delta,omitempty"`
-	ToolCall    *protocol.ToolCall    `json:"tool_call,omitempty"`
-	ToolResult  *protocol.ToolResult  `json:"tool_result,omitempty"`
-	ToolAudit   *ToolAudit            `json:"tool_audit,omitempty"`
-	Approval    *ApprovalRequest      `json:"-"`
-	Context     *contextledger.Report `json:"context,omitempty"`
-	Notice      string                `json:"notice,omitempty"`
-	Error       bool                  `json:"error,omitempty"`
-	RetryAfter  time.Duration         `json:"retry_after,omitempty"`
+	OperationID   string                  `json:"operation_id"`
+	Kind          EventKind               `json:"kind"`
+	State         OperationState          `json:"state,omitempty"`
+	Delta         string                  `json:"delta,omitempty"`
+	ToolCallDelta *protocol.ToolCallDelta `json:"tool_call_delta,omitempty"`
+	ToolCall      *protocol.ToolCall      `json:"tool_call,omitempty"`
+	ToolResult    *protocol.ToolResult    `json:"tool_result,omitempty"`
+	ToolAudit     *ToolAudit              `json:"tool_audit,omitempty"`
+	Approval      *ApprovalRequest        `json:"-"`
+	Context       *contextledger.Report   `json:"context,omitempty"`
+	Notice        string                  `json:"notice,omitempty"`
+	Error         bool                    `json:"error,omitempty"`
+	RetryAfter    time.Duration           `json:"retry_after,omitempty"`
 }
 
 type ToolAudit struct {
@@ -95,6 +99,7 @@ type SkillItem struct {
 
 type Snapshot struct {
 	SessionID string               `json:"session_id"`
+	Workspace string               `json:"workspace"`
 	Mode      string               `json:"mode"`
 	Provider  string               `json:"provider"`
 	Model     string               `json:"model"`

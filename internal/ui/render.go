@@ -2,6 +2,9 @@ package ui
 
 import (
 	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -10,6 +13,11 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
+
+type markdownRenderCache struct {
+	renderer *glamour.TermRenderer
+	width    int
+}
 
 func (m *Model) View() tea.View {
 	if m.screen != screenChat {
@@ -20,7 +28,7 @@ func (m *Model) View() tea.View {
 	status := m.renderStatus()
 	input := strings.Repeat("\n", 2)
 	if m.screen == screenChat {
-		input = m.input.View()
+		input = m.renderInputBand()
 	}
 	content := strings.Join([]string{header, m.viewport.View(), loading, input, status}, "\n")
 	if m.approval != nil {
@@ -33,18 +41,30 @@ func (m *Model) View() tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
 	view.WindowTitle = "Eylu"
+	if m.screen == screenChat && m.approval == nil {
+		view.Cursor = m.input.Cursor()
+		if view.Cursor != nil {
+			view.Cursor.Position.Y += lipgloss.Height(header) + m.viewport.Height() + lipgloss.Height(loading) + 1
+		}
+	}
 	return view
+}
+
+func (m *Model) renderInputBand() string {
+	rule := m.styles.InputBorder.Render(strings.Repeat("─", m.width))
+	input := strings.TrimRight(m.input.View(), "\n")
+	return strings.Join([]string{rule, input, rule}, "\n")
 }
 
 func (m *Model) resize(width, height int) {
 	m.width = max(40, width)
 	m.height = max(12, height)
 	m.input.SetWidth(m.width)
-	m.input.SetHeight(3)
+	m.input.SetHeight(1)
 	m.modelFilter.SetWidth(max(20, m.width-6))
 	m.form.setWidth(m.width)
 	m.viewport.SetWidth(m.width)
-	m.viewport.SetHeight(max(4, m.height-8))
+	m.viewport.SetHeight(max(4, m.height-6))
 	m.refreshViewport()
 }
 
@@ -125,13 +145,14 @@ func (m *Model) renderStatus() string {
 
 func (m *Model) renderTimeline() string {
 	var output strings.Builder
-	for _, item := range m.timeline {
+	for index := range m.timeline {
+		item := &m.timeline[index]
 		switch item.kind {
 		case timelineMessage:
 			if item.role == "user" {
 				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.User.Render("YOU"), wrapPlain(item.text, m.width-2))
 			} else {
-				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.Agent.Render("EYLU"), m.renderMarkdown(item.text))
+				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.Agent.Render("EYLU"), m.renderTimelineMarkdown(item))
 			}
 		case timelineTool:
 			fmt.Fprintf(&output, "%s\n", m.renderTool(item.tool))
@@ -146,12 +167,32 @@ func (m *Model) renderTimeline() string {
 	return strings.TrimRight(output.String(), "\n")
 }
 
+func (m *Model) renderTimelineMarkdown(item *timelineItem) string {
+	if item == nil {
+		return ""
+	}
+	if item.renderedSource == item.text && item.renderedWidth == m.width &&
+		item.renderedWorkspace == m.snapshot.Workspace && item.renderedNoColor == m.noColor {
+		return item.renderedText
+	}
+	item.renderedSource = item.text
+	item.renderedWidth = m.width
+	item.renderedWorkspace = m.snapshot.Workspace
+	item.renderedNoColor = m.noColor
+	item.renderedText = m.renderMarkdown(item.text)
+	return item.renderedText
+}
+
 func (m *Model) renderTool(tool *toolView) string {
 	if tool == nil {
 		return ""
 	}
 	state := "done"
-	if tool.running {
+	if tool.preparing {
+		state = "generating"
+	} else if tool.running && (tool.name == "write_file" || tool.name == "edit_file") {
+		state = "applying"
+	} else if tool.running {
 		state = "running"
 	} else if tool.isError {
 		state = "failed"
@@ -160,8 +201,31 @@ func (m *Model) renderTool(tool *toolView) string {
 	if tool.durationMS > 0 {
 		duration = fmt.Sprintf("  %dms", tool.durationMS)
 	}
-	arguments := summarizeLine(tool.arguments, max(20, m.width-30))
-	return m.styles.Tool.Render(fmt.Sprintf("> %s  %s%s\n  %s", tool.name, state, duration, arguments))
+	detail := summarizeLine(tool.arguments, max(20, m.width-30))
+	if tool.path != "" {
+		detail = fmt.Sprintf("%s  %s  %d lines", m.renderFileLocationLink(tool.path), formatByteCount(tool.generatedBytes), tool.generatedLines)
+	}
+	lines := []string{fmt.Sprintf("> %s  %s%s", tool.name, state, duration)}
+	if detail != "" {
+		lines = append(lines, "  "+ansi.Truncate(detail, max(10, m.width-2), "..."))
+	}
+	if tool.preview != "" {
+		for _, line := range strings.Split(tool.preview, "\n") {
+			lines = append(lines, "  "+truncateColumns(line, max(10, m.width-2)))
+		}
+	}
+	return m.styles.Tool.Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) renderFileLocationLink(path string) string {
+	if m.noColor || path == "" {
+		return path
+	}
+	directoryURL, ok := localContainingDirectoryURL(m.snapshot.Workspace, path)
+	if !ok {
+		return path
+	}
+	return ansi.SetHyperlink(directoryURL) + path + ansi.ResetHyperlink()
 }
 
 func (m *Model) renderToolDetail() string {
@@ -169,7 +233,11 @@ func (m *Model) renderToolDetail() string {
 		return ""
 	}
 	tool := m.timeline[m.toolCursor].tool
-	return fmt.Sprintf("%s\n\nArguments\n%s\n\nResult\n%s", m.styles.Tool.Render(tool.name), tool.arguments, tool.content)
+	preview := tool.preview
+	if preview == "" {
+		preview = "(no file preview)"
+	}
+	return fmt.Sprintf("%s\n\nLive change\n%s\n\nArguments\n%s\n\nResult\n%s", m.styles.Tool.Render(tool.name), preview, tool.arguments, tool.content)
 }
 
 func (m *Model) renderProviders() string {
@@ -285,15 +353,128 @@ func (m *Model) renderMarkdown(value string) string {
 	if m.noColor || strings.TrimSpace(value) == "" {
 		return wrapPlain(value, m.width-2)
 	}
-	renderer, err := glamour.NewTermRenderer(glamour.WithStandardStyle("dark"), glamour.WithWordWrap(max(20, m.width-2)))
+	width := max(20, m.width-2)
+	if m.markdown.renderer == nil || m.markdown.width != width {
+		renderer, err := glamour.NewTermRenderer(glamour.WithStandardStyle("dark"), glamour.WithWordWrap(width))
+		if err != nil {
+			return wrapPlain(value, m.width-2)
+		}
+		m.markdown.renderer = renderer
+		m.markdown.width = width
+	}
+	rendered, err := m.markdown.renderer.Render(value)
 	if err != nil {
 		return wrapPlain(value, m.width-2)
 	}
-	rendered, err := renderer.Render(value)
-	if err != nil {
-		return wrapPlain(value, m.width-2)
+	return rewriteLocalTerminalLinks(strings.TrimSpace(rendered), m.snapshot.Workspace)
+}
+
+func rewriteLocalTerminalLinks(rendered, workspace string) string {
+	if rendered == "" || workspace == "" {
+		return rendered
 	}
-	return strings.TrimSpace(rendered)
+	const marker = "\x1b]8;"
+	var output strings.Builder
+	rest := rendered
+	for {
+		start := strings.Index(rest, marker)
+		if start < 0 {
+			output.WriteString(rest)
+			return output.String()
+		}
+		output.WriteString(rest[:start])
+		sequence := rest[start:]
+		end := strings.IndexByte(sequence, '\a')
+		if end < 0 {
+			output.WriteString(sequence)
+			return output.String()
+		}
+		header := sequence[len(marker):end]
+		separator := strings.IndexByte(header, ';')
+		if separator < 0 {
+			output.WriteString(sequence[:end+1])
+			rest = sequence[end+1:]
+			continue
+		}
+		params, target := header[:separator], header[separator+1:]
+		if directoryURL, ok := localContainingDirectoryURL(workspace, target); ok {
+			target = directoryURL
+		}
+		output.WriteString(marker + params + ";" + target + "\a")
+		rest = sequence[end+1:]
+	}
+}
+
+func localContainingDirectoryURL(workspace, target string) (string, bool) {
+	if workspace == "" || target == "" || strings.HasPrefix(target, "#") {
+		return "", false
+	}
+	pathValue := target
+	windowsPath := filepath.FromSlash(pathValue)
+	if filepath.VolumeName(windowsPath) == "" {
+		parsed, err := url.Parse(target)
+		if err != nil || parsed.Scheme != "" || parsed.Host != "" {
+			return "", false
+		}
+		pathValue = parsed.Path
+	}
+	decoded, err := url.PathUnescape(pathValue)
+	if err != nil {
+		return "", false
+	}
+	localPath := filepath.FromSlash(decoded)
+	candidates := make([]string, 0, 3)
+	if filepath.VolumeName(localPath) != "" {
+		candidates = append(candidates, localPath)
+	} else {
+		relative := strings.TrimLeft(localPath, `/\\`)
+		if relative == "" {
+			return "", false
+		}
+		candidates = append(candidates, filepath.Join(workspace, relative))
+		parts := strings.FieldsFunc(relative, func(character rune) bool { return character == '/' || character == '\\' })
+		if len(parts) > 0 && strings.EqualFold(parts[0], filepath.Base(filepath.Clean(workspace))) {
+			candidates = append(candidates, filepath.Join(filepath.Dir(filepath.Clean(workspace)), relative))
+		}
+		if filepath.IsAbs(localPath) {
+			candidates = append(candidates, localPath)
+		}
+	}
+	for _, candidate := range candidates {
+		info, statErr := os.Stat(candidate)
+		if statErr != nil {
+			continue
+		}
+		directory := candidate
+		if !info.IsDir() {
+			directory = filepath.Dir(candidate)
+		}
+		return directoryFileURL(directory), true
+	}
+	return "", false
+}
+
+func directoryFileURL(directory string) string {
+	absolute, err := filepath.Abs(directory)
+	if err == nil {
+		directory = absolute
+	}
+	pathValue := filepath.ToSlash(filepath.Clean(directory))
+	if strings.HasPrefix(pathValue, "//") {
+		parts := strings.SplitN(strings.TrimPrefix(pathValue, "//"), "/", 2)
+		host := parts[0]
+		pathValue = "/"
+		if len(parts) == 2 {
+			pathValue += parts[1]
+		}
+		pathValue = strings.TrimSuffix(pathValue, "/") + "/"
+		return (&url.URL{Scheme: "file", Host: host, Path: pathValue}).String()
+	}
+	if filepath.VolumeName(directory) != "" && !strings.HasPrefix(pathValue, "/") {
+		pathValue = "/" + pathValue
+	}
+	pathValue = strings.TrimSuffix(pathValue, "/") + "/"
+	return (&url.URL{Scheme: "file", Path: pathValue}).String()
 }
 
 func stateLabel(state OperationState) string {
@@ -306,6 +487,8 @@ func stateLabel(state OperationState) string {
 		return "Waiting for first token"
 	case StateStreaming:
 		return "Streaming"
+	case StatePreparingTool:
+		return "Preparing file change"
 	case StateExecutingTool:
 		return "Executing tool"
 	case StateAwaitingApproval:
@@ -314,9 +497,21 @@ func stateLabel(state OperationState) string {
 		return "Retrying"
 	case StateCancelling:
 		return "Cancelling"
+	case StateCancelled:
+		return "Cancelled"
 	default:
 		return string(state)
 	}
+}
+
+func formatByteCount(value int) string {
+	if value < 1024 {
+		return fmt.Sprintf("%d B", value)
+	}
+	if value < 1024*1024 {
+		return fmt.Sprintf("%.1f KiB", float64(value)/1024)
+	}
+	return fmt.Sprintf("%.1f MiB", float64(value)/(1024*1024))
 }
 
 func progressBar(percent float64, width int) string {

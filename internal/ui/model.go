@@ -2,7 +2,11 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -37,23 +41,36 @@ const (
 )
 
 type timelineItem struct {
-	kind timelineKind
-	role string
-	text string
-	tool *toolView
-	err  bool
+	kind              timelineKind
+	role              string
+	text              string
+	tool              *toolView
+	err               bool
+	renderedSource    string
+	renderedText      string
+	renderedWidth     int
+	renderedWorkspace string
+	renderedNoColor   bool
 }
 
 type toolView struct {
-	name       string
-	callID     string
-	arguments  string
-	content    string
-	running    bool
-	isError    bool
-	truncated  bool
-	durationMS int64
-	exitCode   int
+	name                 string
+	callID               string
+	outputIndex          int
+	argumentBuffer       strings.Builder
+	arguments            string
+	previewArgumentBytes int
+	content              string
+	path                 string
+	preview              string
+	generatedBytes       int
+	generatedLines       int
+	preparing            bool
+	running              bool
+	isError              bool
+	truncated            bool
+	durationMS           int64
+	exitCode             int
 }
 
 type Model struct {
@@ -94,6 +111,7 @@ type Model struct {
 	animation       bool
 	noColor         bool
 	operationSeq    uint64
+	markdown        markdownRenderCache
 }
 
 type snapshotMsg struct {
@@ -130,6 +148,8 @@ type transitionMsg struct {
 	state       OperationState
 }
 
+type interruptRequestMsg struct{}
+
 func NewModel(backend Backend, options Options) *Model {
 	clock := options.Clock
 	if clock == nil {
@@ -151,9 +171,13 @@ func NewModel(backend Backend, options Options) *Model {
 	input.Prompt = "> "
 	input.ShowLineNumbers = false
 	input.DynamicHeight = false
-	input.SetHeight(3)
+	input.SetHeight(1)
 	input.CharLimit = 1 << 20
-	input.SetVirtualCursor(true)
+	input.SetVirtualCursor(false)
+	inputStyles := input.Styles()
+	inputStyles.Cursor.Shape = tea.CursorBar
+	inputStyles.Cursor.Blink = true
+	input.SetStyles(inputStyles)
 	input.SetWidth(width)
 	filter := textinput.New()
 	filter.Placeholder = "Filter models"
@@ -172,7 +196,7 @@ func NewModel(backend Backend, options Options) *Model {
 }
 
 func Run(backend Backend, options Options) error {
-	programOptions := make([]tea.ProgramOption, 0, 2)
+	programOptions := make([]tea.ProgramOption, 0, 4)
 	if options.Input != nil {
 		programOptions = append(programOptions, tea.WithInput(options.Input))
 	}
@@ -182,7 +206,24 @@ func Run(backend Backend, options Options) error {
 	if options.Context != nil {
 		programOptions = append(programOptions, tea.WithContext(options.Context))
 	}
-	_, err := tea.NewProgram(NewModel(backend, options), programOptions...).Run()
+	programOptions = append(programOptions, tea.WithoutSignalHandler())
+	program := tea.NewProgram(NewModel(backend, options), programOptions...)
+	interrupts := make(chan os.Signal, 2)
+	stopped := make(chan struct{})
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	defer close(stopped)
+	go func() {
+		for {
+			select {
+			case <-stopped:
+				return
+			case <-interrupts:
+				program.Send(interruptRequestMsg{})
+			}
+		}
+	}()
+	_, err := program.Run()
 	return err
 }
 
@@ -207,7 +248,9 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleBackendEvent(typed.event)
 	case backendEventClosedMsg:
 		if typed.operationID == m.operationID {
-			if m.state != StateFailed && m.state != StateCancelling {
+			if m.state == StateCancelling {
+				m.state = StateCancelled
+			} else if m.state != StateFailed && m.state != StateCancelled {
 				m.state = StateCompleted
 			}
 			m.cancel = nil
@@ -259,6 +302,8 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyPressMsg:
 		return m.handleKey(typed)
+	case interruptRequestMsg:
+		return m.handleInterrupt()
 	case tea.PasteMsg:
 		if m.screen == screenChat {
 			updated, command := m.input.Update(message)
@@ -288,10 +333,15 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 	case EventTextDelta:
 		m.state = StateStreaming
 		m.appendAgentDelta(event.Delta)
+	case EventToolCallDelta:
+		m.state = StatePreparingTool
+		if event.ToolCallDelta != nil {
+			m.applyToolCallDelta(*event.ToolCallDelta)
+		}
 	case EventToolStart:
 		m.state = StateExecutingTool
 		if event.ToolCall != nil {
-			m.timeline = append(m.timeline, timelineItem{kind: timelineTool, tool: &toolView{name: event.ToolCall.Name, callID: event.ToolCall.ID, arguments: string(event.ToolCall.Arguments), running: true}})
+			m.startTool(*event.ToolCall)
 		}
 	case EventToolResult:
 		if event.ToolResult != nil {
@@ -323,15 +373,7 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := message.String()
 	if key == "ctrl+c" {
-		if m.busy() && !m.cancelRequested {
-			m.cancelRequested = true
-			m.state = StateCancelling
-			if m.cancel != nil {
-				m.cancel()
-			}
-			return m, nil
-		}
-		return m, tea.Quit
+		return m.handleInterrupt()
 	}
 	if m.approval != nil {
 		return m.handleApprovalKey(key)
@@ -363,6 +405,20 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, command
 	}
 	return m.handleChatKey(message)
+}
+
+func (m *Model) handleInterrupt() (tea.Model, tea.Cmd) {
+	if m.busy() && !m.cancelRequested {
+		m.cancelRequested = true
+		m.state = StateCancelling
+		if m.cancel != nil {
+			m.cancel()
+		}
+		m.appendNotice("Cancellation requested.", false)
+		m.refreshViewport()
+		return m, nil
+	}
+	return m, tea.Quit
 }
 
 func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -493,7 +549,7 @@ func (m *Model) handleApprovalKey(key string) (tea.Model, tea.Cmd) {
 
 func (m *Model) busy() bool {
 	switch m.state {
-	case StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StateExecutingTool, StateAwaitingApproval, StateRetryBackoff, StateCancelling:
+	case StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateAwaitingApproval, StateRetryBackoff, StateCancelling:
 		return true
 	default:
 		return false
@@ -502,17 +558,39 @@ func (m *Model) busy() bool {
 
 func runBackendCmd(ctx context.Context, backend Backend, operationID, prompt string, events chan Event) tea.Cmd {
 	return func() tea.Msg {
+		enqueue := func(event Event, lossy bool) {
+			if lossy {
+				select {
+				case events <- event:
+				default:
+				}
+				return
+			}
+			select {
+			case events <- event:
+			case <-ctx.Done():
+				select {
+				case events <- event:
+				default:
+				}
+			}
+		}
 		err := backend.Submit(ctx, operationID, prompt, func(event Event) {
 			if event.OperationID == "" {
 				event.OperationID = operationID
 			}
-			events <- event
+			enqueue(event, event.Kind == EventToolCallDelta)
 		})
 		if err != nil {
-			events <- Event{OperationID: operationID, Kind: EventNotice, Notice: err.Error(), Error: true}
-			events <- Event{OperationID: operationID, Kind: EventState, State: StateFailed}
+			if errors.Is(err, context.Canceled) {
+				enqueue(Event{OperationID: operationID, Kind: EventNotice, Notice: "Request cancelled."}, false)
+				enqueue(Event{OperationID: operationID, Kind: EventState, State: StateCancelled}, false)
+			} else {
+				enqueue(Event{OperationID: operationID, Kind: EventNotice, Notice: err.Error(), Error: true}, false)
+				enqueue(Event{OperationID: operationID, Kind: EventState, State: StateFailed}, false)
+			}
 		} else {
-			events <- Event{OperationID: operationID, Kind: EventState, State: StateCompleted}
+			enqueue(Event{OperationID: operationID, Kind: EventState, State: StateCompleted}, false)
 		}
 		close(events)
 		return backendWorkerMsg{operationID: operationID}
@@ -574,13 +652,185 @@ func (m *Model) completeTool(result *protocol.ToolResult) {
 	for index := len(m.timeline) - 1; index >= 0; index-- {
 		item := &m.timeline[index]
 		if item.kind == timelineTool && item.tool != nil && item.tool.callID == result.CallID {
+			item.tool.preparing = false
 			item.tool.running = false
 			item.tool.content = result.Content
 			item.tool.isError = result.IsError
 			item.tool.truncated = result.Truncated
+			if path, ok := result.Metadata["path"].(string); ok && item.tool.path == "" {
+				item.tool.path = path
+			}
+			if bytes, ok := result.Metadata["bytes"].(int); ok {
+				item.tool.generatedBytes = bytes
+			}
+			if lines, ok := result.Metadata["lines"].(int); ok {
+				item.tool.generatedLines = lines
+			}
 			return
 		}
 	}
+}
+
+func (m *Model) applyToolCallDelta(update protocol.ToolCallDelta) {
+	view := m.findTool(update.ID, update.OutputIndex)
+	if view == nil {
+		view = &toolView{callID: update.ID, outputIndex: update.OutputIndex}
+		m.timeline = append(m.timeline, timelineItem{kind: timelineTool, tool: view})
+	}
+	if update.ID != "" {
+		view.callID = update.ID
+	}
+	if update.Name != "" {
+		view.name = update.Name
+	}
+	if update.Arguments != "" {
+		view.replaceArguments(update.Arguments)
+	} else if update.Delta != "" {
+		view.appendArguments(update.Delta)
+	}
+	view.preparing = true
+	view.running = false
+	if view.path == "" || view.preview == "" || update.Done || len(view.arguments)-view.previewArgumentBytes >= 256 || strings.Contains(update.Delta, `\n`) {
+		updateFileToolPreview(view)
+	}
+}
+
+func (m *Model) startTool(call protocol.ToolCall) {
+	view := m.findTool(call.ID, -1)
+	if view == nil {
+		view = &toolView{callID: call.ID}
+		m.timeline = append(m.timeline, timelineItem{kind: timelineTool, tool: view})
+	}
+	view.name = call.Name
+	view.replaceArguments(string(call.Arguments))
+	view.preparing = false
+	view.running = true
+	updateFileToolPreview(view)
+}
+
+func (view *toolView) replaceArguments(arguments string) {
+	view.argumentBuffer.Reset()
+	view.argumentBuffer.WriteString(arguments)
+	view.arguments = view.argumentBuffer.String()
+}
+
+func (view *toolView) appendArguments(delta string) {
+	if view.argumentBuffer.Len() == 0 && view.arguments != "" {
+		view.argumentBuffer.WriteString(view.arguments)
+	}
+	view.argumentBuffer.WriteString(delta)
+	view.arguments = view.argumentBuffer.String()
+}
+
+func (m *Model) findTool(callID string, outputIndex int) *toolView {
+	for index := len(m.timeline) - 1; index >= 0; index-- {
+		item := m.timeline[index]
+		if item.kind != timelineTool || item.tool == nil {
+			continue
+		}
+		if callID != "" && item.tool.callID == callID {
+			return item.tool
+		}
+		if callID == "" && outputIndex >= 0 && item.tool.preparing && item.tool.outputIndex == outputIndex {
+			return item.tool
+		}
+	}
+	return nil
+}
+
+func updateFileToolPreview(view *toolView) {
+	if view == nil {
+		return
+	}
+	path, _ := partialJSONStringField(view.arguments, "path")
+	view.path = path
+	view.previewArgumentBytes = len(view.arguments)
+	switch view.name {
+	case "write_file":
+		content, started := partialJSONStringField(view.arguments, "content")
+		if !started {
+			return
+		}
+		view.generatedBytes = len([]byte(content))
+		view.generatedLines = countTextLines(content)
+		view.preview = prefixedTail(content, "+ ", 6)
+	case "edit_file":
+		oldString, oldStarted := partialJSONStringField(view.arguments, "old_string")
+		newString, newStarted := partialJSONStringField(view.arguments, "new_string")
+		view.generatedBytes = len([]byte(oldString)) + len([]byte(newString))
+		view.generatedLines = countTextLines(newString)
+		parts := make([]string, 0, 2)
+		if oldStarted {
+			parts = append(parts, prefixedTail(oldString, "- ", 2))
+		}
+		if newStarted {
+			parts = append(parts, prefixedTail(newString, "+ ", 4))
+		}
+		view.preview = strings.Join(parts, "\n")
+	}
+}
+
+func partialJSONStringField(arguments, field string) (string, bool) {
+	marker := `"` + field + `"`
+	index := strings.Index(arguments, marker)
+	if index < 0 {
+		return "", false
+	}
+	rest := arguments[index+len(marker):]
+	rest = strings.TrimLeft(rest, " \t\r\n")
+	if len(rest) == 0 || rest[0] != ':' {
+		return "", false
+	}
+	rest = strings.TrimLeft(rest[1:], " \t\r\n")
+	if len(rest) == 0 || rest[0] != '"' {
+		return "", false
+	}
+	encoded := rest[1:]
+	escaped := false
+	for offset := 0; offset < len(encoded); offset++ {
+		switch {
+		case escaped:
+			escaped = false
+		case encoded[offset] == '\\':
+			escaped = true
+		case encoded[offset] == '"':
+			encoded = encoded[:offset]
+			offset = len(encoded)
+		}
+	}
+	for trim := 0; trim <= 12 && trim <= len(encoded); trim++ {
+		candidate := `"` + encoded[:len(encoded)-trim] + `"`
+		var value string
+		if json.Unmarshal([]byte(candidate), &value) == nil {
+			return value, true
+		}
+	}
+	return "", true
+}
+
+func prefixedTail(value, prefix string, limit int) string {
+	if value == "" || limit <= 0 {
+		return ""
+	}
+	lines := strings.Split(value, "\n")
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	for index := range lines {
+		runes := []rune(lines[index])
+		if len(runes) > 240 {
+			lines[index] = "..." + string(runes[len(runes)-237:])
+		}
+		lines[index] = prefix + lines[index]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func countTextLines(value string) int {
+	if value == "" {
+		return 0
+	}
+	return strings.Count(value, "\n") + 1
 }
 
 func (m *Model) applyToolAudit(audit ToolAudit) {

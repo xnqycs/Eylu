@@ -135,7 +135,11 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 			return protocol.ModelResponse{}, err
 		}
 	}
-	resp, err := d.client.Do(httpReq)
+	client := d.client
+	if req.Stream {
+		client = driver.StreamingHTTPClient(client)
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return protocol.ModelResponse{}, mapTransportError(ctx, err)
 	}
@@ -185,8 +189,19 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
 	text := strings.Builder{}
 	calls := make(map[int]*chatToolCall)
+	deltaBuffers := make(map[int]*driver.StreamDeltaBuffer)
 	result := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted}
 	completed := false
+	emitToolDelta := func(index int, call *chatToolCall, delta string, done bool) error {
+		if emit == nil || call == nil {
+			return nil
+		}
+		update := &protocol.ToolCallDelta{OutputIndex: index, ID: call.ID, Name: call.Function.Name, Delta: delta, Done: done}
+		if done {
+			update.Arguments = call.Function.Arguments
+		}
+		return emit(protocol.ModelEvent{Kind: protocol.EventToolCallDelta, ToolCallDelta: update})
+	}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
@@ -197,6 +212,18 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			continue
 		}
 		if payload == "[DONE]" {
+			for index := 0; index < len(calls); index++ {
+				if buffer := deltaBuffers[index]; buffer != nil {
+					if batch := buffer.Flush(); batch != "" {
+						if err := emitToolDelta(index, calls[index], batch, false); err != nil {
+							return protocol.ModelResponse{}, err
+						}
+					}
+				}
+				if err := emitToolDelta(index, calls[index], "", true); err != nil {
+					return protocol.ModelResponse{}, err
+				}
+			}
 			completed = true
 			continue
 		}
@@ -221,18 +248,31 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			}
 			for _, delta := range choice.Delta.ToolCalls {
 				call := calls[delta.Index]
+				created := call == nil
 				if call == nil {
 					copy := delta
-					calls[delta.Index] = &copy
-					continue
+					call = &copy
+					calls[delta.Index] = call
+					deltaBuffers[delta.Index] = &driver.StreamDeltaBuffer{}
+				} else {
+					if delta.ID != "" {
+						call.ID = delta.ID
+					}
+					if delta.Function.Name != "" {
+						call.Function.Name = delta.Function.Name
+					}
+					call.Function.Arguments += delta.Function.Arguments
 				}
-				if delta.ID != "" {
-					call.ID = delta.ID
+				if created {
+					if err := emitToolDelta(delta.Index, call, "", false); err != nil {
+						return protocol.ModelResponse{}, err
+					}
 				}
-				if delta.Function.Name != "" {
-					call.Function.Name = delta.Function.Name
+				if batch, ready := deltaBuffers[delta.Index].Push(delta.Function.Arguments, time.Now()); ready {
+					if err := emitToolDelta(delta.Index, call, batch, false); err != nil {
+						return protocol.ModelResponse{}, err
+					}
 				}
-				call.Function.Arguments += delta.Function.Arguments
 			}
 			result.Stop = stopFromFinishReason(choice.FinishReason)
 		}

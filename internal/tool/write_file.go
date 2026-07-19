@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
@@ -27,7 +28,7 @@ func NewWriteFile(workspace string) (*WriteFile, error) {
 func (w *WriteFile) Definition() protocol.ToolDefinition {
 	return protocol.ToolDefinition{
 		Name:        "write_file",
-		Description: "Atomically create or replace a UTF-8 file inside the workspace. Use for complete file content after inspecting related code. Parent directories are created only when create_parent_dirs is true. Existing file permissions are preserved.",
+		Description: "Atomically create or replace a UTF-8 file inside the workspace. For a requested standalone file, call this directly once the target path and content are clear. Use for complete file content after inspecting relevant related code. Parent directories are created only when create_parent_dirs is true. Existing file permissions are preserved.",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"create_parent_dirs":{"type":"boolean","default":false}},"required":["path","content"],"additionalProperties":false}`),
 	}
 }
@@ -56,10 +57,15 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return toolError(statErr.Error())
 	}
-	if err := writeFileAtomically(path, []byte(input.Content), mode); err != nil {
+	content := []byte(input.Content)
+	if err := writeFileAtomically(path, content, mode); err != nil {
 		return toolError(err.Error())
 	}
-	return protocol.ToolResult{Content: fmt.Sprintf("wrote %d bytes to %s", len([]byte(input.Content)), input.Path), Metadata: map[string]any{"path": path, "bytes": len([]byte(input.Content))}}
+	lines := 0
+	if len(content) > 0 {
+		lines = strings.Count(input.Content, "\n") + 1
+	}
+	return protocol.ToolResult{Content: fmt.Sprintf("wrote %d bytes to %s", len(content), input.Path), Metadata: map[string]any{"path": path, "bytes": len(content), "lines": lines}}
 }
 
 func writeFileAtomically(path string, content []byte, mode os.FileMode) error {

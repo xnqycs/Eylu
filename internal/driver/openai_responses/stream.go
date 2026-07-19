@@ -31,6 +31,7 @@ type callAccumulator struct {
 	ID        string
 	Name      string
 	Arguments strings.Builder
+	Deltas    driver.StreamDeltaBuffer
 }
 
 func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc) (protocol.ModelResponse, error) {
@@ -41,6 +42,16 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 	calls := make(map[int]*callAccumulator)
 	var final *protocol.ModelResponse
 	completed := false
+	emitToolDelta := func(index int, call *callAccumulator, delta string, done bool) error {
+		if emit == nil || call == nil {
+			return nil
+		}
+		update := &protocol.ToolCallDelta{OutputIndex: index, ID: call.ID, Name: call.Name, Delta: delta, Done: done}
+		if done {
+			update.Arguments = call.Arguments.String()
+		}
+		return emit(protocol.ModelEvent{Kind: protocol.EventToolCallDelta, ToolCallDelta: update})
+	}
 	dispatch := func() error {
 		payload := strings.TrimSpace(data.String())
 		data.Reset()
@@ -69,15 +80,37 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 				}
 				call.Arguments.WriteString(event.Item.Arguments)
 				calls[event.OutputIndex] = call
+				if err := emitToolDelta(event.OutputIndex, call, "", false); err != nil {
+					return err
+				}
 			}
 		case "response.function_call_arguments.delta":
 			if call := calls[event.OutputIndex]; call != nil {
 				call.Arguments.WriteString(event.Delta)
+				if batch, ready := call.Deltas.Push(event.Delta, time.Now()); ready {
+					if err := emitToolDelta(event.OutputIndex, call, batch, false); err != nil {
+						return err
+					}
+				}
 			}
 		case "response.function_call_arguments.done":
-			if call := calls[event.OutputIndex]; call != nil && event.Arguments != "" {
-				call.Arguments.Reset()
-				call.Arguments.WriteString(event.Arguments)
+			if call := calls[event.OutputIndex]; call != nil {
+				if batch := call.Deltas.Flush(); batch != "" {
+					if err := emitToolDelta(event.OutputIndex, call, batch, false); err != nil {
+						return err
+					}
+				}
+				arguments := event.Arguments
+				if arguments == "" {
+					arguments = event.Item.Arguments
+				}
+				if arguments != "" {
+					call.Arguments.Reset()
+					call.Arguments.WriteString(arguments)
+				}
+				if err := emitToolDelta(event.OutputIndex, call, "", true); err != nil {
+					return err
+				}
 			}
 		case "response.completed":
 			converted := convertResponse(event.Response)

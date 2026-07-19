@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"Eylu/internal/driver"
 	"Eylu/internal/protocol"
@@ -68,6 +69,41 @@ func TestChatStreamMergesTextAndRejectsDisconnect(t *testing.T) {
 	_, err = New(disconnected.Client()).Generate(context.Background(), request, nil)
 	if typed, ok := err.(*protocol.Error); !ok || typed.Code != protocol.ErrNetwork {
 		t.Fatalf("disconnect error = %#v", err)
+	}
+}
+
+func TestChatStreamEmitsToolArgumentDeltasAndOutlivesClientTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":\"\"}]}\n\n"))
+		w.(http.Flusher).Flush()
+		time.Sleep(75 * time.Millisecond)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"index.html\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	client := server.Client()
+	client.Timeout = 20 * time.Millisecond
+	request := driver.Request{BaseURL: server.URL, APIKey: "key", Stream: true, Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "create"}}}}}}
+	var deltas []protocol.ToolCallDelta
+	response, err := New(client).Generate(context.Background(), request, func(event protocol.ModelEvent) error {
+		if event.Kind == protocol.EventToolCallDelta && event.ToolCallDelta != nil {
+			deltas = append(deltas, *event.ToolCallDelta)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Stop != protocol.StopToolUse || len(response.Turn.Parts) != 1 || len(deltas) != 3 {
+		t.Fatalf("response=%#v deltas=%#v", response, deltas)
+	}
+	if deltas[0].Delta+deltas[1].Delta != `{"path":"index.html"}` || !deltas[2].Done || deltas[2].Arguments != `{"path":"index.html"}` {
+		t.Fatalf("deltas = %#v", deltas)
+	}
+	if client.Timeout != 20*time.Millisecond {
+		t.Fatalf("shared client timeout = %s", client.Timeout)
 	}
 }
 

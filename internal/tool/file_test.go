@@ -53,6 +53,9 @@ func TestReadAndWriteFileBoundaries(t *testing.T) {
 	if written.IsError {
 		t.Fatalf("write result = %#v", written)
 	}
+	if written.Metadata["bytes"] != 5 || written.Metadata["lines"] != 1 {
+		t.Fatalf("write metadata = %#v", written.Metadata)
+	}
 	data, err := os.ReadFile(filepath.Join(workspace, "nested", "new.txt"))
 	if err != nil || string(data) != "value" {
 		t.Fatalf("file = %q, %v", data, err)

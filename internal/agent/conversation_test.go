@@ -136,6 +136,9 @@ func TestConversationModeChangesPromptAndClearsDriverState(t *testing.T) {
 	if got := fake.requests[1].Model.Turns[0].Parts[0].Text; !strings.Contains(got, "Current permission mode: auto") {
 		t.Fatalf("auto prompt = %q", got)
 	}
+	if got := fake.requests[1].Model.Turns[0].Parts[0].Text; !strings.Contains(got, "Act through tools early") || !strings.Contains(got, "Inspect only files relevant") {
+		t.Fatalf("execution guidance missing from prompt = %q", got)
+	}
 }
 
 func testRuntime(modelDriver driver.ModelDriver, generation uint64) Runtime {
