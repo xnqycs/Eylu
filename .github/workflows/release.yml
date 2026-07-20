@@ -63,6 +63,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Attest release artifacts
+        if: github.event.repository.visibility == 'public'
         uses: actions/attest@v4
         with:
           subject-path: |

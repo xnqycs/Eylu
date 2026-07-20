@@ -241,7 +241,7 @@ goreleaser release --snapshot --clean --skip=sign
 
 CI 在 Linux、Windows、macOS 执行测试、vet、原生构建和 smoke test；Linux 质量任务额外执行 race detector、格式检查、第三方声明漂移检查、GitHub Actions 检查与 Staticcheck。发布 tag 使用严格 SemVer 格式。
 
-稳定版使用 `vMAJOR.MINOR.PATCH` 标签，预览版在版本号后增加 SemVer 预发布标识。发布工作流只接受 main 分支历史中的标签；它会先复用完整 CI，再创建草稿 Release、上传和证明全部产物，最后公开 Release。`rc`、`beta`、`alpha` 等预发布标签会自动显示为 GitHub Pre-release：
+稳定版使用 `vMAJOR.MINOR.PATCH` 标签，预览版在版本号后增加 SemVer 预发布标识。发布工作流只接受 main 分支历史中的标签；它会先复用完整 CI，再创建草稿 Release、上传全部产物，并在公开仓库中生成构建来源证明，最后公开 Release。`rc`、`beta`、`alpha` 等预发布标签会自动显示为 GitHub Pre-release：
 
 ```bash
 # 稳定版
