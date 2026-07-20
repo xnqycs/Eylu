@@ -32,11 +32,19 @@ import (
 )
 
 func TestFormatRequestCompletionUsesInterruptedLabelAndScaledDurations(t *testing.T) {
-	metric := metrics.RequestMetric{DurationMS: 18023, FirstTokenMS: 3053, ToolSuccessRate: 1}
+	metric := metrics.RequestMetric{DurationMS: 18023, FirstTokenMS: 3053, GenerationMS: 2000, TokensPerSecond: 42.64, Usage: protocol.Usage{OutputTokens: 85, Exact: true}}
 	got := formatRequestCompletion(metric, true)
-	want := "Interrupted after 18.023s; first token 3.053s; tool success 100%."
+	want := "Interrupted after 18.023s; TTFT 3.053s; TPS 42.6 t/s."
 	if got != want {
 		t.Fatalf("formatRequestCompletion() = %q, want %q", got, want)
+	}
+	estimated := formatRequestCompletion(metrics.RequestMetric{DurationMS: 1000, TokensPerSecond: 8, Usage: protocol.Usage{OutputTokens: 8}}, false)
+	if estimated != "Completed in 1s; TTFT n/a; TPS ~8.0 t/s." {
+		t.Fatalf("estimated completion = %q", estimated)
+	}
+	empty := formatRequestCompletion(metrics.RequestMetric{DurationMS: 10}, false)
+	if empty != "Completed in 10ms; TTFT n/a; TPS n/a." {
+		t.Fatalf("empty completion = %q", empty)
 	}
 }
 
@@ -73,8 +81,11 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 	conversation := agent.NewConversationWithEnvironment(environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: "2026-07-19"})
 	backend := &tuiBackend{runtime: runtime, conversation: conversation, manager: manager, skills: registry, skillSession: skill.NewSession(registry, nil)}
 	events := make([]ui.Event, 0)
-	if err := backend.Submit(context.Background(), "op-1", ui.Submission{Text: "hello"}, func(event ui.Event) { events = append(events, event) }); err != nil {
+	if err := backend.Submit(context.Background(), "op-1", ui.Submission{Text: "hello", HistoryText: "hello"}, func(event ui.Event) { events = append(events, event) }); err != nil {
 		t.Fatal(err)
+	}
+	if history := conversation.ExportState().PromptHistory; len(history) != 1 || history[0] != "hello" {
+		t.Fatalf("prompt history = %#v", history)
 	}
 	var text strings.Builder
 	textEvents := 0
@@ -354,7 +365,7 @@ func TestTUIAskTodoAndSessionRestoreSmoke(t *testing.T) {
 func TestTUIBackendPreparesGitAwareFileAndSkillReferences(t *testing.T) {
 	workspace := t.TempDir()
 	runAppGit(t, workspace, "init")
-	if err := os.WriteFile(filepath.Join(workspace, ".gitignore"), []byte("ignored.txt\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, ".gitignore"), []byte("ignored.txt\nbuild/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workspace, "visible.go"), []byte("package visible\n"), 0o600); err != nil {
@@ -364,6 +375,12 @@ func TestTUIBackendPreparesGitAwareFileAndSkillReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workspace, "ignored.txt"), []byte("secret ignored\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, "build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "build", "index.html"), []byte("<main>ignored build</main>\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
@@ -414,6 +431,16 @@ func TestTUIBackendPreparesGitAwareFileAndSkillReferences(t *testing.T) {
 	}
 	if !strings.Contains(prompt, `<referenced_file path="space name.go"`) || !strings.Contains(prompt, "package spaced") || backend.conversation.ActivatedSkillDigests()["review"] == "" {
 		t.Fatalf("prompt=%q skills=%v", prompt, backend.conversation.ActivatedSkillDigests())
+	}
+	ignoredPrompt, err := backend.prepareSubmission(context.Background(), ui.Submission{
+		Text: "inspect @index.html and @build/index.html",
+		References: []ui.Reference{
+			{Kind: ui.ReferenceFile, Value: "index.html"},
+			{Kind: ui.ReferenceFile, Value: "build/index.html"},
+		},
+	}, cfg)
+	if err != nil || !strings.Contains(ignoredPrompt, "<main>ignored build</main>") || strings.Count(ignoredPrompt, `<referenced_file path="build/index.html"`) != 1 {
+		t.Fatalf("ignored prompt=%q err=%v", ignoredPrompt, err)
 	}
 }
 

@@ -99,6 +99,44 @@ func TestRepositoryIndexNULSpecialNameAndFallback(t *testing.T) {
 	}
 }
 
+func TestRepositoryIndexResolvesExactAndUniqueIgnoredReferences(t *testing.T) {
+	workspace := t.TempDir()
+	git(t, workspace, "init")
+	writeTestFile(t, workspace, ".gitignore", "build/\n")
+	writeTestFile(t, workspace, "build/index.html", "<main>Eylu</main>\n")
+	writeTestFile(t, workspace, "src/main.go", "package main\n")
+	index, err := NewRepositoryIndex(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exact, err := index.ResolveFileReference(context.Background(), "build/index.html")
+	if err != nil || exact.Relative != "build/index.html" {
+		t.Fatalf("exact=%#v err=%v", exact, err)
+	}
+	unique, err := index.ResolveFileReference(context.Background(), "index.html")
+	if err != nil || unique.Relative != "build/index.html" {
+		t.Fatalf("unique=%#v err=%v", unique, err)
+	}
+}
+
+func TestRepositoryIndexRejectsAmbiguousAndEscapingReferences(t *testing.T) {
+	workspace := t.TempDir()
+	writeTestFile(t, workspace, "a/index.html", "a")
+	writeTestFile(t, workspace, "b/index.html", "b")
+	index, err := NewRepositoryIndex(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := index.ResolveFileReference(context.Background(), "index.html"); err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "a/index.html") || !strings.Contains(err.Error(), "b/index.html") {
+		t.Fatalf("ambiguous err=%v", err)
+	}
+	if _, err := index.ResolveFileReference(context.Background(), "../outside.txt"); err == nil || !strings.Contains(err.Error(), "outside workspace") {
+		t.Fatalf("escape err=%v", err)
+	}
+}
+
 func git(t *testing.T, directory string, args ...string) {
 	t.Helper()
 	command := exec.Command("git", args...)

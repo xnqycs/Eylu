@@ -236,6 +236,7 @@ func (r *runtime) prepareManager(ctx context.Context, opts chatOptions) (*provid
 }
 
 func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
+	conversation.RecordPrompt(prompt)
 	cfg := manager.Config()
 	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
 	report := conversation.ContextReport()
@@ -415,8 +416,8 @@ func (r *runtime) reportMetric(jsonlEncoder *json.Encoder, metric metrics.Reques
 		return
 	}
 	if r.output == "text" {
-		fmt.Fprintf(r.stderr, "[metrics] timestamp=%s session_id=%s request_id=%s provider_name=%s provider_generation=%d model=%s first_token_ms=%d duration_ms=%d tool_success_rate=%.3f compression_count=%d input_tokens=%d output_tokens=%d estimated_cost=%.8f error_code=%s\n",
-			metric.Timestamp.Format(time.RFC3339Nano), metric.SessionID, metric.RequestID, metric.Provider, metric.ProviderGeneration, metric.Model, metric.FirstTokenMS, metric.DurationMS, metric.ToolSuccessRate, metric.CompressionCount, metric.Usage.InputTokens, metric.Usage.OutputTokens, metric.EstimatedCost, metric.ErrorCode)
+		fmt.Fprintf(r.stderr, "[metrics] timestamp=%s session_id=%s request_id=%s provider_name=%s provider_generation=%d model=%s first_token_ms=%d generation_ms=%d tokens_per_second=%.3f duration_ms=%d tool_success_rate=%.3f compression_count=%d input_tokens=%d output_tokens=%d estimated_cost=%.8f error_code=%s\n",
+			metric.Timestamp.Format(time.RFC3339Nano), metric.SessionID, metric.RequestID, metric.Provider, metric.ProviderGeneration, metric.Model, metric.FirstTokenMS, metric.GenerationMS, metric.TokensPerSecond, metric.DurationMS, metric.ToolSuccessRate, metric.CompressionCount, metric.Usage.InputTokens, metric.Usage.OutputTokens, metric.EstimatedCost, metric.ErrorCode)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -70,6 +71,99 @@ func (i *RepositoryIndex) Snapshot() IndexSnapshot {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return cloneSnapshot(i.snapshot)
+}
+
+// ResolveFileReference resolves an exact workspace path first, then a unique
+// basename across the workspace. The basename scan includes ignored files.
+func (i *RepositoryIndex) ResolveFileReference(ctx context.Context, value string) (IndexedFile, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return IndexedFile{}, errors.New("referenced file path is required")
+	}
+	if resolved, err := i.paths.existing(filepath.FromSlash(value)); err == nil {
+		return i.indexedFile(resolved)
+	} else if filepath.IsAbs(value) || strings.ContainsAny(value, `/\`) {
+		return IndexedFile{}, fmt.Errorf("resolve referenced file %q: %w", value, err)
+	}
+
+	matches := make([]IndexedFile, 0, 2)
+	visited := 0
+	err := filepath.WalkDir(i.workspace, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if path == i.workspace {
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		visited++
+		if visited > MaxIndexedFiles {
+			return fmt.Errorf("workspace file scan exceeded %d files; use an exact path", MaxIndexedFiles)
+		}
+		if !sameReferenceBase(entry.Name(), value) {
+			return nil
+		}
+		file, fileErr := i.indexedFile(path)
+		if fileErr != nil {
+			return fileErr
+		}
+		matches = append(matches, file)
+		if len(matches) >= 2 {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return IndexedFile{}, err
+	}
+	switch len(matches) {
+	case 0:
+		return IndexedFile{}, fmt.Errorf("referenced file %q was not found", value)
+	case 1:
+		return matches[0], nil
+	default:
+		return IndexedFile{}, fmt.Errorf("ambiguous file reference %q: %s, %s", value, matches[0].Relative, matches[1].Relative)
+	}
+}
+
+func (i *RepositoryIndex) indexedFile(absolute string) (IndexedFile, error) {
+	info, err := os.Stat(absolute)
+	if err != nil {
+		return IndexedFile{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return IndexedFile{}, errors.New("referenced path is not a regular file")
+	}
+	relative, err := filepath.Rel(i.workspace, absolute)
+	if err != nil || !inside(i.workspace, absolute) {
+		return IndexedFile{}, errors.New("referenced file is outside workspace")
+	}
+	return IndexedFile{Relative: filepath.ToSlash(relative), Absolute: absolute, Size: info.Size()}, nil
+}
+
+func sameReferenceBase(left, right string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func (i *RepositoryIndex) fromGit(ctx context.Context) (IndexSnapshot, error) {

@@ -16,6 +16,7 @@ type EventType string
 const (
 	EventSessionCreated  EventType = "session_created"
 	EventTurnAppended    EventType = "turn_appended"
+	EventPromptRecorded  EventType = "prompt_recorded"
 	EventRuntimeUpdated  EventType = "runtime_updated"
 	EventDriverState     EventType = "driver_state_updated"
 	EventSkillActivated  EventType = "skill_activated"
@@ -65,6 +66,7 @@ type Snapshot struct {
 	PermissionMode string                    `json:"permission_mode"`
 	Provider       ProviderState             `json:"provider"`
 	Turns          []protocol.Turn           `json:"turns"`
+	PromptHistory  []string                  `json:"prompt_history"`
 	DriverState    json.RawMessage           `json:"driver_state,omitempty"`
 	SkillCatalog   string                    `json:"skill_catalog,omitempty"`
 	Skills         []SkillState              `json:"skills,omitempty"`
@@ -86,6 +88,7 @@ type Event struct {
 	PermissionMode string                     `json:"permission_mode,omitempty"`
 	Provider       *ProviderState             `json:"provider,omitempty"`
 	Turn           *protocol.Turn             `json:"turn,omitempty"`
+	Prompt         string                     `json:"prompt,omitempty"`
 	DriverState    json.RawMessage            `json:"driver_state,omitempty"`
 	Skill          *SkillState                `json:"skill,omitempty"`
 	SkillCatalog   string                     `json:"skill_catalog,omitempty"`

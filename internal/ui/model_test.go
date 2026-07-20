@@ -426,7 +426,7 @@ func TestPlanCompletionGateAutoFullRejectAndFeedback(t *testing.T) {
 	_, _ = model.handlePlanGateKey("tab")
 	model.planGate.feedback.SetValue("Keep the public API stable")
 	_, feedbackCommand := model.handlePlanGateKey("enter")
-	if feedbackCommand == nil || model.state != StateConnecting || !strings.Contains(model.draft, "Keep the public API stable") || model.operationMode != "plan" {
+	if feedbackCommand == nil || model.state != StateConnecting || !strings.Contains(model.draft, "Keep the public API stable") || model.operationMode != "plan" || len(model.promptHistory) != 1 || model.promptHistory[0] != "Keep the public API stable" {
 		t.Fatalf("state=%s mode=%q draft=%q command=%v", model.state, model.operationMode, model.draft, feedbackCommand)
 	}
 
@@ -702,6 +702,13 @@ func TestLocalMarkdownLinkTargetsContainingWorkspaceDirectory(t *testing.T) {
 	toolRendered := model.renderTool(&toolView{name: "write_file", path: "index.html", generatedBytes: 17, generatedLines: 1})
 	if !strings.Contains(toolRendered, ";"+directoryURL+"\x07") {
 		t.Fatalf("tool file hyperlink missing: %q", toolRendered)
+	}
+	readResult := protocol.ToolResult{CallID: "read", Content: "one\ntwo", Metadata: map[string]any{"path": file, "bytes": int64(17), "lines": float64(2), "lines_complete": true}}
+	model.timeline = []timelineItem{{kind: timelineTool, tool: &toolView{name: "read_file", callID: "read"}}}
+	model.completeTool(&readResult)
+	readRendered := ansi.Strip(model.renderTool(model.timeline[0].tool))
+	if !strings.Contains(readRendered, "17 B") || !strings.Contains(readRendered, "2 lines") {
+		t.Fatalf("read tool stats = %q tool=%#v", readRendered, model.timeline[0].tool)
 	}
 	longDirectory := strings.Repeat("nested-", 10)
 	longRelativePath := filepath.Join(longDirectory, "a-very-long-generated-file-name.html")
@@ -1051,8 +1058,8 @@ func TestMultilineInputCompletionReferencesAndModeCycle(t *testing.T) {
 	if !strings.Contains(labels, "@skill:review") || !strings.Contains(labels, "@file:internal/ui/model.go") {
 		t.Fatalf("reference items = %s", labels)
 	}
-	references := parseReferences("use @skill:review and @file:\"space name.go\" with\u3000@file:\"中文 路径.go\" @file:internal/ui/model.go")
-	if len(references) != 4 || references[0] != (Reference{Kind: ReferenceSkill, Value: "review"}) || references[1].Value != "space name.go" || references[2].Value != "中文 路径.go" {
+	references := parseReferences("use @skill:review and @file:\"space name.go\" with\u3000@file:\"中文 路径.go\" @file:internal/ui/model.go @index.html @\"bare name.go\"")
+	if len(references) != 6 || references[0] != (Reference{Kind: ReferenceSkill, Value: "review"}) || references[1].Value != "space name.go" || references[2].Value != "中文 路径.go" || references[4] != (Reference{Kind: ReferenceFile, Value: "index.html"}) || references[5].Value != "bare name.go" {
 		t.Fatalf("references = %#v", references)
 	}
 	largeFiles := make([]FileItem, 1_000)
@@ -1072,6 +1079,11 @@ func TestMultilineInputCompletionReferencesAndModeCycle(t *testing.T) {
 	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter, Mod: tea.ModCtrl}))
 	if model.input.Value() != "\n" {
 		t.Fatalf("ctrl+enter value = %q", model.input.Value())
+	}
+	model.input.Reset()
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: 'j', Mod: tea.ModCtrl}))
+	if model.input.Value() != "\n" {
+		t.Fatalf("ctrl+j value = %q", model.input.Value())
 	}
 	model.input.Reset()
 	for index := 0; index < 10; index++ {
@@ -1114,6 +1126,62 @@ func TestMultilineInputCompletionReferencesAndModeCycle(t *testing.T) {
 				t.Fatalf("%dx%d completion line width=%d line=%q", size.width, size.height, lipgloss.Width(line), line)
 			}
 		}
+	}
+}
+
+func TestPromptHistoryNavigationPreservesDraftAndVisualBoundaries(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 20})
+	_ = model.input.Focus()
+	_, _ = model.Update(snapshotMsg{snapshot: Snapshot{SessionID: "session", PromptHistory: []string{"older\nsecond line", "newest"}}})
+	model.input.SetValue("draft")
+	model.input.MoveToEnd()
+
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+	if model.input.Value() != "newest" {
+		t.Fatalf("latest history = %q", model.input.Value())
+	}
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+	if model.input.Value() != "older\nsecond line" {
+		t.Fatalf("older history = %q", model.input.Value())
+	}
+	// The recalled multiline prompt starts at its end, so Up first moves the
+	// cursor through the input before it can cross the visual top boundary.
+	if model.input.Line() != 1 {
+		t.Fatalf("recalled cursor line = %d", model.input.Line())
+	}
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	if model.input.Value() != "newest" {
+		t.Fatalf("newer history = %q", model.input.Value())
+	}
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	if model.input.Value() != "draft" {
+		t.Fatalf("restored draft = %q", model.input.Value())
+	}
+
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: 'x', Text: "x"}))
+	if model.input.Value() != "newestx" || model.historyIndex != -1 {
+		t.Fatalf("edited history value=%q index=%d", model.input.Value(), model.historyIndex)
+	}
+
+	model.completion = completionState{kind: completionReference, cursor: 1, items: []completionItem{{label: "one"}, {label: "two"}}}
+	before := model.input.Value()
+	_, _ = model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+	if model.input.Value() != before || model.completion.cursor != 0 {
+		t.Fatalf("completion priority value=%q cursor=%d", model.input.Value(), model.completion.cursor)
+	}
+
+	_, _ = model.Update(snapshotMsg{snapshot: Snapshot{SessionID: "new-session", PromptHistory: []string{}}})
+	if len(model.promptHistory) != 0 || model.historyIndex != -1 {
+		t.Fatalf("new session history=%#v index=%d", model.promptHistory, model.historyIndex)
+	}
+}
+
+func TestViewRequestsKeyboardEnhancements(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true})
+	view := model.View()
+	if !view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes || !view.KeyboardEnhancements.ReportAssociatedText {
+		t.Fatalf("keyboard enhancements = %#v", view.KeyboardEnhancements)
 	}
 }
 

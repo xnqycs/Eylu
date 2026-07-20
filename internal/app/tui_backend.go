@@ -95,7 +95,7 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 	}
 	snapshot := ui.Snapshot{
 		SessionID: b.conversation.SessionID(), Workspace: b.runtime.workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
-		Context: b.conversation.ContextReport(), TodoList: state.TodoList,
+		Context: b.conversation.ContextReport(), TodoList: state.TodoList, PromptHistory: append([]string{}, state.PromptHistory...),
 	}
 	managerActive, _ := b.manager.Active()
 	for _, item := range b.manager.List() {
@@ -114,10 +114,21 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 	return snapshot, nil
 }
 
-func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission ui.Submission, emit func(ui.Event)) error {
+func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission ui.Submission, emit func(ui.Event)) (returnErr error) {
 	b.mu.Lock()
 	opts := b.opts
 	b.mu.Unlock()
+	if submission.HistoryText != "" {
+		b.conversation.RecordPrompt(submission.HistoryText)
+	}
+	defer func() {
+		if b.runtime.session == nil {
+			return
+		}
+		if syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, returnErr); returnErr == nil {
+			returnErr = syncErr
+		}
+	}()
 	cfg := b.manager.Config()
 	prompt, err := b.prepareSubmission(ctx, submission, cfg)
 	if err != nil {
@@ -217,11 +228,6 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	metric := observation.Finish(response.Usage, err)
 	interrupted := errors.Is(err, agent.ErrRequestInterrupted)
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: formatRequestCompletion(metric, interrupted)})
-	if b.runtime.session != nil {
-		if syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, err); err == nil {
-			err = syncErr
-		}
-	}
 	report := b.conversation.ContextReport()
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &report})
 	if interrupted {
@@ -235,7 +241,19 @@ func formatRequestCompletion(metric metrics.RequestMetric, interrupted bool) str
 	if interrupted {
 		label = "Interrupted after"
 	}
-	return fmt.Sprintf("%s %s; first token %s; tool success %.0f%%.", label, ui.FormatDurationMS(metric.DurationMS), ui.FormatDurationMS(metric.FirstTokenMS), metric.ToolSuccessRate*100)
+	ttft := "n/a"
+	if metric.FirstTokenMS > 0 {
+		ttft = ui.FormatDurationMS(metric.FirstTokenMS)
+	}
+	tps := "n/a"
+	if metric.TokensPerSecond > 0 && metric.Usage.OutputTokens > 0 {
+		prefix := ""
+		if !metric.Usage.Exact {
+			prefix = "~"
+		}
+		tps = fmt.Sprintf("%s%.1f t/s", prefix, metric.TokensPerSecond)
+	}
+	return fmt.Sprintf("%s %s; TTFT %s; TPS %s.", label, ui.FormatDurationMS(metric.DurationMS), ttft, tps)
 }
 
 const maxSubmissionReferences = 32
@@ -270,29 +288,25 @@ func (b *tuiBackend) prepareSubmission(ctx context.Context, submission ui.Submis
 		if err != nil {
 			return "", err
 		}
-		snapshot := index.Refresh(ctx)
-		if snapshot.Diagnostic != "" {
-			if _, statErr := os.Stat(filepath.Join(b.runtime.workspace, ".git")); statErr == nil {
-				return "", fmt.Errorf("git file index unavailable: %s", snapshot.Diagnostic)
-			}
-		}
-		indexed := make(map[string]struct{}, len(snapshot.Files))
-		for _, item := range snapshot.Files {
-			indexed[filepath.ToSlash(item.Relative)] = struct{}{}
-		}
 		reader, err := tool.NewReadFile(b.runtime.workspace, cfg.MaxReadBytes)
 		if err != nil {
 			return "", err
 		}
 		injectedBytes := 0
+		seenFiles := make(map[string]struct{})
 		for _, reference := range references {
 			if reference.Kind != ui.ReferenceFile {
 				continue
 			}
-			path := filepath.ToSlash(filepath.Clean(reference.Value))
-			if _, ok := indexed[path]; !ok {
-				return "", fmt.Errorf("referenced file is outside the Git-aware index: %s", reference.Value)
+			resolved, resolveErr := index.ResolveFileReference(ctx, reference.Value)
+			if resolveErr != nil {
+				return "", resolveErr
 			}
+			path := resolved.Relative
+			if _, duplicate := seenFiles[path]; duplicate {
+				continue
+			}
+			seenFiles[path] = struct{}{}
 			raw, _ := json.Marshal(map[string]string{"path": path})
 			result := reader.Execute(ctx, raw)
 			if result.IsError {

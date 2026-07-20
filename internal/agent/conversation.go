@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +64,7 @@ type Conversation struct {
 	mu                  sync.Mutex
 	sessionID           string
 	turns               []protocol.Turn
+	promptHistory       []string
 	closed              map[string][]protocol.Turn
 	driverState         json.RawMessage
 	providerName        string
@@ -93,7 +95,7 @@ func NewConversation() *Conversation {
 }
 
 func NewConversationWithEnvironment(environmentContext environment.Context) *Conversation {
-	conversation := &Conversation{sessionID: uuid.NewString(), closed: make(map[string][]protocol.Turn), ledger: contextledger.New(nil), permissionMode: "manual", protectedSkills: make(map[string]ProtectedSkill), omittedTurnIDs: make(map[string]struct{}), projectMapDirty: true}
+	conversation := &Conversation{sessionID: uuid.NewString(), turns: nil, promptHistory: []string{}, closed: make(map[string][]protocol.Turn), ledger: contextledger.New(nil), permissionMode: "manual", protectedSkills: make(map[string]ProtectedSkill), omittedTurnIDs: make(map[string]struct{}), projectMapDirty: true}
 	conversation.environment = environmentContext
 	conversation.systemPrompt = promptForRuntime("manual")
 	conversation.rebuildLedger(Runtime{})
@@ -110,6 +112,16 @@ func (c *Conversation) Transcript() []protocol.Turn {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return cloneTurns(c.turns)
+}
+
+func (c *Conversation) RecordPrompt(prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return
+	}
+	c.mu.Lock()
+	c.promptHistory = append(c.promptHistory, prompt)
+	c.mu.Unlock()
 }
 
 func (c *Conversation) ClosedTranscript(sessionID string) ([]protocol.Turn, bool) {
@@ -130,6 +142,7 @@ func (c *Conversation) NewSessionWithEnvironment(environmentContext environment.
 	c.closed[old] = cloneTurns(c.turns)
 	c.sessionID = uuid.NewString()
 	c.turns = nil
+	c.promptHistory = []string{}
 	c.driverState = nil
 	c.providerName = ""
 	c.providerGeneration = 0

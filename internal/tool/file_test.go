@@ -29,6 +29,9 @@ func TestReadAndWriteFileBoundaries(t *testing.T) {
 	if result.IsError || !result.Truncated || !strings.HasPrefix(result.Content, "hello") {
 		t.Fatalf("read result = %#v", result)
 	}
+	if result.Metadata["bytes"] != int64(11) || result.Metadata["lines"] != 1 || result.Metadata["lines_complete"] != false {
+		t.Fatalf("read metadata = %#v", result.Metadata)
+	}
 	traversal := reader.Execute(context.Background(), mustJSON(t, map[string]any{"path": filepath.Join("..", filepath.Base(outside), "secret.txt")}))
 	if !traversal.IsError || !strings.Contains(traversal.Content, "outside workspace") {
 		t.Fatalf("traversal result = %#v", traversal)

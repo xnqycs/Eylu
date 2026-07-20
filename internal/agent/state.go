@@ -35,6 +35,7 @@ type ProviderState struct {
 type ConversationState struct {
 	SessionID       string                    `json:"session_id"`
 	Turns           []protocol.Turn           `json:"turns"`
+	PromptHistory   []string                  `json:"prompt_history"`
 	DriverState     json.RawMessage           `json:"driver_state,omitempty"`
 	Provider        ProviderState             `json:"provider"`
 	Workspace       string                    `json:"workspace"`
@@ -52,7 +53,7 @@ func (c *Conversation) ExportState() ConversationState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	state := ConversationState{
-		SessionID: c.sessionID, Turns: cloneTurns(c.turns), DriverState: append(json.RawMessage(nil), c.driverState...),
+		SessionID: c.sessionID, Turns: cloneTurns(c.turns), PromptHistory: append([]string{}, c.promptHistory...), DriverState: append(json.RawMessage(nil), c.driverState...),
 		Provider: ProviderState{
 			Name: c.providerName, Generation: c.providerGeneration, Adapter: c.providerAdapter, BaseURL: c.providerBaseURL, Model: c.providerModel, CatalogProvider: c.lastRuntime.Provider.Config.CatalogProvider,
 			ContextWindow: c.lastRuntime.Provider.Config.ContextWindow, DetectedContextWindow: c.lastRuntime.Provider.Limits.ContextWindow,
@@ -88,6 +89,7 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 	defer conversation.mu.Unlock()
 	conversation.sessionID = state.SessionID
 	conversation.turns = cloneTurns(state.Turns)
+	conversation.promptHistory = append([]string{}, state.PromptHistory...)
 	conversation.driverState = append(json.RawMessage(nil), state.DriverState...)
 	conversation.providerName = state.Provider.Name
 	conversation.providerGeneration = state.Provider.Generation

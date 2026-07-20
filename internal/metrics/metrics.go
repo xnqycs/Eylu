@@ -31,6 +31,8 @@ type RequestMetric struct {
 	Model              string         `json:"model"`
 	Task               string         `json:"task,omitempty"`
 	FirstTokenMS       int64          `json:"first_token_ms,omitempty"`
+	GenerationMS       int64          `json:"generation_ms,omitempty"`
+	TokensPerSecond    float64        `json:"tokens_per_second,omitempty"`
 	DurationMS         int64          `json:"duration_ms"`
 	ToolCalls          int            `json:"tool_calls"`
 	ToolSuccesses      int            `json:"tool_successes"`
@@ -57,6 +59,7 @@ type Summary struct {
 type Collector struct {
 	mu      sync.Mutex
 	records []RequestMetric
+	now     func() time.Time
 }
 
 type Observation struct {
@@ -65,18 +68,25 @@ type Observation struct {
 	metadata      Metadata
 	started       time.Time
 	firstToken    time.Time
+	roundFirst    time.Time
+	generation    time.Duration
 	toolCalls     int
 	toolSuccesses int
 	compressions  int
 	usage         protocol.Usage
 	finished      bool
+	now           func() time.Time
 }
 
 func (c *Collector) Begin(metadata Metadata) *Observation {
 	if metadata.RequestID == "" {
 		metadata.RequestID = uuid.NewString()
 	}
-	return &Observation{collector: c, metadata: metadata, started: time.Now()}
+	now := time.Now
+	if c != nil && c.now != nil {
+		now = c.now
+	}
+	return &Observation{collector: c, metadata: metadata, started: now(), now: now}
 }
 
 func (o *Observation) RequestID() string { return o.metadata.RequestID }
@@ -85,13 +95,15 @@ func (o *Observation) ObserveModelEvent(event protocol.ModelEvent) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	switch event.Kind {
+	case protocol.EventResponseStart:
+		o.closeGenerationRound(o.now())
 	case protocol.EventTextDelta, protocol.EventReasoningDelta:
-		if event.Delta != "" && o.firstToken.IsZero() {
-			o.firstToken = time.Now()
+		if event.Delta != "" {
+			o.observeOutput(o.now())
 		}
 	case protocol.EventToolCallDelta:
-		if event.ToolCallDelta != nil && o.firstToken.IsZero() {
-			o.firstToken = time.Now()
+		if event.ToolCallDelta != nil {
+			o.observeOutput(o.now())
 		}
 	case protocol.EventToolStart:
 		o.toolCalls++
@@ -106,7 +118,25 @@ func (o *Observation) ObserveModelEvent(event protocol.ModelEvent) {
 			o.usage.ReasoningTokens += event.Usage.ReasoningTokens
 			o.usage.Exact = o.usage.Exact || event.Usage.Exact
 		}
+	case protocol.EventResponseDone:
+		o.closeGenerationRound(o.now())
 	}
+}
+
+func (o *Observation) observeOutput(now time.Time) {
+	if o.firstToken.IsZero() {
+		o.firstToken = now
+	}
+	if o.roundFirst.IsZero() {
+		o.roundFirst = now
+	}
+}
+
+func (o *Observation) closeGenerationRound(now time.Time) {
+	if !o.roundFirst.IsZero() && now.After(o.roundFirst) {
+		o.generation += now.Sub(o.roundFirst)
+	}
+	o.roundFirst = time.Time{}
 }
 
 func (o *Observation) ObserveContextEvent(event contextledger.Event) {
@@ -128,7 +158,8 @@ func (o *Observation) Finish(fallbackUsage protocol.Usage, requestErr error) Req
 	if o.usage.InputTokens == 0 && o.usage.OutputTokens == 0 && o.usage.ReasoningTokens == 0 {
 		o.usage = fallbackUsage
 	}
-	now := time.Now()
+	now := o.now()
+	o.closeGenerationRound(now)
 	metric := RequestMetric{
 		Timestamp: now.UTC(), RequestID: o.metadata.RequestID, SessionID: o.metadata.SessionID,
 		Provider: o.metadata.Provider, ProviderGeneration: o.metadata.ProviderGeneration, Model: o.metadata.Model, Task: o.metadata.Task,
@@ -137,6 +168,10 @@ func (o *Observation) Finish(fallbackUsage protocol.Usage, requestErr error) Req
 	}
 	if !o.firstToken.IsZero() {
 		metric.FirstTokenMS = o.firstToken.Sub(o.started).Milliseconds()
+	}
+	metric.GenerationMS = o.generation.Milliseconds()
+	if metric.Usage.OutputTokens > 0 && o.generation > 0 {
+		metric.TokensPerSecond = float64(metric.Usage.OutputTokens) / o.generation.Seconds()
 	}
 	if metric.ToolCalls > 0 {
 		metric.ToolSuccessRate = float64(metric.ToolSuccesses) / float64(metric.ToolCalls)

@@ -274,6 +274,7 @@ func (m *Model) handleCompletionKey(key string) (bool, tea.Cmd) {
 		value = value[:m.completion.start] + item.insert + value[m.completion.end:]
 		m.input.SetValue(value)
 		m.input.MoveToEnd()
+		m.resetHistoryNavigation()
 		m.completion = completionState{}
 		m.updateViewportHeight()
 		return true, nil
@@ -371,6 +372,8 @@ func parseReferences(value string) []Reference {
 			kind, prefix = ReferenceSkill, "@skill:"
 		case strings.HasPrefix(value[index:], "@file:"):
 			kind, prefix = ReferenceFile, "@file:"
+		case value[index] == '@':
+			kind, prefix = ReferenceFile, "@"
 		default:
 			continue
 		}

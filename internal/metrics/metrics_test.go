@@ -9,24 +9,51 @@ import (
 )
 
 func TestObservationAndSummary(t *testing.T) {
-	collector := &Collector{}
+	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	collector := &Collector{now: func() time.Time { return now }}
 	observation := collector.Begin(Metadata{
 		RequestID: "request", SessionID: "session", Provider: "provider", ProviderGeneration: 3, Model: "model",
 		InputCostPerMillion: 2, OutputCostPerMillion: 4,
 	})
-	time.Sleep(time.Millisecond)
+	now = now.Add(time.Second)
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseStart})
+	now = now.Add(2 * time.Second)
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "x"})
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventToolStart})
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &protocol.ToolResult{}})
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &protocol.Usage{InputTokens: 100, OutputTokens: 50, Exact: true}})
+	now = now.Add(2 * time.Second)
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseDone})
 	observation.ObserveContextEvent(contextledger.Event{Kind: contextledger.EventCompression})
 	metric := observation.Finish(protocol.Usage{}, nil)
-	if metric.RequestID != "request" || metric.FirstTokenMS < 1 || metric.ToolSuccessRate != 1 || metric.CompressionCount != 1 || metric.EstimatedCost != 0.0004 {
+	if metric.RequestID != "request" || metric.FirstTokenMS != 3000 || metric.GenerationMS != 2000 || metric.TokensPerSecond != 25 || metric.ToolSuccessRate != 1 || metric.CompressionCount != 1 || metric.EstimatedCost != 0.0004 {
 		t.Fatalf("metric = %#v", metric)
 	}
 	summary := collector.Snapshot()
 	if summary.Requests != 1 || summary.ToolCalls != 1 || summary.ToolSuccessRate != 1 || summary.Usage.InputTokens != 100 || summary.EstimatedCost != metric.EstimatedCost {
 		t.Fatalf("summary = %#v", summary)
+	}
+}
+
+func TestObservationAggregatesGenerationAcrossToolRounds(t *testing.T) {
+	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	observation := (&Collector{now: func() time.Time { return now }}).Begin(Metadata{})
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseStart})
+	now = now.Add(3 * time.Second)
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventToolCallDelta, ToolCallDelta: &protocol.ToolCallDelta{Name: "read_file"}})
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &protocol.Usage{OutputTokens: 30, Exact: true}})
+	now = now.Add(2 * time.Second)
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseDone})
+	now = now.Add(5 * time.Second) // tool execution is outside generation time
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseStart})
+	now = now.Add(2 * time.Second)
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "done"})
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &protocol.Usage{OutputTokens: 50, Exact: true}})
+	now = now.Add(2 * time.Second)
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseDone})
+	metric := observation.Finish(protocol.Usage{}, nil)
+	if metric.FirstTokenMS != 3000 || metric.GenerationMS != 4000 || metric.TokensPerSecond != 20 || metric.DurationMS != 14000 {
+		t.Fatalf("metric = %#v", metric)
 	}
 }
 

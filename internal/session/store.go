@@ -771,7 +771,7 @@ func truncateEventTail(path string, validBytes int64) error {
 func validEventType(eventType EventType) bool {
 	switch eventType {
 	case EventSessionCreated, EventTurnAppended, EventRuntimeUpdated, EventDriverState,
-		EventSkillActivated, EventContextUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened:
+		EventPromptRecorded, EventSkillActivated, EventContextUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened:
 		return true
 	default:
 		return false
@@ -799,6 +799,10 @@ func applyEvent(snapshot *Snapshot, event Event) {
 	case EventTurnAppended:
 		if event.Turn != nil {
 			snapshot.Turns = append(snapshot.Turns, *event.Turn)
+		}
+	case EventPromptRecorded:
+		if event.Prompt != "" {
+			snapshot.PromptHistory = append(snapshot.PromptHistory, event.Prompt)
 		}
 	case EventRuntimeUpdated:
 		if event.Workspace != "" {

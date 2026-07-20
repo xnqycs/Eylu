@@ -23,14 +23,15 @@ import (
 )
 
 type sessionRuntime struct {
-	mu              sync.Mutex
-	store           *session.Store
-	snapshot        session.Snapshot
-	persistedTurns  int
-	persistedSkills map[string]string
-	revalidated     bool
-	workspace       string
-	redact          func(string) string
+	mu               sync.Mutex
+	store            *session.Store
+	snapshot         session.Snapshot
+	persistedTurns   int
+	persistedPrompts int
+	persistedSkills  map[string]string
+	revalidated      bool
+	workspace        string
+	redact           func(string) string
 }
 
 func (r *runtime) openConversation(ctx context.Context, manager *provider.Manager, opts *chatOptions) (*agent.Conversation, error) {
@@ -133,7 +134,7 @@ func newSessionRuntime(store *session.Store, snapshot session.Snapshot, workspac
 	for _, item := range snapshot.Skills {
 		digests[item.Name] = item.Digest
 	}
-	return &sessionRuntime{store: store, snapshot: snapshot, persistedTurns: len(snapshot.Turns), persistedSkills: digests, workspace: workspace, redact: redact}
+	return &sessionRuntime{store: store, snapshot: snapshot, persistedTurns: len(snapshot.Turns), persistedPrompts: len(snapshot.PromptHistory), persistedSkills: digests, workspace: workspace, redact: redact}
 }
 
 func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, runErr error) error {
@@ -148,6 +149,9 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	}
 	if len(state.Turns) < s.persistedTurns {
 		return fmt.Errorf("session transcript shrank from %d to %d turns", s.persistedTurns, len(state.Turns))
+	}
+	if len(state.PromptHistory) < s.persistedPrompts {
+		return fmt.Errorf("session prompt history shrank from %d to %d entries", s.persistedPrompts, len(state.PromptHistory))
 	}
 	providerState := sessionProviderState(state.Provider)
 	selectedProvider, selectedErr := selectedSessionProvider(manager, opts)
@@ -165,6 +169,9 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	for index := s.persistedTurns; index < len(state.Turns); index++ {
 		turn := state.Turns[index]
 		events = append(events, session.Event{Type: session.EventTurnAppended, Turn: &turn})
+	}
+	for index := s.persistedPrompts; index < len(state.PromptHistory); index++ {
+		events = append(events, session.Event{Type: session.EventPromptRecorded, Prompt: state.PromptHistory[index]})
 	}
 	events = append(events, session.Event{
 		Type: session.EventRuntimeUpdated, Workspace: state.Workspace, PermissionMode: state.PermissionMode, Provider: &providerState,
@@ -208,6 +215,7 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	}
 	s.snapshot = next
 	s.persistedTurns = len(state.Turns)
+	s.persistedPrompts = len(state.PromptHistory)
 	s.persistedSkills = make(map[string]string, len(state.ProtectedSkills))
 	for _, item := range state.ProtectedSkills {
 		s.persistedSkills[item.Name] = item.Digest
@@ -324,7 +332,7 @@ func snapshotFromAgentState(state agent.ConversationState, previous session.Snap
 		CreatedAt: previous.CreatedAt, UpdatedAt: time.Now().UTC(), ClosedAt: previous.ClosedAt,
 		Workspace: state.Workspace, Environment: state.Environment, PermissionMode: state.PermissionMode,
 		Provider: sessionProviderState(state.Provider),
-		Turns:    state.Turns, DriverState: append(json.RawMessage(nil), state.DriverState...), SkillCatalog: state.SkillCatalog,
+		Turns:    state.Turns, PromptHistory: append([]string{}, state.PromptHistory...), DriverState: append(json.RawMessage(nil), state.DriverState...), SkillCatalog: state.SkillCatalog,
 		Summary: state.Summary, TodoList: cloneProtocolTodoList(state.TodoList), OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: state.Ledger,
 	}
 	if snapshot.CreatedAt.IsZero() {
@@ -337,8 +345,12 @@ func snapshotFromAgentState(state agent.ConversationState, previous session.Snap
 }
 
 func agentStateFromSnapshot(snapshot session.Snapshot) agent.ConversationState {
+	promptHistory := append([]string(nil), snapshot.PromptHistory...)
+	if snapshot.PromptHistory == nil {
+		promptHistory = legacyPromptHistory(snapshot.Turns)
+	}
 	return agent.ConversationState{
-		SessionID: snapshot.SessionID, Turns: snapshot.Turns, DriverState: append(json.RawMessage(nil), snapshot.DriverState...),
+		SessionID: snapshot.SessionID, Turns: snapshot.Turns, PromptHistory: promptHistory, DriverState: append(json.RawMessage(nil), snapshot.DriverState...),
 		Provider: agent.ProviderState{
 			Name: snapshot.Provider.Name, Generation: snapshot.Provider.Generation, Adapter: snapshot.Provider.Adapter,
 			BaseURL: snapshot.Provider.BaseURL, Model: snapshot.Provider.Model, CatalogProvider: snapshot.Provider.CatalogProvider, ContextWindow: snapshot.Provider.ContextWindow,
@@ -349,6 +361,42 @@ func agentStateFromSnapshot(snapshot session.Snapshot) agent.ConversationState {
 		Workspace: snapshot.Workspace, Environment: snapshot.Environment, PermissionMode: snapshot.PermissionMode, SkillCatalog: snapshot.SkillCatalog,
 		Summary: snapshot.Summary, TodoList: cloneProtocolTodoList(snapshot.TodoList), OmittedTurnIDs: snapshot.OmittedTurnIDs, Ledger: snapshot.Ledger,
 	}
+}
+
+const (
+	legacyPlanImplementationPrompt = "Implement the approved plan now. Follow the plan already present in this conversation, inspect current files before editing, and run the relevant verification."
+	legacyPlanFeedbackPrefix       = "Revise the current implementation plan using this user feedback:\n\n"
+	legacyUserRequestStart         = "</referenced_files>\n\n<user_request>\n"
+	legacyUserRequestEnd           = "\n</user_request>"
+)
+
+func legacyPromptHistory(turns []protocol.Turn) []string {
+	history := make([]string, 0)
+	for _, turn := range turns {
+		if turn.Role != protocol.RoleUser {
+			continue
+		}
+		var text strings.Builder
+		for _, part := range turn.Parts {
+			if part.Kind == protocol.PartText {
+				text.WriteString(part.Text)
+			}
+		}
+		prompt := text.String()
+		switch {
+		case prompt == "", prompt == legacyPlanImplementationPrompt:
+			continue
+		case strings.HasPrefix(prompt, legacyPlanFeedbackPrefix):
+			prompt = strings.TrimPrefix(prompt, legacyPlanFeedbackPrefix)
+		case strings.Contains(prompt, legacyUserRequestStart) && strings.HasSuffix(prompt, legacyUserRequestEnd):
+			start := strings.Index(prompt, legacyUserRequestStart) + len(legacyUserRequestStart)
+			prompt = prompt[start : len(prompt)-len(legacyUserRequestEnd)]
+		}
+		if prompt = strings.TrimSpace(prompt); prompt != "" {
+			history = append(history, prompt)
+		}
+	}
+	return history
 }
 
 func cloneProtocolTodoList(list protocol.TodoList) protocol.TodoList {

@@ -50,11 +50,11 @@ go run . "审查并测试这个项目" --route auto --task review --require-reas
 
 兼容入口 `go run . chat [prompt]` 继续可用。prompt 与子命令同名时，可使用 `go run . -- "sessions"` 将其作为对话内容发送。
 
-TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、1 至 8 行动态输入框、Markdown、工具状态/详情、独立任务树、底部审批与提问工作台、Provider 表单、模型筛选、Skill 状态与上下文进度。请求运行时，任务树位于 activity 行与输入分隔线之间；请求完成或恢复 session 后，清单以 `3 tasks (0 done, 1 in progress, 2 open)` 摘要紧接最后一条历史内容，并随 viewport 滚动。两种状态最多展示 5 个任务，超出部分使用 `... +N pending`、`... +N completed` 等英文计数；进行中项优先，completed 项稳定移到末尾。`todolist` 工具卡从历史区隐藏，完整参数和结果仍可通过 `Ctrl-T` 查看；`/tasks` 打开带 `[ ]`、`[>]`、`[x]`、`[-]` 状态标记的完整清单。历史区支持鼠标拖选并自动复制纯文本，拖选期间可用滚轮跨越当前 viewport，复制状态在输入框上方显示 2 秒；ANSI、OSC 链接、中文宽字符、软换行和滚动偏移均按显示列处理。界面采用 Eylu Signal 语义色板，焦点、工具活动、确认、风险与选区使用独立颜色；Markdown 内联代码只使用主题强调色文字，不绘制背景。`Enter` 提交，`Shift+Enter` 或 `Ctrl+Enter` 换行，超过 8 行后输入框内部滚动。
+TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、1 至 8 行动态输入框、Markdown、工具状态/详情、独立任务树、底部审批与提问工作台、Provider 表单、模型筛选、Skill 状态与上下文进度。请求运行时，任务树位于 activity 行与输入分隔线之间；请求完成或恢复 session 后，清单以 `3 tasks (0 done, 1 in progress, 2 open)` 摘要紧接最后一条历史内容，并随 viewport 滚动。两种状态最多展示 5 个任务，超出部分使用 `... +N pending`、`... +N completed` 等英文计数；进行中项优先，completed 项稳定移到末尾。`todolist` 工具卡从历史区隐藏，完整参数和结果仍可通过 `Ctrl-T` 查看；`/tasks` 打开带 `[ ]`、`[>]`、`[x]`、`[-]` 状态标记的完整清单。历史区支持鼠标拖选并自动复制纯文本，拖选期间可用滚轮跨越当前 viewport，复制状态在输入框上方显示 2 秒；ANSI、OSC 链接、中文宽字符、软换行和滚动偏移均按显示列处理。界面采用 Eylu Signal 语义色板，焦点、工具活动、确认、风险与选区使用独立颜色；Markdown 内联代码只使用主题强调色文字，不绘制背景。`Enter` 提交，`Shift+Enter`、`Ctrl+Enter` 或兼容编码 `Ctrl+J` 换行，超过 8 行后输入框内部滚动。光标位于输入内容视觉顶端或底端时，`Up`/`Down` 会浏览当前 session 持久化的原始 Prompt，并在越过最新记录时恢复未发送草稿。
 
-输入 `/` 会在输入框上方显示命令与英文说明，继续输入可按前缀筛选；`/mode`、`/provider`、`/skill` 提供上下文子选项，活跃 Skill 也可作为顶层命令使用。输入 `@` 可引用活跃 Skill 或仓库文件，文件列表使用 Git 标准 ignore/exclude 语义；提交时 Skill 自动激活，UTF-8 文件快照按配置预算注入请求。方向键、`Tab`、`Enter` 和 `Esc` 用于操作补全面板。
+输入 `/` 会在输入框上方显示命令与英文说明，继续输入可按前缀筛选；`/mode`、`/provider`、`/skill` 提供上下文子选项，活跃 Skill 也可作为顶层命令使用。输入 `@` 可引用活跃 Skill 或仓库文件，支持 `@index.html`、`@build/index.html` 与带引号路径；补全列表使用 Git 标准 ignore/exclude 语义，主动输入的完整路径或唯一文件名可引用 ignored 文件。提交时 Skill 自动激活，UTF-8 文件快照按配置预算注入请求。方向键、`Tab`、`Enter` 和 `Esc` 用于操作补全面板。
 
-流式活动行展示阶段、自动换算后的耗时、每回合发送 token、实时接收 token 和 thinking 状态；Responses reasoning summary delta 与 Chat `reasoning_content` 用于实时估算，Provider usage 到达后校正为精确累计值。TUI 会把 provider 发出的极小文本与工具参数 delta 合并成小批次，并缓存已完成的 Markdown 渲染，减少长会话重绘。模型生成 `bash`、`write_file`、`edit_file` 或其他需审批的工具参数时，必须提供面向用户的 `reason`；审批工作台同时展示动作摘要、申请理由和策略依据，仅提供单次同意与拒绝。拒绝时按 `Tab` 可填写反馈并回传模型继续当前请求；直接拒绝会中断请求并显示 `Interrupted after <duration>` 指标。模型调用 `ask` 时，工作台逐题展示 2 至 4 个选项和自定义答案入口；方向键切换问题，`Space` 勾选多选项，`Tab` 编辑自定义答案，`Enter` 提交，`Esc` 取消当前请求。`--no-tui` 的文本 TTY 使用编号、逗号分隔多选和 `o` 自定义输入。Provider 表单的 API Key 使用 password input，并明文写入 Provider 配置；模型面板支持刷新、筛选、选择和手工 ID。`Shift+Tab` 按 `manual → plan → auto → full` 循环模式；运行期间的切换在下一轮生效。`Ctrl-C` 在请求期间第一次取消，第二次退出；`Ctrl-T` 打开最近工具详情。
+流式活动行展示阶段、自动换算后的耗时、每回合发送 token、实时接收 token 和 thinking 状态；Responses reasoning summary delta 与 Chat `reasoning_content` 用于实时估算，Provider usage 到达后校正为精确累计值。请求结束行展示总耗时、TTFT 与模型实际生成阶段的 TPS，例如 `Completed in 15.992s; TTFT 3.044s; TPS 42.6 t/s.`。TUI 会把 provider 发出的极小文本与工具参数 delta 合并成小批次，并缓存已完成的 Markdown 渲染，减少长会话重绘。模型生成 `bash`、`write_file`、`edit_file` 或其他需审批的工具参数时，必须提供面向用户的 `reason`；审批工作台同时展示动作摘要、申请理由和策略依据，仅提供单次同意与拒绝。拒绝时按 `Tab` 可填写反馈并回传模型继续当前请求；直接拒绝会中断请求并显示相同指标。模型调用 `ask` 时，工作台逐题展示 2 至 4 个选项和自定义答案入口；方向键切换问题，`Space` 勾选多选项，`Tab` 编辑自定义答案，`Enter` 提交，`Esc` 取消当前请求。`--no-tui` 的文本 TTY 使用编号、逗号分隔多选和 `o` 自定义输入。Provider 表单的 API Key 使用 password input，并明文写入 Provider 配置；模型面板支持刷新、筛选、选择和手工 ID。`Shift+Tab` 按 `manual → plan → auto → full` 循环模式；运行期间的切换在下一轮生效。`Ctrl-C` 在请求期间第一次取消，第二次退出；`Ctrl-T` 打开最近工具详情。
 
 ```powershell
 go run . --no-animation
@@ -79,7 +79,7 @@ go run . sessions delete review-1
 go run . sessions migrate review-1
 ```
 
-`/new` 会先刷新当前快照并追加关闭事件，再创建空 session；历史记录仍可通过 `--session <id>` 恢复。任务清单随 session 保存和恢复，新 session 从空清单开始。每个新 session 会采集工作目录、平台、OS 版本、日期以及 Git 分支、状态和最近五条提交，并将其作为会话快照保存。恢复时复用原快照；旧 session 首次恢复时补采一次。删除操作在终端中确认，脚本环境使用 `sessions delete <id> --yes`。
+`/new` 会先刷新当前快照并追加关闭事件，再创建空 session；历史记录仍可通过 `--session <id>` 恢复。原始 Prompt 与任务清单均随 session 保存和恢复，新 session 从空状态开始；旧 v1 session 首次恢复时会从 user turns 回填 Prompt 历史。每个新 session 会采集工作目录、平台、OS 版本、日期以及 Git 分支、状态和最近五条提交，并将其作为会话快照保存。恢复时复用原快照；旧 session 首次恢复时补采一次。删除操作在终端中确认，脚本环境使用 `sessions delete <id> --yes`。
 
 默认状态目录为 `~/.eylu/state/sessions`，`EYLU_STATE_DIR` 可修改其父目录。每个 session 使用 `events.jsonl` 作为事实日志，`snapshot.json` 加速恢复；超过 16 KiB 的工具输出按 SHA-256 保存为附件并在加载时校验。恢复 Skill 时会重新读取正文并复核保存的 digest。schema 版本不兼容时需显式运行迁移命令，迁移前会保留 v0 备份。
 

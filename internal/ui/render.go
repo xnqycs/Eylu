@@ -99,6 +99,8 @@ func (m *Model) View() tea.View {
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
 	view.WindowTitle = "Eylu"
+	view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
+	view.KeyboardEnhancements.ReportAssociatedText = true
 	if m.screen == screenChat && m.approval == nil && m.ask == nil && m.planGate == nil {
 		view.Cursor = m.input.Cursor()
 		if view.Cursor != nil {
@@ -399,7 +401,7 @@ func (m *Model) renderTool(tool *toolView) string {
 	contentWidth := m.viewportContentWidth()
 	detail := summarizeLine(tool.arguments, max(20, contentWidth-30))
 	if tool.path != "" {
-		detail = fmt.Sprintf("%s  %s  %d lines", m.renderFileLocationLink(tool.path), formatByteCount(tool.generatedBytes), tool.generatedLines)
+		detail = m.renderToolFileDetail(tool)
 	}
 	lines := []string{fmt.Sprintf("> %s  %s%s", tool.name, state, duration)}
 	if detail != "" {
@@ -411,6 +413,18 @@ func (m *Model) renderTool(tool *toolView) string {
 		}
 	}
 	return m.styles.Tool.Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) renderToolFileDetail(tool *toolView) string {
+	location := m.renderFileLocationLink(tool.path)
+	if !tool.fileStatsKnown {
+		return location
+	}
+	lines := fmt.Sprintf("%d lines", tool.generatedLines)
+	if !tool.linesComplete {
+		lines = fmt.Sprintf("%d+ lines", tool.generatedLines)
+	}
+	return fmt.Sprintf("%s  %s  %s", location, formatByteCount(tool.generatedBytes), lines)
 }
 
 func (m *Model) taskPanelRows() int {
@@ -610,14 +624,26 @@ func FormatDurationMS(milliseconds int64) string {
 }
 
 func (m *Model) renderFileLocationLink(path string) string {
+	display := m.workspaceRelativeDisplayPath(path)
 	if m.noColor || path == "" {
-		return path
+		return display
 	}
 	directoryURL, ok := localContainingDirectoryURL(m.snapshot.Workspace, path)
 	if !ok {
+		return display
+	}
+	return ansi.SetHyperlink(directoryURL) + display + ansi.ResetHyperlink()
+}
+
+func (m *Model) workspaceRelativeDisplayPath(path string) string {
+	if path == "" || m.snapshot.Workspace == "" || !filepath.IsAbs(path) {
 		return path
 	}
-	return ansi.SetHyperlink(directoryURL) + path + ansi.ResetHyperlink()
+	relative, err := filepath.Rel(m.snapshot.Workspace, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return path
+	}
+	return filepath.ToSlash(relative)
 }
 
 func (m *Model) renderToolDetail() string {

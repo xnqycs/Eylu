@@ -109,6 +109,23 @@ func TestStoreReplaysAndClearsTodoListFromContextEvents(t *testing.T) {
 	}
 }
 
+func TestStoreReplaysPromptHistoryEvents(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root)
+	createTestSession(t, store, "prompts", root)
+	if _, err := store.Append("prompts", []Event{
+		{Type: EventPromptRecorded, Prompt: "first"},
+		{Type: EventPromptRecorded, Prompt: "first"},
+		{Type: EventPromptRecorded, Prompt: "second\nline"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replayed, _, err := store.Load("prompts")
+	if err != nil || len(replayed.PromptHistory) != 3 || replayed.PromptHistory[0] != "first" || replayed.PromptHistory[1] != "first" || replayed.PromptHistory[2] != "second\nline" {
+		t.Fatalf("history=%#v err=%v", replayed.PromptHistory, err)
+	}
+}
+
 func TestSnapshotTodoListIsOptionalForSchemaVersionOne(t *testing.T) {
 	encoded, err := json.Marshal(Snapshot{Version: SchemaVersion, SessionID: "legacy-v1", TodoList: protocol.TodoList{Items: []protocol.TodoItem{}}})
 	if err != nil {

@@ -147,8 +147,9 @@ type Reference struct {
 }
 
 type Submission struct {
-	Text       string      `json:"text"`
-	References []Reference `json:"references,omitempty"`
+	Text        string      `json:"text"`
+	References  []Reference `json:"references,omitempty"`
+	HistoryText string      `json:"-"`
 }
 
 type FileItem struct {
@@ -157,15 +158,16 @@ type FileItem struct {
 }
 
 type Snapshot struct {
-	SessionID string               `json:"session_id"`
-	Workspace string               `json:"workspace"`
-	Mode      string               `json:"mode"`
-	Provider  string               `json:"provider"`
-	Model     string               `json:"model"`
-	Context   contextledger.Report `json:"context"`
-	Providers []ProviderItem       `json:"providers"`
-	Skills    []SkillItem          `json:"skills"`
-	TodoList  protocol.TodoList    `json:"todo_list,omitzero"`
+	SessionID     string               `json:"session_id"`
+	Workspace     string               `json:"workspace"`
+	Mode          string               `json:"mode"`
+	Provider      string               `json:"provider"`
+	Model         string               `json:"model"`
+	Context       contextledger.Report `json:"context"`
+	Providers     []ProviderItem       `json:"providers"`
+	Skills        []SkillItem          `json:"skills"`
+	TodoList      protocol.TodoList    `json:"todo_list,omitzero"`
+	PromptHistory []string             `json:"prompt_history"`
 }
 
 type ProviderForm struct {

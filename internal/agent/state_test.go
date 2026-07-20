@@ -58,3 +58,26 @@ func TestRestoreConversationRejectsInvalidTranscript(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestConversationPromptHistoryRoundTripAndNewSessionReset(t *testing.T) {
+	conversation := NewConversation()
+	conversation.RecordPrompt("first")
+	conversation.RecordPrompt("first")
+	conversation.RecordPrompt("second\nline")
+	state := conversation.ExportState()
+	if got := state.PromptHistory; len(got) != 3 || got[0] != "first" || got[1] != "first" || got[2] != "second\nline" {
+		t.Fatalf("history = %#v", got)
+	}
+	restored, err := RestoreConversation(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.PromptHistory[0] = "mutated"
+	if got := restored.ExportState().PromptHistory; got[0] != "first" {
+		t.Fatalf("restored history shared storage: %#v", got)
+	}
+	restored.NewSession()
+	if got := restored.ExportState().PromptHistory; len(got) != 0 || got == nil {
+		t.Fatalf("new session history = %#v", got)
+	}
+}

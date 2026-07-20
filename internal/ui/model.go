@@ -69,6 +69,8 @@ type toolView struct {
 	preview              string
 	generatedBytes       int
 	generatedLines       int
+	fileStatsKnown       bool
+	linesComplete        bool
 	preparing            bool
 	running              bool
 	isError              bool
@@ -176,6 +178,9 @@ type Model struct {
 	filesDiagnostic            string
 	queuedMode                 string
 	draft                      string
+	promptHistory              []string
+	historyIndex               int
+	historyDraft               string
 	selection                  selectionState
 	clipboardWrite             func(string) error
 	copyToast                  string
@@ -313,7 +318,7 @@ func NewModel(backend Backend, options Options) *Model {
 		backend: backend, context: baseContext, clock: clock, styles: styles, input: input,
 		viewport: viewport.New(viewport.WithWidth(width), viewport.WithHeight(max(5, height-8))),
 		spinner:  spinner.New(spinner.WithSpinner(spinner.Dot)), modelFilter: filter, approvalReason: approvalReason,
-		width: width, height: height, screen: screenChat, state: StateIdle, followOutput: true,
+		width: width, height: height, screen: screenChat, state: StateIdle, followOutput: true, historyIndex: -1,
 		animation: !options.NoAnimation, noColor: options.NoColor, clipboardWrite: clipboardWrite,
 	}
 	model.viewport.SoftWrap = true
@@ -366,6 +371,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if typed.err != nil {
 			m.appendNotice(typed.err.Error(), true)
 		} else {
+			sessionChanged := m.snapshot.SessionID != typed.snapshot.SessionID
 			if m.snapshot.Workspace != typed.snapshot.Workspace {
 				m.files = nil
 				m.filesLoaded = false
@@ -373,6 +379,10 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.filesDiagnostic = ""
 			}
 			m.snapshot = typed.snapshot
+			m.promptHistory = append(m.promptHistory[:0], typed.snapshot.PromptHistory...)
+			if sessionChanged || m.historyIndex >= len(m.promptHistory) {
+				m.resetHistoryNavigation()
+			}
 		}
 		m.refreshViewport()
 		return m, nil
@@ -545,8 +555,12 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.screen == screenChat {
 			m.clearSelection()
+			before := m.input.Value()
 			updated, command := m.input.Update(message)
 			m.input = updated
+			if m.input.Value() != before {
+				m.resetHistoryNavigation()
+			}
 			completionCommand := m.refreshCompletion()
 			return m, tea.Batch(command, completionCommand)
 		}
@@ -746,10 +760,19 @@ func (m *Model) handleInterrupt() (tea.Model, tea.Cmd) {
 
 func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := message.String()
-	if key != "shift+enter" && key != "ctrl+enter" {
+	modifiedEnter := isModifiedEnter(message)
+	if !modifiedEnter {
 		if handled, command := m.handleCompletionKey(key); handled {
 			return m, command
 		}
+	}
+	if modifiedEnter {
+		m.input.InsertString("\n")
+		m.resetHistoryNavigation()
+		return m, m.refreshCompletion()
+	}
+	if handled, command := m.handleHistoryKey(key); handled {
+		return m, command
 	}
 	switch key {
 	case "enter":
@@ -768,10 +791,7 @@ func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.refreshViewport()
 			return m, nil
 		}
-		return m.startRequest(Submission{Text: value, References: parseReferences(value)})
-	case "shift+enter", "ctrl+enter":
-		m.input.InsertString("\n")
-		return m, m.refreshCompletion()
+		return m.startRequest(Submission{Text: value, References: parseReferences(value), HistoryText: value})
 	case "shift+tab":
 		return m.cycleMode()
 	case "pgup":
@@ -794,10 +814,86 @@ func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	before := m.input.Value()
 	updated, command := m.input.Update(message)
 	m.input = updated
+	if m.input.Value() != before {
+		m.resetHistoryNavigation()
+	}
 	completionCommand := m.refreshCompletion()
 	return m, tea.Batch(command, completionCommand)
+}
+
+func isModifiedEnter(message tea.KeyPressMsg) bool {
+	key := message.Key()
+	if key.Code == tea.KeyEnter && (key.Mod.Contains(tea.ModShift) || key.Mod.Contains(tea.ModCtrl)) {
+		return true
+	}
+	return key.Code == 'j' && key.Mod.Contains(tea.ModCtrl)
+}
+
+func (m *Model) handleHistoryKey(key string) (bool, tea.Cmd) {
+	if len(m.promptHistory) == 0 {
+		return false, nil
+	}
+	switch key {
+	case "up":
+		if !m.inputAtVisualTop() {
+			return false, nil
+		}
+		if m.historyIndex < 0 {
+			m.historyDraft = m.input.Value()
+			m.historyIndex = len(m.promptHistory) - 1
+		} else if m.historyIndex > 0 {
+			m.historyIndex--
+		}
+		m.setHistoryInput(m.promptHistory[m.historyIndex])
+		return true, m.refreshCompletion()
+	case "down":
+		if m.historyIndex < 0 || !m.inputAtVisualBottom() {
+			return false, nil
+		}
+		if m.historyIndex < len(m.promptHistory)-1 {
+			m.historyIndex++
+			m.setHistoryInput(m.promptHistory[m.historyIndex])
+		} else {
+			draft := m.historyDraft
+			m.resetHistoryNavigation()
+			m.setHistoryInput(draft)
+		}
+		return true, m.refreshCompletion()
+	default:
+		return false, nil
+	}
+}
+
+func (m *Model) inputAtVisualTop() bool {
+	info := m.input.LineInfo()
+	return m.input.Line() == 0 && info.RowOffset == 0
+}
+
+func (m *Model) inputAtVisualBottom() bool {
+	info := m.input.LineInfo()
+	return m.input.Line() == m.input.LineCount()-1 && info.RowOffset >= max(0, info.Height-1)
+}
+
+func (m *Model) setHistoryInput(value string) {
+	m.input.SetValue(value)
+	m.input.MoveToEnd()
+	m.completion = completionState{}
+	m.updateViewportHeight()
+}
+
+func (m *Model) resetHistoryNavigation() {
+	m.historyIndex = -1
+	m.historyDraft = ""
+}
+
+func (m *Model) recordLocalPrompt(prompt string) {
+	if prompt = strings.TrimSpace(prompt); prompt != "" {
+		m.promptHistory = append(m.promptHistory, prompt)
+	}
+	m.resetHistoryNavigation()
 }
 
 func (m *Model) startRequest(submission Submission) (tea.Model, tea.Cmd) {
@@ -805,6 +901,9 @@ func (m *Model) startRequest(submission Submission) (tea.Model, tea.Cmd) {
 		m.appendNotice("A request is already running.", true)
 		m.refreshViewport()
 		return m, nil
+	}
+	if submission.HistoryText != "" {
+		m.recordLocalPrompt(submission.HistoryText)
 	}
 	sequence := atomic.AddUint64(&m.operationSeq, 1)
 	m.operationID = fmt.Sprintf("op-%d", sequence)
@@ -1179,7 +1278,7 @@ func (m *Model) handlePlanGateKey(key string) (tea.Model, tea.Cmd) {
 			}
 			m.planGate = nil
 			prompt := "Revise the current implementation plan using this user feedback:\n\n" + feedback
-			return m.startRequest(Submission{Text: prompt})
+			return m.startRequest(Submission{Text: prompt, HistoryText: feedback})
 		case "esc", "tab":
 			m.planGate.editing = false
 			m.planGate.feedback.Blur()
@@ -1344,14 +1443,46 @@ func (m *Model) completeTool(result *protocol.ToolResult) {
 			if path, ok := result.Metadata["path"].(string); ok && item.tool.path == "" {
 				item.tool.path = path
 			}
-			if bytes, ok := result.Metadata["bytes"].(int); ok {
+			if bytes, ok := metadataInt(result.Metadata, "bytes"); ok {
 				item.tool.generatedBytes = bytes
+				item.tool.fileStatsKnown = true
 			}
-			if lines, ok := result.Metadata["lines"].(int); ok {
+			if lines, ok := metadataInt(result.Metadata, "lines"); ok {
 				item.tool.generatedLines = lines
+				item.tool.fileStatsKnown = true
+			}
+			if complete, ok := result.Metadata["lines_complete"].(bool); ok {
+				item.tool.linesComplete = complete
+			} else if item.tool.fileStatsKnown {
+				item.tool.linesComplete = !result.Truncated
 			}
 			return
 		}
+	}
+}
+
+func metadataInt(metadata map[string]any, key string) (int, bool) {
+	value, ok := metadata[key]
+	if !ok {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int32:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case float64:
+		if typed < 0 || typed != float64(int(typed)) {
+			return 0, false
+		}
+		return int(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return int(parsed), err == nil
+	default:
+		return 0, false
 	}
 }
 
@@ -1441,12 +1572,16 @@ func updateFileToolPreview(view *toolView) {
 		}
 		view.generatedBytes = len([]byte(content))
 		view.generatedLines = countTextLines(content)
+		view.fileStatsKnown = true
+		view.linesComplete = true
 		view.preview = prefixedTail(content, "+ ", 6)
 	case "edit_file":
 		oldString, oldStarted := partialJSONStringField(view.arguments, "old_string")
 		newString, newStarted := partialJSONStringField(view.arguments, "new_string")
 		view.generatedBytes = len([]byte(oldString)) + len([]byte(newString))
 		view.generatedLines = countTextLines(newString)
+		view.fileStatsKnown = true
+		view.linesComplete = true
 		parts := make([]string, 0, 2)
 		if oldStarted {
 			parts = append(parts, prefixedTail(oldString, "- ", 2))

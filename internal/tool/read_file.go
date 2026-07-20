@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"unicode/utf8"
 
 	"Eylu/internal/policy"
@@ -74,7 +75,13 @@ func (r *ReadFile) Execute(_ context.Context, raw json.RawMessage) protocol.Tool
 	if !utf8.Valid(data) {
 		return toolError("file is not valid UTF-8 text")
 	}
-	result := protocol.ToolResult{Content: string(data), Truncated: truncated, Metadata: map[string]any{"path": path, "bytes": info.Size()}}
+	lines := 0
+	if len(data) > 0 {
+		lines = strings.Count(string(data), "\n") + 1
+	}
+	result := protocol.ToolResult{Content: string(data), Truncated: truncated, Metadata: map[string]any{
+		"path": path, "bytes": info.Size(), "lines": lines, "lines_complete": !truncated,
+	}}
 	if truncated {
 		result.Content += fmt.Sprintf("\n[read_file truncated at %d bytes]", r.maxBytes)
 	}
