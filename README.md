@@ -239,7 +239,25 @@ goreleaser check
 goreleaser release --snapshot --clean --skip=sign
 ```
 
-CI 在 Linux、Windows、macOS 执行测试、vet、原生构建和 smoke test；Linux 质量任务额外执行 race detector、格式检查、第三方声明漂移检查与 Staticcheck。发布 tag 使用 `v*` 格式。
+CI 在 Linux、Windows、macOS 执行测试、vet、原生构建和 smoke test；Linux 质量任务额外执行 race detector、格式检查、第三方声明漂移检查、GitHub Actions 检查与 Staticcheck。发布 tag 使用严格 SemVer 格式。
+
+稳定版使用 `vMAJOR.MINOR.PATCH` 标签，预览版在版本号后增加 SemVer 预发布标识。发布工作流只接受 main 分支历史中的标签；它会先复用完整 CI，再创建草稿 Release、上传和证明全部产物，最后公开 Release。`rc`、`beta`、`alpha` 等预发布标签会自动显示为 GitHub Pre-release：
+
+```bash
+# 稳定版
+git tag -a v1.1.0 -m "Release v1.1.0"
+git push origin v1.1.0
+
+# 发布候选版
+git tag -a v1.1.0-rc.1 -m "Release v1.1.0-rc.1"
+git push origin v1.1.0-rc.1
+
+# Beta 或 Alpha 版
+git tag -a v1.1.0-beta.1 -m "Release v1.1.0-beta.1"
+git push origin v1.1.0-beta.1
+```
+
+同一版本按 `alpha.1 → beta.1 → rc.1 → v1.1.0` 递进。标签推送错误且工作流尚未成功发布时，可先在 GitHub 删除对应草稿 Release，再删除远端标签并创建正确标签。
 
 ## 许可证
 

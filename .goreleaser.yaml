@@ -75,5 +75,6 @@ changelog:
       - Merge remote-tracking branch
 
 release:
-  draft: false
+  draft: true
+  replace_existing_draft: true
   prerelease: auto
