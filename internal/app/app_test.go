@@ -485,6 +485,38 @@ func TestModeSlashCommand(t *testing.T) {
 	}
 }
 
+func TestEffortSlashCommandReportsUpdatesAndValidates(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.Default()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "gpt-5.6-sol", ReasoningEffort: "medium"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	runtime := &runtime{stdout: &output, stderr: &bytes.Buffer{}}
+	conversation := agent.NewConversation()
+	opts := chatOptions{}
+	reader := bufio.NewReader(strings.NewReader(""))
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/effort", conversation, manager, &opts); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Reasoning effort: medium") || !strings.Contains(output.String(), "auto, low, medium, high, xhigh, max, ultra") {
+		t.Fatalf("output=%q", output.String())
+	}
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/effort ultra", conversation, manager, &opts); err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := manager.Get("work")
+	if updated.ReasoningEffort != "ultra" {
+		t.Fatalf("provider=%#v", updated)
+	}
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/effort impossible", conversation, manager, &opts); err == nil || !strings.Contains(err.Error(), "available:") {
+		t.Fatalf("invalid effort error=%v", err)
+	}
+}
+
 func TestContextSlashRendersAllCategories(t *testing.T) {
 	var output bytes.Buffer
 	runtime := &runtime{stdin: strings.NewReader(""), stdout: &output, stderr: &bytes.Buffer{}, trustPrompted: make(map[string]bool)}

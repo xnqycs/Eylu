@@ -21,11 +21,12 @@ type Capabilities struct {
 }
 
 type Request struct {
-	BaseURL string
-	APIKey  string
-	Headers map[string]string
-	Stream  bool
-	Model   protocol.ModelRequest
+	BaseURL         string
+	APIKey          string
+	Headers         map[string]string
+	ReasoningEffort string
+	Stream          bool
+	Model           protocol.ModelRequest
 }
 
 type EmitFunc func(protocol.ModelEvent) error

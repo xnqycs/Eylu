@@ -158,16 +158,18 @@ type FileItem struct {
 }
 
 type Snapshot struct {
-	SessionID     string               `json:"session_id"`
-	Workspace     string               `json:"workspace"`
-	Mode          string               `json:"mode"`
-	Provider      string               `json:"provider"`
-	Model         string               `json:"model"`
-	Context       contextledger.Report `json:"context"`
-	Providers     []ProviderItem       `json:"providers"`
-	Skills        []SkillItem          `json:"skills"`
-	TodoList      protocol.TodoList    `json:"todo_list,omitzero"`
-	PromptHistory []string             `json:"prompt_history"`
+	SessionID                 string               `json:"session_id"`
+	Workspace                 string               `json:"workspace"`
+	Mode                      string               `json:"mode"`
+	Provider                  string               `json:"provider"`
+	Model                     string               `json:"model"`
+	ReasoningEffort           string               `json:"reasoning_effort"`
+	SupportedReasoningEfforts []string             `json:"supported_reasoning_efforts"`
+	Context                   contextledger.Report `json:"context"`
+	Providers                 []ProviderItem       `json:"providers"`
+	Skills                    []SkillItem          `json:"skills"`
+	TodoList                  protocol.TodoList    `json:"todo_list,omitzero"`
+	PromptHistory             []string             `json:"prompt_history"`
 }
 
 type ProviderForm struct {
@@ -188,6 +190,7 @@ type ProviderForm struct {
 type ModelSelection struct {
 	Provider              string `json:"provider"`
 	Model                 string `json:"model"`
+	EffortResetFrom       string `json:"effort_reset_from,omitempty"`
 	DetectedContextWindow int    `json:"detected_context_window"`
 	LimitSource           string `json:"limit_source"`
 	Cached                bool   `json:"cached,omitempty"`

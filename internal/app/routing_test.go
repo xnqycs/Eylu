@@ -18,11 +18,11 @@ func TestResolveRuntimeAutomaticAndFixedRouting(t *testing.T) {
 	cfg.RoutingMode = "auto"
 	cfg.ActiveProvider = "reasoning"
 	cfg.Providers["reasoning"] = config.ProviderConfig{
-		Adapter: "openai_responses", BaseURL: "https://reasoning.example/v1", Model: "reasoning-model", ContextWindow: 128_000,
+		Adapter: "openai_responses", BaseURL: "https://reasoning.example/v1", Model: "reasoning-model", ReasoningEffort: "high", ContextWindow: 128_000,
 		Routing: config.ProviderRouting{Tasks: []string{"coding"}, InputCostPerMillion: 8},
 	}
 	cfg.Providers["cheap"] = config.ProviderConfig{
-		Adapter: "openai_chat", BaseURL: "https://cheap.example/v1", Model: "cheap-model", ContextWindow: 64_000,
+		Adapter: "openai_chat", BaseURL: "https://cheap.example/v1", Model: "cheap-model", ReasoningEffort: "low", ContextWindow: 64_000,
 		Routing: config.ProviderRouting{Tasks: []string{"coding"}, InputCostPerMillion: 1},
 	}
 	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
@@ -35,21 +35,21 @@ func TestResolveRuntimeAutomaticAndFixedRouting(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected.Provider.Name != "cheap" || decision == nil || decision.Task != "coding" {
+	if selected.Provider.Name != "cheap" || selected.Provider.Config.ReasoningEffort != "low" || decision == nil || decision.Task != "coding" {
 		t.Fatalf("selected=%s decision=%#v", selected.Provider.Name, decision)
 	}
 	selected, decision, err = runtime.resolveRuntimeForPrompt(context.Background(), manager, chatOptions{requireReasoning: true}, "implement this", 10_000, 8_000, 2_000, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected.Provider.Name != "reasoning" || decision == nil {
+	if selected.Provider.Name != "reasoning" || selected.Provider.Config.ReasoningEffort != "high" || decision == nil {
 		t.Fatalf("selected=%s decision=%#v", selected.Provider.Name, decision)
 	}
 	selected, decision, err = runtime.resolveRuntimeForPrompt(context.Background(), manager, chatOptions{provider: "reasoning"}, "implement this", 10_000, 8_000, 2_000, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected.Provider.Name != "reasoning" || decision != nil {
+	if selected.Provider.Name != "reasoning" || selected.Provider.Config.ReasoningEffort != "high" || decision != nil {
 		t.Fatalf("fixed selection=%s decision=%#v", selected.Provider.Name, decision)
 	}
 }

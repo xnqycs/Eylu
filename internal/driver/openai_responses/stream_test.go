@@ -82,12 +82,13 @@ func TestResponsesStreamRequestsReasoningSummaryAndFallsBack(t *testing.T) {
 			var body struct {
 				Reasoning *struct {
 					Summary string `json:"summary"`
+					Effort  string `json:"effort"`
 				} `json:"reasoning"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
-			if body.Reasoning == nil || body.Reasoning.Summary != "auto" {
+			if body.Reasoning == nil || body.Reasoning.Summary != "auto" || body.Reasoning.Effort != "" {
 				t.Errorf("reasoning = %#v", body.Reasoning)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -111,21 +112,22 @@ func TestResponsesStreamRequestsReasoningSummaryAndFallsBack(t *testing.T) {
 			var body struct {
 				Reasoning *struct {
 					Summary string `json:"summary"`
+					Effort  string `json:"effort"`
 				} `json:"reasoning"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
 			if attempt == 1 {
-				if body.Reasoning == nil || body.Reasoning.Summary != "auto" {
+				if body.Reasoning == nil || body.Reasoning.Summary != "auto" || body.Reasoning.Effort != "high" {
 					t.Errorf("first reasoning = %#v", body.Reasoning)
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"error":{"message":"unknown field reasoning"}}`))
+				_, _ = w.Write([]byte(`{"error":{"message":"unsupported parameter reasoning.summary"}}`))
 				return
 			}
-			if body.Reasoning != nil {
+			if body.Reasoning == nil || body.Reasoning.Summary != "" || body.Reasoning.Effort != "high" {
 				t.Errorf("fallback reasoning = %#v", body.Reasoning)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -133,7 +135,9 @@ func TestResponsesStreamRequestsReasoningSummaryAndFallsBack(t *testing.T) {
 		}))
 		defer server.Close()
 
-		response, err := New(server.Client()).Generate(context.Background(), streamRequest(server.URL), nil)
+		request := streamRequest(server.URL)
+		request.ReasoningEffort = "high"
+		response, err := New(server.Client()).Generate(context.Background(), request, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -142,6 +146,22 @@ func TestResponsesStreamRequestsReasoningSummaryAndFallsBack(t *testing.T) {
 		}
 		if requests.Load() != 2 {
 			t.Fatalf("requests = %d", requests.Load())
+		}
+	})
+
+	t.Run("effort rejection is returned without retry", func(t *testing.T) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"unsupported reasoning effort ultra"}}`))
+		}))
+		defer server.Close()
+		request := streamRequest(server.URL)
+		request.ReasoningEffort = "ultra"
+		_, err := New(server.Client()).Generate(context.Background(), request, nil)
+		if err == nil || requests.Load() != 1 {
+			t.Fatalf("error=%v requests=%d", err, requests.Load())
 		}
 	})
 }

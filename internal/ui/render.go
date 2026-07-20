@@ -212,11 +212,21 @@ func (m *Model) renderHeader() string {
 	if model == "" {
 		model = "no model"
 	}
+	effort := m.snapshot.ReasoningEffort
+	if effort == "" {
+		effort = "auto"
+	}
 	title := m.styles.Header.Render("Eylu")
-	available := max(8, m.width-lipgloss.Width(title)-1)
-	meta := m.styles.Status.Render(truncateColumns(fmt.Sprintf("%s  %s", provider, model), available))
+	available := max(0, m.width-lipgloss.Width(title)-1)
+	effort = truncateColumns(effort, available)
+	coreAvailable := max(0, available-lipgloss.Width(effort)-2)
+	core := truncateColumns(fmt.Sprintf("%s  %s", provider, model), coreAvailable)
+	meta := m.styles.Active.Render(effort)
+	if core != "" {
+		meta = m.styles.Status.Render(core+"  ") + meta
+	}
 	space := max(1, m.width-lipgloss.Width(title)-lipgloss.Width(meta))
-	return title + strings.Repeat(" ", space) + meta
+	return truncateColumns(title+strings.Repeat(" ", space)+meta, m.width)
 }
 
 func (m *Model) renderLoading() string {

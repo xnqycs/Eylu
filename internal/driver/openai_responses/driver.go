@@ -48,6 +48,7 @@ type requestBody struct {
 
 type reasoningConfig struct {
 	Summary string `json:"summary,omitempty"`
+	Effort  string `json:"effort,omitempty"`
 }
 
 type remoteState struct {
@@ -115,8 +116,15 @@ type responseUsage struct {
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	body := requestBody{Model: req.Model.Model, Stream: req.Stream}
-	if req.Stream {
-		body.Reasoning = &reasoningConfig{Summary: "auto"}
+	effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
+	if effort == "auto" {
+		effort = ""
+	}
+	if req.Stream || effort != "" {
+		body.Reasoning = &reasoningConfig{Effort: effort}
+		if req.Stream {
+			body.Reasoning.Summary = "auto"
+		}
 	}
 	state := decodeRemoteState(req.Model.DriverState)
 	if !state.DisablePrevious {
@@ -149,8 +157,11 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 			body.PreviousResponseID = ""
 			body.Input = nil
 			appendResponseInput(&body, req.Model.Turns)
-		} else if body.Reasoning != nil && resp.StatusCode == http.StatusBadRequest {
-			body.Reasoning = nil
+		} else if body.Reasoning != nil && body.Reasoning.Summary != "" && resp.StatusCode == http.StatusBadRequest && reasoningSummaryUnsupported(raw, body.Reasoning.Effort != "") {
+			body.Reasoning.Summary = ""
+			if body.Reasoning.Effort == "" {
+				body.Reasoning = nil
+			}
 		} else {
 			return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
 		}
@@ -214,6 +225,18 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	}
 	result.DriverState = encodeRemoteState(result.DriverState, req.Model.Turns, disablePrevious)
 	return result, nil
+}
+
+func reasoningSummaryUnsupported(raw []byte, explicitEffort bool) bool {
+	message := strings.ToLower(string(raw))
+	unsupported := strings.Contains(message, "unsupported") || strings.Contains(message, "unknown") || strings.Contains(message, "unrecognized") || strings.Contains(message, "invalid")
+	if !unsupported {
+		return false
+	}
+	if strings.Contains(message, "summary") {
+		return true
+	}
+	return !explicitEffort && strings.Contains(message, "reasoning")
 }
 
 func appendResponseInput(body *requestBody, turns []protocol.Turn) {

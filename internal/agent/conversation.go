@@ -239,7 +239,7 @@ func (c *Conversation) prepareRuntime(prompt string, runtime Runtime) error {
 	if mode == "" {
 		mode = "manual"
 	}
-	if c.providerName != runtime.Provider.Name || c.providerGeneration != runtime.Provider.Generation || c.providerAdapter != runtime.Provider.Config.Adapter || c.providerBaseURL != runtime.Provider.Config.BaseURL || c.providerModel != runtime.Provider.Config.Model || c.permissionMode != mode || c.skillCatalog != runtime.SkillCatalog || c.mcpFingerprint != runtime.MCPFingerprint {
+	if c.providerName != runtime.Provider.Name || c.providerGeneration != runtime.Provider.Generation || c.providerAdapter != runtime.Provider.Config.Adapter || c.providerBaseURL != runtime.Provider.Config.BaseURL || c.providerModel != runtime.Provider.Config.Model || c.lastRuntime.Provider.Config.ReasoningEffort != runtime.Provider.Config.ReasoningEffort || c.permissionMode != mode || c.skillCatalog != runtime.SkillCatalog || c.mcpFingerprint != runtime.MCPFingerprint {
 		c.driverState = nil
 		c.providerName = runtime.Provider.Name
 		c.providerGeneration = runtime.Provider.Generation
@@ -277,10 +277,11 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 			return protocol.ModelResponse{}, err
 		}
 		request := driver.Request{
-			BaseURL: runtime.Provider.Config.BaseURL,
-			APIKey:  runtime.APIKey,
-			Headers: runtime.Provider.Config.Headers,
-			Stream:  stream,
+			BaseURL:         runtime.Provider.Config.BaseURL,
+			APIKey:          runtime.APIKey,
+			Headers:         runtime.Provider.Config.Headers,
+			ReasoningEffort: runtime.Provider.Config.ReasoningEffort,
+			Stream:          stream,
 			Model: protocol.ModelRequest{
 				ProtocolVersion: protocol.Version,
 				Model:           runtime.Provider.Config.Model,
@@ -349,6 +350,14 @@ func (c *Conversation) ContextReport() contextledger.Report {
 func (c *Conversation) ApplyProviderSnapshot(snapshot provider.Snapshot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.providerName != snapshot.Name || c.providerGeneration != snapshot.Generation || c.providerAdapter != snapshot.Config.Adapter || c.providerBaseURL != snapshot.Config.BaseURL || c.providerModel != snapshot.Config.Model || c.lastRuntime.Provider.Config.ReasoningEffort != snapshot.Config.ReasoningEffort {
+		c.driverState = nil
+	}
+	c.providerName = snapshot.Name
+	c.providerGeneration = snapshot.Generation
+	c.providerAdapter = snapshot.Config.Adapter
+	c.providerBaseURL = snapshot.Config.BaseURL
+	c.providerModel = snapshot.Config.Model
 	c.lastRuntime.Provider = snapshot
 	c.rebuildLedger(c.lastRuntime)
 }

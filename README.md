@@ -46,13 +46,41 @@ go run . "审查并测试这个项目" --route auto --task review --require-reas
 - `openai_responses`：使用 `/v1/responses` 和类型化 SSE 事件。
 - `openai_chat`：使用 `/v1/chat/completions` 和 Chat Completions 流。
 
-在终端直接运行 `go run .` 会进入多轮交互会话。可用命令包括 `/help`、`/new`、`/tasks`、`/context`、`/skills`、`/skill`、`/providers`、`/provider add|edit|delete|use`、`/model`、`/mode` 与 `/quit`。文本输出实时呈现模型增量；`--output json` 输出完整响应对象。
+思考等级与 `base_url`、`model` 一起配置在 Provider 表中：
+
+```toml
+[providers.default]
+adapter = "openai_responses"
+base_url = "https://api.example.com/v1"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+```
+
+统一等级为 `auto | low | medium | high | xhigh | max | ultra`。`auto` 使用 Provider 的模型默认值，Responses 请求省略 `reasoning.effort`，Chat Completions 请求省略顶层 `reasoning_effort`；其他等级原样发送。模型档案按规范化后的模型 ID 选择可用等级：
+
+| 模型 | 可用等级 |
+|---|---|
+| `gpt-5.6-sol`、`gpt-5.6-terra` | `auto, low, medium, high, xhigh, max, ultra` |
+| GPT/o-series `*-pro` | `auto, high` |
+| `gpt-5.1-codex-max`、`gpt-5.2*` 至 `gpt-5.5*` | `auto, low, medium, high, xhigh` |
+| 其他 GPT-5/Codex/o-series/GPT-OSS | `auto, low, medium, high` |
+| Claude Opus 4.7+ | `auto, low, medium, high, xhigh, max` |
+| 其他 Claude reasoning 模型 | `auto, high, max` |
+| Gemini reasoning 模型 | `auto, low, high` |
+| DeepSeek V4、GLM-5.2 | `auto, high, max` |
+| Kimi K3 | `auto, max` |
+| Qwen、其他 GLM/Kimi、MiniMax、DeepSeek R1 | `auto` |
+| 未知或自定义模型 | `auto, low, medium, high` |
+
+模型切换后，超出新档案范围的已存等级会在同一次配置更新中重置为 `auto` 并显示提示。档案设计参考 [Codex 模型目录](https://github.com/openai/codex/blob/main/codex-rs/core/models.json)、[OpenCode variants](https://opencode.ai/docs/models/)、[Hermes reasoning 配置](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/configuration.md) 和 [OpenClaw thinking profiles](https://docs.openclaw.ai/thinking)。
+
+在终端直接运行 `go run .` 会进入多轮交互会话。可用命令包括 `/help`、`/new`、`/tasks`、`/context`、`/skills`、`/skill`、`/providers`、`/provider add|edit|delete|use`、`/model`、`/effort`、`/mode` 与 `/quit`。文本输出实时呈现模型增量；`--output json` 输出完整响应对象。
 
 兼容入口 `go run . chat [prompt]` 继续可用。prompt 与子命令同名时，可使用 `go run . -- "sessions"` 将其作为对话内容发送。
 
 TTY 默认启动 Bubble Tea v2 全屏界面，包含滚动历史、1 至 8 行动态输入框、Markdown、工具状态/详情、独立任务树、底部审批与提问工作台、Provider 表单、模型筛选、Skill 状态与上下文进度。请求运行时，任务树位于 activity 行与输入分隔线之间；请求完成或恢复 session 后，清单以 `3 tasks (0 done, 1 in progress, 2 open)` 摘要紧接最后一条历史内容，并随 viewport 滚动。两种状态最多展示 5 个任务，超出部分使用 `... +N pending`、`... +N completed` 等英文计数；进行中项优先，completed 项稳定移到末尾。`todolist` 工具卡从历史区隐藏，完整参数和结果仍可通过 `Ctrl-T` 查看；`/tasks` 打开带 `[ ]`、`[>]`、`[x]`、`[-]` 状态标记的完整清单。历史区支持鼠标拖选并自动复制纯文本，拖选期间可用滚轮跨越当前 viewport，复制状态在输入框上方显示 2 秒；ANSI、OSC 链接、中文宽字符、软换行和滚动偏移均按显示列处理。界面采用 Eylu Signal 语义色板，焦点、工具活动、确认、风险与选区使用独立颜色；Markdown 内联代码只使用主题强调色文字，不绘制背景。`Enter` 提交，`Shift+Enter`、`Ctrl+Enter` 或兼容编码 `Ctrl+J` 换行，超过 8 行后输入框内部滚动。光标位于输入内容视觉顶端或底端时，`Up`/`Down` 会浏览当前 session 持久化的原始 Prompt，并在越过最新记录时恢复未发送草稿。
 
-输入 `/` 会在输入框上方显示命令与英文说明，继续输入可按前缀筛选；`/mode`、`/provider`、`/skill` 提供上下文子选项，活跃 Skill 也可作为顶层命令使用。输入 `@` 可引用活跃 Skill 或仓库文件，支持 `@index.html`、`@build/index.html` 与带引号路径；补全列表使用 Git 标准 ignore/exclude 语义，主动输入的完整路径或唯一文件名可引用 ignored 文件。提交时 Skill 自动激活，UTF-8 文件快照按配置预算注入请求。方向键、`Tab`、`Enter` 和 `Esc` 用于操作补全面板。
+输入 `/` 会在输入框上方显示命令与英文说明，继续输入可按前缀筛选；`/mode`、`/provider`、`/skill` 提供上下文子选项，活跃 Skill 也可作为顶层命令使用。输入 `/effort` 会立即展开当前模型支持的等级，光标定位到带绿色 `*` 的当前项；`Up`/`Down` 或 `Ctrl-P`/`Ctrl-N` 移动，`Enter` 选择并持久化，`Tab` 填入输入框后继续编辑，`Esc` 关闭。也可直接提交 `/effort high`；`/effort` 在 `--no-tui` 中显示当前值和可用等级。右上角按 `provider  model  effort` 展示当前请求状态，窄终端优先保留 effort。输入 `@` 可引用活跃 Skill 或仓库文件，支持 `@index.html`、`@build/index.html` 与带引号路径；补全列表使用 Git 标准 ignore/exclude 语义，主动输入的完整路径或唯一文件名可引用 ignored 文件。提交时 Skill 自动激活，UTF-8 文件快照按配置预算注入请求。方向键、`Tab`、`Enter` 和 `Esc` 用于操作补全面板。
 
 流式活动行展示阶段、自动换算后的耗时、每回合发送 token、实时接收 token 和 thinking 状态；Responses reasoning summary delta 与 Chat `reasoning_content` 用于实时估算，Provider usage 到达后校正为精确累计值。请求结束行展示总耗时、TTFT 与模型实际生成阶段的 TPS，例如 `Completed in 15.992s; TTFT 3.044s; TPS 42.6 t/s.`。TUI 会把 provider 发出的极小文本与工具参数 delta 合并成小批次，并缓存已完成的 Markdown 渲染，减少长会话重绘。模型生成 `bash`、`write_file`、`edit_file` 或其他需审批的工具参数时，必须提供面向用户的 `reason`；审批工作台同时展示动作摘要、申请理由和策略依据，仅提供单次同意与拒绝。拒绝时按 `Tab` 可填写反馈并回传模型继续当前请求；直接拒绝会中断请求并显示相同指标。模型调用 `ask` 时，工作台逐题展示 2 至 4 个选项和自定义答案入口；方向键切换问题，`Space` 勾选多选项，`Tab` 编辑自定义答案，`Enter` 提交，`Esc` 取消当前请求。`--no-tui` 的文本 TTY 使用编号、逗号分隔多选和 `o` 自定义输入。Provider 表单的 API Key 使用 password input，并明文写入 Provider 配置；模型面板支持刷新、筛选、选择和手工 ID。`Shift+Tab` 按 `manual → plan → auto → full` 循环模式；运行期间的切换在下一轮生效。`Ctrl-C` 在请求期间第一次取消，第二次退出；`Ctrl-T` 打开最近工具详情。
 
@@ -198,7 +226,7 @@ max_parallel_tools = 4
 
 常规配置优先级为命令行参数、`EYLU_*` 环境变量、工作区 `.eylu/config.toml`、用户目录 `~/.eylu/config.toml`、默认值。所有默认值由代码提供，TOML 只保存用户显式字段；显式的默认值、`false`、`0` 和空数组会稳定保留。命令只更新当前配置层，继承值与环境变量保持在来源层。`[model_metadata]` 默认省略，用户可按字段覆盖探测超时、TTL、目录 URL、缓存限制和阶梯。workspace 使用独立的运行时优先级 `--workspace > EYLU_WORKSPACE > cwd`。Provider 的 `api_key` 与 `base_url` 位于同一个 TOML 表并以明文保存；应限制配置文件仅供当前系统用户读取。`EYLU_API_KEY` 可临时覆盖所有 Provider 的配置值。
 
-session 保存完整 Eylu transcript、环境快照、上下文账本、权限模式、Provider generation、模型引用、最近一次探测限制和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。恢复请求会重新解析模型限制。旧 session 补采环境时会清除原 DriverState，并使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
+session 保存完整 Eylu transcript、环境快照、上下文账本、权限模式、Provider generation、模型引用、有效思考等级、最近一次探测限制和 opaque DriverState；API Key 与 Provider headers 不进入 session 文件。恢复请求会重新解析模型限制。旧 session 补采环境时会清除原 DriverState，并使用本地 transcript 重建模型请求。`max_sessions` 与 `max_session_bytes` 控制自动清理上限，`sessions cleanup` 可立即执行清理。
 
 ## 发布
 

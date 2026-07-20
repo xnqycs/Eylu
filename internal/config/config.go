@@ -15,13 +15,19 @@ import (
 	"time"
 )
 
-const SchemaVersion = 1
+const (
+	SchemaVersion       = 1
+	ReasoningEffortAuto = "auto"
+)
+
+var allReasoningEfforts = []string{"auto", "low", "medium", "high", "xhigh", "max", "ultra"}
 
 type ProviderConfig struct {
 	Adapter         string            `toml:"adapter" json:"adapter"`
 	BaseURL         string            `toml:"base_url" json:"base_url"`
 	APIKey          string            `toml:"api_key,omitempty" json:"-"`
 	Model           string            `toml:"model" json:"model"`
+	ReasoningEffort string            `toml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
 	CatalogProvider string            `toml:"catalog_provider,omitempty" json:"catalog_provider,omitempty"`
 	ContextWindow   int               `toml:"context_window,omitempty" json:"context_window,omitempty"`
 	TimeoutSeconds  int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
@@ -73,6 +79,97 @@ func (p ProviderConfig) Timeout(fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return time.Duration(p.TimeoutSeconds) * time.Second
+}
+
+func EffectiveReasoningEffort(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ReasoningEffortAuto
+	}
+	return value
+}
+
+func SupportedReasoningEfforts(modelID string) []string {
+	model := normalizedModelID(modelID)
+	levels := []string{"auto", "low", "medium", "high"}
+	switch {
+	case strings.HasPrefix(model, "gpt-5.6-sol"), strings.HasPrefix(model, "gpt-5.6-terra"):
+		levels = allReasoningEfforts
+	case isOpenAIProModel(model):
+		levels = []string{"auto", "high"}
+	case model == "gpt-5.1-codex-max", strings.HasPrefix(model, "gpt-5.1-codex-max-"), modernGPTXHigh(model):
+		levels = []string{"auto", "low", "medium", "high", "xhigh"}
+	case strings.HasPrefix(model, "gpt-5"), strings.HasPrefix(model, "codex"), strings.HasPrefix(model, "o1"), strings.HasPrefix(model, "o3"), strings.HasPrefix(model, "o4"), strings.HasPrefix(model, "gpt-oss"):
+		levels = []string{"auto", "low", "medium", "high"}
+	case modernClaudeOpus(model):
+		levels = []string{"auto", "low", "medium", "high", "xhigh", "max"}
+	case strings.HasPrefix(model, "claude-"):
+		levels = []string{"auto", "high", "max"}
+	case strings.HasPrefix(model, "gemini-"):
+		levels = []string{"auto", "low", "high"}
+	case strings.HasPrefix(model, "deepseek-v4"), strings.HasPrefix(model, "glm-5.2"):
+		levels = []string{"auto", "high", "max"}
+	case strings.HasPrefix(model, "kimi-k3"):
+		levels = []string{"auto", "max"}
+	case strings.HasPrefix(model, "qwen"), strings.HasPrefix(model, "glm-"), strings.HasPrefix(model, "kimi-"), strings.HasPrefix(model, "minimax"), strings.HasPrefix(model, "deepseek-r1"):
+		levels = []string{"auto"}
+	}
+	return append([]string(nil), levels...)
+}
+
+func ValidateReasoningEffort(modelID, effort string) error {
+	effort = EffectiveReasoningEffort(effort)
+	for _, available := range SupportedReasoningEfforts(modelID) {
+		if effort == available {
+			return nil
+		}
+	}
+	return fmt.Errorf("reasoning effort %q is unavailable for model %q; available: %s", effort, modelID, strings.Join(SupportedReasoningEfforts(modelID), ", "))
+}
+
+func normalizedModelID(modelID string) string {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	if index := strings.LastIndex(modelID, "/"); index >= 0 {
+		modelID = modelID[index+1:]
+	}
+	return modelID
+}
+
+func isOpenAIProModel(model string) bool {
+	openAI := strings.HasPrefix(model, "gpt-5") || strings.HasPrefix(model, "o1") || strings.HasPrefix(model, "o3") || strings.HasPrefix(model, "o4")
+	return openAI && (strings.HasSuffix(model, "-pro") || strings.Contains(model, "-pro-"))
+}
+
+func modernGPTXHigh(model string) bool {
+	for _, prefix := range []string{"gpt-5.2", "gpt-5.3", "gpt-5.4", "gpt-5.5"} {
+		if model == prefix || strings.HasPrefix(model, prefix+"-") || strings.HasPrefix(model, prefix+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func modernClaudeOpus(model string) bool {
+	const prefix = "claude-opus-"
+	if !strings.HasPrefix(model, prefix) {
+		return false
+	}
+	version := strings.FieldsFunc(strings.TrimPrefix(model, prefix), func(character rune) bool { return character == '.' || character == '-' })
+	if len(version) == 0 {
+		return false
+	}
+	major, err := strconv.Atoi(version[0])
+	if err != nil || major < 4 {
+		return false
+	}
+	if major > 4 {
+		return true
+	}
+	if len(version) < 2 {
+		return false
+	}
+	minor, err := strconv.Atoi(version[1])
+	return err == nil && minor >= 7 && minor <= 99
 }
 
 type Config struct {
@@ -268,6 +365,9 @@ func ValidateProvider(name string, p ProviderConfig) error {
 	}
 	if strings.TrimSpace(p.Model) == "" {
 		return fmt.Errorf("provider %q model is required", name)
+	}
+	if err := ValidateReasoningEffort(p.Model, p.ReasoningEffort); err != nil {
+		return fmt.Errorf("provider %q %w", name, err)
 	}
 	if p.ContextWindow < 0 || p.TimeoutSeconds < 0 {
 		return fmt.Errorf("provider %q numeric limits cannot be negative", name)

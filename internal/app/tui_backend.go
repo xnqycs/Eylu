@@ -91,10 +91,13 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		if selected, ok := b.manager.Snapshot(state.Provider.Name); ok {
 			active = selected
 			active.Config.Model = state.Provider.Model
+			active.Config.ReasoningEffort = state.Provider.ReasoningEffort
 		}
 	}
+	effort := config.EffectiveReasoningEffort(active.Config.ReasoningEffort)
 	snapshot := ui.Snapshot{
 		SessionID: b.conversation.SessionID(), Workspace: b.runtime.workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
+		ReasoningEffort: effort, SupportedReasoningEfforts: config.SupportedReasoningEfforts(active.Config.Model),
 		Context: b.conversation.ContextReport(), TodoList: state.TodoList, PromptHistory: append([]string{}, state.PromptHistory...),
 	}
 	managerActive, _ := b.manager.Active()
@@ -105,11 +108,13 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		})
 	}
 	activated := b.conversation.ActivatedSkillDigests()
-	for _, record := range b.skills.Records() {
-		snapshot.Skills = append(snapshot.Skills, ui.SkillItem{
-			Name: record.Skill.Name, Description: record.Skill.Description, Source: record.Skill.Source.String(), Status: string(record.Status),
-			ShadowedBy: record.ShadowedBy, Reason: record.Reason, Activated: activated[record.Skill.Name] != "",
-		})
+	if b.skills != nil {
+		for _, record := range b.skills.Records() {
+			snapshot.Skills = append(snapshot.Skills, ui.SkillItem{
+				Name: record.Skill.Name, Description: record.Skill.Description, Source: record.Skill.Source.String(), Status: string(record.Status),
+				ShadowedBy: record.ShadowedBy, Reason: record.Reason, Activated: activated[record.Skill.Name] != "",
+			})
+		}
 	}
 	return snapshot, nil
 }
@@ -621,7 +626,38 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("Model: %s; detected context window: %d (%s)", fields[1], selection.DetectedContextWindow, selection.LimitSource), nil
+		message := fmt.Sprintf("Model: %s; detected context window: %d (%s)", fields[1], selection.DetectedContextWindow, selection.LimitSource)
+		if selection.EffortResetFrom != "" {
+			message += fmt.Sprintf("; reasoning effort reset from %s to auto", selection.EffortResetFrom)
+		}
+		return message, nil
+	case "/effort":
+		b.mu.Lock()
+		opts := b.opts
+		b.mu.Unlock()
+		snapshot, err := selectedEffortProvider(b.manager, b.conversation, opts)
+		if err != nil {
+			return "", err
+		}
+		available := config.SupportedReasoningEfforts(snapshot.Config.Model)
+		if len(fields) == 1 {
+			return fmt.Sprintf("Reasoning effort: %s; available: %s", config.EffectiveReasoningEffort(snapshot.Config.ReasoningEffort), strings.Join(available, ", ")), nil
+		}
+		if len(fields) != 2 {
+			return "", fmt.Errorf("usage: /effort <%s>", strings.Join(available, "|"))
+		}
+		active, _ := b.manager.Active()
+		updated, err := updateProviderReasoningEffort(b.manager, snapshot.Name, fields[1], active.Name == snapshot.Name)
+		if err != nil {
+			return "", err
+		}
+		b.conversation.ApplyProviderSnapshot(updated)
+		if b.runtime.session != nil {
+			if err := b.runtime.session.Sync(b.conversation, b.manager, opts, nil); err != nil {
+				return "", err
+			}
+		}
+		return "Reasoning effort: " + config.EffectiveReasoningEffort(updated.Config.ReasoningEffort), nil
 	default:
 		return "", fmt.Errorf("unknown command %s", fields[0])
 	}
@@ -650,6 +686,7 @@ func (b *tuiBackend) SetMode(_ context.Context, value string) error {
 
 func (b *tuiBackend) UpsertProvider(ctx context.Context, form ui.ProviderForm) (ui.ModelSelection, error) {
 	patch := config.ProviderPatch{}
+	effortResetFrom := ""
 	if form.OriginalName == "" {
 		patch.Adapter = config.SetValue(form.Adapter)
 		patch.BaseURL = config.SetValue(form.BaseURL)
@@ -666,6 +703,10 @@ func (b *tuiBackend) UpsertProvider(ctx context.Context, form ui.ProviderForm) (
 		}
 		if form.Model != current.Model {
 			patch.Model = config.SetValue(form.Model)
+			if currentEffort := config.EffectiveReasoningEffort(current.ReasoningEffort); config.ValidateReasoningEffort(form.Model, currentEffort) != nil {
+				patch.ReasoningEffort = config.SetValue(config.ReasoningEffortAuto)
+				effortResetFrom = currentEffort
+			}
 		}
 	}
 	if form.APIKey != "" {
@@ -694,7 +735,9 @@ func (b *tuiBackend) UpsertProvider(ctx context.Context, form ui.ProviderForm) (
 	b.opts.provider = ""
 	b.mu.Unlock()
 	resolved, err := b.probeProviderModelLimits(ctx, form.Name)
-	return modelSelection(resolved), err
+	selection := modelSelection(resolved)
+	selection.EffortResetFrom = effortResetFrom
+	return selection, err
 }
 
 func (b *tuiBackend) DeleteProvider(ctx context.Context, name string) error {
@@ -731,16 +774,54 @@ func (b *tuiBackend) UseProvider(ctx context.Context, name string) error {
 }
 
 func (b *tuiBackend) SetModel(ctx context.Context, providerName, modelID string) (ui.ModelSelection, error) {
-	_, ok := b.manager.Get(providerName)
+	current, ok := b.manager.Get(providerName)
 	if !ok {
 		return ui.ModelSelection{}, fmt.Errorf("provider %q does not exist", providerName)
 	}
 	active, _ := b.manager.Active()
-	if err := b.manager.UpsertPatch(providerName, config.ProviderPatch{Model: config.SetValue(modelID)}, active.Name == providerName); err != nil {
+	patch := config.ProviderPatch{Model: config.SetValue(modelID)}
+	resetFrom := ""
+	if currentEffort := config.EffectiveReasoningEffort(current.ReasoningEffort); config.ValidateReasoningEffort(modelID, currentEffort) != nil {
+		patch.ReasoningEffort = config.SetValue(config.ReasoningEffortAuto)
+		resetFrom = currentEffort
+	}
+	if err := b.manager.UpsertPatch(providerName, patch, active.Name == providerName); err != nil {
 		return ui.ModelSelection{}, err
 	}
 	resolved, err := b.probeProviderModelLimits(ctx, providerName)
-	return modelSelection(resolved), err
+	selection := modelSelection(resolved)
+	selection.EffortResetFrom = resetFrom
+	return selection, err
+}
+
+func updateProviderReasoningEffort(manager *provider.Manager, providerName, value string, activate bool) (provider.Snapshot, error) {
+	current, ok := manager.Get(providerName)
+	if !ok {
+		return provider.Snapshot{}, fmt.Errorf("provider %q does not exist", providerName)
+	}
+	value = config.EffectiveReasoningEffort(value)
+	if err := config.ValidateReasoningEffort(current.Model, value); err != nil {
+		return provider.Snapshot{}, err
+	}
+	if err := manager.UpsertPatch(providerName, config.ProviderPatch{ReasoningEffort: config.SetValue(value)}, activate); err != nil {
+		return provider.Snapshot{}, err
+	}
+	updated, _ := manager.Snapshot(providerName)
+	return updated, nil
+}
+
+func selectedEffortProvider(manager *provider.Manager, conversation *agent.Conversation, opts chatOptions) (provider.Snapshot, error) {
+	name := opts.provider
+	if name == "" && conversation != nil {
+		name = conversation.ExportState().Provider.Name
+	}
+	if name != "" {
+		if selected, ok := manager.Snapshot(name); ok {
+			return selected, nil
+		}
+		return provider.Snapshot{}, fmt.Errorf("provider %q does not exist", name)
+	}
+	return manager.Active()
 }
 
 func (b *tuiBackend) SetContextWindow(ctx context.Context, providerName string, contextWindow int) error {

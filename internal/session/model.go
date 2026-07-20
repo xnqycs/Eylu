@@ -32,6 +32,7 @@ type ProviderState struct {
 	Adapter                string    `json:"adapter"`
 	BaseURL                string    `json:"base_url"`
 	Model                  string    `json:"model"`
+	ReasoningEffort        string    `json:"reasoning_effort,omitempty"`
 	CatalogProvider        string    `json:"catalog_provider,omitempty"`
 	ContextWindow          int       `json:"context_window,omitempty"`
 	DetectedContextWindow  int       `json:"detected_context_window,omitempty"`

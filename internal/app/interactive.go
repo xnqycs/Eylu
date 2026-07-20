@@ -117,7 +117,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	command := fields[0]
 	switch command {
 	case "/help":
-		fmt.Fprintln(r.stdout, "/new  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /mode manual|plan|auto|full  /quit")
+		fmt.Fprintln(r.stdout, "/new  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /effort [level]  /mode manual|plan|auto|full  /quit")
 		return nil
 	case "/quit":
 		return errQuit
@@ -186,6 +186,32 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		if r.session != nil {
 			return r.session.Sync(conversation, manager, *opts, nil)
 		}
+		return nil
+	case "/effort":
+		selected, err := selectedEffortProvider(manager, conversation, *opts)
+		if err != nil {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
+		}
+		available := config.SupportedReasoningEfforts(selected.Config.Model)
+		if len(fields) == 1 {
+			fmt.Fprintf(r.stdout, "Reasoning effort: %s; available: %s\n", config.EffectiveReasoningEffort(selected.Config.ReasoningEffort), strings.Join(available, ", "))
+			return nil
+		}
+		if len(fields) != 2 {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("usage: /effort <%s>", strings.Join(available, "|"))}
+		}
+		active, _ := manager.Active()
+		updated, err := updateProviderReasoningEffort(manager, selected.Name, fields[1], active.Name == selected.Name)
+		if err != nil {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
+		}
+		conversation.ApplyProviderSnapshot(updated)
+		if r.session != nil {
+			if err := r.session.Sync(conversation, manager, *opts, nil); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintf(r.stdout, "Reasoning effort: %s\n", config.EffectiveReasoningEffort(updated.Config.ReasoningEffort))
 		return nil
 	case "/mode":
 		if len(fields) != 2 {
@@ -384,8 +410,16 @@ func (r *runtime) handleProviderSlash(ctx context.Context, reader *bufio.Reader,
 		model := promptLine(reader, r.stdout, "Model ID", current.Model)
 		adapter := promptLine(reader, r.stdout, "Adapter", current.Adapter)
 		patch := config.ProviderPatch{BaseURL: config.SetValue(baseURL), Model: config.SetValue(model), Adapter: config.SetValue(adapter)}
+		resetFrom := ""
+		if currentEffort := config.EffectiveReasoningEffort(current.ReasoningEffort); config.ValidateReasoningEffort(model, currentEffort) != nil {
+			patch.ReasoningEffort = config.SetValue(config.ReasoningEffortAuto)
+			resetFrom = currentEffort
+		}
 		if err := manager.UpsertPatch(fields[2], patch, true); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		}
+		if resetFrom != "" {
+			fmt.Fprintf(r.stdout, "Reasoning effort reset from %s to auto for %s.\n", resetFrom, model)
 		}
 		if model != current.Model {
 			probed, probeErr := r.probeProviderModelLimits(ctx, manager, fields[2])
@@ -448,8 +482,17 @@ func (r *runtime) handleModelSlash(ctx context.Context, fields []string, manager
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	if len(fields) == 2 {
-		if err := manager.UpsertPatch(snapshot.Name, config.ProviderPatch{Model: config.SetValue(fields[1])}, true); err != nil {
+		patch := config.ProviderPatch{Model: config.SetValue(fields[1])}
+		resetFrom := ""
+		if currentEffort := config.EffectiveReasoningEffort(snapshot.Config.ReasoningEffort); config.ValidateReasoningEffort(fields[1], currentEffort) != nil {
+			patch.ReasoningEffort = config.SetValue(config.ReasoningEffortAuto)
+			resetFrom = currentEffort
+		}
+		if err := manager.UpsertPatch(snapshot.Name, patch, true); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		}
+		if resetFrom != "" {
+			fmt.Fprintf(r.stdout, "Reasoning effort reset from %s to auto for %s.\n", resetFrom, fields[1])
 		}
 		fmt.Fprintf(r.stdout, "Model: %s\n", fields[1])
 		return nil

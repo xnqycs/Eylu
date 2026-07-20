@@ -57,7 +57,9 @@ func TestConfigPersistsProviderAPIKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	cfg := Default()
 	cfg.ActiveProvider = "work"
-	cfg.Providers["work"] = validProvider("https://example.com/v1", "model")
+	provider := validProvider("https://example.com/v1", "model")
+	provider.ReasoningEffort = "high"
+	cfg.Providers["work"] = provider
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +70,9 @@ func TestConfigPersistsProviderAPIKey(t *testing.T) {
 	if !strings.Contains(string(data), "api_key = 'sk-test-secret'") {
 		t.Fatalf("config did not persist provider API key: %s", data)
 	}
+	if !strings.Contains(string(data), "reasoning_effort = 'high'") {
+		t.Fatalf("config did not persist reasoning effort: %s", data)
+	}
 	if strings.Contains(string(data), "workspace") {
 		t.Fatalf("config persisted runtime workspace: %s", data)
 	}
@@ -75,8 +80,8 @@ func TestConfigPersistsProviderAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Config.Providers["work"].APIKey != "sk-test-secret" {
-		t.Fatal("provider API key did not round-trip")
+	if got := loaded.Config.Providers["work"]; got.APIKey != "sk-test-secret" || got.ReasoningEffort != "high" {
+		t.Fatalf("provider settings did not round-trip: %#v", got)
 	}
 	encoded, err := json.Marshal(loaded.Config)
 	if err != nil {
@@ -84,6 +89,55 @@ func TestConfigPersistsProviderAPIKey(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "sk-test-secret") {
 		t.Fatal("provider API key leaked into JSON runtime state")
+	}
+}
+
+func TestReasoningEffortProfilesAndValidation(t *testing.T) {
+	tests := []struct {
+		model string
+		want  string
+	}{
+		{model: "openai/gpt-5.6-sol", want: "auto,low,medium,high,xhigh,max,ultra"},
+		{model: "gpt-5.4-pro", want: "auto,high"},
+		{model: "gpt-5.4", want: "auto,low,medium,high,xhigh"},
+		{model: "gpt-5.1-codex", want: "auto,low,medium,high"},
+		{model: "anthropic/claude-opus-4.7", want: "auto,low,medium,high,xhigh,max"},
+		{model: "claude-opus-5.1", want: "auto,low,medium,high,xhigh,max"},
+		{model: "claude-sonnet-4.6", want: "auto,high,max"},
+		{model: "google/gemini-3-pro", want: "auto,low,high"},
+		{model: "deepseek-v4", want: "auto,high,max"},
+		{model: "glm-5.2", want: "auto,high,max"},
+		{model: "kimi-k3", want: "auto,max"},
+		{model: "qwen3", want: "auto"},
+		{model: "custom-model", want: "auto,low,medium,high"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := strings.Join(SupportedReasoningEfforts(tc.model), ","); got != tc.want {
+				t.Fatalf("SupportedReasoningEfforts(%q) = %q, want %q", tc.model, got, tc.want)
+			}
+		})
+	}
+
+	if got := EffectiveReasoningEffort(""); got != "auto" {
+		t.Fatalf("EffectiveReasoningEffort(empty) = %q", got)
+	}
+	if err := ValidateReasoningEffort("gpt-5.6-sol", "ultra"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateReasoningEffort("qwen3", "high"); err == nil || !strings.Contains(err.Error(), "available: auto") {
+		t.Fatalf("incompatible effort error = %v", err)
+	}
+	if err := ValidateReasoningEffort("gpt-5.6-sol", "extreme"); err == nil {
+		t.Fatal("invalid effort passed validation")
+	}
+}
+
+func TestProviderReasoningEffortPatch(t *testing.T) {
+	provider := validProvider("https://example.com/v1", "gpt-5.6-sol")
+	provider = ApplyProviderPatch(provider, ProviderPatch{ReasoningEffort: SetValue("max")})
+	if provider.ReasoningEffort != "max" || SparseProviderPatch(provider).ReasoningEffort.Value != "max" || !SparseProviderPatch(provider).ReasoningEffort.Set {
+		t.Fatalf("reasoning effort patch was not preserved: %#v", provider)
 	}
 }
 

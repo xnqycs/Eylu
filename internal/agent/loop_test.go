@@ -77,9 +77,11 @@ func (echoTool) Execute(_ context.Context, input json.RawMessage) protocol.ToolR
 func TestAgentLoopTranscriptAndToolResultPairing(t *testing.T) {
 	model := &loopDriver{}
 	conversation := NewConversation()
+	runtime := testRuntime(model, 1)
+	runtime.Provider.Config.ReasoningEffort = "high"
 	executor := &tool.Executor{Registry: tool.NewRegistry(echoTool{}), Policy: policy.AllowAllChecker{}, Workspace: t.TempDir()}
 	events := make([]protocol.EventKind, 0)
-	response, err := conversation.Run(context.Background(), "use echo", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, func(event protocol.ModelEvent) error {
+	response, err := conversation.Run(context.Background(), "use echo", runtime, executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, func(event protocol.ModelEvent) error {
 		events = append(events, event.Kind)
 		return nil
 	})
@@ -94,7 +96,7 @@ func TestAgentLoopTranscriptAndToolResultPairing(t *testing.T) {
 	if turns[2].Parts[0].ToolResult.CallID != callID {
 		t.Fatal("tool result is not paired with its call")
 	}
-	if len(model.requests[0].Model.Tools) != 1 || len(model.requests[1].Model.Turns) != 4 {
+	if len(model.requests[0].Model.Tools) != 1 || len(model.requests[1].Model.Turns) != 4 || model.requests[0].ReasoningEffort != "high" || model.requests[1].ReasoningEffort != "high" {
 		t.Fatalf("requests = %#v", model.requests)
 	}
 	if len(events) != 2 || events[0] != protocol.EventToolStart || events[1] != protocol.EventToolResult {

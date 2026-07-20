@@ -224,6 +224,77 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	}
 }
 
+func TestTUIBackendReasoningEffortAndModelReset(t *testing.T) {
+	cfg := testAppConfig()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{
+		Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "gpt-5.6-sol", ReasoningEffort: "high",
+	}
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, _ := manager.Active()
+	conversation, err := agent.RestoreConversation(agent.ConversationState{
+		SessionID: "effort-session", PermissionMode: "manual",
+		Provider: agent.ProviderState{Name: initial.Name, Generation: initial.Generation, Adapter: initial.Config.Adapter, BaseURL: initial.Config.BaseURL, Model: initial.Config.Model, ReasoningEffort: initial.Config.ReasoningEffort},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &tuiBackend{runtime: &runtime{metadataCachePath: filepath.Join(t.TempDir(), "metadata.json")}, conversation: conversation, manager: manager}
+
+	message, err := backend.Command(context.Background(), "/effort max")
+	if err != nil || !strings.Contains(message, "max") {
+		t.Fatalf("command message=%q error=%v", message, err)
+	}
+	snapshot, err := backend.Snapshot(context.Background())
+	if err != nil || snapshot.ReasoningEffort != "max" || strings.Join(snapshot.SupportedReasoningEfforts, ",") != "auto,low,medium,high,xhigh,max,ultra" {
+		t.Fatalf("snapshot=%#v error=%v", snapshot, err)
+	}
+
+	selection, err := backend.SetModel(context.Background(), "work", "qwen3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, _ := manager.Get("work")
+	if updated.Model != "qwen3" || updated.ReasoningEffort != "auto" || selection.EffortResetFrom != "max" {
+		t.Fatalf("updated=%#v selection=%#v", updated, selection)
+	}
+	snapshot, err = backend.Snapshot(context.Background())
+	if err != nil || snapshot.Model != "qwen3" || snapshot.ReasoningEffort != "auto" {
+		t.Fatalf("refreshed snapshot=%#v error=%v", snapshot, err)
+	}
+	if _, err := backend.Command(context.Background(), "/effort high"); err == nil || !strings.Contains(err.Error(), "available: auto") {
+		t.Fatalf("incompatible command error=%v", err)
+	}
+}
+
+func TestTUIBackendEffortUpdatesLastRoutedProvider(t *testing.T) {
+	cfg := testAppConfig()
+	cfg.ActiveProvider = "active"
+	cfg.Providers["active"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://active.example/v1", Model: "gpt-5.6-sol", ReasoningEffort: "low"}
+	cfg.Providers["routed"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://routed.example/v1", Model: "gpt-5.6-sol", ReasoningEffort: "medium"}
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed, _ := manager.Snapshot("routed")
+	conversation := agent.NewConversation()
+	conversation.ApplyProviderSnapshot(routed)
+	backend := &tuiBackend{runtime: &runtime{}, conversation: conversation, manager: manager}
+
+	if _, err := backend.Command(context.Background(), "/effort max"); err != nil {
+		t.Fatal(err)
+	}
+	active, _ := manager.Get("active")
+	updated, _ := manager.Get("routed")
+	managerActive, _ := manager.Active()
+	if active.ReasoningEffort != "low" || updated.ReasoningEffort != "max" || managerActive.Name != "active" {
+		t.Fatalf("active=%#v routed=%#v manager_active=%s", active, updated, managerActive.Name)
+	}
+}
+
 func TestTUIBackendSetModelProbesImmediately(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

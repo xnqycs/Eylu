@@ -29,6 +29,7 @@ type fakeBackend struct {
 	snapshot      Snapshot
 	submit        func(context.Context, string, Submission, func(Event)) error
 	err           error
+	command       string
 	models        []string
 	files         []FileItem
 	mode          string
@@ -43,7 +44,10 @@ func (b *fakeBackend) Submit(ctx context.Context, operationID string, submission
 	}
 	return b.err
 }
-func (b *fakeBackend) Command(context.Context, string) (string, error) { return "command ok", b.err }
+func (b *fakeBackend) Command(_ context.Context, command string) (string, error) {
+	b.command = command
+	return "command ok", b.err
+}
 func (b *fakeBackend) ListFiles(context.Context) ([]FileItem, error) {
 	return append([]FileItem(nil), b.files...), b.err
 }
@@ -1126,6 +1130,100 @@ func TestMultilineInputCompletionReferencesAndModeCycle(t *testing.T) {
 				t.Fatalf("%dx%d completion line width=%d line=%q", size.width, size.height, lipgloss.Width(line), line)
 			}
 		}
+	}
+}
+
+func TestReasoningEffortCompletionSelectionAndExecution(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 64, Height: 24})
+	model.snapshot = Snapshot{
+		Provider: "default", Model: "gpt-5.6-sol", ReasoningEffort: "high",
+		SupportedReasoningEfforts: []string{"auto", "low", "medium", "high", "xhigh", "max", "ultra"},
+	}
+
+	model.input.SetValue("/effort")
+	_ = model.refreshCompletion()
+	if len(model.completion.items) != 7 || model.completion.items[model.completion.cursor].label != "high" || !model.completion.items[model.completion.cursor].current {
+		t.Fatalf("completion=%#v cursor=%d", model.completion.items, model.completion.cursor)
+	}
+	if rendered := ansi.Strip(model.renderCompletion()); !strings.Contains(rendered, ">* high") {
+		t.Fatalf("current effort marker missing:\n%s", rendered)
+	}
+	if handled, command := model.handleCompletionKey("tab"); !handled || command != nil || model.input.Value() != "/effort high" || backend.command != "" {
+		t.Fatalf("tab handled=%t input=%q command=%q", handled, model.input.Value(), backend.command)
+	}
+
+	model.input.SetValue("/effort")
+	_ = model.refreshCompletion()
+	model.moveCompletion(1)
+	if model.completion.items[model.completion.cursor].label != "xhigh" {
+		t.Fatalf("cursor item=%#v", model.completion.items[model.completion.cursor])
+	}
+	handled, command := model.handleCompletionKey("enter")
+	if !handled || command == nil || model.input.Value() != "" {
+		t.Fatalf("enter handled=%t command=%v input=%q", handled, command, model.input.Value())
+	}
+	_ = command()
+	if backend.command != "/effort xhigh" {
+		t.Fatalf("command=%q", backend.command)
+	}
+
+	model.input.SetValue("/effort impossible")
+	_ = model.refreshCompletion()
+	if handled, _ := model.handleCompletionKey("enter"); handled {
+		t.Fatal("no-match effort completion swallowed validation")
+	}
+	model.input.SetValue("/effort")
+	_ = model.refreshCompletion()
+	if handled, _ := model.handleCompletionKey("esc"); !handled || model.completion.kind != completionNone {
+		t.Fatalf("escape handled=%t completion=%#v", handled, model.completion)
+	}
+
+	colored := NewModel(backend, Options{NoAnimation: true, Width: 64, Height: 24})
+	colored.snapshot = model.snapshot
+	colored.input.SetValue("/effort")
+	_ = colored.refreshCompletion()
+	coloredView := colored.renderCompletion()
+	if !strings.Contains(coloredView, "\x1b[") || !strings.Contains(ansi.Strip(coloredView), ">* high") || colored.completionHeight() != 7 {
+		t.Fatalf("colored completion height=%d view=%q", colored.completionHeight(), coloredView)
+	}
+}
+
+func TestReasoningEffortRootCompletionTabExpandsLevels(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 64, Height: 24})
+	model.snapshot = Snapshot{
+		Provider: "default", Model: "gpt-5.6-sol", ReasoningEffort: "high",
+		SupportedReasoningEfforts: []string{"auto", "low", "medium", "high", "xhigh", "max", "ultra"},
+	}
+	model.input.SetValue("/effor")
+	_ = model.refreshCompletion()
+
+	handled, command := model.handleCompletionKey("tab")
+	if !handled || command != nil {
+		t.Fatalf("tab handled=%t command=%v", handled, command)
+	}
+	if model.input.Value() != "/effort " || len(model.completion.items) != 7 {
+		t.Fatalf("input=%q completion=%#v", model.input.Value(), model.completion.items)
+	}
+	current := model.completion.items[model.completion.cursor]
+	if current.label != "high" || !current.current {
+		t.Fatalf("cursor=%d current=%#v", model.completion.cursor, current)
+	}
+}
+
+func TestHeaderKeepsReasoningEffortVisibleAtNarrowWidths(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 36, Height: 18})
+	model.snapshot = Snapshot{Provider: "provider-with-a-long-name", Model: "model-with-a-long-name", ReasoningEffort: "ultra"}
+	header := ansi.Strip(model.renderHeader())
+	if !strings.HasSuffix(header, "ultra") || lipgloss.Width(header) > model.width {
+		t.Fatalf("header width=%d content=%q", lipgloss.Width(header), header)
+	}
+
+	model.width = 80
+	model.snapshot = Snapshot{Provider: "default", Model: "gpt-5.6-sol", ReasoningEffort: "high"}
+	header = ansi.Strip(model.renderHeader())
+	if !strings.Contains(header, "default  gpt-5.6-sol  high") {
+		t.Fatalf("header=%q", header)
 	}
 }
 

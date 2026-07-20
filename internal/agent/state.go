@@ -21,6 +21,7 @@ type ProviderState struct {
 	Adapter                string    `json:"adapter"`
 	BaseURL                string    `json:"base_url"`
 	Model                  string    `json:"model"`
+	ReasoningEffort        string    `json:"reasoning_effort,omitempty"`
 	CatalogProvider        string    `json:"catalog_provider,omitempty"`
 	ContextWindow          int       `json:"context_window,omitempty"`
 	DetectedContextWindow  int       `json:"detected_context_window,omitempty"`
@@ -55,7 +56,8 @@ func (c *Conversation) ExportState() ConversationState {
 	state := ConversationState{
 		SessionID: c.sessionID, Turns: cloneTurns(c.turns), PromptHistory: append([]string{}, c.promptHistory...), DriverState: append(json.RawMessage(nil), c.driverState...),
 		Provider: ProviderState{
-			Name: c.providerName, Generation: c.providerGeneration, Adapter: c.providerAdapter, BaseURL: c.providerBaseURL, Model: c.providerModel, CatalogProvider: c.lastRuntime.Provider.Config.CatalogProvider,
+			Name: c.providerName, Generation: c.providerGeneration, Adapter: c.providerAdapter, BaseURL: c.providerBaseURL, Model: c.providerModel,
+			ReasoningEffort: c.lastRuntime.Provider.Config.ReasoningEffort, CatalogProvider: c.lastRuntime.Provider.Config.CatalogProvider,
 			ContextWindow: c.lastRuntime.Provider.Config.ContextWindow, DetectedContextWindow: c.lastRuntime.Provider.Limits.ContextWindow,
 			EffectiveContextWindow: c.lastRuntime.Provider.ContextWindowLimit(), LimitSource: string(c.lastRuntime.Provider.Limits.Source),
 			LimitObservedAt: c.lastRuntime.Provider.Limits.ObservedAt, LimitCached: c.lastRuntime.Provider.Limits.Cached,
@@ -165,7 +167,7 @@ func validateTodoListState(list protocol.TodoList) error {
 }
 
 func configForState(state ProviderState) config.ProviderConfig {
-	return config.ProviderConfig{Adapter: state.Adapter, BaseURL: state.BaseURL, Model: state.Model, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow}
+	return config.ProviderConfig{Adapter: state.Adapter, BaseURL: state.BaseURL, Model: state.Model, ReasoningEffort: state.ReasoningEffort, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow}
 }
 
 func validateTurns(turns []protocol.Turn) error {

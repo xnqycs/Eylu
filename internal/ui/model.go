@@ -480,6 +480,10 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if typed.selection.EffortResetFrom != "" {
+			m.appendNotice(fmt.Sprintf("Reasoning effort reset from %s to auto for %s.", typed.selection.EffortResetFrom, typed.selection.Model), false)
+			m.refreshViewport()
+		}
 		m.modelFilter.Blur()
 		m.contextWindowConfirm = newContextWindowConfirmState(typed.selection, m.viewportContentWidth())
 		if typed.selection.DetectedContextWindow <= 0 {
@@ -989,7 +993,7 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 			return m.requestMode(fields[1])
 		}
 	case "/help":
-		m.appendNotice("/new /tasks /context /skills /skill /providers /provider /model /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
+		m.appendNotice("/new /tasks /context /skills /skill /providers /provider /model /effort /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
 		m.refreshViewport()
 		return m, nil
 	}

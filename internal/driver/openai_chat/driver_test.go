@@ -22,14 +22,14 @@ func TestChatRequestHistoryAndResponse(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
-		if len(body.Messages) != 3 || body.Messages[0].Role != "system" || body.Messages[1].Role != "user" || body.Messages[2].Role != "assistant" {
+		if len(body.Messages) != 3 || body.Messages[0].Role != "system" || body.Messages[1].Role != "user" || body.Messages[2].Role != "assistant" || body.ReasoningEffort != "max" {
 			t.Fatalf("messages = %#v", body.Messages)
 		}
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":1}}`))
 	}))
 	defer server.Close()
 	response, err := New(server.Client()).Generate(context.Background(), driver.Request{
-		BaseURL: server.URL + "/v1", APIKey: "key", Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{
+		BaseURL: server.URL + "/v1", APIKey: "key", ReasoningEffort: "max", Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{
 			{Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "system"}}},
 			{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "question"}}},
 			{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "prior"}}},
@@ -37,6 +37,24 @@ func TestChatRequestHistoryAndResponse(t *testing.T) {
 	}, nil)
 	if err != nil || response.Turn.Parts[0].Text != "ok" || response.Usage.InputTokens != 7 {
 		t.Fatalf("response = %#v, err = %v", response, err)
+	}
+}
+
+func TestChatAutoReasoningEffortIsOmitted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := body["reasoning_effort"]; exists {
+			t.Fatalf("auto reasoning effort was serialized: %#v", body)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, ReasoningEffort: "auto", Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "hi"}}}}}}, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

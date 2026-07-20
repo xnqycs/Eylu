@@ -54,6 +54,7 @@ type FileProviderConfig struct {
 	BaseURL         *string              `toml:"base_url,omitempty"`
 	APIKey          *string              `toml:"api_key,omitempty"`
 	Model           *string              `toml:"model,omitempty"`
+	ReasoningEffort *string              `toml:"reasoning_effort,omitempty"`
 	CatalogProvider *string              `toml:"catalog_provider,omitempty"`
 	ContextWindow   *int                 `toml:"context_window,omitempty"`
 	TimeoutSeconds  *int                 `toml:"timeout_seconds,omitempty"`
@@ -114,6 +115,7 @@ type ProviderPatch struct {
 	BaseURL         ValuePatch[string]
 	APIKey          ValuePatch[string]
 	Model           ValuePatch[string]
+	ReasoningEffort ValuePatch[string]
 	CatalogProvider ValuePatch[string]
 	ContextWindow   ValuePatch[int]
 	TimeoutSeconds  ValuePatch[int]
@@ -133,6 +135,9 @@ func SparseProviderPatch(provider ProviderConfig) ProviderPatch {
 	}
 	if provider.APIKey != "" {
 		patch.APIKey = SetValue(provider.APIKey)
+	}
+	if provider.ReasoningEffort != "" {
+		patch.ReasoningEffort = SetValue(provider.ReasoningEffort)
 	}
 	if provider.CatalogProvider != "" {
 		patch.CatalogProvider = SetValue(provider.CatalogProvider)
@@ -163,7 +168,7 @@ func SparseProviderPatch(provider ProviderConfig) ProviderPatch {
 
 func CompleteProviderPatch(provider ProviderConfig) ProviderPatch {
 	return ProviderPatch{
-		Adapter: SetValue(provider.Adapter), BaseURL: SetValue(provider.BaseURL), APIKey: SetValue(provider.APIKey), Model: SetValue(provider.Model),
+		Adapter: SetValue(provider.Adapter), BaseURL: SetValue(provider.BaseURL), APIKey: SetValue(provider.APIKey), Model: SetValue(provider.Model), ReasoningEffort: SetValue(provider.ReasoningEffort),
 		CatalogProvider: SetValue(provider.CatalogProvider), ContextWindow: SetValue(provider.ContextWindow), TimeoutSeconds: SetValue(provider.TimeoutSeconds),
 		Headers: SetValue(cloneStringMap(provider.Headers)), RoutingTasks: SetValue(append([]string(nil), provider.Routing.Tasks...)),
 		RoutingPriority: SetValue(provider.Routing.Priority), InputCost: SetValue(provider.Routing.InputCostPerMillion), OutputCost: SetValue(provider.Routing.OutputCostPerMillion),
@@ -196,6 +201,7 @@ func ApplyProviderPatch(provider ProviderConfig, patch ProviderPatch) ProviderCo
 	applyValue(&provider.BaseURL, patch.BaseURL)
 	applyValue(&provider.APIKey, patch.APIKey)
 	applyValue(&provider.Model, patch.Model)
+	applyValue(&provider.ReasoningEffort, patch.ReasoningEffort)
 	applyValue(&provider.CatalogProvider, patch.CatalogProvider)
 	applyInt(&provider.ContextWindow, patch.ContextWindow)
 	applyInt(&provider.TimeoutSeconds, patch.TimeoutSeconds)
@@ -283,6 +289,7 @@ func (s *Store) UpdateProvider(name string, patch ProviderPatch, activate bool) 
 			applyPatch(&provider.BaseURL, patch.BaseURL)
 			applyPatch(&provider.APIKey, patch.APIKey)
 			applyPatch(&provider.Model, patch.Model)
+			applyPatch(&provider.ReasoningEffort, patch.ReasoningEffort)
 			applyPatch(&provider.CatalogProvider, patch.CatalogProvider)
 			applyPatch(&provider.ContextWindow, patch.ContextWindow)
 			applyPatch(&provider.TimeoutSeconds, patch.TimeoutSeconds)
@@ -456,6 +463,7 @@ func applyFileProvider(provider *ProviderConfig, file FileProviderConfig) {
 	assign(provider.BaseURL, file.BaseURL, func(value string) { provider.BaseURL = value })
 	assign(provider.APIKey, file.APIKey, func(value string) { provider.APIKey = value })
 	assign(provider.Model, file.Model, func(value string) { provider.Model = value })
+	assign(provider.ReasoningEffort, file.ReasoningEffort, func(value string) { provider.ReasoningEffort = value })
 	assign(provider.CatalogProvider, file.CatalogProvider, func(value string) { provider.CatalogProvider = value })
 	assign(provider.ContextWindow, file.ContextWindow, func(value int) { provider.ContextWindow = value })
 	assign(provider.TimeoutSeconds, file.TimeoutSeconds, func(value int) { provider.TimeoutSeconds = value })
@@ -561,6 +569,9 @@ func fileProvider(provider ProviderConfig) FileProviderConfig {
 	file := FileProviderConfig{Adapter: ptr(provider.Adapter), BaseURL: ptr(provider.BaseURL), Model: ptr(provider.Model)}
 	if provider.APIKey != "" {
 		file.APIKey = ptr(provider.APIKey)
+	}
+	if provider.ReasoningEffort != "" {
+		file.ReasoningEffort = ptr(provider.ReasoningEffort)
 	}
 	if provider.CatalogProvider != "" {
 		file.CatalogProvider = ptr(provider.CatalogProvider)

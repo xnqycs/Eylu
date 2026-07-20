@@ -353,7 +353,8 @@ func agentStateFromSnapshot(snapshot session.Snapshot) agent.ConversationState {
 		SessionID: snapshot.SessionID, Turns: snapshot.Turns, PromptHistory: promptHistory, DriverState: append(json.RawMessage(nil), snapshot.DriverState...),
 		Provider: agent.ProviderState{
 			Name: snapshot.Provider.Name, Generation: snapshot.Provider.Generation, Adapter: snapshot.Provider.Adapter,
-			BaseURL: snapshot.Provider.BaseURL, Model: snapshot.Provider.Model, CatalogProvider: snapshot.Provider.CatalogProvider, ContextWindow: snapshot.Provider.ContextWindow,
+			BaseURL: snapshot.Provider.BaseURL, Model: snapshot.Provider.Model, ReasoningEffort: snapshot.Provider.ReasoningEffort,
+			CatalogProvider: snapshot.Provider.CatalogProvider, ContextWindow: snapshot.Provider.ContextWindow,
 			DetectedContextWindow: snapshot.Provider.DetectedContextWindow, EffectiveContextWindow: snapshot.Provider.EffectiveContextWindow,
 			LimitSource: snapshot.Provider.LimitSource, LimitObservedAt: snapshot.Provider.LimitObservedAt,
 			LimitCached: snapshot.Provider.LimitCached, LimitAssumed: snapshot.Provider.LimitAssumed, LimitDegradations: snapshot.Provider.LimitDegradations,
@@ -444,14 +445,15 @@ func selectedSessionProvider(manager *provider.Manager, opts chatOptions) (sessi
 	}
 	return session.ProviderState{
 		Name: selected.Name, Generation: selected.Generation, Adapter: providerConfig.Adapter, BaseURL: providerConfig.BaseURL,
-		Model: providerConfig.Model, CatalogProvider: providerConfig.CatalogProvider, ContextWindow: providerConfig.ContextWindow,
+		Model: providerConfig.Model, ReasoningEffort: providerConfig.ReasoningEffort,
+		CatalogProvider: providerConfig.CatalogProvider, ContextWindow: providerConfig.ContextWindow,
 	}, nil
 }
 
 func agentProviderState(state session.ProviderState) agent.ProviderState {
 	return agent.ProviderState{
 		Name: state.Name, Generation: state.Generation, Adapter: state.Adapter, BaseURL: state.BaseURL,
-		Model: state.Model, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow,
+		Model: state.Model, ReasoningEffort: state.ReasoningEffort, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow,
 		DetectedContextWindow: state.DetectedContextWindow, EffectiveContextWindow: state.EffectiveContextWindow,
 		LimitSource: state.LimitSource, LimitObservedAt: state.LimitObservedAt,
 		LimitCached: state.LimitCached, LimitAssumed: state.LimitAssumed, LimitDegradations: state.LimitDegradations,
@@ -461,7 +463,7 @@ func agentProviderState(state session.ProviderState) agent.ProviderState {
 func sessionProviderState(state agent.ProviderState) session.ProviderState {
 	return session.ProviderState{
 		Name: state.Name, Generation: state.Generation, Adapter: state.Adapter, BaseURL: state.BaseURL,
-		Model: state.Model, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow,
+		Model: state.Model, ReasoningEffort: state.ReasoningEffort, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow,
 		DetectedContextWindow: state.DetectedContextWindow, EffectiveContextWindow: state.EffectiveContextWindow,
 		LimitSource: state.LimitSource, LimitObservedAt: state.LimitObservedAt,
 		LimitCached: state.LimitCached, LimitAssumed: state.LimitAssumed, LimitDegradations: state.LimitDegradations,
@@ -469,7 +471,7 @@ func sessionProviderState(state agent.ProviderState) session.ProviderState {
 }
 
 func sameSessionProvider(left, right session.ProviderState) bool {
-	return left.Name == right.Name && left.Generation == right.Generation && left.Adapter == right.Adapter && left.BaseURL == right.BaseURL && left.Model == right.Model && left.CatalogProvider == right.CatalogProvider && left.ContextWindow == right.ContextWindow
+	return left.Name == right.Name && left.Generation == right.Generation && left.Adapter == right.Adapter && left.BaseURL == right.BaseURL && left.Model == right.Model && left.ReasoningEffort == right.ReasoningEffort && left.CatalogProvider == right.CatalogProvider && left.ContextWindow == right.ContextWindow
 }
 
 func selectedMode(manager *provider.Manager, opts chatOptions) string {

@@ -32,15 +32,16 @@ func New(client *http.Client) *Driver {
 func (d *Driver) Name() string { return Name }
 
 func (d *Driver) Capabilities() driver.Capabilities {
-	return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, ImageInput: true}
+	return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, Reasoning: true, ImageInput: true}
 }
 
 type chatRequest struct {
-	Model         string        `json:"model"`
-	Messages      []chatMessage `json:"messages"`
-	Tools         []chatTool    `json:"tools,omitempty"`
-	Stream        bool          `json:"stream,omitempty"`
-	StreamOptions *struct {
+	Model           string        `json:"model"`
+	Messages        []chatMessage `json:"messages"`
+	Tools           []chatTool    `json:"tools,omitempty"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
+	Stream          bool          `json:"stream,omitempty"`
+	StreamOptions   *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
 }
@@ -93,6 +94,10 @@ type chatResponse struct {
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	body := chatRequest{Model: req.Model.Model, Stream: req.Stream}
+	effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
+	if effort != "auto" {
+		body.ReasoningEffort = effort
+	}
 	if req.Stream {
 		body.StreamOptions = &struct {
 			IncludeUsage bool `json:"include_usage"`

@@ -29,6 +29,9 @@ type completionItem struct {
 	description string
 	insert      string
 	disabled    bool
+	current     bool
+	execute     bool
+	expand      bool
 	rank        int
 }
 
@@ -64,7 +67,7 @@ func (m *Model) refreshCompletion() tea.Cmd {
 	if len(state.items) == 0 {
 		state.items = []completionItem{{label: "No matches", disabled: true}}
 	}
-	state.cursor = firstEnabledCompletion(state.items)
+	state.cursor = preferredCompletionCursor(state.items)
 	m.completion = state
 	m.updateViewportHeight()
 	if needFiles && !m.filesLoading {
@@ -99,6 +102,7 @@ func previousRune(value string) (rune, int) {
 func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 	commands := []completionItem{
 		{label: "/context", description: "Inspect context usage", insert: "/context"},
+		{label: "/effort", description: "Choose the reasoning effort", insert: "/effort ", expand: true},
 		{label: "/help", description: "Show available commands", insert: "/help"},
 		{label: "/mode", description: "Change permission mode", insert: "/mode "},
 		{label: "/model", description: "Choose the active model", insert: "/model"},
@@ -112,6 +116,19 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 	}
 	lower := strings.ToLower(value)
 	switch {
+	case lower == "/effort" || strings.HasPrefix(lower, "/effort "):
+		query := ""
+		if strings.HasPrefix(lower, "/effort ") {
+			query = strings.TrimSpace(strings.TrimPrefix(lower, "/effort "))
+		}
+		items := make([]completionItem, 0, len(snapshot.SupportedReasoningEfforts))
+		for index, effort := range snapshot.SupportedReasoningEfforts {
+			items = append(items, completionItem{
+				label: effort, description: effortDescription(effort), insert: "/effort " + effort,
+				current: strings.EqualFold(effort, snapshot.ReasoningEffort), execute: true, rank: index,
+			})
+		}
+		return filterCompletionItems(items, query)
 	case strings.HasPrefix(lower, "/mode "):
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/mode "))
 		return filterCompletionItems([]completionItem{
@@ -250,6 +267,36 @@ func firstEnabledCompletion(items []completionItem) int {
 	return 0
 }
 
+func preferredCompletionCursor(items []completionItem) int {
+	for index, item := range items {
+		if item.current && !item.disabled {
+			return index
+		}
+	}
+	return firstEnabledCompletion(items)
+}
+
+func effortDescription(effort string) string {
+	switch effort {
+	case "auto":
+		return "Provider default"
+	case "low":
+		return "Light reasoning"
+	case "medium":
+		return "Balanced reasoning"
+	case "high":
+		return "Deep reasoning"
+	case "xhigh":
+		return "Extended reasoning"
+	case "max":
+		return "Maximum reasoning"
+	case "ultra":
+		return "Ultra reasoning"
+	default:
+		return "Reasoning effort"
+	}
+}
+
 func (m *Model) handleCompletionKey(key string) (bool, tea.Cmd) {
 	if m.completion.kind == completionNone || len(m.completion.items) == 0 {
 		return false, nil
@@ -272,11 +319,21 @@ func (m *Model) handleCompletionKey(key string) (bool, tea.Cmd) {
 		}
 		value := m.input.Value()
 		value = value[:m.completion.start] + item.insert + value[m.completion.end:]
-		m.input.SetValue(value)
-		m.input.MoveToEnd()
+		if key == "enter" && item.execute {
+			m.input.Reset()
+		} else {
+			m.input.SetValue(value)
+			m.input.MoveToEnd()
+		}
 		m.resetHistoryNavigation()
 		m.completion = completionState{}
 		m.updateViewportHeight()
+		if key == "enter" && item.execute {
+			return true, m.commandCmd(value)
+		}
+		if item.expand {
+			return true, m.refreshCompletion()
+		}
 		return true, nil
 	default:
 		return false, nil
@@ -316,23 +373,36 @@ func (m *Model) renderCompletion() string {
 	lines := make([]string, 0, end-start)
 	for index := start; index < end; index++ {
 		item := m.completion.items[index]
-		marker := "  "
-		if index == m.completion.cursor && !item.disabled {
-			marker = "> "
+		selected := index == m.completion.cursor && !item.disabled
+		focusMarker := " "
+		if selected {
+			focusMarker = m.styles.Accent.Render(">")
 		}
-		markerWidth := lipgloss.Width(marker)
+		currentMarker := " "
+		if item.current {
+			currentMarker = m.styles.Active.Render("*")
+		}
+		marker := focusMarker + currentMarker + " "
+		markerWidth := 3
 		labelWidth := min(max(12, m.width/2), max(0, m.width-markerWidth))
 		label := truncateColumns(item.label, labelWidth)
 		descriptionWidth := max(0, m.width-markerWidth-lipgloss.Width(label)-2)
 		description := truncateColumns(strings.Join(strings.Fields(item.description), " "), descriptionWidth)
+		if selected {
+			label = m.styles.Accent.Render(label)
+		} else if item.current {
+			label = m.styles.Active.Render(label)
+		}
 		line := marker + label
 		if description != "" {
-			line += strings.Repeat(" ", max(2, m.width-lipgloss.Width(line)-lipgloss.Width(description))) + m.styles.Muted.Render(description)
+			descriptionStyle := m.styles.Muted
+			if selected {
+				descriptionStyle = m.styles.Accent
+			}
+			line += strings.Repeat(" ", max(2, m.width-lipgloss.Width(line)-lipgloss.Width(description))) + descriptionStyle.Render(description)
 		}
 		line = padWidth(truncateColumns(line, m.width), m.width)
-		if index == m.completion.cursor && !item.disabled {
-			line = m.styles.Active.Render(line)
-		} else if item.disabled {
+		if item.disabled {
 			line = m.styles.Muted.Render(line)
 		}
 		lines = append(lines, line)

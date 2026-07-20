@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 增加 Provider 级 `reasoning_effort` 与 `/effort`：按模型档案提供 `auto` 至 `ultra` 动态选择器、当前项标识、右上角状态、TOML/session 往返和模型切换原子回退；Responses 使用 `reasoning.effort`，Chat Completions 使用顶层 `reasoning_effort`，`auto` 省略请求字段。
 - 修复 TUI 文件引用、输入导航与完成指标：裸 `@path` 支持 ignored 文件的精确或唯一名称解析，`read_file` 卡片显示真实字节/行数；session 持久化原始 Prompt 并支持顶/底方向键回放；增强 `Shift+Enter`、`Ctrl+Enter`/`Ctrl+J` 换行；结束状态改为 TTFT 与生成阶段 TPS。
 - 增加模型上下文窗口自动解析：交互启动时预热活动模型或全部自动路由候选模型，Provider/模型切换后立即解析并要求用户确认探测值，手动输入的窗口覆盖探测结果；支持 OpenAI/OpenRouter 扩展元数据、Ollama、llama.cpp、models.dev、独立缓存、自动路由有效窗口和三轮溢出压缩恢复；配置改为保留字段存在性的分层稀疏持久化。
 - 增加内置 `todolist`：完整替换并校验 session 任务清单，类型化结果进入 Agent 上下文、受保护的 `Task state` 账本分类、压缩摘要和 schema v1 session 快照；`/new` 清空清单。
