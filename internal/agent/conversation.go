@@ -323,7 +323,7 @@ func (c *Conversation) ContextReport() contextledger.Report {
 	snapshot := c.lastRuntime.Provider
 	source := snapshot.Limits.Source
 	effective := snapshot.ContextWindowLimit()
-	if cap := snapshot.Config.ContextWindow; cap > 0 && effective == cap && (snapshot.Limits.ContextWindow == 0 || cap < snapshot.Limits.ContextWindow) {
+	if snapshot.Config.ContextWindow > 0 {
 		source = provider.LimitSourceUserCap
 	}
 	return c.ledger.ReportWithLimits(snapshot.Name, snapshot.Config.Model, contextledger.LimitDetails{
@@ -331,6 +331,13 @@ func (c *Conversation) ContextReport() contextledger.Report {
 		Source: string(source), Cached: snapshot.Limits.Cached, Assumed: snapshot.Limits.Assumed,
 		ObservedAt: snapshot.Limits.ObservedAt, Degradations: snapshot.Limits.Degradations,
 	})
+}
+
+func (c *Conversation) ApplyProviderSnapshot(snapshot provider.Snapshot) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastRuntime.Provider = snapshot
+	c.rebuildLedger(c.lastRuntime)
 }
 
 func (c *Conversation) TodoList() protocol.TodoList {

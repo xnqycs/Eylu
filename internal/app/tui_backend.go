@@ -603,10 +603,11 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err := b.SetModel(ctx, snapshot.Name, fields[1]); err != nil {
+		selection, err := b.SetModel(ctx, snapshot.Name, fields[1])
+		if err != nil {
 			return "", err
 		}
-		return "Model: " + fields[1], nil
+		return fmt.Sprintf("Model: %s; detected context window: %d (%s)", fields[1], selection.DetectedContextWindow, selection.LimitSource), nil
 	default:
 		return "", fmt.Errorf("unknown command %s", fields[0])
 	}
@@ -633,7 +634,7 @@ func (b *tuiBackend) SetMode(_ context.Context, value string) error {
 	return nil
 }
 
-func (b *tuiBackend) UpsertProvider(_ context.Context, form ui.ProviderForm) error {
+func (b *tuiBackend) UpsertProvider(ctx context.Context, form ui.ProviderForm) (ui.ModelSelection, error) {
 	patch := config.ProviderPatch{}
 	if form.OriginalName == "" {
 		patch.Adapter = config.SetValue(form.Adapter)
@@ -667,21 +668,22 @@ func (b *tuiBackend) UpsertProvider(_ context.Context, form ui.ProviderForm) err
 		patch.ContextWindow = config.SetValue(form.ContextWindow)
 	}
 	if err := b.manager.UpsertPatch(form.Name, patch, true); err != nil {
-		return err
+		return ui.ModelSelection{}, err
 	}
 	if form.OriginalName != "" && form.OriginalName != form.Name {
 		if err := b.manager.Delete(form.OriginalName, form.Name); err != nil {
-			return err
+			return ui.ModelSelection{}, err
 		}
 	}
 	b.runtime.rememberProviderAPIKeys(b.manager.Config())
 	b.mu.Lock()
 	b.opts.provider = ""
 	b.mu.Unlock()
-	return nil
+	resolved, err := b.probeProviderModelLimits(ctx, form.Name)
+	return modelSelection(resolved), err
 }
 
-func (b *tuiBackend) DeleteProvider(_ context.Context, name string) error {
+func (b *tuiBackend) DeleteProvider(ctx context.Context, name string) error {
 	replacement := ""
 	active, _ := b.manager.Active()
 	if active.Name == name {
@@ -696,26 +698,66 @@ func (b *tuiBackend) DeleteProvider(_ context.Context, name string) error {
 		return err
 	}
 	b.runtime.rememberProviderAPIKeys(b.manager.Config())
+	if active, err := b.manager.Active(); err == nil {
+		_, probeErr := b.probeProviderModelLimits(ctx, active.Name)
+		return probeErr
+	}
 	return nil
 }
 
-func (b *tuiBackend) UseProvider(_ context.Context, name string) error {
+func (b *tuiBackend) UseProvider(ctx context.Context, name string) error {
 	if err := b.manager.Use(name); err != nil {
 		return err
 	}
 	b.mu.Lock()
 	b.opts.provider = ""
 	b.mu.Unlock()
-	return nil
+	_, err := b.probeProviderModelLimits(ctx, name)
+	return err
 }
 
-func (b *tuiBackend) SetModel(_ context.Context, providerName, modelID string) error {
+func (b *tuiBackend) SetModel(ctx context.Context, providerName, modelID string) (ui.ModelSelection, error) {
 	_, ok := b.manager.Get(providerName)
 	if !ok {
-		return fmt.Errorf("provider %q does not exist", providerName)
+		return ui.ModelSelection{}, fmt.Errorf("provider %q does not exist", providerName)
 	}
 	active, _ := b.manager.Active()
-	return b.manager.UpsertPatch(providerName, config.ProviderPatch{Model: config.SetValue(modelID)}, active.Name == providerName)
+	if err := b.manager.UpsertPatch(providerName, config.ProviderPatch{Model: config.SetValue(modelID)}, active.Name == providerName); err != nil {
+		return ui.ModelSelection{}, err
+	}
+	resolved, err := b.probeProviderModelLimits(ctx, providerName)
+	return modelSelection(resolved), err
+}
+
+func (b *tuiBackend) SetContextWindow(ctx context.Context, providerName string, contextWindow int) error {
+	if contextWindow <= 0 {
+		return errors.New("context window must be a positive integer")
+	}
+	active, _ := b.manager.Active()
+	if err := b.manager.UpsertPatch(providerName, config.ProviderPatch{ContextWindow: config.SetValue(contextWindow)}, active.Name == providerName); err != nil {
+		return err
+	}
+	_, err := b.probeProviderModelLimits(ctx, providerName)
+	return err
+}
+
+func (b *tuiBackend) probeProviderModelLimits(ctx context.Context, name string) (provider.Snapshot, error) {
+	resolved, err := b.runtime.probeProviderModelLimits(ctx, b.manager, name)
+	if err != nil {
+		return provider.Snapshot{}, err
+	}
+	active, activeErr := b.manager.Active()
+	if activeErr == nil && active.Name == resolved.Name && b.conversation != nil {
+		b.conversation.ApplyProviderSnapshot(resolved)
+	}
+	return resolved, nil
+}
+
+func modelSelection(snapshot provider.Snapshot) ui.ModelSelection {
+	return ui.ModelSelection{
+		Provider: snapshot.Name, Model: snapshot.Config.Model, DetectedContextWindow: snapshot.Limits.ContextWindow,
+		LimitSource: string(snapshot.Limits.Source), Cached: snapshot.Limits.Cached, Assumed: snapshot.Limits.Assumed,
+	}
 }
 
 func (b *tuiBackend) FetchModels(ctx context.Context, name string) ([]string, error) {

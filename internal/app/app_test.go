@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -156,6 +157,71 @@ func TestRuntimeRedactsConfiguredAPIKeys(t *testing.T) {
 	redacted := runtime.redact("request failed with stored-secret")
 	if strings.Contains(redacted, "stored-secret") || !strings.Contains(redacted, "[REDACTED]") {
 		t.Fatalf("redacted=%q", redacted)
+	}
+}
+
+func TestInteractiveStartupProbesActiveModel(t *testing.T) {
+	isolateUserState(t)
+	t.Setenv("EYLU_MODEL_METADATA_ENABLED", "true")
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/models" {
+			t.Fatalf("path = %s", request.URL.Path)
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[{"id":"startup-model","context_length":131072,"max_completion_tokens":16384}]}`)
+	}))
+	defer server.Close()
+
+	workspace := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	cfg := config.Default()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "startup-model"}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &runtime{
+		stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, output: "text",
+		workspace: workspace, configPath: configPath, metadataCachePath: filepath.Join(t.TempDir(), "metadata.json"), trustPrompted: make(map[string]bool),
+	}
+	if err := runtime.runInteractive(context.Background(), chatOptions{noTUI: true}); err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("metadata requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestStartupProbeResolvesAutomaticRoutingCandidates(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/models" {
+			t.Fatalf("path = %s", request.URL.Path)
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[{"id":"model-a","context_length":64000},{"id":"model-b","context_length":128000}]}`)
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.RoutingMode = "auto"
+	cfg.ActiveProvider = "a"
+	cfg.Providers["a"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "model-a"}
+	cfg.Providers["b"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "model-b"}
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &runtime{metadataCachePath: filepath.Join(t.TempDir(), "metadata.json")}
+	active, err := runtime.probeStartupModelLimits(context.Background(), manager, chatOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 2 || active.Name != "a" || active.Limits.ContextWindow != 64000 {
+		t.Fatalf("requests=%d active=%#v", requests.Load(), active)
 	}
 }
 
@@ -430,6 +496,30 @@ func TestContextSlashRendersAllCategories(t *testing.T) {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("context output missing %q:\n%s", expected, output.String())
 		}
+	}
+}
+
+func TestModelSlashAcceptsManualContextWindow(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.Default()
+	cfg.ModelMetadata.Enabled = false
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "old-model"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	runtime := &runtime{stdout: &output, stderr: &bytes.Buffer{}, metadataCachePath: filepath.Join(t.TempDir(), "metadata.json")}
+	conversation := agent.NewConversation()
+	reader := bufio.NewReader(strings.NewReader("n\n200000\n"))
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/model next-model", conversation, manager, &chatOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	configured, _ := manager.Get("work")
+	report := conversation.ContextReport()
+	if configured.ContextWindow != 200000 || report.ContextWindow != 200000 || report.DetectedContextWindow != 256000 || report.LimitSource != string(provider.LimitSourceUserCap) {
+		t.Fatalf("configured=%#v report=%#v output=%q", configured, report, output.String())
 	}
 }
 

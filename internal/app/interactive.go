@@ -38,6 +38,11 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 	if err != nil {
 		return err
 	}
+	probed, err := r.probeStartupModelLimits(ctx, manager, opts)
+	if err != nil {
+		return err
+	}
+	conversation.ApplyProviderSnapshot(probed)
 	if !opts.noTUI && isTerminal(r.stdout) && !strings.EqualFold(os.Getenv("TERM"), "dumb") && r.output == "text" {
 		return r.runTUI(ctx, conversation, manager, opts)
 	}
@@ -148,6 +153,13 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		if err := r.handleProviderSlash(ctx, reader, fields, manager, opts); err != nil {
 			return err
 		}
+		if active, activeErr := manager.Active(); activeErr == nil {
+			probed, probeErr := r.probeProviderModelLimits(ctx, manager, active.Name)
+			if probeErr != nil {
+				return probeErr
+			}
+			conversation.ApplyProviderSnapshot(probed)
+		}
 		if r.session != nil {
 			return r.session.Sync(conversation, manager, *opts, nil)
 		}
@@ -155,6 +167,21 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	case "/model":
 		if err := r.handleModelSlash(ctx, fields, manager); err != nil {
 			return err
+		}
+		if len(fields) == 2 {
+			active, err := manager.Active()
+			if err != nil {
+				return err
+			}
+			probed, err := r.probeProviderModelLimits(ctx, manager, active.Name)
+			if err != nil {
+				return err
+			}
+			confirmed, err := r.confirmModelContextWindow(ctx, reader, manager, probed)
+			if err != nil {
+				return err
+			}
+			conversation.ApplyProviderSnapshot(confirmed)
 		}
 		if r.session != nil {
 			return r.session.Sync(conversation, manager, *opts, nil)
@@ -360,10 +387,58 @@ func (r *runtime) handleProviderSlash(ctx context.Context, reader *bufio.Reader,
 		if err := manager.UpsertPatch(fields[2], patch, true); err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
+		if model != current.Model {
+			probed, probeErr := r.probeProviderModelLimits(ctx, manager, fields[2])
+			if probeErr != nil {
+				return probeErr
+			}
+			if _, confirmErr := r.confirmModelContextWindow(ctx, reader, manager, probed); confirmErr != nil {
+				return confirmErr
+			}
+		}
 		fmt.Fprintf(r.stdout, "Provider %s updated.\n", fields[2])
 		return nil
 	default:
 		return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("unknown provider command %s", fields[1])}
+	}
+}
+
+func (r *runtime) confirmModelContextWindow(ctx context.Context, reader *bufio.Reader, manager *provider.Manager, snapshot provider.Snapshot) (provider.Snapshot, error) {
+	detected := snapshot.Limits.ContextWindow
+	for {
+		fmt.Fprintf(r.stdout, "Detected context window for %s: %d tokens (source: %s). Is this correct? [Y/n]: ", snapshot.Config.Model, detected, snapshot.Limits.Source)
+		answer, err := reader.ReadString('\n')
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		if err != nil && !errors.Is(err, io.EOF) {
+			return provider.Snapshot{}, err
+		}
+		value := detected
+		switch answer {
+		case "", "y", "yes":
+			if value <= 0 {
+				fmt.Fprintln(r.stdout, "Enter the context window because detection did not return a positive value.")
+				value = 0
+			}
+		case "n", "no":
+			value = 0
+		default:
+			fmt.Fprintln(r.stdout, "Please answer y or n.")
+			continue
+		}
+		if value <= 0 {
+			input := promptLine(reader, r.stdout, "Context window tokens", "")
+			parsed, parseErr := strconv.Atoi(strings.TrimSpace(input))
+			if parseErr != nil || parsed <= 0 {
+				fmt.Fprintln(r.stdout, "Context window must be a positive integer.")
+				continue
+			}
+			value = parsed
+		}
+		active, _ := manager.Active()
+		if err := manager.UpsertPatch(snapshot.Name, config.ProviderPatch{ContextWindow: config.SetValue(value)}, active.Name == snapshot.Name); err != nil {
+			return provider.Snapshot{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
+		}
+		return r.probeProviderModelLimits(ctx, manager, snapshot.Name)
 	}
 }
 

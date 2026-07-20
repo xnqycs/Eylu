@@ -142,6 +142,17 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 				return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 			}
 			r.rememberProviderAPIKeys(manager.Config())
+			probed, err := r.probeProviderModelLimits(cmd.Context(), manager, name)
+			if err != nil {
+				return err
+			}
+			modelSelected := !editing || cmd.Flags().Changed("model")
+			if modelSelected && !cmd.Flags().Changed("context-window") && isTerminal(r.stdin) {
+				reader := bufio.NewReader(r.stdin)
+				if _, err := r.confirmModelContextWindow(cmd.Context(), reader, manager, probed); err != nil {
+					return err
+				}
+			}
 			fmt.Fprintf(r.stdout, "Provider %s saved.\n", name)
 			return nil
 		},
@@ -179,6 +190,11 @@ func (r *runtime) providerDeleteCommand() *cobra.Command {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
 		r.rememberProviderAPIKeys(manager.Config())
+		if active, activeErr := manager.Active(); activeErr == nil {
+			if _, probeErr := r.probeProviderModelLimits(cmd.Context(), manager, active.Name); probeErr != nil {
+				return probeErr
+			}
+		}
 		fmt.Fprintf(r.stdout, "Provider %s deleted.\n", args[0])
 		return nil
 	}
@@ -189,13 +205,16 @@ func (r *runtime) providerDeleteCommand() *cobra.Command {
 func (r *runtime) providerUseCommand() *cobra.Command {
 	return &cobra.Command{
 		Use: "use <name>", Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			_, manager, err := r.loadManager()
 			if err != nil {
 				return err
 			}
 			if err := manager.Use(args[0]); err != nil {
 				return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+			}
+			if _, err := r.probeProviderModelLimits(cmd.Context(), manager, args[0]); err != nil {
+				return err
 			}
 			fmt.Fprintf(r.stdout, "Active provider: %s\n", args[0])
 			return nil
@@ -287,6 +306,13 @@ func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error 
 		return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
 	}
 	r.rememberProviderAPIKeys(manager.Config())
+	probed, err := r.probeProviderModelLimits(ctx, manager, name)
+	if err != nil {
+		return err
+	}
+	if _, err := r.confirmModelContextWindow(ctx, reader, manager, probed); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- 增加模型上下文窗口自动解析：支持 OpenAI/OpenRouter 扩展元数据、Ollama、llama.cpp、models.dev、独立缓存、自动路由有效窗口和三轮溢出压缩恢复；配置改为保留字段存在性的分层稀疏持久化。
+- 增加模型上下文窗口自动解析：交互启动时预热活动模型或全部自动路由候选模型，Provider/模型切换后立即解析并要求用户确认探测值，手动输入的窗口覆盖探测结果；支持 OpenAI/OpenRouter 扩展元数据、Ollama、llama.cpp、models.dev、独立缓存、自动路由有效窗口和三轮溢出压缩恢复；配置改为保留字段存在性的分层稀疏持久化。
 - 增加内置 `todolist`：完整替换并校验 session 任务清单，类型化结果进入 Agent 上下文、受保护的 `Task state` 账本分类、压缩摘要和 schema v1 session 快照；`/new` 清空清单。
 - TUI 增加双态任务树：请求运行时显示在 activity 行下方，完成或恢复后以状态摘要紧接最后一条历史内容并随 viewport 滚动。最多显示 5 个任务并用英文状态计数折叠其余项目；进行中项优先、completed 项后置。`todolist` 卡片从历史区隐藏，`/tasks` 与 `Ctrl-T` 保留全量清单和工具详情。
 - Markdown 内联代码改为仅使用 Eylu 主题强调色文字，移除背景填充。

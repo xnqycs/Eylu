@@ -183,16 +183,26 @@ type ProviderForm struct {
 	CatalogProviderRemove bool   `json:"-"`
 }
 
+type ModelSelection struct {
+	Provider              string `json:"provider"`
+	Model                 string `json:"model"`
+	DetectedContextWindow int    `json:"detected_context_window"`
+	LimitSource           string `json:"limit_source"`
+	Cached                bool   `json:"cached,omitempty"`
+	Assumed               bool   `json:"assumed,omitempty"`
+}
+
 type Backend interface {
 	Snapshot(context.Context) (Snapshot, error)
 	Submit(context.Context, string, Submission, func(Event)) error
 	Command(context.Context, string) (string, error)
 	ListFiles(context.Context) ([]FileItem, error)
 	SetMode(context.Context, string) error
-	UpsertProvider(context.Context, ProviderForm) error
+	UpsertProvider(context.Context, ProviderForm) (ModelSelection, error)
 	DeleteProvider(context.Context, string) error
 	UseProvider(context.Context, string) error
-	SetModel(context.Context, string, string) error
+	SetModel(context.Context, string, string) (ModelSelection, error)
+	SetContextWindow(context.Context, string, int) error
 	FetchModels(context.Context, string) ([]string, error)
 }
 

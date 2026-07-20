@@ -57,10 +57,10 @@ func TestResolveRuntimeAutomaticAndFixedRouting(t *testing.T) {
 func TestContextLimitWarningIsEmittedOnce(t *testing.T) {
 	var stderr bytes.Buffer
 	runtime := &runtime{stderr: &stderr}
-	snapshot := provider.Snapshot{Name: "work", Config: config.ProviderConfig{Model: "model", ContextWindow: 128000}, Limits: provider.ModelLimits{ContextWindow: 64000, Source: provider.LimitSourceModelsDev}, EffectiveContextWindow: 64000}
+	snapshot := provider.Snapshot{Name: "work", Config: config.ProviderConfig{Model: "model", ContextWindow: 128000}}.WithLimits(provider.ModelLimits{ContextWindow: 64000, Source: provider.LimitSourceModelsDev})
 	runtime.warnContextLimit(snapshot)
 	runtime.warnContextLimit(snapshot)
-	if strings.Count(stderr.String(), "configured cap=128000 exceeds detected limit=64000") != 1 {
+	if strings.Count(stderr.String(), "configured override=128000 exceeds detected limit=64000; effective=128000") != 1 {
 		t.Fatalf("warning = %q", stderr.String())
 	}
 }

@@ -139,6 +139,9 @@ func (m *Model) resize(width, height int) {
 	if m.planGate != nil {
 		m.planGate.feedback.SetWidth(max(20, m.width-12))
 	}
+	if m.contextWindowConfirm != nil {
+		m.contextWindowConfirm.input.SetWidth(max(20, m.viewportContentWidth()-8))
+	}
 	m.form.setWidth(m.viewportContentWidth())
 	m.viewport.SetWidth(m.viewportContentWidth())
 	m.updateViewportHeight()
@@ -179,6 +182,8 @@ func (m *Model) refreshViewport() {
 		content = m.form.view(m.styles)
 	case screenModels:
 		content = m.renderModels()
+	case screenContextConfirm:
+		content = m.renderContextWindowConfirmation()
 	case screenSkills:
 		content = m.renderSkills()
 	case screenContext:
@@ -667,6 +672,40 @@ func (m *Model) renderModels() string {
 			line = m.styles.Active.Render(line)
 		}
 		output.WriteString(line + "\n")
+	}
+	return output.String()
+}
+
+func (m *Model) renderContextWindowConfirmation() string {
+	state := m.contextWindowConfirm
+	if state == nil {
+		return ""
+	}
+	selection := state.selection
+	var output strings.Builder
+	output.WriteString(m.styles.Header.Render("Confirm context window") + "\n\n")
+	fmt.Fprintf(&output, "Model     %s\nDetected  %d tokens\nSource    %s", selection.Model, selection.DetectedContextWindow, selection.LimitSource)
+	if selection.Cached {
+		output.WriteString(" · cached")
+	}
+	if selection.Assumed {
+		output.WriteString(" · assumed")
+	}
+	output.WriteString("\n\nIs this context window correct?\n\n")
+	choices := []string{"Use detected value", "Enter a different value"}
+	for index, choice := range choices {
+		prefix := "  "
+		if index == state.cursor {
+			prefix = "> "
+			choice = m.styles.Active.Render(choice)
+		}
+		output.WriteString(prefix + choice + "\n")
+	}
+	if state.editing {
+		output.WriteString("\n" + state.input.View() + "\n")
+	}
+	if state.err != "" {
+		output.WriteString("\n" + m.styles.Error.Render(state.err) + "\n")
 	}
 	return output.String()
 }

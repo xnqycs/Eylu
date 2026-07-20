@@ -25,12 +25,12 @@ func TestLimitResolverReadsOpenAICompatibleMetadataAndCache(t *testing.T) {
 	}))
 	defer server.Close()
 	resolver := NewLimitResolver(config.Default().ModelMetadata, filepath.Join(t.TempDir(), "cache.json"), server.Client())
-	snapshot := Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: "openai_chat", BaseURL: server.URL + "/v1", Model: "model-a", ContextWindow: 64000}}
+	snapshot := Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: "openai_chat", BaseURL: server.URL + "/v1", Model: "model-a", ContextWindow: 256000}}
 	resolved, err := resolver.Resolve(context.Background(), snapshot, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.Limits.ContextWindow != 131072 || resolved.Limits.MaxOutputTokens != 16384 || resolved.EffectiveContextWindow != 64000 || resolved.Limits.Source != LimitSourceOpenAIExtension {
+	if resolved.Limits.ContextWindow != 131072 || resolved.Limits.MaxOutputTokens != 16384 || resolved.EffectiveContextWindow != 256000 || resolved.Limits.Source != LimitSourceOpenAIExtension {
 		t.Fatalf("resolved limits = %#v", resolved)
 	}
 	second, err := resolver.Resolve(context.Background(), snapshot, "secret")

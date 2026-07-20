@@ -514,20 +514,8 @@ func (r *runtime) resolveRuntimeForPrompt(ctx context.Context, manager *provider
 	var err error
 	metadata := manager.Config().ModelMetadata
 	resolver := r.modelLimitResolver(metadata)
-	applyOverrides := func(snapshot provider.Snapshot) provider.Snapshot {
-		if opts.model != "" {
-			snapshot.Config.Model = opts.model
-		}
-		if opts.baseURL != "" {
-			snapshot.Config.BaseURL = opts.baseURL
-		}
-		if opts.adapter != "" && opts.adapter != openai_responses.Name {
-			snapshot.Config.Adapter = opts.adapter
-		}
-		return snapshot
-	}
 	resolveOne := func(candidate provider.Snapshot) (provider.Snapshot, error) {
-		candidate = applyOverrides(candidate)
+		candidate = applyChatProviderOverrides(candidate, opts)
 		resolved, resolveErr := resolver.Resolve(ctx, candidate, providerAPIKey(candidate.Config))
 		if resolveErr != nil {
 			return provider.Snapshot{}, resolveErr
@@ -562,7 +550,7 @@ func (r *runtime) resolveRuntimeForPrompt(ctx context.Context, manager *provider
 			}
 			candidates := manager.List()
 			for index := range candidates {
-				candidates[index] = applyOverrides(candidates[index])
+				candidates[index] = applyChatProviderOverrides(candidates[index], opts)
 			}
 			resolveCtx, cancel := context.WithTimeout(ctx, time.Duration(metadata.RequestTimeoutSeconds)*time.Second)
 			candidates = resolver.ResolveMany(resolveCtx, candidates, providerAPIKey, 4)
@@ -605,6 +593,73 @@ func (r *runtime) resolveRuntimeForPrompt(ctx context.Context, manager *provider
 	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, LimitResolver: resolver, Timeout: requestTimeout}, decision, nil
 }
 
+func applyChatProviderOverrides(snapshot provider.Snapshot, opts chatOptions) provider.Snapshot {
+	if opts.model != "" {
+		snapshot.Config.Model = opts.model
+	}
+	if opts.baseURL != "" {
+		snapshot.Config.BaseURL = opts.baseURL
+	}
+	if opts.adapter != "" && opts.adapter != openai_responses.Name {
+		snapshot.Config.Adapter = opts.adapter
+	}
+	return snapshot
+}
+
+func (r *runtime) probeStartupModelLimits(ctx context.Context, manager *provider.Manager, opts chatOptions) (provider.Snapshot, error) {
+	cfg := manager.Config()
+	metadata := cfg.ModelMetadata
+	resolver := r.modelLimitResolver(metadata)
+	if opts.provider != "" {
+		snapshot, ok := manager.Snapshot(opts.provider)
+		if !ok {
+			return provider.Snapshot{}, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", opts.provider)}
+		}
+		return resolver.Resolve(ctx, applyChatProviderOverrides(snapshot, opts), providerAPIKey(snapshot.Config))
+	}
+	routeMode := opts.routeMode
+	if routeMode == "" {
+		routeMode = cfg.RoutingMode
+	}
+	if routeMode == "fixed" {
+		snapshot, err := manager.Active()
+		if err != nil {
+			return provider.Snapshot{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+		}
+		snapshot = applyChatProviderOverrides(snapshot, opts)
+		return resolver.Resolve(ctx, snapshot, providerAPIKey(snapshot.Config))
+	}
+	if routeMode != "auto" {
+		return provider.Snapshot{}, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("invalid routing mode %q", routeMode)}
+	}
+	candidates := manager.List()
+	for index := range candidates {
+		candidates[index] = applyChatProviderOverrides(candidates[index], opts)
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, time.Duration(metadata.RequestTimeoutSeconds)*time.Second)
+	resolved := resolver.ResolveMany(resolveCtx, candidates, providerAPIKey, 4)
+	cancel()
+	active, err := manager.Active()
+	if err != nil {
+		return provider.Snapshot{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+	}
+	for _, snapshot := range resolved {
+		if snapshot.Name == active.Name {
+			return snapshot, nil
+		}
+	}
+	return applyChatProviderOverrides(active, opts), nil
+}
+
+func (r *runtime) probeProviderModelLimits(ctx context.Context, manager *provider.Manager, name string) (provider.Snapshot, error) {
+	snapshot, ok := manager.Snapshot(name)
+	if !ok {
+		return provider.Snapshot{}, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", name)}
+	}
+	resolver := r.modelLimitResolver(manager.Config().ModelMetadata)
+	return resolver.Resolve(ctx, snapshot, providerAPIKey(snapshot.Config))
+}
+
 func (r *runtime) modelLimitResolver(metadata config.ModelMetadataConfig) *provider.LimitResolver {
 	r.limitMu.Lock()
 	defer r.limitMu.Unlock()
@@ -630,7 +685,7 @@ func (r *runtime) warnContextLimit(snapshot provider.Snapshot) {
 	}
 	r.limitWarnings[key] = true
 	r.limitMu.Unlock()
-	fmt.Fprintf(r.stderr, "[context] configured cap=%d exceeds detected limit=%d; effective=%d source=%s\n", configured, detected, snapshot.ContextWindowLimit(), snapshot.Limits.Source)
+	fmt.Fprintf(r.stderr, "[context] configured override=%d exceeds detected limit=%d; effective=%d source=%s\n", configured, detected, snapshot.ContextWindowLimit(), snapshot.Limits.Source)
 }
 
 func knownDriverCapabilities(adapter string) (driver.Capabilities, bool) {

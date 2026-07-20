@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -181,7 +182,7 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	if err != nil || !decision.Approved {
 		t.Fatalf("decision=%#v err=%v", decision, err)
 	}
-	if err := backend.UpsertProvider(context.Background(), ui.ProviderForm{Name: "new", BaseURL: "https://new.example/v1", Model: "new-model", Adapter: "openai_responses", APIKey: "provider-secret", ContextWindow: 64000}); err != nil {
+	if _, err := backend.UpsertProvider(context.Background(), ui.ProviderForm{Name: "new", BaseURL: "https://new.example/v1", Model: "new-model", Adapter: "openai_responses", APIKey: "provider-secret", ContextWindow: 64000}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(configPath)
@@ -191,7 +192,7 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	if !strings.Contains(string(data), "api_key = 'provider-secret'") {
 		t.Fatalf("config=%s", data)
 	}
-	if err := backend.SetModel(context.Background(), "work", "work-updated"); err != nil {
+	if _, err := backend.SetModel(context.Background(), "work", "work-updated"); err != nil {
 		t.Fatal(err)
 	}
 	work, _ := manager.Get("work")
@@ -203,12 +204,45 @@ func TestTUIBackendApprovalProviderAndSecretPersistence(t *testing.T) {
 	if err != nil || snapshot.Workspace != workspace || snapshot.Provider != "new" || snapshot.Model != "new-model" {
 		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
 	}
-	if err := backend.UpsertProvider(context.Background(), ui.ProviderForm{OriginalName: "new", Name: "renamed", BaseURL: "https://new.example/v1", Model: "new-model", Adapter: "openai_responses", ContextWindow: 64000}); err != nil {
+	if _, err := backend.UpsertProvider(context.Background(), ui.ProviderForm{OriginalName: "new", Name: "renamed", BaseURL: "https://new.example/v1", Model: "new-model", Adapter: "openai_responses", ContextWindow: 64000}); err != nil {
 		t.Fatal(err)
 	}
 	renamed, exists := manager.Get("renamed")
 	if _, oldExists := manager.Get("new"); !exists || oldExists || renamed.APIKey != "provider-secret" || renamed.ContextWindow != 64000 {
 		t.Fatalf("renamed=%#v exists=%t old=%t", renamed, exists, oldExists)
+	}
+}
+
+func TestTUIBackendSetModelProbesImmediately(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/models" {
+			t.Fatalf("path = %s", request.URL.Path)
+		}
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[{"id":"next-model","context_length":131072,"max_completion_tokens":16384}]}`)
+	}))
+	defer server.Close()
+
+	cfg := testAppConfig()
+	cfg.ModelMetadata.Enabled = true
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "old-model"}
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := agent.NewConversation()
+	appRuntime := &runtime{metadataCachePath: filepath.Join(t.TempDir(), "metadata.json")}
+	backend := &tuiBackend{runtime: appRuntime, conversation: conversation, manager: manager}
+	selection, err := backend.SetModel(context.Background(), "work", "next-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := conversation.ContextReport()
+	if requests != 1 || selection.DetectedContextWindow != 131072 || report.Provider != "work" || report.Model != "next-model" || report.DetectedContextWindow != 131072 || report.ContextWindow != 131072 {
+		t.Fatalf("requests=%d selection=%#v report=%#v", requests, selection, report)
 	}
 }
 

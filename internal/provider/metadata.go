@@ -50,12 +50,8 @@ type ModelLimits struct {
 func (s Snapshot) WithLimits(limits ModelLimits) Snapshot {
 	s.Limits = limits
 	s.EffectiveContextWindow = limits.ContextWindow
-	if cap := s.Config.ContextWindow; cap > 0 && (s.EffectiveContextWindow == 0 || cap < s.EffectiveContextWindow) {
-		s.EffectiveContextWindow = cap
-	}
-	if s.EffectiveContextWindow == 0 && s.Config.ContextWindow > 0 {
-		s.EffectiveContextWindow = s.Config.ContextWindow
-		s.Limits.Source = LimitSourceUserCap
+	if configured := s.Config.ContextWindow; configured > 0 {
+		s.EffectiveContextWindow = configured
 	}
 	return s
 }
@@ -162,7 +158,7 @@ func (r *LimitResolver) Resolve(ctx context.Context, snapshot Snapshot, apiKey s
 			return Snapshot{}, ctx.Err()
 		}
 		now = r.now().UTC()
-		entry := cacheEntry{}
+		var entry cacheEntry
 		if found {
 			entry = cacheEntry{Limits: limits, ExpiresAt: now.Add(r.ttlFor(limits.Source)), StaleUntil: now.Add(time.Duration(r.config.StaleTTLHours) * time.Hour)}
 		} else if hasStale && now.Before(stale.StaleUntil) && !stale.Negative {

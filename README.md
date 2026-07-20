@@ -39,7 +39,7 @@ go run . "审查并测试这个项目" --route auto --task review --require-reas
 
 `routing_mode = "fixed"` 保持活动 Provider；`routing_mode = "auto"` 允许每个请求选择 Provider。显式 `--provider` 固定本次请求。文本模式在 stderr 输出路由决策与请求指标；JSONL 模式输出 `routing` 和 `metrics` 事件，指标包含 request ID、首 token/总耗时、工具成功率、压缩次数、usage 与估算成本。
 
-模型上下文窗口默认自动解析。Eylu 依次使用服务端模型元数据、Ollama `/api/ps`/`/api/show`、llama.cpp `/props`、models.dev 和内置 `256K → 8K` 阶梯；上下文溢出会触发最多三轮压缩重试并缓存服务确认的限制。`--context-window` 是用户上限，`--catalog-provider` 可显式指定 models.dev Provider ID。解析缓存位于 `~/.eylu/state/model-metadata.json`，`/context` 展示配置值、探测值、有效值和来源。
+模型上下文窗口默认自动解析。交互程序启动时会预热活动模型，自动路由会并发预热全部候选模型；Provider 或模型切换成功后会立即解析新模型，无需先发送 prompt。用户选择模型后，界面会展示探测值与来源并要求确认；探测不正确时可输入正整数覆盖值。用户确认或输入的 `context_window` 优先于探测结果。Eylu 依次使用服务端模型元数据、Ollama `/api/ps`/`/api/show`、llama.cpp `/props`、models.dev 和内置 `256K → 8K` 阶梯；上下文溢出会触发最多三轮压缩重试并缓存服务确认的限制。`--catalog-provider` 可显式指定 models.dev Provider ID。解析缓存位于 `~/.eylu/state/model-metadata.json`，`/context` 展示配置值、探测值、有效值和来源。
 
 兼容端点可在 Provider 中选择两种 adapter：
 

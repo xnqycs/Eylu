@@ -26,12 +26,14 @@ func (c *fakeClock) Tick(duration time.Duration, fn func(time.Time) tea.Msg) tea
 }
 
 type fakeBackend struct {
-	snapshot Snapshot
-	submit   func(context.Context, string, Submission, func(Event)) error
-	err      error
-	models   []string
-	files    []FileItem
-	mode     string
+	snapshot      Snapshot
+	submit        func(context.Context, string, Submission, func(Event)) error
+	err           error
+	models        []string
+	files         []FileItem
+	mode          string
+	selection     ModelSelection
+	contextWindow int
 }
 
 func (b *fakeBackend) Snapshot(context.Context) (Snapshot, error) { return b.snapshot, b.err }
@@ -49,10 +51,18 @@ func (b *fakeBackend) SetMode(_ context.Context, mode string) error {
 	b.mode = mode
 	return b.err
 }
-func (b *fakeBackend) UpsertProvider(context.Context, ProviderForm) error { return b.err }
-func (b *fakeBackend) DeleteProvider(context.Context, string) error       { return b.err }
-func (b *fakeBackend) UseProvider(context.Context, string) error          { return b.err }
-func (b *fakeBackend) SetModel(context.Context, string, string) error     { return b.err }
+func (b *fakeBackend) UpsertProvider(context.Context, ProviderForm) (ModelSelection, error) {
+	return b.selection, b.err
+}
+func (b *fakeBackend) DeleteProvider(context.Context, string) error { return b.err }
+func (b *fakeBackend) UseProvider(context.Context, string) error    { return b.err }
+func (b *fakeBackend) SetModel(context.Context, string, string) (ModelSelection, error) {
+	return b.selection, b.err
+}
+func (b *fakeBackend) SetContextWindow(_ context.Context, _ string, value int) error {
+	b.contextWindow = value
+	return b.err
+}
 func (b *fakeBackend) FetchModels(context.Context, string) ([]string, error) {
 	return append([]string(nil), b.models...), b.err
 }
@@ -913,6 +923,50 @@ func TestProviderFormValidationAndModelFiltering(t *testing.T) {
 	if len(filtered) != 1 || filtered[0] != "beta-code" {
 		t.Fatalf("filtered = %#v", filtered)
 	}
+}
+
+func TestContextWindowConfirmationAcceptsDetectedAndManualValues(t *testing.T) {
+	selection := ModelSelection{Provider: "work", Model: "next-model", DetectedContextWindow: 131072, LimitSource: "models_dev"}
+	t.Run("detected", func(t *testing.T) {
+		backend := &fakeBackend{selection: selection}
+		model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+		model.screen = screenModels
+		model.snapshot.Provider = "work"
+		model.models = []string{"next-model"}
+		_, selectCommand := model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+		if selectCommand == nil {
+			t.Fatal("model selection did not return a command")
+		}
+		_, _ = model.Update(selectCommand())
+		view := ansi.Strip(model.View().Content)
+		if model.screen != screenContextConfirm || !strings.Contains(view, "131072 tokens") || !strings.Contains(view, "Use detected value") {
+			t.Fatalf("screen=%s view=%s", model.screen, view)
+		}
+		_, command := model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+		if command == nil {
+			t.Fatal("detected confirmation did not return a command")
+		}
+		_, _ = model.Update(command())
+		if backend.contextWindow != 131072 || model.screen != screenChat {
+			t.Fatalf("context=%d screen=%s", backend.contextWindow, model.screen)
+		}
+	})
+
+	t.Run("manual", func(t *testing.T) {
+		backend := &fakeBackend{selection: selection}
+		model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+		_, _ = model.Update(modelSelectionMsg{selection: selection, returnTo: screenModels})
+		_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: 'n', Text: "n"}))
+		model.contextWindowConfirm.input.SetValue("200000")
+		_, command := model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+		if command == nil {
+			t.Fatal("manual confirmation did not return a command")
+		}
+		_, _ = model.Update(command())
+		if backend.contextWindow != 200000 || model.screen != screenChat {
+			t.Fatalf("context=%d screen=%s", backend.contextWindow, model.screen)
+		}
+	})
 }
 
 func TestResizeStormLongWordsAndStaleAnimationTick(t *testing.T) {

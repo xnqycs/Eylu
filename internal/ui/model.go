@@ -23,14 +23,15 @@ import (
 type screenKind string
 
 const (
-	screenChat         screenKind = "chat"
-	screenProviders    screenKind = "providers"
-	screenProviderForm screenKind = "provider_form"
-	screenModels       screenKind = "models"
-	screenSkills       screenKind = "skills"
-	screenContext      screenKind = "context"
-	screenTasks        screenKind = "tasks"
-	screenToolDetail   screenKind = "tool_detail"
+	screenChat           screenKind = "chat"
+	screenProviders      screenKind = "providers"
+	screenProviderForm   screenKind = "provider_form"
+	screenModels         screenKind = "models"
+	screenContextConfirm screenKind = "context_confirm"
+	screenSkills         screenKind = "skills"
+	screenContext        screenKind = "context"
+	screenTasks          screenKind = "tasks"
+	screenToolDetail     screenKind = "tool_detail"
 )
 
 type timelineKind string
@@ -96,6 +97,23 @@ type askState struct {
 	err        string
 }
 
+type contextWindowConfirmState struct {
+	selection ModelSelection
+	cursor    int
+	input     textinput.Model
+	editing   bool
+	err       string
+}
+
+func newContextWindowConfirmState(selection ModelSelection, width int) *contextWindowConfirmState {
+	input := textinput.New()
+	input.Placeholder = "Context window tokens"
+	input.CharLimit = 12
+	input.SetVirtualCursor(true)
+	input.SetWidth(max(20, width-8))
+	return &contextWindowConfirmState{selection: selection, input: input}
+}
+
 func newAskState(request *AskRequest, width int) *askState {
 	input := textinput.New()
 	input.Placeholder = "Type a custom answer"
@@ -144,6 +162,7 @@ type Model struct {
 	models                     []string
 	modelManual                bool
 	contextExpand              bool
+	contextWindowConfirm       *contextWindowConfirmState
 	approval                   *ApprovalRequest
 	approvalCursor             int
 	approvalEditing            bool
@@ -200,6 +219,18 @@ type commandResultMsg struct {
 }
 
 type mutationResultMsg struct{ err error }
+
+type modelSelectionMsg struct {
+	selection ModelSelection
+	returnTo  screenKind
+	err       error
+}
+
+type contextWindowResultMsg struct {
+	selection ModelSelection
+	value     int
+	err       error
+}
 
 type modelsResultMsg struct {
 	models []string
@@ -426,6 +457,39 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenChat
 		m.refreshViewport()
 		return m, m.loadSnapshotCmd()
+	case modelSelectionMsg:
+		m.state = StateIdle
+		if typed.err != nil {
+			if typed.returnTo == screenProviderForm {
+				m.form.err = typed.err
+				m.screen = screenProviderForm
+			} else {
+				m.appendNotice(typed.err.Error(), true)
+				m.screen = screenChat
+				m.refreshViewport()
+			}
+			return m, nil
+		}
+		m.modelFilter.Blur()
+		m.contextWindowConfirm = newContextWindowConfirmState(typed.selection, m.viewportContentWidth())
+		if typed.selection.DetectedContextWindow <= 0 {
+			m.contextWindowConfirm.cursor = 1
+			m.contextWindowConfirm.err = "No context window was detected; enter the correct value."
+		}
+		m.screen = screenContextConfirm
+		return m, m.loadSnapshotCmd()
+	case contextWindowResultMsg:
+		if typed.err != nil {
+			if m.contextWindowConfirm != nil {
+				m.contextWindowConfirm.err = typed.err.Error()
+			}
+			return m, nil
+		}
+		m.appendNotice(fmt.Sprintf("Model: %s · context window: %d", typed.selection.Model, typed.value), false)
+		m.contextWindowConfirm = nil
+		m.screen = screenChat
+		m.refreshViewport()
+		return m, m.loadSnapshotCmd()
 	case mutationResultMsg:
 		if typed.err != nil {
 			m.appendNotice(typed.err.Error(), true)
@@ -629,6 +693,8 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleProviderFormKey(message)
 	case screenModels:
 		return m.handleModelsKey(message)
+	case screenContextConfirm:
+		return m.handleContextWindowConfirmKey(message)
 	case screenSkills:
 		return m.handleSkillsKey(key)
 	case screenContext:
@@ -815,6 +881,9 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 		if len(fields) == 1 {
 			m.screen = screenModels
 			return m, tea.Batch(m.modelFilter.Focus(), m.fetchModelsCmd())
+		}
+		if len(fields) == 2 {
+			return m, m.selectModelCmd(m.snapshot.Provider, fields[1], screenChat)
 		}
 	case "/mode":
 		if len(fields) == 2 {

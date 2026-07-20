@@ -2,6 +2,7 @@ package ui
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -70,7 +71,11 @@ func (m *Model) submitProviderForm() (tea.Model, tea.Cmd) {
 		m.form.err = err
 		return m, nil
 	}
-	return m, func() tea.Msg { return mutationResultMsg{err: m.backend.UpsertProvider(m.context, value)} }
+	m.state = StateConnecting
+	return m, func() tea.Msg {
+		selection, err := m.backend.UpsertProvider(m.context, value)
+		return modelSelectionMsg{selection: selection, returnTo: screenProviderForm, err: err}
+	}
 }
 
 func (m *Model) handleModelsKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -106,10 +111,7 @@ func (m *Model) handleModelsKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if modelID != "" {
 			m.modelManual = false
 			providerName := m.snapshot.Provider
-			return m, func() tea.Msg {
-				err := m.backend.SetModel(m.context, providerName, modelID)
-				return commandResultMsg{text: "Model: " + modelID, err: err}
-			}
+			return m, m.selectModelCmd(providerName, modelID, screenModels)
 		}
 		return m, nil
 	}
@@ -117,6 +119,82 @@ func (m *Model) handleModelsKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.modelFilter = updated
 	m.modelCursor = clampCursor(m.modelCursor, len(m.filteredModels()))
 	return m, command
+}
+
+func (m *Model) selectModelCmd(providerName, modelID string, returnTo screenKind) tea.Cmd {
+	m.state = StateConnecting
+	return func() tea.Msg {
+		selection, err := m.backend.SetModel(m.context, providerName, modelID)
+		return modelSelectionMsg{selection: selection, returnTo: returnTo, err: err}
+	}
+}
+
+func (m *Model) handleContextWindowConfirmKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	state := m.contextWindowConfirm
+	if state == nil {
+		m.screen = screenChat
+		return m, nil
+	}
+	key := message.String()
+	if state.editing {
+		switch key {
+		case "esc":
+			state.editing = false
+			state.input.Blur()
+			state.err = ""
+			return m, nil
+		case "enter":
+			value, err := strconv.Atoi(strings.TrimSpace(state.input.Value()))
+			if err != nil || value <= 0 {
+				state.err = "Context window must be a positive integer."
+				return m, nil
+			}
+			return m, m.setContextWindowCmd(state.selection, value)
+		default:
+			updated, command := state.input.Update(message)
+			state.input = updated
+			return m, command
+		}
+	}
+	switch key {
+	case "up", "down", "tab", "shift+tab":
+		state.cursor = (state.cursor + 1) % 2
+	case "y":
+		if state.selection.DetectedContextWindow > 0 {
+			return m, m.setContextWindowCmd(state.selection, state.selection.DetectedContextWindow)
+		}
+		return m, m.beginContextWindowInput()
+	case "n":
+		state.cursor = 1
+		return m, m.beginContextWindowInput()
+	case "enter":
+		if state.cursor == 0 && state.selection.DetectedContextWindow > 0 {
+			return m, m.setContextWindowCmd(state.selection, state.selection.DetectedContextWindow)
+		}
+		return m, m.beginContextWindowInput()
+	case "esc":
+		m.contextWindowConfirm = nil
+		m.screen = screenModels
+	}
+	return m, nil
+}
+
+func (m *Model) beginContextWindowInput() tea.Cmd {
+	state := m.contextWindowConfirm
+	if state == nil {
+		return nil
+	}
+	state.editing = true
+	state.err = ""
+	state.input.Reset()
+	return state.input.Focus()
+}
+
+func (m *Model) setContextWindowCmd(selection ModelSelection, value int) tea.Cmd {
+	return func() tea.Msg {
+		err := m.backend.SetContextWindow(m.context, selection.Provider, value)
+		return contextWindowResultMsg{selection: selection, value: value, err: err}
+	}
 }
 
 func (m *Model) handleSkillsKey(key string) (tea.Model, tea.Cmd) {
