@@ -32,6 +32,8 @@ type Runtime struct {
 	TokenEstimator        contextledger.TokenEstimator
 	OutputReserveTokens   int
 	ContextRecentRounds   int
+	ContextCompactTrigger int
+	ContextCompactTarget  int
 	MaxProjectMapBytes    int
 	MaxToolContextBytes   int
 	SkillCatalogPageBytes int
@@ -61,33 +63,34 @@ type ProtectedSkill struct {
 }
 
 type Conversation struct {
-	mu                  sync.Mutex
-	sessionID           string
-	turns               []protocol.Turn
-	promptHistory       []string
-	closed              map[string][]protocol.Turn
-	driverState         json.RawMessage
-	providerName        string
-	providerGeneration  uint64
-	providerAdapter     string
-	providerBaseURL     string
-	providerModel       string
-	permissionMode      string
-	systemPrompt        string
-	environment         environment.Context
-	skillCatalog        string
-	protectedSkills     map[string]ProtectedSkill
-	toolDefinitions     []protocol.ToolDefinition
-	ledger              *contextledger.Ledger
-	lastRuntime         Runtime
-	summary             string
-	todoList            protocol.TodoList
-	omittedTurnIDs      map[string]struct{}
-	projectMap          string
-	projectMapWorkspace string
-	projectMapMaxBytes  int
-	projectMapDirty     bool
-	mcpFingerprint      string
+	mu                         sync.Mutex
+	sessionID                  string
+	turns                      []protocol.Turn
+	promptHistory              []string
+	closed                     map[string][]protocol.Turn
+	driverState                json.RawMessage
+	providerName               string
+	providerGeneration         uint64
+	providerAdapter            string
+	providerBaseURL            string
+	providerModel              string
+	permissionMode             string
+	systemPrompt               string
+	environment                environment.Context
+	skillCatalog               string
+	protectedSkills            map[string]ProtectedSkill
+	toolDefinitions            []protocol.ToolDefinition
+	ledger                     *contextledger.Ledger
+	lastRuntime                Runtime
+	summary                    string
+	todoList                   protocol.TodoList
+	omittedTurnIDs             map[string]struct{}
+	projectMap                 string
+	projectMapWorkspace        string
+	projectMapMaxBytes         int
+	projectMapDirty            bool
+	mcpFingerprint             string
+	lastCompressionFingerprint string
 }
 
 func NewConversation() *Conversation {
@@ -150,6 +153,7 @@ func (c *Conversation) NewSessionWithEnvironment(environmentContext environment.
 	c.providerBaseURL = ""
 	c.providerModel = ""
 	c.mcpFingerprint = ""
+	c.lastCompressionFingerprint = ""
 	c.permissionMode = c.lastRuntime.PermissionMode
 	c.environment = environmentContext
 	if c.permissionMode == "" {
@@ -232,6 +236,10 @@ func (c *Conversation) prepareRuntime(prompt string, runtime Runtime) error {
 	if prompt == "" {
 		return errors.New("prompt is empty")
 	}
+	return c.applyRuntime(runtime)
+}
+
+func (c *Conversation) applyRuntime(runtime Runtime) error {
 	if runtime.Driver == nil {
 		return errors.New("model driver is nil")
 	}
@@ -272,7 +280,7 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 	}
 	responseStarted := false
 	for attempt := 0; attempt <= 3; attempt++ {
-		prepared, err := c.prepareRequestContext(runtime, definitions)
+		prepared, err := c.prepareRequestContext(ctx, runtime, definitions)
 		if err != nil {
 			return protocol.ModelResponse{}, err
 		}

@@ -196,6 +196,8 @@ type Config struct {
 	TokenBytesPerToken    int                            `toml:"token_bytes_per_token,omitempty" json:"token_bytes_per_token,omitempty"`
 	ReservedOutputTokens  int                            `toml:"reserved_output_tokens,omitempty" json:"reserved_output_tokens,omitempty"`
 	ContextRecentRounds   int                            `toml:"context_recent_rounds,omitempty" json:"context_recent_rounds,omitempty"`
+	ContextCompactTrigger int                            `toml:"context_compact_trigger_percent,omitempty" json:"context_compact_trigger_percent,omitempty"`
+	ContextCompactTarget  int                            `toml:"context_compact_target_percent,omitempty" json:"context_compact_target_percent,omitempty"`
 	MaxProjectMapBytes    int                            `toml:"max_project_map_bytes,omitempty" json:"max_project_map_bytes,omitempty"`
 	MaxToolContextBytes   int                            `toml:"max_tool_context_bytes,omitempty" json:"max_tool_context_bytes,omitempty"`
 	SkillCatalogPageBytes int                            `toml:"skill_catalog_page_bytes,omitempty" json:"skill_catalog_page_bytes,omitempty"`
@@ -226,6 +228,8 @@ func Default() Config {
 		TokenBytesPerToken:    4,
 		ReservedOutputTokens:  8192,
 		ContextRecentRounds:   3,
+		ContextCompactTrigger: 85,
+		ContextCompactTarget:  60,
 		MaxProjectMapBytes:    32 << 10,
 		MaxToolContextBytes:   8 << 10,
 		SkillCatalogPageBytes: 8 << 10,
@@ -314,6 +318,9 @@ func (c Config) Validate() error {
 	}
 	if c.TokenBytesPerToken <= 0 || c.ReservedOutputTokens <= 0 || c.ContextRecentRounds <= 0 || c.MaxProjectMapBytes <= 0 || c.MaxToolContextBytes <= 0 || c.SkillCatalogPageBytes <= 0 || c.MaxSummaryBytes <= 0 {
 		return errors.New("context limits must be greater than zero")
+	}
+	if c.ContextCompactTarget < 1 || c.ContextCompactTrigger > 99 || c.ContextCompactTarget >= c.ContextCompactTrigger {
+		return errors.New("context compaction percentages must satisfy 1 <= target < trigger <= 99")
 	}
 	if c.MaxSessions <= 0 || c.MaxSessionBytes <= 0 {
 		return errors.New("session limits must be greater than zero")
@@ -561,19 +568,21 @@ func applyEnvironment(cfg *Config, environ []string) {
 		}
 	}
 	for key, target := range map[string]*int{
-		"EYLU_MAX_TURNS":                &cfg.MaxTurns,
-		"EYLU_MAX_TOTAL_TOKENS":         &cfg.MaxTotalTokens,
-		"EYLU_TOOL_TIMEOUT":             &cfg.ToolTimeoutSec,
-		"EYLU_MAX_OUTPUT_BYTES":         &cfg.MaxOutputBytes,
-		"EYLU_MAX_PARALLEL_TOOLS":       &cfg.MaxParallelTools,
-		"EYLU_TOKEN_BYTES_PER_TOKEN":    &cfg.TokenBytesPerToken,
-		"EYLU_RESERVED_OUTPUT_TOKENS":   &cfg.ReservedOutputTokens,
-		"EYLU_CONTEXT_RECENT_ROUNDS":    &cfg.ContextRecentRounds,
-		"EYLU_MAX_PROJECT_MAP_BYTES":    &cfg.MaxProjectMapBytes,
-		"EYLU_MAX_TOOL_CONTEXT_BYTES":   &cfg.MaxToolContextBytes,
-		"EYLU_SKILL_CATALOG_PAGE_BYTES": &cfg.SkillCatalogPageBytes,
-		"EYLU_MAX_SUMMARY_BYTES":        &cfg.MaxSummaryBytes,
-		"EYLU_MAX_SESSIONS":             &cfg.MaxSessions,
+		"EYLU_MAX_TURNS":                       &cfg.MaxTurns,
+		"EYLU_MAX_TOTAL_TOKENS":                &cfg.MaxTotalTokens,
+		"EYLU_TOOL_TIMEOUT":                    &cfg.ToolTimeoutSec,
+		"EYLU_MAX_OUTPUT_BYTES":                &cfg.MaxOutputBytes,
+		"EYLU_MAX_PARALLEL_TOOLS":              &cfg.MaxParallelTools,
+		"EYLU_TOKEN_BYTES_PER_TOKEN":           &cfg.TokenBytesPerToken,
+		"EYLU_RESERVED_OUTPUT_TOKENS":          &cfg.ReservedOutputTokens,
+		"EYLU_CONTEXT_RECENT_ROUNDS":           &cfg.ContextRecentRounds,
+		"EYLU_CONTEXT_COMPACT_TRIGGER_PERCENT": &cfg.ContextCompactTrigger,
+		"EYLU_CONTEXT_COMPACT_TARGET_PERCENT":  &cfg.ContextCompactTarget,
+		"EYLU_MAX_PROJECT_MAP_BYTES":           &cfg.MaxProjectMapBytes,
+		"EYLU_MAX_TOOL_CONTEXT_BYTES":          &cfg.MaxToolContextBytes,
+		"EYLU_SKILL_CATALOG_PAGE_BYTES":        &cfg.SkillCatalogPageBytes,
+		"EYLU_MAX_SUMMARY_BYTES":               &cfg.MaxSummaryBytes,
+		"EYLU_MAX_SESSIONS":                    &cfg.MaxSessions,
 	} {
 		if value := env[key]; value != "" {
 			if parsed, err := strconv.Atoi(value); err == nil {

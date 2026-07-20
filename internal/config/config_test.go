@@ -231,14 +231,48 @@ func TestValidatePermissionModeAndClonePolicyLists(t *testing.T) {
 func TestContextLimitEnvironmentOverrides(t *testing.T) {
 	workspace := t.TempDir()
 	loaded, err := Load(LoadOptions{ExplicitPath: filepath.Join(t.TempDir(), "missing.toml"), Workspace: workspace, Environ: []string{
-		"EYLU_TOKEN_BYTES_PER_TOKEN=3", "EYLU_RESERVED_OUTPUT_TOKENS=1024", "EYLU_CONTEXT_RECENT_ROUNDS=2", "EYLU_MAX_PROJECT_MAP_BYTES=4096", "EYLU_MAX_TOOL_CONTEXT_BYTES=2048", "EYLU_SKILL_CATALOG_PAGE_BYTES=1024", "EYLU_MAX_SUMMARY_BYTES=3072", "EYLU_MAX_SESSIONS=7", "EYLU_MAX_SESSION_BYTES=123456", "EYLU_ROUTING_MODE=auto", "EYLU_MAX_PARALLEL_TOOLS=6", "EYLU_MODEL_METADATA_ENABLED=false",
+		"EYLU_TOKEN_BYTES_PER_TOKEN=3", "EYLU_RESERVED_OUTPUT_TOKENS=1024", "EYLU_CONTEXT_RECENT_ROUNDS=2", "EYLU_CONTEXT_COMPACT_TRIGGER_PERCENT=80", "EYLU_CONTEXT_COMPACT_TARGET_PERCENT=55", "EYLU_MAX_PROJECT_MAP_BYTES=4096", "EYLU_MAX_TOOL_CONTEXT_BYTES=2048", "EYLU_SKILL_CATALOG_PAGE_BYTES=1024", "EYLU_MAX_SUMMARY_BYTES=3072", "EYLU_MAX_SESSIONS=7", "EYLU_MAX_SESSION_BYTES=123456", "EYLU_ROUTING_MODE=auto", "EYLU_MAX_PARALLEL_TOOLS=6", "EYLU_MODEL_METADATA_ENABLED=false",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := loaded.Config
-	if cfg.TokenBytesPerToken != 3 || cfg.ReservedOutputTokens != 1024 || cfg.ContextRecentRounds != 2 || cfg.MaxProjectMapBytes != 4096 || cfg.MaxToolContextBytes != 2048 || cfg.SkillCatalogPageBytes != 1024 || cfg.MaxSummaryBytes != 3072 || cfg.MaxSessions != 7 || cfg.MaxSessionBytes != 123456 || cfg.RoutingMode != "auto" || cfg.MaxParallelTools != 6 || cfg.ModelMetadata.Enabled {
+	if cfg.TokenBytesPerToken != 3 || cfg.ReservedOutputTokens != 1024 || cfg.ContextRecentRounds != 2 || cfg.ContextCompactTrigger != 80 || cfg.ContextCompactTarget != 55 || cfg.MaxProjectMapBytes != 4096 || cfg.MaxToolContextBytes != 2048 || cfg.SkillCatalogPageBytes != 1024 || cfg.MaxSummaryBytes != 3072 || cfg.MaxSessions != 7 || cfg.MaxSessionBytes != 123456 || cfg.RoutingMode != "auto" || cfg.MaxParallelTools != 6 || cfg.ModelMetadata.Enabled {
 		t.Fatalf("context config = %#v", cfg)
+	}
+}
+
+func TestContextCompactionPercentValidation(t *testing.T) {
+	for _, values := range [][2]int{{0, 60}, {100, 60}, {60, 60}, {50, 60}} {
+		cfg := Default()
+		cfg.ContextCompactTrigger = values[0]
+		cfg.ContextCompactTarget = values[1]
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("trigger=%d target=%d accepted", values[0], values[1])
+		}
+	}
+	cfg := Default()
+	cfg.ContextCompactTrigger = 85
+	cfg.ContextCompactTarget = 60
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestContextCompactionPercentagesPersist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := Default()
+	cfg.ContextCompactTrigger = 80
+	cfg.ContextCompactTarget = 50
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.ContextCompactTrigger != 80 || loaded.Config.ContextCompactTarget != 50 {
+		t.Fatalf("config=%#v", loaded.Config)
 	}
 }
 

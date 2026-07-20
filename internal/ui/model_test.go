@@ -28,6 +28,7 @@ func (c *fakeClock) Tick(duration time.Duration, fn func(time.Time) tea.Msg) tea
 type fakeBackend struct {
 	snapshot      Snapshot
 	submit        func(context.Context, string, Submission, func(Event)) error
+	compact       func(context.Context, string, func(Event)) error
 	err           error
 	command       string
 	models        []string
@@ -41,6 +42,12 @@ func (b *fakeBackend) Snapshot(context.Context) (Snapshot, error) { return b.sna
 func (b *fakeBackend) Submit(ctx context.Context, operationID string, submission Submission, emit func(Event)) error {
 	if b.submit != nil {
 		return b.submit(ctx, operationID, submission, emit)
+	}
+	return b.err
+}
+func (b *fakeBackend) Compact(ctx context.Context, operationID string, emit func(Event)) error {
+	if b.compact != nil {
+		return b.compact(ctx, operationID, emit)
 	}
 	return b.err
 }
@@ -528,6 +535,35 @@ func TestStreamingActivityShowsEstimatedExactTokensAndThinking(t *testing.T) {
 	model.resize(40, 16)
 	if width := lipgloss.Width(ansi.Strip(model.renderLoading())); width > 40 {
 		t.Fatalf("activity width=%d line=%q", width, ansi.Strip(model.renderLoading()))
+	}
+}
+
+func TestCompactingActivityShowsOnlyElapsedAndPreservesTaskHint(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 20, 12, 0, 1, 0, time.UTC)}
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Clock: clock, Width: 100, Height: 24})
+	model.state = StateCompacting
+	model.startedAt = clock.now.Add(-time.Second)
+	model.activity = Activity{InputTokens: 3791, InputExact: true, TokenBytesPerToken: 4}
+	model.operationUsage = protocol.Usage{OutputTokens: 20, Exact: true}
+	model.reasoningSeen = true
+	model.reasoningElapsed = 10 * time.Second
+	activity := strings.TrimSpace(ansi.Strip(model.renderLoading()))
+	if activity != "* Compacting...  (1s)" {
+		t.Fatalf("activity=%q", activity)
+	}
+	if status := ansi.Strip(model.renderStatus()); !strings.Contains(status, "Preserving task context") {
+		t.Fatalf("status=%q", status)
+	}
+
+	fresh := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Clock: clock, Width: 100, Height: 24})
+	started, command := fresh.executeSlash("/compact")
+	compactModel := started.(*Model)
+	if compactModel.state != StateCompacting || command == nil || len(compactModel.timeline) != 0 {
+		t.Fatalf("state=%s command=%v timeline=%#v", compactModel.state, command, compactModel.timeline)
+	}
+	items := slashCompletionItems("/comp", Snapshot{})
+	if len(items) != 1 || items[0].label != "/compact" {
+		t.Fatalf("completion=%#v", items)
 	}
 }
 

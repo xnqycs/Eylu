@@ -99,11 +99,11 @@ func TestLedgerStateRoundTrip(t *testing.T) {
 	ledger := New(ApproxEstimator{BytesPerToken: 1})
 	ledger.AddText("user", CategoryUserMessage, "turn", "hello", false)
 	ledger.SetLastUsage(protocol.Usage{InputTokens: 5, OutputTokens: 1, Exact: true})
-	ledger.RecordCompression(CompressionEvent{BeforeTokens: 10, AfterTokens: 5, OmittedTurns: 2})
+	ledger.RecordCompression(CompressionEvent{Trigger: "manual", Strategy: "model", BeforeTokens: 10, AfterTokens: 5, OmittedTurns: 2, DurationMS: 25, Usage: protocol.Usage{InputTokens: 3, OutputTokens: 1, Exact: true}})
 	restored := New(nil)
 	restored.Restore(ledger.State())
 	report := restored.Report("provider", "model", 100)
-	if report.InputTokens != 5 || report.LastUsage.InputTokens != 5 || report.CompressionCount != 1 || report.LastCompression.OmittedTurns != 2 {
+	if report.InputTokens != 5 || report.LastUsage.InputTokens != 5 || report.CompressionCount != 1 || report.LastCompression.OmittedTurns != 2 || report.LastCompression.Trigger != "manual" || report.LastCompression.Strategy != "model" || report.LastCompression.DurationMS != 25 || report.LastCompression.Usage.OutputTokens != 1 {
 		t.Fatalf("report = %#v", report)
 	}
 }

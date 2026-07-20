@@ -455,25 +455,76 @@ func (b *tuiBackend) ListFiles(ctx context.Context) ([]ui.FileItem, error) {
 	return result, nil
 }
 
+func (b *tuiBackend) Compact(ctx context.Context, operationID string, emit func(ui.Event)) (returnErr error) {
+	b.mu.Lock()
+	opts := b.opts
+	b.mu.Unlock()
+	defer func() {
+		if b.runtime.session == nil {
+			return
+		}
+		if syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, returnErr); returnErr == nil {
+			returnErr = syncErr
+		}
+	}()
+	catalog := ""
+	if b.skills != nil {
+		catalog = b.skills.Catalog()
+	}
+	modelRuntime, err := b.runtime.resolveCompactionRuntime(ctx, b.manager, b.conversation, opts, catalog)
+	if err != nil {
+		return err
+	}
+	configureTUIContextRuntime(&modelRuntime, b.runtime.workspace, b.manager.Config(), operationID, emit)
+	emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateCompacting})
+	event, err := b.conversation.Compact(ctx, modelRuntime)
+	if err != nil {
+		return err
+	}
+	if event.Noop {
+		emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: "Context is already compact."})
+	}
+	report := b.conversation.ContextReport()
+	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &report})
+	return nil
+}
+
 func configureTUIContextRuntime(modelRuntime *agent.Runtime, workspace string, cfg config.Config, operationID string, emit func(ui.Event)) {
-	modelRuntime.Workspace = workspace
-	modelRuntime.TokenEstimator = contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
-	modelRuntime.OutputReserveTokens = cfg.ReservedOutputTokens
-	modelRuntime.ContextRecentRounds = cfg.ContextRecentRounds
-	modelRuntime.MaxProjectMapBytes = cfg.MaxProjectMapBytes
-	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
-	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
-	modelRuntime.MaxSummaryBytes = cfg.MaxSummaryBytes
+	configureContextRuntime(modelRuntime, workspace, cfg)
 	modelRuntime.ContextEvent = func(event contextledger.Event) {
 		if event.Kind == contextledger.EventBudget && event.InputTokens > 0 {
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventActivity, Activity: &ui.Activity{
 				TokenBytesPerToken: max(1, cfg.TokenBytesPerToken), InputTokens: event.InputTokens,
 			}})
 		}
+		if event.Kind == contextledger.EventCompressionStarted {
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateCompacting})
+		}
 		if event.Kind == contextledger.EventCompression && event.Compression != nil {
-			emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: fmt.Sprintf("Context compressed: %d to %d tokens, %d turns summarized.", event.Compression.BeforeTokens, event.Compression.AfterTokens, event.Compression.OmittedTurns)})
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: formatCompactionCompletion(*event.Compression)})
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventState, State: ui.StateConnecting})
 		}
 	}
+}
+
+func configureContextRuntime(modelRuntime *agent.Runtime, workspace string, cfg config.Config) {
+	modelRuntime.Workspace = workspace
+	modelRuntime.TokenEstimator = contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
+	modelRuntime.OutputReserveTokens = cfg.ReservedOutputTokens
+	if maximum := modelRuntime.Provider.Limits.MaxOutputTokens; maximum > 0 && maximum < modelRuntime.OutputReserveTokens {
+		modelRuntime.OutputReserveTokens = maximum
+	}
+	modelRuntime.ContextRecentRounds = cfg.ContextRecentRounds
+	modelRuntime.ContextCompactTrigger = cfg.ContextCompactTrigger
+	modelRuntime.ContextCompactTarget = cfg.ContextCompactTarget
+	modelRuntime.MaxProjectMapBytes = cfg.MaxProjectMapBytes
+	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
+	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
+	modelRuntime.MaxSummaryBytes = cfg.MaxSummaryBytes
+}
+
+func formatCompactionCompletion(event contextledger.CompressionEvent) string {
+	return fmt.Sprintf("Context compacted in %s; %s → %s tokens; %d turns summarized.", ui.FormatDurationMS(event.DurationMS), ui.FormatTokenCount(event.BeforeTokens), ui.FormatTokenCount(event.AfterTokens), event.OmittedTurns)
 }
 
 func (b *tuiBackend) confirmTools(operationID string, approve bool, emit func(ui.Event)) tool.ConfirmFunc {

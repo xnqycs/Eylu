@@ -271,6 +271,8 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		modelRuntime.OutputReserveTokens = maximum
 	}
 	modelRuntime.ContextRecentRounds = cfg.ContextRecentRounds
+	modelRuntime.ContextCompactTrigger = cfg.ContextCompactTrigger
+	modelRuntime.ContextCompactTarget = cfg.ContextCompactTarget
 	modelRuntime.MaxProjectMapBytes = cfg.MaxProjectMapBytes
 	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
 	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
@@ -592,6 +594,30 @@ func (r *runtime) resolveRuntimeForPrompt(ctx context.Context, manager *provider
 		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
 	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, LimitResolver: resolver, Timeout: requestTimeout}, decision, nil
+}
+
+func (r *runtime) resolveCompactionRuntime(ctx context.Context, manager *provider.Manager, conversation *agent.Conversation, opts chatOptions, skillCatalog string) (agent.Runtime, error) {
+	selected, err := selectedEffortProvider(manager, conversation, opts)
+	if err != nil {
+		return agent.Runtime{}, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
+	}
+	compactOptions := opts
+	compactOptions.provider = selected.Name
+	report := conversation.ContextReport()
+	modelRuntime, _, err := r.resolveRuntimeForPrompt(ctx, manager, compactOptions, "context compaction", report.TotalTokens, report.InputTokens, report.OutputReserve, false)
+	if err != nil {
+		return agent.Runtime{}, err
+	}
+	modelRuntime.PermissionMode = selectedMode(manager, opts)
+	if skillCatalog == "" {
+		skillCatalog = conversation.ExportState().SkillCatalog
+	}
+	modelRuntime.SkillCatalog = skillCatalog
+	if err := r.configureMCPRuntime(ctx, manager.Config(), &modelRuntime); err != nil {
+		return agent.Runtime{}, err
+	}
+	configureContextRuntime(&modelRuntime, r.workspace, manager.Config())
+	return modelRuntime, nil
 }
 
 func applyChatProviderOverrides(snapshot provider.Snapshot, opts chatOptions) provider.Snapshot {

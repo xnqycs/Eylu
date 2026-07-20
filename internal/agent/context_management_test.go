@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,6 +87,38 @@ type contextCaptureDriver struct {
 	request driver.Request
 }
 
+type compactionSummaryDriver struct {
+	requests []driver.Request
+	err      error
+}
+
+func (d *compactionSummaryDriver) Name() string { return "compaction-summary" }
+func (d *compactionSummaryDriver) Capabilities() driver.Capabilities {
+	return driver.Capabilities{Reasoning: true}
+}
+func (d *compactionSummaryDriver) Generate(_ context.Context, request driver.Request, _ driver.EmitFunc) (protocol.ModelResponse, error) {
+	d.requests = append(d.requests, request)
+	if d.err != nil {
+		return protocol.ModelResponse{}, d.err
+	}
+	return protocol.ModelResponse{Turn: protocol.Turn{ID: "summary", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: `<conversation_summary>
+User goals:
+- Continue implementation.
+Constraints and decisions:
+- Preserve task state.
+Completed modifications:
+- Changes complete.
+Unfinished tasks:
+- Verify.
+Failed attempts:
+- none
+Validation results:
+- tests passed
+Key files:
+- context_management.go
+</conversation_summary>`}}}, Stop: protocol.StopCompleted, Usage: protocol.Usage{InputTokens: 700, OutputTokens: 90, Exact: true}}, nil
+}
+
 type reasoningPolicyDriver struct {
 	t        *testing.T
 	requests int
@@ -145,11 +178,15 @@ func TestTwentyFileConversationCompressesWithoutBreakingToolPairs(t *testing.T) 
 		}
 	}
 	foundCompression, foundBudget := false, false
+	omittedThisRun := 0
 	for _, event := range events {
 		foundCompression = foundCompression || event.Kind == contextledger.EventCompression
 		foundBudget = foundBudget || event.Kind == contextledger.EventBudget
+		if event.Kind == contextledger.EventCompression && event.Compression != nil {
+			omittedThisRun += event.Compression.OmittedTurns
+		}
 	}
-	if !foundCompression || !foundBudget || conversation.ContextReport().CompressionCount == 0 {
+	if !foundCompression || !foundBudget || conversation.ContextReport().CompressionCount == 0 || omittedThisRun != len(conversation.ExportState().OmittedTurnIDs) {
 		t.Fatalf("events=%#v report=%#v", events, conversation.ContextReport())
 	}
 	report := conversation.ContextReport()
@@ -173,6 +210,133 @@ func TestTwentyFileConversationCompressesWithoutBreakingToolPairs(t *testing.T) 
 	}
 	if !strings.Contains(requestText(capture.request.Model.Turns), "goal-marker-20") || !strings.Contains(requestText(capture.request.Model.Turns), "write_file file-00.txt") || !strings.Contains(requestText(capture.request.Model.Turns), "file-19.txt") {
 		t.Fatalf("portable request = %#v", capture.request.Model.Turns)
+	}
+}
+
+func TestCompactionUsesConfiguredWatermarksAndModelSummary(t *testing.T) {
+	model := &compactionSummaryDriver{}
+	conversation := NewConversation()
+	for index := 0; index < 10; index++ {
+		conversation.turns = append(conversation.turns,
+			protocol.Turn{ID: fmt.Sprintf("user-%d", index), Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: fmt.Sprintf("goal-%d %s", index, strings.Repeat("u", 500))}}},
+			protocol.Turn{ID: fmt.Sprintf("agent-%d", index), Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: strings.Repeat("a", 500)}}},
+		)
+	}
+	events := make([]contextledger.Event, 0)
+	runtime := Runtime{
+		Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), BaseURL: "https://example.com/v1", Model: "gpt-5.6-sol", ContextWindow: 12_000}},
+		Driver:   model, TokenEstimator: contextledger.ApproxEstimator{BytesPerToken: 1}, OutputReserveTokens: 200,
+		ContextRecentRounds: 2, ContextCompactTrigger: 85, ContextCompactTarget: 60, MaxSummaryBytes: 512,
+		ContextEvent: func(event contextledger.Event) { events = append(events, event) },
+	}
+	prepared, err := conversation.prepareRequestContext(context.Background(), runtime, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := conversation.ContextReport()
+	if prepared.InputTokens()+200 > 7_200 || report.CompressionCount != 1 || len(model.requests) != 1 {
+		t.Fatalf("tokens=%d report=%#v requests=%d", prepared.InputTokens()+200, report, len(model.requests))
+	}
+	last := report.LastCompression
+	if last == nil || last.Trigger != "auto" || last.Strategy != "model" || last.OmittedTurns == 0 || last.Usage.OutputTokens != 90 {
+		t.Fatalf("compression=%#v", last)
+	}
+	if len(model.requests[0].Model.Tools) != 0 || len(model.requests[0].Model.DriverState) != 0 || model.requests[0].ReasoningEffort != "low" {
+		t.Fatalf("summary request=%#v", model.requests[0])
+	}
+	foundStarted, foundCompleted := false, false
+	for _, event := range events {
+		foundStarted = foundStarted || event.Kind == contextledger.EventCompressionStarted
+		foundCompleted = foundCompleted || event.Kind == contextledger.EventCompression
+	}
+	if !foundStarted || !foundCompleted {
+		t.Fatalf("events=%#v", events)
+	}
+}
+
+func TestManualCompactionFallsBackAndPreservesTranscript(t *testing.T) {
+	model := &compactionSummaryDriver{err: fmt.Errorf("summary unavailable")}
+	conversation := NewConversation()
+	for index := 0; index < 8; index++ {
+		conversation.turns = append(conversation.turns,
+			protocol.Turn{ID: fmt.Sprintf("manual-user-%d", index), Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: strings.Repeat("u", 420)}}},
+			protocol.Turn{ID: fmt.Sprintf("manual-agent-%d", index), Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: strings.Repeat("a", 420)}}},
+		)
+	}
+	before := conversation.Transcript()
+	runtime := Runtime{
+		Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), BaseURL: "https://example.com/v1", Model: "test", ContextWindow: 10_000}},
+		Driver:   model, TokenEstimator: contextledger.ApproxEstimator{BytesPerToken: 1}, OutputReserveTokens: 200,
+		ContextRecentRounds: 2, ContextCompactTrigger: 85, ContextCompactTarget: 60, MaxSummaryBytes: 2048,
+	}
+	event, err := conversation.Compact(context.Background(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Noop || event.Trigger != "manual" || event.Strategy != "deterministic_fallback" || event.OmittedTurns == 0 {
+		t.Fatalf("event=%#v", event)
+	}
+	after := conversation.Transcript()
+	if len(after) != len(before) || after[len(after)-1].ID != before[len(before)-1].ID || len(conversation.ExportState().PromptHistory) != 0 {
+		t.Fatalf("before=%d after=%d state=%#v", len(before), len(after), conversation.ExportState())
+	}
+}
+
+func TestCancelledManualCompactionLeavesCandidateStateUnchanged(t *testing.T) {
+	model := &compactionSummaryDriver{err: context.Canceled}
+	conversation := NewConversation()
+	for index := 0; index < 8; index++ {
+		conversation.turns = append(conversation.turns,
+			protocol.Turn{ID: fmt.Sprintf("cancel-user-%d", index), Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: strings.Repeat("u", 420)}}},
+			protocol.Turn{ID: fmt.Sprintf("cancel-agent-%d", index), Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: strings.Repeat("a", 420)}}},
+		)
+	}
+	before := conversation.ExportState()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	runtime := Runtime{
+		Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), BaseURL: "https://example.com/v1", Model: "test", ContextWindow: 10_000}},
+		Driver:   model, TokenEstimator: contextledger.ApproxEstimator{BytesPerToken: 1}, OutputReserveTokens: 200,
+		ContextRecentRounds: 2, ContextCompactTrigger: 85, ContextCompactTarget: 60, MaxSummaryBytes: 1024,
+	}
+	if _, err := conversation.Compact(ctx, runtime); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	after := conversation.ExportState()
+	if after.Summary != before.Summary || len(after.OmittedTurnIDs) != len(before.OmittedTurnIDs) || len(after.Turns) != len(before.Turns) {
+		t.Fatalf("before=%#v after=%#v", before, after)
+	}
+}
+
+func TestDeterministicSummaryRequiresSuccessfulChangesAndValidationCommands(t *testing.T) {
+	editArgs := json.RawMessage(`{"path":"ok.go"}`)
+	writeArgs := json.RawMessage(`{"path":"failed.go","content":"x"}`)
+	echoArgs := json.RawMessage(`{"command":"echo hello"}`)
+	testArgs := json.RawMessage(`{"command":"go test ./..."}`)
+	conversation := NewConversation()
+	conversation.turns = []protocol.Turn{
+		{ID: "calls", Role: protocol.RoleAgent, Parts: []protocol.Part{
+			{Kind: protocol.PartToolCall, ToolCall: &protocol.ToolCall{ID: "edit", Name: "edit_file", Arguments: editArgs}},
+			{Kind: protocol.PartToolCall, ToolCall: &protocol.ToolCall{ID: "write", Name: "write_file", Arguments: writeArgs}},
+			{Kind: protocol.PartToolCall, ToolCall: &protocol.ToolCall{ID: "echo", Name: "bash", Arguments: echoArgs}},
+			{Kind: protocol.PartToolCall, ToolCall: &protocol.ToolCall{ID: "test", Name: "bash", Arguments: testArgs}},
+		}},
+		{ID: "results", Role: protocol.RoleTool, Parts: []protocol.Part{
+			{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: "edit", Content: "edited"}},
+			{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: "write", Content: "permission denied", IsError: true}},
+			{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: "echo", Content: "hello"}},
+			{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: "test", Content: "ok"}},
+		}},
+	}
+	omitted := map[string]struct{}{"calls": {}, "results": {}}
+	summary := conversation.buildSummaryFor(4096, omitted)
+	for _, expected := range []string{"edit_file ok.go", "write_file: permission denied", "go test ./...: ok", "Key files:", "ok.go"} {
+		if !strings.Contains(summary, expected) {
+			t.Fatalf("summary missing %q:\n%s", expected, summary)
+		}
+	}
+	if strings.Contains(summary, "write_file failed.go") || strings.Contains(summary, "echo hello: hello") {
+		t.Fatalf("summary recorded an unsuccessful change or non-validation command:\n%s", summary)
 	}
 }
 

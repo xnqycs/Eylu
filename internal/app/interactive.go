@@ -117,7 +117,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	command := fields[0]
 	switch command {
 	case "/help":
-		fmt.Fprintln(r.stdout, "/new  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /effort [level]  /gradient [on|off]  /mode manual|plan|auto|full  /quit")
+		fmt.Fprintln(r.stdout, "/new  /compact  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /effort [level]  /gradient [on|off]  /mode manual|plan|auto|full  /quit")
 		return nil
 	case "/quit":
 		return errQuit
@@ -130,6 +130,29 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		return nil
 	case "/context":
 		return contextledger.RenderText(r.stdout, conversation.ContextReport())
+	case "/compact":
+		if len(fields) != 1 {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /compact"}
+		}
+		modelRuntime, err := r.resolveCompactionRuntime(ctx, manager, conversation, *opts, "")
+		if err != nil {
+			return err
+		}
+		event, err := conversation.Compact(ctx, modelRuntime)
+		if err != nil {
+			return err
+		}
+		if r.session != nil {
+			if err := r.session.Sync(conversation, manager, *opts, nil); err != nil {
+				return err
+			}
+		}
+		if event.Noop {
+			fmt.Fprintln(r.stdout, "Context is already compact.")
+		} else {
+			fmt.Fprintln(r.stdout, formatCompactionCompletion(event))
+		}
+		return nil
 	case "/tasks":
 		renderTodoListText(r.stdout, conversation.TodoList())
 		return nil

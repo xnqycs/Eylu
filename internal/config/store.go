@@ -41,6 +41,8 @@ type FileConfig struct {
 	TokenBytesPerToken     *int                           `toml:"token_bytes_per_token,omitempty"`
 	ReservedOutputTokens   *int                           `toml:"reserved_output_tokens,omitempty"`
 	ContextRecentRounds    *int                           `toml:"context_recent_rounds,omitempty"`
+	ContextCompactTrigger  *int                           `toml:"context_compact_trigger_percent,omitempty"`
+	ContextCompactTarget   *int                           `toml:"context_compact_target_percent,omitempty"`
 	MaxProjectMapBytes     *int                           `toml:"max_project_map_bytes,omitempty"`
 	MaxToolContextBytes    *int                           `toml:"max_tool_context_bytes,omitempty"`
 	SkillCatalogPageBytes  *int                           `toml:"skill_catalog_page_bytes,omitempty"`
@@ -453,6 +455,8 @@ func applyFileConfig(cfg *Config, file FileConfig) {
 	assign(cfg.TokenBytesPerToken, file.TokenBytesPerToken, func(value int) { cfg.TokenBytesPerToken = value })
 	assign(cfg.ReservedOutputTokens, file.ReservedOutputTokens, func(value int) { cfg.ReservedOutputTokens = value })
 	assign(cfg.ContextRecentRounds, file.ContextRecentRounds, func(value int) { cfg.ContextRecentRounds = value })
+	assign(cfg.ContextCompactTrigger, file.ContextCompactTrigger, func(value int) { cfg.ContextCompactTrigger = value })
+	assign(cfg.ContextCompactTarget, file.ContextCompactTarget, func(value int) { cfg.ContextCompactTarget = value })
 	assign(cfg.MaxProjectMapBytes, file.MaxProjectMapBytes, func(value int) { cfg.MaxProjectMapBytes = value })
 	assign(cfg.MaxToolContextBytes, file.MaxToolContextBytes, func(value int) { cfg.MaxToolContextBytes = value })
 	assign(cfg.SkillCatalogPageBytes, file.SkillCatalogPageBytes, func(value int) { cfg.SkillCatalogPageBytes = value })
@@ -562,6 +566,8 @@ func fileConfigFromResolved(cfg Config) FileConfig {
 	setDifferent(&file.TokenBytesPerToken, cfg.TokenBytesPerToken, defaults.TokenBytesPerToken)
 	setDifferent(&file.ReservedOutputTokens, cfg.ReservedOutputTokens, defaults.ReservedOutputTokens)
 	setDifferent(&file.ContextRecentRounds, cfg.ContextRecentRounds, defaults.ContextRecentRounds)
+	setDifferent(&file.ContextCompactTrigger, cfg.ContextCompactTrigger, defaults.ContextCompactTrigger)
+	setDifferent(&file.ContextCompactTarget, cfg.ContextCompactTarget, defaults.ContextCompactTarget)
 	setDifferent(&file.MaxProjectMapBytes, cfg.MaxProjectMapBytes, defaults.MaxProjectMapBytes)
 	setDifferent(&file.MaxToolContextBytes, cfg.MaxToolContextBytes, defaults.MaxToolContextBytes)
 	setDifferent(&file.SkillCatalogPageBytes, cfg.SkillCatalogPageBytes, defaults.SkillCatalogPageBytes)

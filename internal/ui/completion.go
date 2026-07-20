@@ -101,6 +101,7 @@ func previousRune(value string) (rune, int) {
 
 func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 	commands := []completionItem{
+		{label: "/compact", description: "Compact the current context", insert: "/compact"},
 		{label: "/context", description: "Inspect context usage", insert: "/context"},
 		{label: "/effort", description: "Choose the reasoning effort", insert: "/effort ", expand: true},
 		{label: "/gradient", description: "Toggle the animated theme gradient", insert: "/gradient ", expand: true},

@@ -20,6 +20,7 @@ import (
 
 	"Eylu/internal/agent"
 	"Eylu/internal/config"
+	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
 	"Eylu/internal/environment"
 	"Eylu/internal/metrics"
@@ -45,6 +46,43 @@ func TestFormatRequestCompletionUsesInterruptedLabelAndScaledDurations(t *testin
 	empty := formatRequestCompletion(metrics.RequestMetric{DurationMS: 10}, false)
 	if empty != "Completed in 10ms; TTFT n/a; TPS n/a." {
 		t.Fatalf("empty completion = %q", empty)
+	}
+}
+
+func TestFormatCompactionCompletionAndNoopBackendEvents(t *testing.T) {
+	formatted := formatCompactionCompletion(contextledger.CompressionEvent{DurationMS: 1234, BeforeTokens: 42_100, AfterTokens: 20_300, OmittedTurns: 18})
+	if formatted != "Context compacted in 1.234s; 42.1K → 20.3K tokens; 18 turns summarized." {
+		t.Fatalf("formatted=%q", formatted)
+	}
+	workspace := t.TempDir()
+	cfg := testAppConfig()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "test", ContextWindow: 10_000}
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := skill.Discover(skill.DiscoveryOptions{Workspace: workspace, Home: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := agent.NewConversation()
+	backend := &tuiBackend{
+		runtime:      &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, trustPrompted: make(map[string]bool)},
+		conversation: conversation, manager: manager, skills: registry, skillSession: skill.NewSession(registry, nil),
+	}
+	events := make([]ui.Event, 0)
+	if err := backend.Compact(context.Background(), "compact-op", func(event ui.Event) { events = append(events, event) }); err != nil {
+		t.Fatal(err)
+	}
+	foundState, foundNoop, foundContext := false, false, false
+	for _, event := range events {
+		foundState = foundState || event.Kind == ui.EventState && event.State == ui.StateCompacting
+		foundNoop = foundNoop || event.Kind == ui.EventNotice && event.Notice == "Context is already compact."
+		foundContext = foundContext || event.Kind == ui.EventContext && event.Context != nil
+	}
+	if !foundState || !foundNoop || !foundContext || len(conversation.Transcript()) != 0 || len(conversation.ExportState().PromptHistory) != 0 {
+		t.Fatalf("events=%#v state=%#v", events, conversation.ExportState())
 	}
 }
 

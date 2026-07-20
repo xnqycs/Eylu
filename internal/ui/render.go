@@ -258,13 +258,22 @@ func (m *Model) renderActivityLine() string {
 	if m.animation {
 		prefix = m.spinner.View()
 	}
-	elapsed := time.Duration(0)
-	if !m.startedAt.IsZero() {
-		elapsed = max(time.Duration(0), m.clock.Now().Sub(m.startedAt)).Round(time.Second)
+	startedAt := m.startedAt
+	if m.state == StateCompacting && !m.compactionStartedAt.IsZero() {
+		startedAt = m.compactionStartedAt
 	}
-	details := []string{elapsed.String(), m.renderInputActivity(), m.renderTokenActivity()}
-	if thinking := m.renderThinkingActivity(); thinking != "" {
-		details = append(details, thinking)
+	elapsed := time.Duration(0)
+	if !startedAt.IsZero() {
+		elapsed = max(time.Duration(0), m.clock.Now().Sub(startedAt)).Round(time.Second)
+	}
+	details := []string{elapsed.String()}
+	if m.state != StateCompacting {
+		details = append(details, m.renderInputActivity(), m.renderTokenActivity())
+	}
+	if m.state != StateCompacting {
+		if thinking := m.renderThinkingActivity(); thinking != "" {
+			details = append(details, thinking)
+		}
 	}
 	if m.state == StateRetryBackoff && !m.retryAt.IsZero() {
 		remaining := max(time.Duration(0), m.retryAt.Sub(m.clock.Now())).Round(100 * time.Millisecond)
@@ -1488,6 +1497,8 @@ func stateLabel(state OperationState) string {
 	switch state {
 	case StateConnecting:
 		return "Connecting"
+	case StateCompacting:
+		return "Compacting"
 	case StateFetchingModels:
 		return "Fetching models"
 	case StateWaitingFirstToken:
@@ -1521,6 +1532,8 @@ func statusHint(state OperationState) string {
 		return "Ready when you are"
 	case StateConnecting:
 		return "Opening a line"
+	case StateCompacting:
+		return "Preserving task context"
 	case StateFetchingModels:
 		return "Gathering models"
 	case StateWaitingFirstToken:
@@ -1558,7 +1571,7 @@ func (m *Model) renderStatusHint(value string) string {
 		return m.styles.Error.Render(value)
 	case StateAwaitingApproval, StateAwaitingInput, StateRetryBackoff:
 		return m.styles.Warning.Render(value)
-	case StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateCancelling:
+	case StateConnecting, StateCompacting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateCancelling:
 		return m.styles.Loading.Render(value)
 	default:
 		return m.styles.Status.Render(value)
@@ -1569,6 +1582,8 @@ func activityLabel(state OperationState) string {
 	switch state {
 	case StateConnecting:
 		return "Connecting"
+	case StateCompacting:
+		return "Compacting"
 	case StateFetchingModels:
 		return "Fetching models"
 	case StateWaitingFirstToken:
@@ -1615,6 +1630,8 @@ func formatTokenCount(value int) string {
 		return trimCompactDecimal(float64(value)/1_000_000) + "M"
 	}
 }
+
+func FormatTokenCount(value int) string { return formatTokenCount(value) }
 
 func formatOptionalTokenCount(value int) string {
 	if value <= 0 {

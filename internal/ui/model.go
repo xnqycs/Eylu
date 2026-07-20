@@ -193,25 +193,26 @@ type Model struct {
 	colorAnimationElapsed      time.Duration
 	colorAnimationGeneration   uint64
 
-	operationID        string
-	operationMode      string
-	eventChannel       chan Event
-	cancel             context.CancelFunc
-	startedAt          time.Time
-	retryAt            time.Time
-	cancelRequested    bool
-	activity           Activity
-	operationUsage     protocol.Usage
-	streamedBytes      int
-	reasoningStartedAt time.Time
-	reasoningElapsed   time.Duration
-	reasoningActive    bool
-	reasoningSeen      bool
-	followOutput       bool
-	animation          bool
-	noColor            bool
-	operationSeq       uint64
-	markdown           markdownRenderCache
+	operationID         string
+	operationMode       string
+	eventChannel        chan Event
+	cancel              context.CancelFunc
+	startedAt           time.Time
+	compactionStartedAt time.Time
+	retryAt             time.Time
+	cancelRequested     bool
+	activity            Activity
+	operationUsage      protocol.Usage
+	streamedBytes       int
+	reasoningStartedAt  time.Time
+	reasoningElapsed    time.Duration
+	reasoningActive     bool
+	reasoningSeen       bool
+	followOutput        bool
+	animation           bool
+	noColor             bool
+	operationSeq        uint64
+	markdown            markdownRenderCache
 }
 
 type snapshotMsg struct {
@@ -647,6 +648,9 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 	var command tea.Cmd
 	switch event.Kind {
 	case EventState:
+		if event.State == StateCompacting && m.state != StateCompacting {
+			m.compactionStartedAt = m.clock.Now()
+		}
 		m.state = event.State
 		if event.State == StateWaitingFirstToken {
 			m.resetReasoningRound()
@@ -1015,6 +1019,7 @@ func (m *Model) startRequest(submission Submission) (tea.Model, tea.Cmd) {
 	m.cancel = cancel
 	m.cancelRequested = false
 	m.startedAt = m.clock.Now()
+	m.compactionStartedAt = m.startedAt
 	m.contextStarted = true
 	m.activity = Activity{TokenBytesPerToken: 4}
 	m.operationUsage = protocol.Usage{}
@@ -1054,6 +1059,13 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		m.viewport.GotoTop()
 		return m, m.loadSnapshotCmd()
+	case "/compact":
+		if len(fields) != 1 {
+			m.appendNotice("usage: /compact", true)
+			m.refreshViewport()
+			return m, nil
+		}
+		return m.startCompact()
 	case "/tasks":
 		m.screen = screenTasks
 		m.refreshViewport()
@@ -1089,7 +1101,7 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 			return m.requestMode(fields[1])
 		}
 	case "/help":
-		m.appendNotice("/new /tasks /context /skills /skill /providers /provider /model /effort /gradient /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
+		m.appendNotice("/new /compact /tasks /context /skills /skill /providers /provider /model /effort /gradient /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
 		m.refreshViewport()
 		return m, nil
 	}
@@ -1426,11 +1438,44 @@ func (m *Model) handlePlanGateKey(key string) (tea.Model, tea.Cmd) {
 
 func (m *Model) busy() bool {
 	switch m.state {
-	case StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateAwaitingApproval, StateAwaitingInput, StateRetryBackoff, StateCancelling:
+	case StateConnecting, StateCompacting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateAwaitingApproval, StateAwaitingInput, StateRetryBackoff, StateCancelling:
 		return true
 	default:
 		return false
 	}
+}
+
+func (m *Model) startCompact() (tea.Model, tea.Cmd) {
+	if m.busy() {
+		m.appendNotice("A request is already running.", true)
+		m.refreshViewport()
+		return m, nil
+	}
+	sequence := atomic.AddUint64(&m.operationSeq, 1)
+	m.operationID = fmt.Sprintf("op-%d", sequence)
+	m.operationMode = m.snapshot.Mode
+	m.eventChannel = make(chan Event, 256)
+	operationContext, cancel := context.WithCancel(m.context)
+	m.cancel = cancel
+	m.cancelRequested = false
+	m.startedAt = m.clock.Now()
+	m.compactionStartedAt = m.startedAt
+	m.contextStarted = true
+	m.activity = Activity{TokenBytesPerToken: 4}
+	m.operationUsage = protocol.Usage{}
+	m.streamedBytes = 0
+	m.resetReasoningRound()
+	m.state = StateCompacting
+	m.input.Reset()
+	m.completion = completionState{}
+	m.followOutput = true
+	m.updateViewportHeight()
+	m.refreshViewport()
+	commands := []tea.Cmd{runCompactCmd(operationContext, m.backend, m.operationID, m.eventChannel), waitEventCmd(m.operationID, m.eventChannel)}
+	if m.animation {
+		commands = append(commands, wrapOperationCmd(m.operationID, func() tea.Msg { return m.spinner.Tick() }))
+	}
+	return m, tea.Batch(commands...)
 }
 
 func runBackendCmd(ctx context.Context, backend Backend, operationID string, submission Submission, events chan Event) tea.Cmd {
@@ -1470,6 +1515,38 @@ func runBackendCmd(ctx context.Context, backend Backend, operationID string, sub
 			}
 		} else {
 			enqueue(Event{OperationID: operationID, Kind: EventState, State: StateCompleted}, false)
+		}
+		close(events)
+		return backendWorkerMsg{operationID: operationID}
+	}
+}
+
+func runCompactCmd(ctx context.Context, backend Backend, operationID string, events chan Event) tea.Cmd {
+	return func() tea.Msg {
+		enqueue := func(event Event) {
+			if event.OperationID == "" {
+				event.OperationID = operationID
+			}
+			select {
+			case events <- event:
+			case <-ctx.Done():
+				select {
+				case events <- event:
+				default:
+				}
+			}
+		}
+		err := backend.Compact(ctx, operationID, enqueue)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				enqueue(Event{Kind: EventNotice, Notice: "Context compaction cancelled."})
+				enqueue(Event{Kind: EventState, State: StateCancelled})
+			} else {
+				enqueue(Event{Kind: EventNotice, Notice: err.Error(), Error: true})
+				enqueue(Event{Kind: EventState, State: StateFailed})
+			}
+		} else {
+			enqueue(Event{Kind: EventState, State: StateCompleted})
 		}
 		close(events)
 		return backendWorkerMsg{operationID: operationID}

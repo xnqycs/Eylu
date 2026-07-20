@@ -17,6 +17,7 @@ type OperationState string
 const (
 	StateIdle              OperationState = "idle"
 	StateConnecting        OperationState = "connecting"
+	StateCompacting        OperationState = "compacting"
 	StateFetchingModels    OperationState = "fetching_models"
 	StateWaitingFirstToken OperationState = "waiting_first_token"
 	StateStreaming         OperationState = "streaming"
@@ -201,6 +202,7 @@ type ModelSelection struct {
 type Backend interface {
 	Snapshot(context.Context) (Snapshot, error)
 	Submit(context.Context, string, Submission, func(Event)) error
+	Compact(context.Context, string, func(Event)) error
 	Command(context.Context, string) (string, error)
 	ListFiles(context.Context) ([]FileItem, error)
 	SetMode(context.Context, string) error
