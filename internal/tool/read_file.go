@@ -41,6 +41,20 @@ func (r *ReadFile) Risk() policy.Risk { return policy.RiskRead }
 
 func (r *ReadFile) ParallelSafe() bool { return true }
 
+func (r *ReadFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) ConcurrencySpec {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(raw, &input) != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	path, err := r.paths.resourcePath(input.Path)
+	if err != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceFile, Path: path, Access: ResourceRead}}}
+}
+
 func (r *ReadFile) Execute(_ context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Path string `json:"path"`

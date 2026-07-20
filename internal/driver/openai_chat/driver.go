@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,7 +21,8 @@ import (
 const Name = "openai_chat"
 
 type Driver struct {
-	client *http.Client
+	client              *http.Client
+	parallelUnsupported sync.Map
 }
 
 func New(client *http.Client) *Driver {
@@ -36,12 +39,13 @@ func (d *Driver) Capabilities() driver.Capabilities {
 }
 
 type chatRequest struct {
-	Model           string        `json:"model"`
-	Messages        []chatMessage `json:"messages"`
-	Tools           []chatTool    `json:"tools,omitempty"`
-	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
-	Stream          bool          `json:"stream,omitempty"`
-	StreamOptions   *struct {
+	Model             string        `json:"model"`
+	Messages          []chatMessage `json:"messages"`
+	Tools             []chatTool    `json:"tools,omitempty"`
+	ReasoningEffort   string        `json:"reasoning_effort,omitempty"`
+	ParallelToolCalls bool          `json:"parallel_tool_calls,omitempty"`
+	Stream            bool          `json:"stream,omitempty"`
+	StreamOptions     *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
 }
@@ -94,6 +98,11 @@ type chatResponse struct {
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	body := chatRequest{Model: req.Model.Model, Stream: req.Stream}
+	parallelKey := requestCapabilityKey(req)
+	if req.ParallelToolCalls && len(req.Model.Tools) > 0 {
+		_, unsupported := d.parallelUnsupported.Load(parallelKey)
+		body.ParallelToolCalls = !unsupported
+	}
 	effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
 	if effort != "auto" {
 		body.ReasoningEffort = effort
@@ -122,32 +131,30 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	for _, definition := range req.Model.Tools {
 		body.Tools = append(body.Tools, chatTool{Type: "function", Function: chatFunction{Name: definition.Name, Description: definition.Description, Parameters: definition.InputSchema}})
 	}
-	payload, err := json.Marshal(body)
+	resp, err := d.send(ctx, req, body)
 	if err != nil {
-		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "encode chat request", Cause: err}
+		return protocol.ModelResponse{}, mapSendError(ctx, err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(req.BaseURL, "/")+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrConfig, Message: "build chat request", Cause: err}
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
-	for key, value := range req.Headers {
-		httpReq.Header.Set(key, value)
-	}
-	client := d.client
-	if req.Stream {
-		client = driver.StreamingHTTPClient(client)
-	}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return protocol.ModelResponse{}, mapTransportError(ctx, err)
-	}
-	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
+		resp.Body.Close()
+		if body.ParallelToolCalls && parallelToolCallsUnsupported(resp.StatusCode, raw) {
+			d.parallelUnsupported.Store(parallelKey, struct{}{})
+			body.ParallelToolCalls = false
+			resp, err = d.send(ctx, req, body)
+			if err != nil {
+				return protocol.ModelResponse{}, mapSendError(ctx, err)
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				raw, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				resp.Body.Close()
+				return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
+			}
+		} else {
+			return protocol.ModelResponse{}, mapHTTPError(resp.StatusCode, raw)
+		}
 	}
+	defer resp.Body.Close()
 	if emit != nil {
 		if err := emit(protocol.ModelEvent{Kind: protocol.EventResponseStart}); err != nil {
 			return protocol.ModelResponse{}, err
@@ -187,6 +194,55 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		}
 	}
 	return result, nil
+}
+
+func (d *Driver) send(ctx context.Context, req driver.Request, body chatRequest) (*http.Response, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrProtocol, Message: "encode chat request", Cause: err}
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(req.BaseURL, "/")+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "build chat request", Cause: err}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+req.APIKey)
+	for key, value := range req.Headers {
+		httpReq.Header.Set(key, value)
+	}
+	client := d.client
+	if req.Stream {
+		client = driver.StreamingHTTPClient(client)
+	}
+	return client.Do(httpReq)
+}
+
+func mapSendError(ctx context.Context, err error) error {
+	var protocolError *protocol.Error
+	if errors.As(err, &protocolError) {
+		return err
+	}
+	return mapTransportError(ctx, err)
+}
+
+func requestCapabilityKey(req driver.Request) string {
+	return strings.TrimRight(strings.ToLower(strings.TrimSpace(req.BaseURL)), "/") + "\x00" + strings.ToLower(strings.TrimSpace(req.Model.Model))
+}
+
+func parallelToolCallsUnsupported(status int, raw []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	message := strings.ToLower(string(raw))
+	if !strings.Contains(message, "parallel_tool_calls") {
+		return false
+	}
+	for _, marker := range []string{"unsupported", "unknown", "unrecognized", "invalid", "unexpected", "not permitted", "not allowed"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc) (protocol.ModelResponse, error) {

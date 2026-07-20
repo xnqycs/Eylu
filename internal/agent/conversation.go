@@ -18,7 +18,7 @@ import (
 	"Eylu/internal/provider"
 )
 
-const SystemPrompt = `You are Eylu, a terminal programming agent working in a local repository. Follow the user's request, preserve unrelated files, report failures accurately, and keep responses concise. Tool availability and local permission policy are authoritative. Act through tools early and keep pre-tool narration brief. Inspect only files relevant to the change. Use write_file for complete new files and focused edit_file calls for updates.`
+const SystemPrompt = `You are Eylu, a terminal programming agent working in a local repository. Follow the user's request, preserve unrelated files, report failures accurately, and keep responses concise. Tool availability and local permission policy are authoritative. Act through tools early and keep pre-tool narration brief. Inspect only files relevant to the change. Use write_file for complete new files and focused edit_file calls for updates. Emit independent tool calls together in the same response. Keep calls with data, file, or state dependencies in separate rounds.`
 
 type Runtime struct {
 	Provider              provider.Snapshot
@@ -182,7 +182,7 @@ func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime,
 	}
 	c.appendUser(prompt)
 	c.toolDefinitions = nil
-	return c.generate(ctx, runtime, nil, stream, emit)
+	return c.generate(ctx, runtime, nil, false, stream, emit)
 }
 
 func (c *Conversation) Fork(profile Profile) (*Conversation, error) {
@@ -270,7 +270,7 @@ func (c *Conversation) appendUser(prompt string) {
 	c.turns = append(c.turns, userTurn)
 }
 
-func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
+func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, parallelToolCalls, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	if runtime.LimitResolver != nil {
 		resolved, err := runtime.LimitResolver.Resolve(ctx, runtime.Provider, runtime.APIKey)
 		if err != nil {
@@ -285,11 +285,12 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 			return protocol.ModelResponse{}, err
 		}
 		request := driver.Request{
-			BaseURL:         runtime.Provider.Config.BaseURL,
-			APIKey:          runtime.APIKey,
-			Headers:         runtime.Provider.Config.Headers,
-			ReasoningEffort: runtime.Provider.Config.ReasoningEffort,
-			Stream:          stream,
+			BaseURL:           runtime.Provider.Config.BaseURL,
+			APIKey:            runtime.APIKey,
+			Headers:           runtime.Provider.Config.Headers,
+			ReasoningEffort:   runtime.Provider.Config.ReasoningEffort,
+			ParallelToolCalls: parallelToolCalls,
+			Stream:            stream,
 			Model: protocol.ModelRequest{
 				ProtocolVersion: protocol.Version,
 				Model:           runtime.Provider.Config.Model,

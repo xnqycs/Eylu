@@ -58,6 +58,44 @@ func TestChatAutoReasoningEffortIsOmitted(t *testing.T) {
 	}
 }
 
+func TestChatSendsParallelToolCallsAndCachesUnsupportedGateway(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if requests == 1 {
+			if body["parallel_tool_calls"] != true {
+				t.Fatalf("first body = %#v", body)
+			}
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"error":{"message":"unsupported field parallel_tool_calls"}}`))
+			return
+		}
+		if _, exists := body["parallel_tool_calls"]; exists {
+			t.Fatalf("fallback body = %#v", body)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+	model := New(server.Client())
+	request := driver.Request{BaseURL: server.URL, ParallelToolCalls: true, Model: protocol.ModelRequest{
+		Model: "model", Tools: []protocol.ToolDefinition{{Name: "read_file", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "read"}}}},
+	}}
+	if _, err := model.Generate(context.Background(), request, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := model.Generate(context.Background(), request, nil); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 3 {
+		t.Fatalf("requests = %d", requests)
+	}
+}
+
 func TestChatStreamMergesTextAndRejectsDisconnect(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

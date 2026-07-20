@@ -70,6 +70,13 @@ func (b *Bash) Definition() protocol.ToolDefinition {
 
 func (b *Bash) Risk() policy.Risk { return policy.RiskExec }
 
+func (b *Bash) ClassifyConcurrency(_ json.RawMessage, outcome policy.Outcome) ConcurrencySpec {
+	if outcome.Classification == policy.CommandReadOnly {
+		return ConcurrencySpec{Mode: ConcurrencyShared}
+	}
+	return ConcurrencySpec{Mode: ConcurrencyExclusive}
+}
+
 func (b *Bash) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Command          string `json:"command"`

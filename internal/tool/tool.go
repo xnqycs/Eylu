@@ -24,6 +24,45 @@ type ParallelSafe interface {
 	ParallelSafe() bool
 }
 
+type ConcurrencyMode string
+
+const (
+	ConcurrencyShared    ConcurrencyMode = "shared"
+	ConcurrencyClaimed   ConcurrencyMode = "claimed"
+	ConcurrencyExclusive ConcurrencyMode = "exclusive"
+)
+
+type ResourceKind string
+
+const (
+	ResourceFile ResourceKind = "file"
+	ResourceTree ResourceKind = "tree"
+)
+
+type ResourceAccess string
+
+const (
+	ResourceRead  ResourceAccess = "read"
+	ResourceWrite ResourceAccess = "write"
+)
+
+type ResourceClaim struct {
+	Kind   ResourceKind   `json:"kind"`
+	Path   string         `json:"path"`
+	Access ResourceAccess `json:"access"`
+}
+
+type ConcurrencySpec struct {
+	Mode   ConcurrencyMode `json:"mode"`
+	Claims []ResourceClaim `json:"claims,omitempty"`
+}
+
+// ConcurrencyClassifier lets a tool classify each call after policy checks.
+// Tools without this interface use the fail-closed compatibility rules.
+type ConcurrencyClassifier interface {
+	ClassifyConcurrency(json.RawMessage, policy.Outcome) ConcurrencySpec
+}
+
 // ExecutorTimeoutPolicy lets interactive tools rely on the parent request
 // context instead of the per-tool execution deadline.
 type ExecutorTimeoutPolicy interface {

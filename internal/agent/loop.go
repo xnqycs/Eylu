@@ -48,7 +48,8 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		if err := ctx.Err(); err != nil {
 			return protocol.ModelResponse{}, err
 		}
-		response, err := c.generate(ctx, runtime, definitions, stream, emit)
+		parallelToolCalls := executor.ParallelLimit() > 1 && runtime.Driver.Capabilities().ParallelTools
+		response, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit)
 		if err != nil {
 			return protocol.ModelResponse{}, err
 		}
@@ -75,44 +76,24 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			}
 			seenCalls[call.ID] = struct{}{}
 		}
-		parallelTools := runtime.Driver.Capabilities().ParallelTools
-		for start := 0; start < len(calls); {
-			end := start + 1
-			if parallelTools && executor.CanExecuteConcurrently(calls[start]) {
-				for end < len(calls) && executor.CanExecuteConcurrently(calls[end]) {
-					end++
-				}
+		hooks := tool.BatchHooks{}
+		if emit != nil {
+			hooks.OnStart = func(call protocol.ToolCall) error {
+				return emit(protocol.ModelEvent{Kind: protocol.EventToolStart, ToolCall: &call})
 			}
-			batch := calls[start:end]
-			if emit != nil {
-				for index := range batch {
-					call := batch[index]
-					if err := emit(protocol.ModelEvent{Kind: protocol.EventToolStart, ToolCall: &call}); err != nil {
-						return last, err
-					}
-				}
+			hooks.OnResult = func(result protocol.ToolResult) error {
+				return emit(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &result})
 			}
-			var results []protocol.ToolResult
-			if parallelTools && len(batch) > 1 && executor.CanExecuteConcurrently(batch[0]) {
-				results = executor.ExecuteConcurrent(ctx, requestID, batch)
-			} else {
-				results = []protocol.ToolResult{executor.Execute(ctx, requestID, batch[0])}
+		}
+		results, batchErr := executor.ExecuteBatch(ctx, requestID, calls, hooks)
+		for index := range results {
+			result := results[index]
+			if result.Metadata != nil && result.Metadata["interrupt_request"] == true {
+				interrupted = true
 			}
-			for index := range results {
-				result := results[index]
-				if result.Metadata != nil && result.Metadata["interrupt_request"] == true {
-					interrupted = true
-				}
-				c.captureSkillResult(result)
-				c.captureTodoListResult(result)
-				toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
-				if emit != nil {
-					if err := emit(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &result}); err != nil {
-						return last, err
-					}
-				}
-			}
-			start = end
+			c.captureSkillResult(result)
+			c.captureTodoListResult(result)
+			toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
 		}
 		c.turns = append(c.turns, toolTurn)
 		c.projectMapDirty = true
@@ -120,6 +101,9 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			c.driverState = nil
 		}
 		c.rebuildLedger(runtime)
+		if batchErr != nil {
+			return last, batchErr
+		}
 		if interrupted {
 			return last, ErrRequestInterrupted
 		}

@@ -82,6 +82,8 @@ func planProfile() Profile {
 
 Explore the repository before deciding. Use only read-only tools and commands, inherit the parent's model and relevant conversation context, and keep every recommendation grounded in inspected code. Do not modify files. Do not spawn another agent. Ask a concise clarification only when a product decision cannot be derived from the repository.
 
+Emit independent read-only tool calls together in the same response. Keep calls with data, file, or state dependencies in separate rounds.
+
 The final response must be a decision-complete plan with a title, summary, implementation changes, important interface or compatibility changes, test scenarios, and explicit assumptions. Mention concrete files only when they disambiguate ownership. Local permission policy is authoritative.`
 		},
 		AllowTool: func(name string, risk policy.Risk) bool {

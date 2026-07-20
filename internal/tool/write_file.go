@@ -35,6 +35,20 @@ func (w *WriteFile) Definition() protocol.ToolDefinition {
 
 func (w *WriteFile) Risk() policy.Risk { return policy.RiskWrite }
 
+func (w *WriteFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) ConcurrencySpec {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(raw, &input) != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	path, err := w.paths.resourcePath(input.Path)
+	if err != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceFile, Path: path, Access: ResourceWrite}}}
+}
+
 func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Path             string `json:"path"`

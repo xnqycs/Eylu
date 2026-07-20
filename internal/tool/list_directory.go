@@ -37,6 +37,23 @@ func (l *ListDirectory) Risk() policy.Risk { return policy.RiskRead }
 
 func (l *ListDirectory) ParallelSafe() bool { return true }
 
+func (l *ListDirectory) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) ConcurrencySpec {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(raw, &input) != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	if strings.TrimSpace(input.Path) == "" {
+		input.Path = "."
+	}
+	resourcePath, err := l.index.paths.resourcePath(input.Path)
+	if err != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceTree, Path: resourcePath, Access: ResourceRead}}}
+}
+
 func (l *ListDirectory) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Path          string `json:"path"`

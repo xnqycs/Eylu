@@ -11,6 +11,7 @@ import (
 
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
+	"Eylu/internal/tool"
 )
 
 type remoteToolAdapter struct {
@@ -22,6 +23,12 @@ type remoteToolAdapter struct {
 
 func (t *remoteToolAdapter) Definition() protocol.ToolDefinition { return t.definition }
 func (t *remoteToolAdapter) ParallelSafe() bool                  { return t.readOnly }
+func (t *remoteToolAdapter) ClassifyConcurrency(json.RawMessage, policy.Outcome) tool.ConcurrencySpec {
+	if t.readOnly {
+		return tool.ConcurrencySpec{Mode: tool.ConcurrencyShared}
+	}
+	return tool.ConcurrencySpec{Mode: tool.ConcurrencyExclusive}
+}
 func (t *remoteToolAdapter) Risk() policy.Risk {
 	if t.readOnly {
 		return policy.RiskRead
@@ -67,6 +74,9 @@ func newResourceTool(server *serverRuntime) (*resourceTool, protocol.ToolDefinit
 func (t *resourceTool) Definition() protocol.ToolDefinition { return t.definition }
 func (t *resourceTool) Risk() policy.Risk                   { return policy.RiskRead }
 func (t *resourceTool) ParallelSafe() bool                  { return true }
+func (t *resourceTool) ClassifyConcurrency(json.RawMessage, policy.Outcome) tool.ConcurrencySpec {
+	return tool.ConcurrencySpec{Mode: tool.ConcurrencyShared}
+}
 func (t *resourceTool) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		URI string `json:"uri"`

@@ -168,13 +168,18 @@ func TestAgentLoopLimitsAndDuplicateIDs(t *testing.T) {
 	}
 }
 
-type concurrentLoopDriver struct{ requests atomic.Int32 }
+type concurrentLoopDriver struct {
+	requests           atomic.Int32
+	parallelCapability bool
+	lastRequest        driver.Request
+}
 
 func (d *concurrentLoopDriver) Name() string { return "concurrent-loop" }
 func (d *concurrentLoopDriver) Capabilities() driver.Capabilities {
-	return driver.Capabilities{ToolCalling: true, ParallelTools: true}
+	return driver.Capabilities{ToolCalling: true, ParallelTools: d.parallelCapability}
 }
-func (d *concurrentLoopDriver) Generate(_ context.Context, _ driver.Request, _ driver.EmitFunc) (protocol.ModelResponse, error) {
+func (d *concurrentLoopDriver) Generate(_ context.Context, request driver.Request, _ driver.EmitFunc) (protocol.ModelResponse, error) {
+	d.lastRequest = request
 	if d.requests.Add(1) == 1 {
 		parts := make([]protocol.Part, 0, 3)
 		for _, value := range []string{"first", "second", "third"} {
@@ -218,7 +223,7 @@ func (t *barrierReadTool) Execute(ctx context.Context, input json.RawMessage) pr
 }
 
 func TestAgentLoopRunsParallelSafeBatchAndOrdersResults(t *testing.T) {
-	model := &concurrentLoopDriver{}
+	model := &concurrentLoopDriver{parallelCapability: true}
 	parallelTool := &barrierReadTool{release: make(chan struct{})}
 	executor := &tool.Executor{Registry: tool.NewRegistry(parallelTool), Policy: policy.AllowAllChecker{}, MaxParallelTools: 3, Timeout: time.Second}
 	events := make([]protocol.ModelEvent, 0, 6)
@@ -227,7 +232,7 @@ func TestAgentLoopRunsParallelSafeBatchAndOrdersResults(t *testing.T) {
 		events = append(events, event)
 		return nil
 	})
-	if err != nil || response.Turn.ID != "parallel-final" || parallelTool.ready.Load() != 3 {
+	if err != nil || response.Turn.ID != "parallel-final" || parallelTool.ready.Load() != 3 || !model.lastRequest.ParallelToolCalls {
 		t.Fatalf("response=%#v ready=%d error=%v", response, parallelTool.ready.Load(), err)
 	}
 	toolTurn := conversation.Transcript()[2]
@@ -242,8 +247,27 @@ func TestAgentLoopRunsParallelSafeBatchAndOrdersResults(t *testing.T) {
 		if events[index].Kind != protocol.EventToolStart || events[index].ToolCall.ID != "call-"+expected {
 			t.Fatalf("start event[%d] = %#v", index, events[index])
 		}
-		if events[index+3].Kind != protocol.EventToolResult || events[index+3].ToolResult.CallID != "call-"+expected {
-			t.Fatalf("result event[%d] = %#v", index, events[index+3])
+	}
+	completed := make(map[string]bool)
+	for _, event := range events[3:] {
+		if event.Kind != protocol.EventToolResult || event.ToolResult == nil {
+			t.Fatalf("result event = %#v", event)
 		}
+		completed[event.ToolResult.CallID] = true
+	}
+	for _, expected := range []string{"call-first", "call-second", "call-third"} {
+		if !completed[expected] {
+			t.Fatalf("completion events = %#v", completed)
+		}
+	}
+}
+
+func TestAgentLoopRunsReturnedBatchWithoutDriverParallelCapability(t *testing.T) {
+	model := &concurrentLoopDriver{}
+	parallelTool := &barrierReadTool{release: make(chan struct{})}
+	executor := &tool.Executor{Registry: tool.NewRegistry(parallelTool), Policy: policy.AllowAllChecker{}, MaxParallelTools: 3, Timeout: time.Second}
+	response, err := NewConversation().Run(context.Background(), "parallel reads", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3}, false, nil)
+	if err != nil || response.Turn.ID != "parallel-final" || parallelTool.ready.Load() != 3 || model.lastRequest.ParallelToolCalls {
+		t.Fatalf("response=%#v ready=%d request=%#v error=%v", response, parallelTool.ready.Load(), model.lastRequest, err)
 	}
 }

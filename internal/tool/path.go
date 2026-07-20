@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -94,6 +95,46 @@ func (r *pathResolver) lexical(path string) (string, error) {
 		return "", errors.New("path is outside workspace")
 	}
 	return filepath.Clean(candidate), nil
+}
+
+// resourcePath resolves the existing portion of a path without creating it.
+// It gives the scheduler one stable key for aliases, symlinks and new files.
+func (r *pathResolver) resourcePath(path string) (string, error) {
+	candidate, err := r.lexical(path)
+	if err != nil {
+		return "", err
+	}
+	ancestor := candidate
+	tail := make([]string, 0)
+	for {
+		if _, statErr := os.Lstat(ancestor); statErr == nil {
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", statErr
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return "", errors.New("cannot find an existing parent inside workspace")
+		}
+		tail = append(tail, filepath.Base(ancestor))
+		ancestor = parent
+	}
+	realAncestor, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return "", err
+	}
+	if !inside(r.real, realAncestor) {
+		return "", errors.New("path resolves outside workspace")
+	}
+	resolved := realAncestor
+	for index := len(tail) - 1; index >= 0; index-- {
+		resolved = filepath.Join(resolved, tail[index])
+	}
+	resolved = filepath.ToSlash(filepath.Clean(resolved))
+	if runtime.GOOS == "windows" {
+		resolved = strings.ToLower(resolved)
+	}
+	return resolved, nil
 }
 
 func inside(root, candidate string) bool {

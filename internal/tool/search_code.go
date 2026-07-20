@@ -51,6 +51,14 @@ func (s *SearchCode) Risk() policy.Risk { return policy.RiskRead }
 
 func (s *SearchCode) ParallelSafe() bool { return true }
 
+func (s *SearchCode) ClassifyConcurrency(_ json.RawMessage, _ policy.Outcome) ConcurrencySpec {
+	resourcePath, err := s.index.paths.resourcePath(".")
+	if err != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceTree, Path: resourcePath, Access: ResourceRead}}}
+}
+
 func (s *SearchCode) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Query      string `json:"query"`

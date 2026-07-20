@@ -700,8 +700,12 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 				m.snapshot.TodoList = cloneUITodoList(*event.ToolResult.TodoList)
 			}
 			m.completeTool(event.ToolResult)
-			m.state = StateWaitingFirstToken
-			command = m.transitionAfter(m.operationID, StateWaitingFirstToken)
+			if m.hasActiveTools() {
+				m.state = StateExecutingTool
+			} else {
+				m.state = StateWaitingFirstToken
+				command = m.transitionAfter(m.operationID, StateWaitingFirstToken)
+			}
 		}
 	case EventToolAudit:
 		if event.ToolAudit != nil {
@@ -1636,6 +1640,19 @@ func (m *Model) completeTool(result *protocol.ToolResult) {
 			return
 		}
 	}
+}
+
+func (m *Model) hasActiveTools() bool {
+	for index := len(m.timeline) - 1; index >= 0; index-- {
+		item := m.timeline[index]
+		if item.kind != timelineTool {
+			break
+		}
+		if item.tool != nil && (item.tool.preparing || item.tool.running) {
+			return true
+		}
+	}
+	return false
 }
 
 func metadataInt(metadata map[string]any, key string) (int, bool) {

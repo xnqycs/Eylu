@@ -288,6 +288,16 @@ Common paths:
 
 `EYLU_WORKSPACE` overrides the current workspace, and `EYLU_STATE_DIR` changes the state directory. Session files exclude API keys, provider headers, and other credentials.
 
+### Parallel tool calls
+
+Eylu asks the model to return independent tool calls in one turn and schedules them with file, directory, and session-state awareness. Read-only tools, classified read-only Bash commands, and writes to different files may run concurrently. Writes to the same file plus interactive or session-state operations stay ordered.
+
+```toml
+max_parallel_tools = 4
+```
+
+The default concurrency limit is `4`. Set it to `1` for serial execution, or override it temporarily with `EYLU_MAX_PARALLEL_TOOLS`. Explicitly configured read-only MCP tools can join concurrent batches; other MCP tools execute exclusively.
+
 ## Terminal Compatibility
 
 - An interactive TTY starts the full-screen Bubble Tea interface by default.

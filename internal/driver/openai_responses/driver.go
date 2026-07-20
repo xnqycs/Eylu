@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,7 +22,8 @@ import (
 const Name = "openai_responses"
 
 type Driver struct {
-	client *http.Client
+	client              *http.Client
+	parallelUnsupported sync.Map
 }
 
 func New(client *http.Client) *Driver {
@@ -41,6 +43,7 @@ type requestBody struct {
 	Model              string           `json:"model"`
 	Input              []any            `json:"input"`
 	Tools              []tool           `json:"tools,omitempty"`
+	ParallelToolCalls  bool             `json:"parallel_tool_calls,omitempty"`
 	Stream             bool             `json:"stream,omitempty"`
 	PreviousResponseID string           `json:"previous_response_id,omitempty"`
 	Reasoning          *reasoningConfig `json:"reasoning,omitempty"`
@@ -116,6 +119,11 @@ type responseUsage struct {
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	body := requestBody{Model: req.Model.Model, Stream: req.Stream}
+	parallelKey := requestCapabilityKey(req)
+	if req.ParallelToolCalls && len(req.Model.Tools) > 0 {
+		_, unsupported := d.parallelUnsupported.Load(parallelKey)
+		body.ParallelToolCalls = !unsupported
+	}
 	effort := strings.ToLower(strings.TrimSpace(req.ReasoningEffort))
 	if effort == "auto" {
 		effort = ""
@@ -152,7 +160,10 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		if errors.As(mapped, &providerError) && providerError.Code == protocol.ErrContextWindow {
 			return protocol.ModelResponse{}, mapped
 		}
-		if body.PreviousResponseID != "" && resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(string(raw)), "previous_response_id") {
+		if body.ParallelToolCalls && parallelToolCallsUnsupported(resp.StatusCode, raw) {
+			d.parallelUnsupported.Store(parallelKey, struct{}{})
+			body.ParallelToolCalls = false
+		} else if body.PreviousResponseID != "" && resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(string(raw)), "previous_response_id") {
 			disablePrevious = true
 			body.PreviousResponseID = ""
 			body.Input = nil
@@ -225,6 +236,26 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	}
 	result.DriverState = encodeRemoteState(result.DriverState, req.Model.Turns, disablePrevious)
 	return result, nil
+}
+
+func requestCapabilityKey(req driver.Request) string {
+	return strings.TrimRight(strings.ToLower(strings.TrimSpace(req.BaseURL)), "/") + "\x00" + strings.ToLower(strings.TrimSpace(req.Model.Model))
+}
+
+func parallelToolCallsUnsupported(status int, raw []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	message := strings.ToLower(string(raw))
+	if !strings.Contains(message, "parallel_tool_calls") {
+		return false
+	}
+	for _, marker := range []string{"unsupported", "unknown", "unrecognized", "invalid", "unexpected", "not permitted", "not allowed"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func reasoningSummaryUnsupported(raw []byte, explicitEffort bool) bool {

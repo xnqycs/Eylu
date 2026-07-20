@@ -71,12 +71,18 @@ func TestManagerConnectsToolsResourcesAndPolicy(t *testing.T) {
 	if !ok || echo.Risk() != policy.RiskRead || !echo.(tool.ParallelSafe).ParallelSafe() {
 		t.Fatalf("echo tool = %#v", echo)
 	}
+	if spec := echo.(tool.ConcurrencyClassifier).ClassifyConcurrency(nil, policy.Outcome{}); spec.Mode != tool.ConcurrencyShared {
+		t.Fatalf("echo concurrency = %#v", spec)
+	}
 	hintOnly, ok := registry.Get("mcp__fixture__hint_only")
 	if !ok || hintOnly.Risk() != policy.RiskWrite {
 		t.Fatalf("hint-only risk = %v", hintOnly.Risk())
 	}
 	if safe, ok := hintOnly.(tool.ParallelSafe); !ok || safe.ParallelSafe() {
 		t.Fatal("untrusted MCP annotation granted parallel read authorization")
+	}
+	if spec := hintOnly.(tool.ConcurrencyClassifier).ClassifyConcurrency(nil, policy.Outcome{}); spec.Mode != tool.ConcurrencyExclusive {
+		t.Fatalf("hint-only concurrency = %#v", spec)
 	}
 
 	executor := &tool.Executor{Registry: registry, Policy: policy.AllowAllChecker{}, MaxParallelTools: 2, Timeout: time.Second}
@@ -91,6 +97,9 @@ func TestManagerConnectsToolsResourcesAndPolicy(t *testing.T) {
 	resource, ok := registry.Get("mcp__fixture__read_resource")
 	if !ok {
 		t.Fatal("resource tool missing")
+	}
+	if spec := resource.(tool.ConcurrencyClassifier).ClassifyConcurrency(nil, policy.Outcome{}); spec.Mode != tool.ConcurrencyShared {
+		t.Fatalf("resource concurrency = %#v", spec)
 	}
 	resourceResult := resource.Execute(context.Background(), json.RawMessage(`{"uri":"fixture://secret"}`))
 	if resourceResult.IsError || resourceResult.Content != "resource:forwarded" || resourceResult.Metadata["mcp_server"] != "fixture" {

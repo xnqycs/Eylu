@@ -40,6 +40,20 @@ func (e *EditFile) Definition() protocol.ToolDefinition {
 
 func (e *EditFile) Risk() policy.Risk { return policy.RiskWrite }
 
+func (e *EditFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) ConcurrencySpec {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(raw, &input) != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	path, err := e.paths.resourcePath(input.Path)
+	if err != nil {
+		return ConcurrencySpec{Mode: ConcurrencyExclusive}
+	}
+	return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceFile, Path: path, Access: ResourceWrite}}}
+}
+
 func (e *EditFile) Execute(_ context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
 		Path                 string `json:"path"`

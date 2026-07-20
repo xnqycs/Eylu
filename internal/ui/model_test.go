@@ -132,6 +132,41 @@ func TestOperationStatesStaleMessagesApprovalAndCancellation(t *testing.T) {
 	}
 }
 
+func TestParallelToolCompletionKeepsExecutingStateUntilBatchFinishes(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-parallel"
+	model.eventChannel = make(chan Event, 1)
+	first := protocol.ToolCall{ID: "first", Name: "read_file", Arguments: []byte(`{"path":"first.go"}`)}
+	second := protocol.ToolCall{ID: "second", Name: "read_file", Arguments: []byte(`{"path":"second.go"}`)}
+	_, _ = model.handleBackendEvent(Event{OperationID: model.operationID, Kind: EventToolStart, ToolCall: &first})
+	_, _ = model.handleBackendEvent(Event{OperationID: model.operationID, Kind: EventToolStart, ToolCall: &second})
+	_, _ = model.handleBackendEvent(Event{OperationID: model.operationID, Kind: EventToolResult, ToolResult: &protocol.ToolResult{CallID: "second", Content: "done"}})
+	if model.state != StateExecutingTool {
+		t.Fatalf("state=%s", model.state)
+	}
+	if len(model.timeline) != 2 || model.timeline[0].tool.callID != "first" || model.timeline[1].tool.callID != "second" || !model.timeline[0].tool.running || model.timeline[1].tool.running {
+		t.Fatalf("timeline = %#v", model.timeline)
+	}
+	_, _ = model.handleBackendEvent(Event{OperationID: model.operationID, Kind: EventToolResult, ToolResult: &protocol.ToolResult{CallID: "first", Content: "done"}})
+	if model.state != StateWaitingFirstToken {
+		t.Fatalf("state=%s", model.state)
+	}
+}
+
+func TestToolCompletionIgnoresActiveCardsBeforeCurrentTimelineGroup(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-current"
+	model.timeline = []timelineItem{
+		{kind: timelineTool, tool: &toolView{callID: "stale", running: true}},
+		{kind: timelineMessage, role: "user", text: "new request"},
+		{kind: timelineTool, tool: &toolView{callID: "current", running: true}},
+	}
+	_, _ = model.handleBackendEvent(Event{OperationID: model.operationID, Kind: EventToolResult, ToolResult: &protocol.ToolResult{CallID: "current", Content: "done"}})
+	if model.state != StateWaitingFirstToken {
+		t.Fatalf("state=%s", model.state)
+	}
+}
+
 func TestApprovalRejectReasonAndImmediateInterruptDecisions(t *testing.T) {
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
 	model.operationID = "op-approval"

@@ -198,7 +198,7 @@ func TestPlanProfileForksContextFiltersToolsAndAdoptsFinalResult(t *testing.T) {
 	if forkState.SessionID == parentState.SessionID || len(forkState.Turns) != len(parentState.Turns) || len(forkState.DriverState) != 0 || forkState.PermissionMode != "plan" || forkState.Environment != environmentContext {
 		t.Fatalf("fork state = %#v parent = %#v", forkState, parentState)
 	}
-	if !strings.Contains(fork.systemPrompt, "software architecture planner") || !strings.Contains(fork.systemPrompt, "read-only") {
+	if !strings.Contains(fork.systemPrompt, "software architecture planner") || !strings.Contains(fork.systemPrompt, "read-only") || !strings.Contains(fork.systemPrompt, "same response") {
 		t.Fatalf("fork prompt = %q", fork.systemPrompt)
 	}
 
