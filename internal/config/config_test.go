@@ -10,6 +10,34 @@ import (
 	"testing"
 )
 
+func TestGradientEnabledDefaultsDisabledAndStorePersistsExplicitState(t *testing.T) {
+	workspace := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	loaded, err := Load(LoadOptions{ExplicitPath: configPath, Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Config.GradientEnabled {
+		t.Fatal("gradient should default to disabled")
+	}
+	updated, err := loaded.Store.SetGradientEnabled(true)
+	if err != nil || !updated.GradientEnabled {
+		t.Fatalf("enable config=%#v error=%v", updated, err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil || !strings.Contains(string(data), "gradient_enabled = true") {
+		t.Fatalf("enabled config=%q error=%v", data, err)
+	}
+	updated, err = loaded.Store.SetGradientEnabled(false)
+	if err != nil || updated.GradientEnabled {
+		t.Fatalf("disable config=%#v error=%v", updated, err)
+	}
+	data, err = os.ReadFile(configPath)
+	if err != nil || !strings.Contains(string(data), "gradient_enabled = false") {
+		t.Fatalf("disabled config=%q error=%v", data, err)
+	}
+}
+
 func TestLoadPrecedenceAndSave(t *testing.T) {
 	workspace := t.TempDir()
 	home := t.TempDir()

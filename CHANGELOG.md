@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- 重构 TUI 启动与运行反馈：加入加宽粗体斜体 Eylu 字符画、版本和工作目录 Banner；新启动或 `/new` 后在首个 Prompt 前将 Context 展示为 100% 可用，之后按真实剩余/已用比例和友好状态短句展示；activity 行将 reasoning token 改为 `thinking` 与整秒 `thought for` 用时；`/context` 增加 Signal Strip、分类聚合和可滚动详情；连续工具组与后续消息之间增加留白。
+- 重构 TUI 启动与运行反馈：加入加宽粗体斜体 Eylu 字符画、版本和工作目录 Banner；增加默认关闭的 `/gradient` On/Off 选择器及 `gradient_enabled` 持久化配置，启用后 Banner 与底部状态栏以约 20 FPS 显示主题强调色的逐字符 ANSI 真彩单色流光；新启动或 `/new` 后在首个 Prompt 前将 Context 展示为 100% 可用，之后按真实剩余/已用比例和友好状态短句展示；activity 行将 reasoning token 改为 `thinking` 与整秒 `thought for` 用时；`/context` 增加 Signal Strip、分类聚合和可滚动详情；连续工具组与后续消息之间增加留白。
 - 增加 Provider 级 `reasoning_effort` 与 `/effort`：按模型档案提供 `auto` 至 `ultra` 动态选择器、当前项标识、右上角状态、TOML/session 往返和模型切换原子回退；Responses 使用 `reasoning.effort`，Chat Completions 使用顶层 `reasoning_effort`，`auto` 省略请求字段。
 - 修复 TUI 文件引用、输入导航与完成指标：裸 `@path` 支持 ignored 文件的精确或唯一名称解析，`read_file` 卡片显示真实字节/行数；session 持久化原始 Prompt 并支持顶/底方向键回放；增强 `Shift+Enter`、`Ctrl+Enter`/`Ctrl+J` 换行；结束状态改为 TTFT 与生成阶段 TPS。
 - 增加模型上下文窗口自动解析：交互启动时预热活动模型或全部自动路由候选模型，Provider/模型切换后立即解析并要求用户确认探测值，手动输入的窗口覆盖探测结果；支持 OpenAI/OpenRouter 扩展元数据、Ollama、llama.cpp、models.dev、独立缓存、自动路由有效窗口和三轮溢出压缩恢复；配置改为保留字段存在性的分层稀疏持久化。
@@ -22,7 +22,7 @@
 - Bubble Tea 界面采用 Eylu Signal 语义色板，统一输入、Markdown、工具活动、选择、高危提示与底部工作台的视觉层级。
 - 根命令默认进入多轮 Chat，并支持直接传入 prompt 和全部 Chat 参数；`eylu chat` 保持兼容。
 - 项目采用 Apache License 2.0，版权主体为 xnqycs。
-- 发布归档增加项目 NOTICE、许可证和覆盖六个目标平台的第三方许可证全文。
+- GoReleaser 的六个平台 tar.gz/zip 归档调整为仅包含对应的 `eylu` 或 `eylu.exe` 主程序，checksum 与 Sigstore 签名资产保持独立发布。
 - 增加可复现的第三方声明生成器及 CI 漂移检查。
 
 兼容性：protocol v1 与 session schema v1 保持不变。依赖：新增 `github.com/atotto/clipboard`。

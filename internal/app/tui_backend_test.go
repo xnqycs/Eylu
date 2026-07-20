@@ -295,6 +295,37 @@ func TestTUIBackendEffortUpdatesLastRoutedProvider(t *testing.T) {
 	}
 }
 
+func TestTUIBackendGradientCommandUpdatesSnapshotAndSavedConfig(t *testing.T) {
+	cfg := testAppConfig()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "model"}
+	var saved config.Config
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(_ string, value config.Config) error {
+		saved = value
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &tuiBackend{runtime: &runtime{}, conversation: agent.NewConversation(), manager: manager}
+
+	message, err := backend.Command(context.Background(), "/gradient")
+	if err != nil || message != "Gradient: Off; available: On, Off" {
+		t.Fatalf("default message=%q error=%v", message, err)
+	}
+	message, err = backend.Command(context.Background(), "/gradient on")
+	if err != nil || message != "Gradient: On" || !saved.GradientEnabled {
+		t.Fatalf("enabled message=%q config=%#v error=%v", message, saved, err)
+	}
+	snapshot, err := backend.Snapshot(context.Background())
+	if err != nil || !snapshot.GradientEnabled {
+		t.Fatalf("snapshot=%#v error=%v", snapshot, err)
+	}
+	if _, err := backend.Command(context.Background(), "/gradient maybe"); err == nil || !strings.Contains(err.Error(), "usage: /gradient on|off") {
+		t.Fatalf("invalid gradient error=%v", err)
+	}
+}
+
 func TestTUIBackendSetModelProbesImmediately(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

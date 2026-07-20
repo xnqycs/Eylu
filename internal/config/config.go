@@ -180,6 +180,7 @@ type Config struct {
 	SkillRegistries       map[string]SkillRegistryConfig `toml:"skill_registries,omitempty" json:"skill_registries,omitempty"`
 	PermissionMode        string                         `toml:"permission_mode,omitempty" json:"permission_mode,omitempty"`
 	RoutingMode           string                         `toml:"routing_mode,omitempty" json:"routing_mode,omitempty"`
+	GradientEnabled       bool                           `toml:"gradient_enabled,omitempty" json:"gradient_enabled,omitempty"`
 	MaxTurns              int                            `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
 	MaxTotalTokens        int                            `toml:"max_total_tokens,omitempty" json:"max_total_tokens,omitempty"`
 	ToolTimeoutSec        int                            `toml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`

@@ -485,6 +485,50 @@ func TestModeSlashCommand(t *testing.T) {
 	}
 }
 
+func TestGradientSlashCommandReportsPersistsAndValidates(t *testing.T) {
+	workspace := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	loaded, err := config.Load(config.LoadOptions{ExplicitPath: configPath, Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := provider.NewManagerWithStore(loaded.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	runtime := &runtime{stdout: &output, stderr: &bytes.Buffer{}}
+	conversation := agent.NewConversation()
+	opts := chatOptions{}
+	reader := bufio.NewReader(strings.NewReader(""))
+
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/gradient", conversation, manager, &opts); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Gradient: Off") {
+		t.Fatalf("default output=%q", output.String())
+	}
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/gradient On", conversation, manager, &opts); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.Config().GradientEnabled {
+		t.Fatal("gradient was not enabled")
+	}
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/gradient OFF", conversation, manager, &opts); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Config().GradientEnabled {
+		t.Fatal("gradient was not disabled")
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil || !strings.Contains(string(data), "gradient_enabled = false") {
+		t.Fatalf("config=%q error=%v", data, err)
+	}
+	if err := runtime.handleSlashCommand(context.Background(), reader, "/gradient maybe", conversation, manager, &opts); err == nil || !strings.Contains(err.Error(), "usage: /gradient on|off") {
+		t.Fatalf("invalid gradient error=%v", err)
+	}
+}
+
 func TestEffortSlashCommandReportsUpdatesAndValidates(t *testing.T) {
 	workspace := t.TempDir()
 	cfg := config.Default()

@@ -147,6 +147,29 @@ func (m *Manager) Use(name string) error {
 	return m.commit(candidate)
 }
 
+func (m *Manager) SetGradientEnabled(value bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store != nil {
+		updated, err := m.store.SetGradientEnabled(value)
+		if err != nil {
+			return err
+		}
+		m.cfg = updated
+		return nil
+	}
+	candidate := m.cfg.Clone()
+	candidate.GradientEnabled = value
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	if err := m.save(m.path, candidate); err != nil {
+		return err
+	}
+	m.cfg = candidate
+	return nil
+}
+
 func (m *Manager) Delete(name, replacement string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

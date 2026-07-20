@@ -165,6 +165,7 @@ type Snapshot struct {
 	Model                     string               `json:"model"`
 	ReasoningEffort           string               `json:"reasoning_effort"`
 	SupportedReasoningEfforts []string             `json:"supported_reasoning_efforts"`
+	GradientEnabled           bool                 `json:"gradient_enabled"`
 	Context                   contextledger.Report `json:"context"`
 	Providers                 []ProviderItem       `json:"providers"`
 	Skills                    []SkillItem          `json:"skills"`

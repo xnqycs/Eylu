@@ -616,6 +616,124 @@ func TestBannerUsesSpacedItalicWordmarkAndMiddleTruncatedWorkspace(t *testing.T)
 	}
 }
 
+func TestThemeGradientUsesDisplayColumnsAndPreservesText(t *testing.T) {
+	value := "A界 B\nCD"
+	elapsed := 1250 * time.Millisecond
+	rendered := renderThemeGradient(value, elapsed, false)
+	if plain := ansi.Strip(rendered); plain != value {
+		t.Fatalf("plain=%q want=%q", plain, value)
+	}
+	if count := strings.Count(rendered, "\x1b[38;2;"); count != 6 {
+		t.Fatalf("true-color sequence count=%d rendered=%q", count, rendered)
+	}
+	for index, line := range strings.Split(rendered, "\n") {
+		if got, want := lipgloss.Width(line), lipgloss.Width(strings.Split(value, "\n")[index]); got != want {
+			t.Fatalf("line %d width=%d want=%d rendered=%q", index, got, want, line)
+		}
+	}
+	first := themeGradientRGB(0, elapsed)
+	adjacent := themeGradientRGB(1, elapsed)
+	afterWideRune := themeGradientRGB(3, elapsed)
+	later := themeGradientRGB(0, elapsed+colorAnimationInterval)
+	if first == adjacent || adjacent == afterWideRune {
+		t.Fatalf("display columns did not produce a gradient: first=%v adjacent=%v wide=%v", first, adjacent, afterWideRune)
+	}
+	if first == later {
+		t.Fatalf("time did not advance the gradient: first=%v later=%v", first, later)
+	}
+	for _, rgb := range [][3]uint8{first, adjacent, afterWideRune, later} {
+		for channel := range rgb {
+			if rgb[channel] > eyluAccentRGB[channel] {
+				t.Fatalf("theme gradient exceeded accent color: rgb=%v accent=%v", rgb, eyluAccentRGB)
+			}
+		}
+	}
+}
+
+func TestColorAnimationTickRecolorsBannerStatusAndSkipsHiddenBannerRefresh(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)}
+	model := NewModel(&fakeBackend{}, Options{Clock: clock, Version: "1.2.3", Workspace: "E:/Eylu", Width: 80, Height: 24})
+	if model.colorAnimationTickCmd() != nil {
+		t.Fatal("default-disabled gradient scheduled a color tick")
+	}
+	_, enableCommand := model.Update(snapshotMsg{snapshot: Snapshot{Mode: "manual", GradientEnabled: true}})
+	if enableCommand == nil {
+		t.Fatal("enabled gradient did not schedule a color tick")
+	}
+	generation := model.colorAnimationGeneration
+	model.followOutput = false
+	model.timeline = []timelineItem{{kind: timelineMessage, role: "user", text: strings.Repeat("history line\n", 40)}}
+	model.refreshViewport()
+	model.viewport.GotoTop()
+	scheduled, ok := model.colorAnimationTickCmd()().(colorAnimationTickMsg)
+	if !ok || scheduled.at.Sub(clock.now) != 50*time.Millisecond {
+		t.Fatalf("scheduled tick=%#v", scheduled)
+	}
+
+	bannerBefore := model.renderBanner()
+	statusBefore := model.renderStatus()
+	viewportBefore := model.viewport.GetContent()
+	_, command := model.Update(colorAnimationTickMsg{at: clock.now.Add(colorAnimationInterval), generation: generation})
+	if command == nil {
+		t.Fatal("color animation tick did not reschedule")
+	}
+	if model.colorAnimationElapsed != colorAnimationInterval {
+		t.Fatalf("elapsed=%s want=%s", model.colorAnimationElapsed, colorAnimationInterval)
+	}
+	bannerAfter := model.renderBanner()
+	statusAfter := model.renderStatus()
+	if bannerBefore == bannerAfter || statusBefore == statusAfter {
+		t.Fatalf("tick did not recolor banner/status: banner_changed=%t status_changed=%t", bannerBefore != bannerAfter, statusBefore != statusAfter)
+	}
+	if ansi.Strip(bannerBefore) != ansi.Strip(bannerAfter) || ansi.Strip(statusBefore) != ansi.Strip(statusAfter) {
+		t.Fatal("animation changed visible text")
+	}
+	if viewportBefore == model.viewport.GetContent() {
+		t.Fatal("visible banner viewport was not refreshed")
+	}
+
+	model.viewport.SetYOffset(bannerViewportRows)
+	hiddenBefore := model.viewport.GetContent()
+	_, _ = model.Update(colorAnimationTickMsg{at: clock.now.Add(2 * colorAnimationInterval), generation: generation})
+	if hiddenBefore != model.viewport.GetContent() {
+		t.Fatal("hidden banner caused a full viewport refresh")
+	}
+
+	_, _ = model.Update(snapshotMsg{snapshot: Snapshot{Mode: "manual", GradientEnabled: false}})
+	disabledElapsed := model.colorAnimationElapsed
+	_, staleCommand := model.Update(colorAnimationTickMsg{at: clock.now.Add(3 * colorAnimationInterval), generation: generation})
+	if staleCommand != nil || model.colorAnimationElapsed != disabledElapsed {
+		t.Fatal("disabled gradient accepted a stale tick")
+	}
+	_, reenabledCommand := model.Update(snapshotMsg{snapshot: Snapshot{Mode: "manual", GradientEnabled: true}})
+	if reenabledCommand == nil || model.colorAnimationGeneration == generation {
+		t.Fatal("re-enabled gradient did not start a fresh tick generation")
+	}
+}
+
+func TestColorAnimationFallbacksKeepStaticStylesAndPlainText(t *testing.T) {
+	static := NewModel(&fakeBackend{}, Options{NoAnimation: true, Version: "1.2.3", Workspace: "E:/Eylu", Width: 80, Height: 24})
+	static.snapshot = Snapshot{Mode: "manual", GradientEnabled: true}
+	static.gradientEnabled = true
+	if static.colorAnimationTickCmd() != nil {
+		t.Fatal("--no-animation scheduled a color tick")
+	}
+	if count := strings.Count(static.renderBanner(), "\x1b[38;2;"); count > 2 {
+		t.Fatalf("--no-animation did not retain fixed banner styles: sequences=%d", count)
+	}
+
+	plain := NewModel(&fakeBackend{}, Options{NoColor: true, Version: "1.2.3", Workspace: "E:/Eylu", Width: 80, Height: 24})
+	plain.snapshot = Snapshot{Mode: "manual", GradientEnabled: true}
+	plain.gradientEnabled = true
+	if plain.colorAnimationTickCmd() != nil {
+		t.Fatal("NO_COLOR scheduled a color tick")
+	}
+	view := plain.View().Content
+	if strings.Contains(view, "\x1b[") {
+		t.Fatalf("NO_COLOR emitted ANSI: %q", view)
+	}
+}
+
 func TestTimelineAddsOneBlankLineAfterVisibleToolGroup(t *testing.T) {
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
 	model.timeline = []timelineItem{
@@ -1207,7 +1325,7 @@ func TestMultilineInputCompletionReferencesAndModeCycle(t *testing.T) {
 
 	model.input.SetValue("/")
 	_ = model.refreshCompletion()
-	if labels := completionLabels(model.completion.items); !strings.Contains(labels, "/model") || !strings.Contains(labels, "/review") {
+	if labels := completionLabels(model.completion.items); !strings.Contains(labels, "/gradient") || !strings.Contains(labels, "/model") || !strings.Contains(labels, "/review") {
 		t.Fatalf("slash items = %s", labels)
 	}
 	model.input.SetValue("/m")
@@ -1354,6 +1472,39 @@ func TestReasoningEffortCompletionSelectionAndExecution(t *testing.T) {
 	coloredView := colored.renderCompletion()
 	if !strings.Contains(coloredView, "\x1b[") || !strings.Contains(ansi.Strip(coloredView), ">* high") || colored.completionHeight() != 7 {
 		t.Fatalf("colored completion height=%d view=%q", colored.completionHeight(), coloredView)
+	}
+}
+
+func TestGradientCompletionSelectionAndExecution(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 64, Height: 24})
+	model.snapshot = Snapshot{GradientEnabled: false}
+
+	model.input.SetValue("/gradient")
+	_ = model.refreshCompletion()
+	if len(model.completion.items) != 2 || model.completion.items[model.completion.cursor].label != "Off" || !model.completion.items[model.completion.cursor].current {
+		t.Fatalf("completion=%#v cursor=%d", model.completion.items, model.completion.cursor)
+	}
+	if rendered := ansi.Strip(model.renderCompletion()); !strings.Contains(rendered, ">* Off") {
+		t.Fatalf("current gradient marker missing:\n%s", rendered)
+	}
+	if handled, command := model.handleCompletionKey("tab"); !handled || command != nil || model.input.Value() != "/gradient off" {
+		t.Fatalf("tab handled=%t command=%v input=%q", handled, command, model.input.Value())
+	}
+
+	model.input.SetValue("/gradient")
+	_ = model.refreshCompletion()
+	model.moveCompletion(-1)
+	if model.completion.items[model.completion.cursor].label != "On" {
+		t.Fatalf("cursor item=%#v", model.completion.items[model.completion.cursor])
+	}
+	handled, command := model.handleCompletionKey("enter")
+	if !handled || command == nil || model.input.Value() != "" {
+		t.Fatalf("enter handled=%t command=%v input=%q", handled, command, model.input.Value())
+	}
+	_ = command()
+	if backend.command != "/gradient on" {
+		t.Fatalf("command=%q", backend.command)
 	}
 }
 

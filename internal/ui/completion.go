@@ -103,6 +103,7 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 	commands := []completionItem{
 		{label: "/context", description: "Inspect context usage", insert: "/context"},
 		{label: "/effort", description: "Choose the reasoning effort", insert: "/effort ", expand: true},
+		{label: "/gradient", description: "Toggle the animated theme gradient", insert: "/gradient ", expand: true},
 		{label: "/help", description: "Show available commands", insert: "/help"},
 		{label: "/mode", description: "Change permission mode", insert: "/mode "},
 		{label: "/model", description: "Choose the active model", insert: "/model"},
@@ -116,6 +117,15 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 	}
 	lower := strings.ToLower(value)
 	switch {
+	case lower == "/gradient" || strings.HasPrefix(lower, "/gradient "):
+		query := ""
+		if strings.HasPrefix(lower, "/gradient ") {
+			query = strings.TrimSpace(strings.TrimPrefix(lower, "/gradient "))
+		}
+		return filterCompletionItems([]completionItem{
+			{label: "On", description: "Enable the animated theme gradient", insert: "/gradient on", current: snapshot.GradientEnabled, execute: true},
+			{label: "Off", description: "Use the fixed theme colors", insert: "/gradient off", current: !snapshot.GradientEnabled, execute: true, rank: 1},
+		}, query)
 	case lower == "/effort" || strings.HasPrefix(lower, "/effort "):
 		query := ""
 		if strings.HasPrefix(lower, "/effort ") {

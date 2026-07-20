@@ -117,7 +117,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	command := fields[0]
 	switch command {
 	case "/help":
-		fmt.Fprintln(r.stdout, "/new  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /effort [level]  /mode manual|plan|auto|full  /quit")
+		fmt.Fprintln(r.stdout, "/new  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /effort [level]  /gradient [on|off]  /mode manual|plan|auto|full  /quit")
 		return nil
 	case "/quit":
 		return errQuit
@@ -212,6 +212,20 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 			}
 		}
 		fmt.Fprintf(r.stdout, "Reasoning effort: %s\n", config.EffectiveReasoningEffort(updated.Config.ReasoningEffort))
+		return nil
+	case "/gradient":
+		if len(fields) == 1 {
+			fmt.Fprintf(r.stdout, "Gradient: %s; available: On, Off\n", gradientStateLabel(manager.Config().GradientEnabled))
+			return nil
+		}
+		if len(fields) != 2 {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /gradient on|off"}
+		}
+		enabled, err := updateGradientSetting(manager, fields[1])
+		if err != nil {
+			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error(), Cause: err}
+		}
+		fmt.Fprintf(r.stdout, "Gradient: %s\n", gradientStateLabel(enabled))
 		return nil
 	case "/mode":
 		if len(fields) != 2 {

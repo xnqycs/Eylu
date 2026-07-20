@@ -24,10 +24,14 @@ type markdownRenderCache struct {
 }
 
 const (
-	activityGapRows   = 1
-	fixedChromeRows   = 5 + activityGapRows
-	minViewportRows   = 4
-	maxTaskPanelItems = 5
+	activityGapRows        = 1
+	fixedChromeRows        = 5 + activityGapRows
+	minViewportRows        = 4
+	maxTaskPanelItems      = 5
+	bannerViewportRows     = 7
+	colorAnimationInterval = 50 * time.Millisecond
+	colorSpatialFrequency  = 0.24
+	colorTemporalFrequency = 2.0
 )
 
 type tuiLayout struct {
@@ -341,6 +345,14 @@ func (m *Model) renderStatus() string {
 	} else {
 		right = truncateColumns(right, rightAvailable)
 	}
+	if m.colorAnimationEnabled() {
+		line := strings.Repeat(" ", inset) + left
+		if right != "" {
+			gap := max(1, m.width-lipgloss.Width(line)-lipgloss.Width(right))
+			line += strings.Repeat(" ", gap) + right
+		}
+		return renderThemeGradient(padWidth(line, m.width), m.colorAnimationElapsed, false)
+	}
 	line := strings.Repeat(" ", inset) + m.styles.Status.Render(left)
 	if right != "" {
 		gap := max(1, m.width-lipgloss.Width(line)-lipgloss.Width(right))
@@ -428,7 +440,45 @@ func (m *Model) renderBanner() string {
 	if pathWidth > 0 {
 		meta += separator + truncateMiddleColumns(workspace, pathWidth)
 	}
+	if m.colorAnimationEnabled() {
+		return renderThemeGradient(art, m.colorAnimationElapsed, true) + "\n\n" +
+			renderThemeGradient(meta, m.colorAnimationElapsed, false)
+	}
 	return m.styles.Accent.Bold(true).Render(art) + "\n\n" + m.styles.Muted.Render(meta)
+}
+
+func renderThemeGradient(value string, elapsed time.Duration, bold bool) string {
+	if value == "" {
+		return ""
+	}
+	var output strings.Builder
+	output.Grow(len(value) * 20)
+	column := 0
+	for _, character := range value {
+		if character == '\n' {
+			output.WriteString("\x1b[0m\n")
+			column = 0
+			continue
+		}
+		rgb := themeGradientRGB(column, elapsed)
+		if bold {
+			fmt.Fprintf(&output, "\x1b[1;38;2;%d;%d;%dm%c", rgb[0], rgb[1], rgb[2], character)
+		} else {
+			fmt.Fprintf(&output, "\x1b[38;2;%d;%d;%dm%c", rgb[0], rgb[1], rgb[2], character)
+		}
+		column += ansi.StringWidth(string(character))
+	}
+	output.WriteString("\x1b[0m")
+	return output.String()
+}
+
+func themeGradientRGB(column int, elapsed time.Duration) [3]uint8 {
+	phase := float64(column)*colorSpatialFrequency + elapsed.Seconds()*colorTemporalFrequency
+	brightness := 0.35 + 0.65*(math.Sin(phase)+1)/2
+	channel := func(accent uint8) uint8 {
+		return uint8(math.Round(float64(accent) * brightness))
+	}
+	return [3]uint8{channel(eyluAccentRGB[0]), channel(eyluAccentRGB[1]), channel(eyluAccentRGB[2])}
 }
 
 func (m *Model) renderTimelineMarkdown(item *timelineItem) string {

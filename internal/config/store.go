@@ -25,6 +25,7 @@ type FileConfig struct {
 	RemovedSkillRegistries []string                       `toml:"removed_skill_registries,omitempty"`
 	PermissionMode         *string                        `toml:"permission_mode,omitempty"`
 	RoutingMode            *string                        `toml:"routing_mode,omitempty"`
+	GradientEnabled        *bool                          `toml:"gradient_enabled,omitempty"`
 	MaxTurns               *int                           `toml:"max_turns,omitempty"`
 	MaxTotalTokens         *int                           `toml:"max_total_tokens,omitempty"`
 	ToolTimeoutSec         *int                           `toml:"tool_timeout_seconds,omitempty"`
@@ -319,6 +320,10 @@ func (s *Store) SetActiveProvider(name string) (Config, error) {
 	return s.update(func(file *FileConfig) { file.ActiveProvider = ptr(name) })
 }
 
+func (s *Store) SetGradientEnabled(value bool) (Config, error) {
+	return s.update(func(file *FileConfig) { file.GradientEnabled = ptr(value) })
+}
+
 func (s *Store) DeleteProvider(name, active string) (Config, error) {
 	return s.update(func(file *FileConfig) {
 		delete(file.Providers, name)
@@ -432,6 +437,7 @@ func applyFileConfig(cfg *Config, file FileConfig) {
 	}
 	assign(cfg.PermissionMode, file.PermissionMode, func(value string) { cfg.PermissionMode = value })
 	assign(cfg.RoutingMode, file.RoutingMode, func(value string) { cfg.RoutingMode = value })
+	assign(cfg.GradientEnabled, file.GradientEnabled, func(value bool) { cfg.GradientEnabled = value })
 	assign(cfg.MaxTurns, file.MaxTurns, func(value int) { cfg.MaxTurns = value })
 	assign(cfg.MaxTotalTokens, file.MaxTotalTokens, func(value int) { cfg.MaxTotalTokens = value })
 	assign(cfg.ToolTimeoutSec, file.ToolTimeoutSec, func(value int) { cfg.ToolTimeoutSec = value })
@@ -540,6 +546,7 @@ func fileConfigFromResolved(cfg Config) FileConfig {
 	}
 	setDifferent(&file.PermissionMode, cfg.PermissionMode, defaults.PermissionMode)
 	setDifferent(&file.RoutingMode, cfg.RoutingMode, defaults.RoutingMode)
+	setDifferent(&file.GradientEnabled, cfg.GradientEnabled, defaults.GradientEnabled)
 	setDifferent(&file.MaxTurns, cfg.MaxTurns, defaults.MaxTurns)
 	setDifferent(&file.MaxTotalTokens, cfg.MaxTotalTokens, defaults.MaxTotalTokens)
 	setDifferent(&file.ToolTimeoutSec, cfg.ToolTimeoutSec, defaults.ToolTimeoutSec)

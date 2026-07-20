@@ -99,7 +99,8 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 	snapshot := ui.Snapshot{
 		SessionID: b.conversation.SessionID(), Workspace: b.runtime.workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
 		ReasoningEffort: effort, SupportedReasoningEfforts: config.SupportedReasoningEfforts(active.Config.Model),
-		Context: b.conversation.ContextReport(), TodoList: state.TodoList, PromptHistory: append([]string{}, state.PromptHistory...),
+		GradientEnabled: cfg.GradientEnabled,
+		Context:         b.conversation.ContextReport(), TodoList: state.TodoList, PromptHistory: append([]string{}, state.PromptHistory...),
 	}
 	managerActive, _ := b.manager.Active()
 	for _, item := range b.manager.List() {
@@ -574,6 +575,18 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 			return "", err
 		}
 		return "Permission mode: " + fields[1], nil
+	case "/gradient":
+		if len(fields) == 1 {
+			return fmt.Sprintf("Gradient: %s; available: On, Off", gradientStateLabel(b.manager.Config().GradientEnabled)), nil
+		}
+		if len(fields) != 2 {
+			return "", fmt.Errorf("usage: /gradient on|off")
+		}
+		enabled, err := updateGradientSetting(b.manager, fields[1])
+		if err != nil {
+			return "", err
+		}
+		return "Gradient: " + gradientStateLabel(enabled), nil
 	case "/skill":
 		if len(fields) != 2 {
 			return "", fmt.Errorf("usage: /skill <name>")
@@ -662,6 +675,29 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown command %s", fields[0])
 	}
+}
+
+func updateGradientSetting(manager *provider.Manager, value string) (bool, error) {
+	var enabled bool
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "on":
+		enabled = true
+	case "off":
+		enabled = false
+	default:
+		return false, fmt.Errorf("usage: /gradient on|off")
+	}
+	if err := manager.SetGradientEnabled(enabled); err != nil {
+		return false, err
+	}
+	return enabled, nil
+}
+
+func gradientStateLabel(enabled bool) string {
+	if enabled {
+		return "On"
+	}
+	return "Off"
 }
 
 func (b *tuiBackend) SetMode(_ context.Context, value string) error {

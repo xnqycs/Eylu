@@ -42,12 +42,8 @@ archives:
           - zip
     name_template: "Eylu_{{ .Version }}_{{ title .Os }}_{{ .Arch }}"
     files:
-      - README.md
-      - CHANGELOG.md
-      - LICENSE
-      - NOTICE
-      - THIRD_PARTY_NOTICES.md
-      - docs/go-terminal-agent-development-plan.md
+      # A non-matching glob prevents GoReleaser from adding its default README/LICENSE files.
+      - __eylu_binary_only__*
 
 checksum:
   name_template: Eylu_{{ .Version }}_checksums.txt

@@ -188,6 +188,10 @@ type Model struct {
 	clipboardWrite             func(string) error
 	copyToast                  string
 	copyToastSequence          uint64
+	gradientEnabled            bool
+	colorAnimationStartedAt    time.Time
+	colorAnimationElapsed      time.Duration
+	colorAnimationGeneration   uint64
 
 	operationID        string
 	operationMode      string
@@ -262,6 +266,11 @@ type transitionMsg struct {
 	state       OperationState
 }
 
+type colorAnimationTickMsg struct {
+	at         time.Time
+	generation uint64
+}
+
 type interruptRequestMsg struct{}
 
 func NewModel(backend Backend, options Options) *Model {
@@ -325,6 +334,7 @@ func NewModel(backend Backend, options Options) *Model {
 		width: width, height: height, screen: screenChat, state: StateIdle, followOutput: true, historyIndex: -1,
 		version: strings.TrimSpace(options.Version), workspace: strings.TrimSpace(options.Workspace),
 		animation: !options.NoAnimation, noColor: options.NoColor, clipboardWrite: clipboardWrite,
+		colorAnimationStartedAt: clock.Now(),
 	}
 	if model.version == "" {
 		model.version = "dev"
@@ -367,7 +377,11 @@ func Run(backend Backend, options Options) error {
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(m.input.Focus(), m.loadSnapshotCmd())
+	commands := []tea.Cmd{m.input.Focus(), m.loadSnapshotCmd()}
+	if command := m.colorAnimationTickCmd(); command != nil {
+		commands = append(commands, command)
+	}
+	return tea.Batch(commands...)
 }
 
 func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -376,10 +390,12 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize(typed.Width, typed.Height)
 		return m, nil
 	case snapshotMsg:
+		var colorCommand tea.Cmd
 		if typed.err != nil {
 			m.appendNotice(typed.err.Error(), true)
 		} else {
 			sessionChanged := m.snapshot.SessionID != typed.snapshot.SessionID
+			gradientChanged := m.gradientEnabled != typed.snapshot.GradientEnabled
 			if m.snapshot.Workspace != typed.snapshot.Workspace {
 				m.files = nil
 				m.filesLoaded = false
@@ -387,6 +403,15 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.filesDiagnostic = ""
 			}
 			m.snapshot = typed.snapshot
+			m.gradientEnabled = typed.snapshot.GradientEnabled
+			if gradientChanged {
+				m.colorAnimationGeneration++
+				if m.gradientEnabled {
+					m.colorAnimationStartedAt = m.clock.Now()
+					m.colorAnimationElapsed = 0
+					colorCommand = m.colorAnimationTickCmd()
+				}
+			}
 			m.promptHistory = append(m.promptHistory[:0], typed.snapshot.PromptHistory...)
 			if sessionChanged {
 				m.contextStarted = len(typed.snapshot.PromptHistory) > 0
@@ -398,7 +423,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.refreshViewport()
-		return m, nil
+		return m, colorCommand
 	case filesResultMsg:
 		m.filesLoading = false
 		if typed.err != nil {
@@ -536,6 +561,16 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = StateIdle
 		}
 		return m, nil
+	case colorAnimationTickMsg:
+		if typed.generation != m.colorAnimationGeneration || !m.colorAnimationEnabled() {
+			return m, nil
+		}
+		elapsed := max(time.Duration(0), typed.at.Sub(m.colorAnimationStartedAt))
+		m.colorAnimationElapsed = max(m.colorAnimationElapsed, elapsed)
+		if m.screen == screenChat && m.viewport.YOffset() < bannerViewportRows {
+			m.refreshViewport()
+		}
+		return m, m.colorAnimationTickCmd()
 	case operationSpinnerMsg:
 		if typed.operationID != m.operationID || !m.busy() || !m.animation {
 			return m, nil
@@ -589,6 +624,20 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(command, completionCommand)
 	}
 	return m, nil
+}
+
+func (m *Model) colorAnimationEnabled() bool {
+	return m.gradientEnabled && m.animation && !m.noColor
+}
+
+func (m *Model) colorAnimationTickCmd() tea.Cmd {
+	if !m.colorAnimationEnabled() {
+		return nil
+	}
+	generation := m.colorAnimationGeneration
+	return m.clock.Tick(colorAnimationInterval, func(at time.Time) tea.Msg {
+		return colorAnimationTickMsg{at: at, generation: generation}
+	})
 }
 
 func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
@@ -1040,7 +1089,7 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 			return m.requestMode(fields[1])
 		}
 	case "/help":
-		m.appendNotice("/new /tasks /context /skills /skill /providers /provider /model /effort /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
+		m.appendNotice("/new /tasks /context /skills /skill /providers /provider /model /effort /gradient /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
 		m.refreshViewport()
 		return m, nil
 	}

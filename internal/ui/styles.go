@@ -20,6 +20,8 @@ const (
 	eyluSelectionInkColor = "#071315"
 )
 
+var eyluAccentRGB = [3]uint8{0x35, 0xBD, 0xB2}
+
 type Styles struct {
 	Accent      lipgloss.Style
 	User        lipgloss.Style
