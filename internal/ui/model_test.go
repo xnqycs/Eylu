@@ -468,10 +468,16 @@ func TestStreamingActivityShowsEstimatedExactTokensAndThinking(t *testing.T) {
 	model.startedAt = clock.now.Add(-14 * time.Second)
 
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventActivity, Activity: &Activity{Reasoning: true, ReasoningKnown: true, TokenBytesPerToken: 4, InputTokens: 1200}})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventState, State: StateWaitingFirstToken})
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventReasoningDelta, Delta: strings.Repeat("r", 204)})
+	thinking := ansi.Strip(model.renderLoading())
+	if !strings.Contains(thinking, "Thinking...") || !strings.Contains(thinking, " · thinking)") || strings.Contains(thinking, "thinking ≈") || strings.Contains(thinking, "thinking 320") {
+		t.Fatalf("active reasoning = %q", thinking)
+	}
+	clock.now = clock.now.Add(13 * time.Second)
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventTextDelta, Delta: strings.Repeat("x", 2936)})
 	estimated := ansi.Strip(model.renderLoading())
-	for _, expected := range []string{"Composing...", "14s", "↑ ≈1200 sent", "↓ ≈734 received", "thinking ≈51 tokens"} {
+	for _, expected := range []string{"Composing...", "27s", "↑ ≈1200 sent", "↓ ≈734 received", "thought for 13s"} {
 		if !strings.Contains(estimated, expected) {
 			t.Fatalf("estimated activity missing %q: %q", expected, estimated)
 		}
@@ -480,7 +486,7 @@ func TestStreamingActivityShowsEstimatedExactTokensAndThinking(t *testing.T) {
 	usage := protocol.Usage{InputTokens: 1100, OutputTokens: 700, ReasoningTokens: 320, Exact: true}
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventUsage, Usage: &usage})
 	exact := ansi.Strip(model.renderLoading())
-	for _, expected := range []string{"↑ 1100 sent", "↓ 700 received", "thinking 320 tokens"} {
+	for _, expected := range []string{"↑ 1100 sent", "↓ 700 received", "thought for 13s"} {
 		if !strings.Contains(exact, expected) {
 			t.Fatalf("exact activity missing %q: %q", expected, exact)
 		}
@@ -489,11 +495,11 @@ func TestStreamingActivityShowsEstimatedExactTokensAndThinking(t *testing.T) {
 		t.Fatalf("exact activity remained estimated: %q", exact)
 	}
 	model.state = StateExecutingTool
-	if toolActivity := ansi.Strip(model.renderLoading()); strings.Contains(toolActivity, "thinking") {
-		t.Fatalf("tool activity reported active thinking: %q", toolActivity)
+	if toolActivity := ansi.Strip(model.renderLoading()); !strings.Contains(toolActivity, "thought for 13s") {
+		t.Fatalf("tool activity lost completed thought duration: %q", toolActivity)
 	}
-	model.state = StateWaitingFirstToken
 
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventState, State: StateWaitingFirstToken})
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventActivity, Activity: &Activity{InputTokens: 1500, TokenBytesPerToken: 4}})
 	pending := ansi.Strip(model.renderLoading())
 	for _, expected := range []string{"Thinking...", "↑ ≈1500 sent"} {
@@ -501,26 +507,174 @@ func TestStreamingActivityShowsEstimatedExactTokensAndThinking(t *testing.T) {
 			t.Fatalf("pending activity missing %q: %q", expected, pending)
 		}
 	}
-	if strings.Contains(pending, "thinking 320") || strings.Contains(pending, "+ tokens") {
-		t.Fatalf("pending activity reused a prior-round token count: %q", pending)
+	if strings.Contains(pending, "thinking") || strings.Contains(pending, "thought for") {
+		t.Fatalf("pending activity reused a prior-round thought: %q", pending)
 	}
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventReasoningDelta, Delta: strings.Repeat("z", 40)})
+	clock.now = clock.now.Add(2 * time.Second)
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventTextDelta, Delta: strings.Repeat("y", 40)})
 	nextTurn := ansi.Strip(model.renderLoading())
-	for _, expected := range []string{"↓ ≈710 received", "thinking ≈10 tokens"} {
+	for _, expected := range []string{"↓ ≈710 received", "thought for 2s"} {
 		if !strings.Contains(nextTurn, expected) {
 			t.Fatalf("next turn activity missing %q: %q", expected, nextTurn)
 		}
 	}
 	inexactUsage := protocol.Usage{}
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-activity", Kind: EventUsage, Usage: &inexactUsage})
-	if local := ansi.Strip(model.renderLoading()); !strings.Contains(local, "thinking ≈10 tokens") {
-		t.Fatalf("local thinking estimate was lost without exact usage: %q", local)
+	if local := ansi.Strip(model.renderLoading()); !strings.Contains(local, "thought for 2s") {
+		t.Fatalf("local thought duration was lost without exact usage: %q", local)
 	}
 
 	model.resize(40, 16)
 	if width := lipgloss.Width(ansi.Strip(model.renderLoading())); width > 40 {
 		t.Fatalf("activity width=%d line=%q", width, ansi.Strip(model.renderLoading()))
+	}
+}
+
+func TestStatusAlignsWithInputAndUsesFriendlyContextCopy(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 100, Height: 24})
+	model.contextStarted = true
+	model.snapshot = Snapshot{Mode: "manual", Context: contextledger.Report{TotalTokens: 2_400, ContextWindow: 100_000, LimitKnown: true, Percent: 2.4}}
+	model.state = StateIdle
+	status := ansi.Strip(model.renderStatus())
+	if !strings.HasPrefix(status, "  manual · Context 98% left · Context 2% used") || !strings.HasSuffix(strings.TrimSpace(status), "Ready when you are") {
+		t.Fatalf("status=%q", status)
+	}
+	if lipgloss.Width(status) != 100 {
+		t.Fatalf("status width=%d", lipgloss.Width(status))
+	}
+
+	model.resize(40, 16)
+	narrow := ansi.Strip(model.renderStatus())
+	if !strings.HasPrefix(narrow, "  manual · 98% left · 2% used") || strings.Contains(narrow, "Ready when") {
+		t.Fatalf("narrow status=%q", narrow)
+	}
+
+	model.resize(80, 24)
+	model.snapshot.Context = contextledger.Report{TotalTokens: 12_400}
+	unknown := ansi.Strip(model.renderStatus())
+	if !strings.HasPrefix(unknown, "  manual · Context 12.4K tokens") {
+		t.Fatalf("unknown status=%q", unknown)
+	}
+
+	model.snapshot.Context = contextledger.Report{TotalTokens: 120, ContextWindow: 100, LimitKnown: true, Percent: 120}
+	overflow := ansi.Strip(model.renderStatus())
+	if !strings.Contains(overflow, "Context 0% left · Context 100% used") {
+		t.Fatalf("overflow status=%q", overflow)
+	}
+}
+
+func TestPristineSessionShowsFullContextUntilFirstPrompt(t *testing.T) {
+	report := contextledger.Report{
+		Provider: "default", Model: "gpt-5.6-sol", ContextWindow: 200_000, LimitKnown: true,
+		InputTokens: 4_000, OutputReserve: 8_000, TotalTokens: 12_000, Percent: 6,
+		Categories: []contextledger.CategoryUsage{{Category: contextledger.CategorySystemPrompt, Label: "System prompt", Tokens: 4_000}},
+	}
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	_, _ = model.Update(snapshotMsg{snapshot: Snapshot{SessionID: "fresh", Mode: "manual", Context: report}})
+	status := ansi.Strip(model.renderStatus())
+	if !strings.Contains(status, "Context 100% left · Context 0% used") {
+		t.Fatalf("fresh status=%q", status)
+	}
+	contextView := model.renderContext()
+	if !strings.Contains(contextView, "0% used") || !strings.Contains(contextView, "200K free") || strings.Contains(contextView, "System") {
+		t.Fatalf("fresh context view:\n%s", contextView)
+	}
+
+	_, _ = model.startRequest(Submission{Text: "hello", HistoryText: "hello"})
+	if status = ansi.Strip(model.renderStatus()); !strings.Contains(status, "Context 94% left · Context 6% used") {
+		t.Fatalf("started status=%q", status)
+	}
+
+	_, _ = model.Update(snapshotMsg{snapshot: Snapshot{SessionID: "new-session", Mode: "manual", Context: report}})
+	if status = ansi.Strip(model.renderStatus()); !strings.Contains(status, "Context 100% left · Context 0% used") {
+		t.Fatalf("new session status=%q", status)
+	}
+}
+
+func TestBannerUsesSpacedItalicWordmarkAndMiddleTruncatedWorkspace(t *testing.T) {
+	workspace := "E:/Projects/very-long-parent-directory/another-long-directory/Eylu"
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Version: "1.2.3", Workspace: workspace, Width: 40, Height: 20})
+	banner := ansi.Strip(model.renderBanner())
+	for _, expected := range []string{"______   __  __", "/ /___", "v1.2.3", "E:/", "Eylu"} {
+		if !strings.Contains(banner, expected) {
+			t.Fatalf("banner missing %q:\n%s", expected, banner)
+		}
+	}
+	for _, line := range strings.Split(banner, "\n") {
+		if lipgloss.Width(line) > model.viewportContentWidth() {
+			t.Fatalf("banner line width=%d line=%q", lipgloss.Width(line), line)
+		}
+	}
+	if count := strings.Count(ansi.Strip(model.renderTimeline()), "______"); count != 1 {
+		t.Fatalf("banner count=%d", count)
+	}
+
+	styled := NewModel(&fakeBackend{}, Options{NoAnimation: true, Version: "1.2.3", Workspace: workspace, Width: 80, Height: 24})
+	if rendered := styled.renderBanner(); !strings.Contains(rendered, "\x1b[1;") {
+		t.Fatalf("banner is not bold: %q", rendered)
+	}
+}
+
+func TestTimelineAddsOneBlankLineAfterVisibleToolGroup(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.timeline = []timelineItem{
+		{kind: timelineTool, tool: &toolView{name: "read_file"}},
+		{kind: timelineTool, tool: &toolView{name: "todolist"}},
+		{kind: timelineTool, tool: &toolView{name: "bash"}},
+		{kind: timelineMessage, role: "agent", text: "Tool result explained."},
+	}
+	rendered := ansi.Strip(model.renderTimeline())
+	if strings.Contains(rendered, "> read_file  done\n\n> bash  done") {
+		t.Fatalf("tool group contains an extra blank line:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "> bash  done\n\nEYLU\nTool result explained.") {
+		t.Fatalf("tool group/message spacing is incorrect:\n%s", rendered)
+	}
+}
+
+func TestContextMapGroupsUsageAndExpandsDetails(t *testing.T) {
+	report := contextledger.Report{
+		Provider: "default", Model: "gpt-5.6-sol", ConfiguredContextWindow: 200_000, DetectedContextWindow: 200_000,
+		ContextWindow: 200_000, LimitKnown: true, LimitSource: "models_dev", LimitCached: true,
+		InputTokens: 12_000, OutputReserve: 8_000, TotalTokens: 20_000, Percent: 10, CompressionCount: 1,
+		LastCompression: &contextledger.CompressionEvent{BeforeTokens: 40_000, AfterTokens: 12_000, OmittedTurns: 4},
+		LastUsage:       protocol.Usage{InputTokens: 9_000, OutputTokens: 1_200},
+		Categories: []contextledger.CategoryUsage{
+			{Category: contextledger.CategorySystemPrompt, Label: "System prompt", Tokens: 2_000, Measurement: "estimated", Sources: []contextledger.SourceUsage{{Source: "eylu", Tokens: 2_000}}},
+			{Category: contextledger.CategoryUserMessage, Label: "User messages", Tokens: 3_000, Measurement: "estimated"},
+			{Category: contextledger.CategoryBuiltinToolSchema, Label: "Tool schemas", Tokens: 4_000, Measurement: "estimated"},
+			{Category: contextledger.CategorySkillBody, Label: "Skill body", Tokens: 1_000, Measurement: "estimated"},
+			{Category: contextledger.CategoryMCPToolSchema, Label: "MCP tool schemas", Tokens: 2_000, Measurement: "estimated"},
+			{Category: contextledger.CategoryOutputReserve, Label: "Output reserve", Tokens: 8_000, Measurement: "estimated"},
+		},
+	}
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.contextStarted = true
+	model.snapshot.Context = report
+	compact := model.renderContext()
+	for _, expected := range []string{"Context map", "default · gpt-5.6-sol", "10% used", "◆", "◇", "System", "Conversation", "Tools", "Skills", "MCP", "180K free"} {
+		if !strings.Contains(compact, expected) {
+			t.Fatalf("compact context missing %q:\n%s", expected, compact)
+		}
+	}
+	if strings.Contains(compact, "Categories") {
+		t.Fatalf("compact context unexpectedly expanded:\n%s", compact)
+	}
+
+	model.contextExpand = true
+	expanded := model.renderContext()
+	for _, expected := range []string{"Details", "Categories", "System prompt", "eylu", "Compression", "40K → 12K", "Provider usage", "9K input · 1.2K output"} {
+		if !strings.Contains(expanded, expected) {
+			t.Fatalf("expanded context missing %q:\n%s", expected, expanded)
+		}
+	}
+
+	model.snapshot.Context = contextledger.Report{InputTokens: 12_400, TotalTokens: 12_400, Categories: []contextledger.CategoryUsage{{Category: contextledger.CategoryAgentMessage, Label: "Agent messages", Tokens: 12_400}}}
+	model.contextExpand = false
+	unknown := model.renderContext()
+	if !strings.Contains(unknown, "Limit unknown · 12.4K tokens tracked") || strings.Contains(unknown, "% used") {
+		t.Fatalf("unknown context:\n%s", unknown)
 	}
 }
 
@@ -623,7 +777,20 @@ func TestViewportContentStartsAtEmptyInputCursorColumnAndKeepsHeaderPosition(t *
 			}
 		}
 	}
-	assertInset("timeline")
+	timelineAligned := false
+	for _, line := range strings.Split(ansi.Strip(model.renderViewport()), "\n") {
+		if !strings.Contains(line, "Aligned response") {
+			continue
+		}
+		left := lipgloss.Width(line) - lipgloss.Width(strings.TrimLeft(line, " "))
+		if left != view.Cursor.Position.X {
+			t.Fatalf("timeline column=%d cursor column=%d line=%q", left, view.Cursor.Position.X, line)
+		}
+		timelineAligned = true
+	}
+	if !timelineAligned {
+		t.Fatal("aligned timeline response is missing")
+	}
 
 	model.screen = screenProviders
 	model.snapshot.Providers = []ProviderItem{{Name: "work", Adapter: "openai_responses", Model: "model", Active: true}}
@@ -824,12 +991,13 @@ func TestStaticNarrowViewportPasswordMaskAndContextPanel(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)}
 	backend := &fakeBackend{snapshot: Snapshot{
 		Mode: "auto", Provider: "work-provider-with-long-name", Model: "model-with-a-very-long-id",
-		Context:   contextledger.Report{InputTokens: 50, OutputReserve: 10, TotalTokens: 60, ContextWindow: 100, LimitKnown: true, Percent: 60, Categories: []contextledger.CategoryUsage{{Label: "User messages", Tokens: 50, Percent: 100, Measurement: "estimated"}}},
+		Context:   contextledger.Report{InputTokens: 50, OutputReserve: 10, TotalTokens: 60, ContextWindow: 100, LimitKnown: true, Percent: 60, Categories: []contextledger.CategoryUsage{{Category: contextledger.CategoryUserMessage, Label: "User messages", Tokens: 50, Percent: 100, Measurement: "estimated"}}},
 		Providers: []ProviderItem{{Name: "work", Adapter: "openai_responses", Model: "model", Active: true}},
 		Skills:    []SkillItem{{Name: "demo-skill", Source: "project", Status: "active", Activated: true}},
 	}}
 	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Clock: clock, Width: 40, Height: 16})
 	model.snapshot = backend.snapshot
+	model.contextStarted = true
 	model.timeline = []timelineItem{
 		{kind: timelineMessage, role: "user", text: "检查中文和 narrow layout"},
 		{kind: timelineMessage, role: "agent", text: "# Result\n完成"},
@@ -857,7 +1025,7 @@ func TestStaticNarrowViewportPasswordMaskAndContextPanel(t *testing.T) {
 	model.screen = screenContext
 	model.contextExpand = true
 	model.refreshViewport()
-	if content := model.viewport.GetContent(); !strings.Contains(content, "Context") || !strings.Contains(content, "[==================]") {
+	if content := model.viewport.GetContent(); !strings.Contains(content, "Context map") || !strings.Contains(content, "◆") || !strings.Contains(content, "Conversation") || !strings.Contains(content, "Categories") {
 		t.Fatalf("context panel = %q", content)
 	}
 }

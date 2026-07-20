@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	contextledger "Eylu/internal/context"
 	"Eylu/internal/protocol"
 )
 
@@ -175,7 +177,7 @@ func (m *Model) setViewportHeight(height int) {
 }
 
 func (m *Model) refreshViewport() {
-	wasBottom := m.viewport.AtBottom() || m.followOutput
+	wasBottom := m.viewport.AtBottom() || (m.followOutput && m.screen == screenChat)
 	var content string
 	switch m.screen {
 	case screenProviders:
@@ -296,24 +298,15 @@ func (m *Model) renderTokenActivity() string {
 }
 
 func (m *Model) renderThinkingActivity() string {
-	switch m.state {
-	case StateWaitingFirstToken, StateStreaming, StatePreparingTool:
-	default:
-		return ""
+	if m.reasoningActive {
+		return "thinking"
 	}
-	bytesPerToken := m.activity.TokenBytesPerToken
-	if bytesPerToken <= 0 {
-		bytesPerToken = 4
-	}
-	if m.roundReasoningExact {
-		if m.roundReasoningTokens > 0 {
-			return fmt.Sprintf("thinking %d tokens", m.roundReasoningTokens)
+	if m.reasoningSeen {
+		duration := m.reasoningElapsed.Round(time.Second)
+		if duration < time.Second {
+			duration = time.Second
 		}
-		return ""
-	}
-	if m.reasoningBytes > 0 {
-		estimatedTokens := (m.reasoningBytes + bytesPerToken - 1) / bytesPerToken
-		return fmt.Sprintf("thinking ≈%d tokens", estimatedTokens)
+		return "thought for " + duration.String()
 	}
 	return ""
 }
@@ -326,21 +319,43 @@ func (m *Model) renderStatus() string {
 	if m.queuedMode != "" {
 		mode += " -> " + m.queuedMode
 	}
-	report := m.snapshot.Context
-	contextText := fmt.Sprintf("%d tokens", report.TotalTokens)
-	if report.LimitKnown {
-		contextText = fmt.Sprintf("%.1f%% context", report.Percent)
+	report := m.displayContextReport()
+	fullLeft := fmt.Sprintf("%s · Context %s tokens", mode, formatTokenCount(report.TotalTokens))
+	compactLeft := fullLeft
+	if report.LimitKnown && report.ContextWindow > 0 {
+		used := roundedContextPercent(report)
+		fullLeft = fmt.Sprintf("%s · Context %d%% left · Context %d%% used", mode, 100-used, used)
+		compactLeft = fmt.Sprintf("%s · %d%% left · %d%% used", mode, 100-used, used)
 	}
-	left := fmt.Sprintf("%s  %s", mode, contextText)
-	right := truncateColumns(string(m.state), max(0, m.width-1))
-	left = truncateColumns(left, max(0, m.width-lipgloss.Width(right)-1))
-	space := max(0, m.width-lipgloss.Width(left)-lipgloss.Width(right))
-	return m.styles.Status.Render(left + strings.Repeat(" ", space) + right)
+	inset := m.viewportLeftInset()
+	available := max(0, m.width-inset)
+	right := statusHint(m.state)
+	left := fullLeft
+	if lipgloss.Width(fullLeft)+1+lipgloss.Width(right) > available && lipgloss.Width(compactLeft) < lipgloss.Width(fullLeft) {
+		left = compactLeft
+	}
+	left = truncateColumns(left, available)
+	rightAvailable := available - lipgloss.Width(left) - 1
+	if rightAvailable < 8 {
+		right = ""
+	} else {
+		right = truncateColumns(right, rightAvailable)
+	}
+	line := strings.Repeat(" ", inset) + m.styles.Status.Render(left)
+	if right != "" {
+		gap := max(1, m.width-lipgloss.Width(line)-lipgloss.Width(right))
+		line += strings.Repeat(" ", gap) + m.renderStatusHint(right)
+	}
+	return padWidth(line, m.width)
 }
 
 func (m *Model) renderTimeline() string {
 	var output strings.Builder
 	contentWidth := m.viewportContentWidth()
+	output.WriteString(m.renderBanner())
+	if len(m.timeline) > 0 {
+		output.WriteString("\n\n")
+	}
 	for index := range m.timeline {
 		item := &m.timeline[index]
 		switch item.kind {
@@ -355,6 +370,9 @@ func (m *Model) renderTimeline() string {
 				continue
 			}
 			fmt.Fprintf(&output, "%s\n", m.renderTool(item.tool))
+			if next, ok := m.nextVisibleTimelineKind(index); ok && next != timelineTool {
+				output.WriteByte('\n')
+			}
 		case timelineNotice:
 			style := m.styles.Status
 			if item.err {
@@ -371,6 +389,46 @@ func (m *Model) renderTimeline() string {
 		timeline += m.renderInlineTaskPanel()
 	}
 	return timeline
+}
+
+func (m *Model) nextVisibleTimelineKind(index int) (timelineKind, bool) {
+	for next := index + 1; next < len(m.timeline); next++ {
+		item := m.timeline[next]
+		if item.kind == timelineTool && (item.tool == nil || item.tool.name == "todolist") {
+			continue
+		}
+		return item.kind, true
+	}
+	return "", false
+}
+
+func (m *Model) renderBanner() string {
+	const art = "    ______   __  __    __    __  __\n" +
+		"   / ____/  / / / /   / /   / / / /\n" +
+		"  / __/    / /_/ /   / /   / / / /\n" +
+		" / /___    \\__, /   / /   / /_/ /\n" +
+		"/_____/    /____/   /_/    \\__,_/"
+	workspace := m.workspace
+	if m.snapshot.Workspace != "" {
+		workspace = m.snapshot.Workspace
+	}
+	if workspace == "" {
+		workspace = "."
+	}
+	workspace = filepath.ToSlash(filepath.Clean(workspace))
+	version := strings.TrimSpace(m.version)
+	if version == "" {
+		version = "dev"
+	} else if version != "dev" && !strings.HasPrefix(strings.ToLower(version), "v") {
+		version = "v" + version
+	}
+	separator := "  ·  "
+	pathWidth := max(0, m.viewportContentWidth()-lipgloss.Width(version)-lipgloss.Width(separator))
+	meta := version
+	if pathWidth > 0 {
+		meta += separator + truncateMiddleColumns(workspace, pathWidth)
+	}
+	return m.styles.Accent.Bold(true).Render(art) + "\n\n" + m.styles.Muted.Render(meta)
 }
 
 func (m *Model) renderTimelineMarkdown(item *timelineItem) string {
@@ -775,30 +833,220 @@ func (m *Model) renderSkills() string {
 }
 
 func (m *Model) renderContext() string {
-	report := m.snapshot.Context
+	report := m.displayContextReport()
 	var output strings.Builder
-	limit := "unknown"
-	if report.LimitKnown {
-		limit = fmt.Sprintf("%d", report.ContextWindow)
+	width := m.viewportContentWidth()
+	provider := report.Provider
+	if provider == "" {
+		provider = m.snapshot.Provider
 	}
-	fmt.Fprintf(&output, "%s\n%d input + %d reserved / %s\n", m.styles.Header.Render("Context"), report.InputTokens, report.OutputReserve, limit)
-	if report.ConfiguredContextWindow > 0 || report.DetectedContextWindow > 0 {
-		fmt.Fprintf(&output, "configured %d  detected %d  effective %d\nsource %s  cached %t  assumed %t  degradations %d\n", report.ConfiguredContextWindow, report.DetectedContextWindow, report.ContextWindow, report.LimitSource, report.LimitCached, report.LimitAssumed, report.LimitDegradations)
+	model := report.Model
+	if model == "" {
+		model = m.snapshot.Model
 	}
-	output.WriteByte('\n')
+	identity := strings.Trim(strings.Join([]string{provider, model}, " · "), " ·")
+	fmt.Fprintf(&output, "%s\n", m.styles.Header.Render("Context map"))
+	if identity != "" {
+		fmt.Fprintf(&output, "%s\n", m.styles.Status.Render(truncateColumns(identity, width)))
+	}
+	if report.LimitKnown && report.ContextWindow > 0 {
+		used := roundedContextPercent(report)
+		barWidth := min(32, max(12, width-13))
+		fmt.Fprintf(&output, "\n%s  %d%% used\n", m.renderContextSignal(report, barWidth), used)
+		free := max(0, report.ContextWindow-report.TotalTokens)
+		fmt.Fprintf(&output, "%s input · %s reserve · %s free\n",
+			formatTokenCount(report.InputTokens), formatTokenCount(report.OutputReserve), formatTokenCount(free))
+	} else {
+		fmt.Fprintf(&output, "\n%s\n", m.styles.Muted.Render("Limit unknown · "+formatTokenCount(report.TotalTokens)+" tokens tracked"))
+		fmt.Fprintf(&output, "%s input · %s reserve\n", formatTokenCount(report.InputTokens), formatTokenCount(report.OutputReserve))
+	}
+	fmt.Fprintf(&output, "%s\n", m.styles.Muted.Render("◆ input  ◇ reserve  · free"))
+
+	fmt.Fprintf(&output, "\n%s\n", m.styles.Header.Render("Footprint"))
+	for _, group := range groupedContextUsage(report) {
+		output.WriteString(m.renderContextUsageRow("◆", group.name, group.tokens, report))
+		output.WriteByte('\n')
+	}
+	if report.OutputReserve > 0 {
+		output.WriteString(m.renderContextUsageRow("◇", "Output reserve", report.OutputReserve, report))
+		output.WriteByte('\n')
+	}
+	if report.LimitKnown && report.ContextWindow > 0 {
+		free := max(0, report.ContextWindow-report.TotalTokens)
+		output.WriteString(m.renderContextUsageRow("·", "Free", free, report))
+		output.WriteByte('\n')
+	}
+
+	if m.contextExpand {
+		m.renderContextDetails(&output, report, width)
+	}
+	footer := "Enter show details · Esc back"
+	if m.contextExpand {
+		footer = "Enter hide details · Esc back"
+	}
+	fmt.Fprintf(&output, "\n%s", m.styles.Muted.Render(footer))
+	return strings.TrimRight(output.String(), "\n")
+}
+
+func (m *Model) displayContextReport() contextledger.Report {
+	report := m.snapshot.Context
+	if m.contextStarted {
+		return report
+	}
+	report.InputTokens = 0
+	report.OutputReserve = 0
+	report.TotalTokens = 0
+	report.Percent = 0
+	report.Categories = nil
+	report.LastUsage = protocol.Usage{}
+	report.CompressionCount = 0
+	report.LastCompression = nil
+	return report
+}
+
+type contextUsageGroup struct {
+	name   string
+	tokens int
+}
+
+func groupedContextUsage(report contextledger.Report) []contextUsageGroup {
+	order := []string{"System", "Conversation", "Tools", "Skills", "MCP", "Model state", "Other"}
+	totals := make(map[string]int, len(order))
 	for _, category := range report.Categories {
-		bar := progressBar(category.Percent, 18)
-		fmt.Fprintf(&output, "%-22s %6d  %s %5.1f%%  %s\n", category.Label, category.Tokens, bar, category.Percent, category.Measurement)
-		if m.contextExpand {
-			for _, source := range category.Sources {
-				fmt.Fprintf(&output, "  %-20s %6d  %5.1f%%\n", truncateColumns(source.Source, 20), source.Tokens, source.Percent)
+		if category.Tokens <= 0 || category.Category == contextledger.CategoryOutputReserve {
+			continue
+		}
+		totals[contextUsageGroupName(category.Category)] += category.Tokens
+	}
+	groups := make([]contextUsageGroup, 0, len(order))
+	for _, name := range order {
+		if totals[name] > 0 {
+			groups = append(groups, contextUsageGroup{name: name, tokens: totals[name]})
+		}
+	}
+	return groups
+}
+
+func contextUsageGroupName(category contextledger.Category) string {
+	switch category {
+	case contextledger.CategorySystemPrompt, contextledger.CategoryTaskState, contextledger.CategoryProjectContext:
+		return "System"
+	case contextledger.CategoryUserMessage, contextledger.CategoryAgentMessage, contextledger.CategorySummary:
+		return "Conversation"
+	case contextledger.CategoryBuiltinToolSchema, contextledger.CategoryBuiltinToolResult:
+		return "Tools"
+	case contextledger.CategorySkillCatalog, contextledger.CategorySkillBody, contextledger.CategorySkillResource:
+		return "Skills"
+	case contextledger.CategoryMCPInstructions, contextledger.CategoryMCPToolSchema, contextledger.CategoryMCPResource, contextledger.CategoryMCPToolResult:
+		return "MCP"
+	case contextledger.CategoryDriverState:
+		return "Model state"
+	default:
+		return "Other"
+	}
+}
+
+func (m *Model) renderContextUsageRow(marker, label string, tokens int, report contextledger.Report) string {
+	markerStyle := m.styles.Accent
+	if marker == "◇" {
+		markerStyle = m.styles.Tool
+	} else if marker == "·" {
+		markerStyle = m.styles.Muted
+	}
+	value := fmt.Sprintf("%-15s %8s", truncateColumns(label, 15), formatTokenCount(tokens))
+	if report.LimitKnown && report.ContextWindow > 0 {
+		percent := int(math.Round(float64(tokens) / float64(report.ContextWindow) * 100))
+		value += fmt.Sprintf(" %4d%%", max(0, percent))
+	}
+	return markerStyle.Render(marker) + " " + value
+}
+
+func (m *Model) renderContextSignal(report contextledger.Report, width int) string {
+	width = max(1, width)
+	denominator := max(report.ContextWindow, report.TotalTokens)
+	if denominator <= 0 {
+		return m.styles.Muted.Render(strings.Repeat("·", width))
+	}
+	inputCells := int(math.Round(float64(report.InputTokens) / float64(denominator) * float64(width)))
+	reserveCells := int(math.Round(float64(report.OutputReserve) / float64(denominator) * float64(width)))
+	if report.InputTokens > 0 && inputCells == 0 {
+		inputCells = 1
+	}
+	if report.OutputReserve > 0 && reserveCells == 0 {
+		reserveCells = 1
+	}
+	if inputCells+reserveCells > width {
+		reserveCells = max(0, width-inputCells)
+	}
+	if report.TotalTokens >= report.ContextWindow {
+		reserveCells = max(0, width-inputCells)
+	}
+	freeCells := max(0, width-inputCells-reserveCells)
+	return m.styles.Accent.Render(strings.Repeat("◆", min(width, inputCells))) +
+		m.styles.Tool.Render(strings.Repeat("◇", min(max(0, width-inputCells), reserveCells))) +
+		m.styles.Muted.Render(strings.Repeat("·", freeCells))
+}
+
+func (m *Model) renderContextDetails(output *strings.Builder, report contextledger.Report, width int) {
+	fmt.Fprintf(output, "\n%s\n", m.styles.Header.Render("Details"))
+	limitLine := fmt.Sprintf("Configured %s · detected %s · effective %s",
+		formatOptionalTokenCount(report.ConfiguredContextWindow), formatOptionalTokenCount(report.DetectedContextWindow), formatOptionalTokenCount(report.ContextWindow))
+	output.WriteString(wrapPlain(limitLine, width) + "\n")
+	source := report.LimitSource
+	if source == "" {
+		source = "unknown"
+	}
+	flags := []string{"source " + source}
+	if report.LimitCached {
+		flags = append(flags, "cached")
+	}
+	if report.LimitAssumed {
+		flags = append(flags, "assumed")
+	}
+	if report.LimitDegradations > 0 {
+		flags = append(flags, fmt.Sprintf("%d degradations", report.LimitDegradations))
+	}
+	output.WriteString(m.styles.Muted.Render(wrapPlain(strings.Join(flags, " · "), width)) + "\n")
+
+	fmt.Fprintf(output, "\n%s\n", m.styles.Header.Render("Categories"))
+	for _, category := range report.Categories {
+		if category.Tokens <= 0 {
+			continue
+		}
+		line := fmt.Sprintf("%-18s %8s", truncateColumns(category.Label, 18), formatTokenCount(category.Tokens))
+		if report.LimitKnown && report.ContextWindow > 0 {
+			percent := int(math.Round(float64(category.Tokens) / float64(report.ContextWindow) * 100))
+			line += fmt.Sprintf(" %4d%%", max(0, percent))
+		}
+		if width >= 48 && category.Measurement != "" {
+			line += "  " + category.Measurement
+		}
+		output.WriteString(truncateColumns(line, width) + "\n")
+		for _, source := range category.Sources {
+			if source.Tokens <= 0 {
+				continue
 			}
+			sourceLine := fmt.Sprintf("  %-16s %8s", truncateColumns(source.Source, 16), formatTokenCount(source.Tokens))
+			if report.LimitKnown && report.ContextWindow > 0 {
+				percent := int(math.Round(float64(source.Tokens) / float64(report.ContextWindow) * 100))
+				sourceLine += fmt.Sprintf(" %4d%%", max(0, percent))
+			}
+			output.WriteString(m.styles.Muted.Render(truncateColumns(sourceLine, width)) + "\n")
+		}
+	}
+	if report.CompressionCount > 0 {
+		fmt.Fprintf(output, "\n%s\n", m.styles.Header.Render("Compression"))
+		fmt.Fprintf(output, "%d compactions\n", report.CompressionCount)
+		if report.LastCompression != nil {
+			line := fmt.Sprintf("Last %s → %s · %d turns summarized",
+				formatTokenCount(report.LastCompression.BeforeTokens), formatTokenCount(report.LastCompression.AfterTokens), report.LastCompression.OmittedTurns)
+			output.WriteString(m.styles.Muted.Render(wrapPlain(line, width)) + "\n")
 		}
 	}
 	if report.LastUsage.InputTokens > 0 || report.LastUsage.OutputTokens > 0 {
-		fmt.Fprintf(&output, "\nProvider usage  %d input  %d output", report.LastUsage.InputTokens, report.LastUsage.OutputTokens)
+		fmt.Fprintf(output, "\n%s\n", m.styles.Header.Render("Provider usage"))
+		fmt.Fprintf(output, "%s input · %s output\n", formatTokenCount(report.LastUsage.InputTokens), formatTokenCount(report.LastUsage.OutputTokens))
 	}
-	return output.String()
 }
 
 func (m *Model) renderTasks() string {
@@ -1217,6 +1465,56 @@ func stateLabel(state OperationState) string {
 	}
 }
 
+func statusHint(state OperationState) string {
+	switch state {
+	case StateIdle:
+		return "Ready when you are"
+	case StateConnecting:
+		return "Opening a line"
+	case StateFetchingModels:
+		return "Gathering models"
+	case StateWaitingFirstToken:
+		return "Thinking it through"
+	case StateStreaming:
+		return "Putting it into words"
+	case StatePreparingTool:
+		return "Planning the next move"
+	case StateExecutingTool:
+		return "Making it happen"
+	case StateAwaitingApproval:
+		return "Your call"
+	case StateAwaitingInput:
+		return "Your turn"
+	case StateRetryBackoff:
+		return "Trying again shortly"
+	case StateCancelling:
+		return "Wrapping up"
+	case StateCancelled, StateInterrupted:
+		return "Paused"
+	case StateCompleted:
+		return "All set"
+	case StateFailed:
+		return "Needs attention"
+	default:
+		return "Ready when you are"
+	}
+}
+
+func (m *Model) renderStatusHint(value string) string {
+	switch m.state {
+	case StateCompleted:
+		return m.styles.Active.Render(value)
+	case StateFailed, StateCancelled, StateInterrupted:
+		return m.styles.Error.Render(value)
+	case StateAwaitingApproval, StateAwaitingInput, StateRetryBackoff:
+		return m.styles.Warning.Render(value)
+	case StateConnecting, StateFetchingModels, StateWaitingFirstToken, StateStreaming, StatePreparingTool, StateExecutingTool, StateCancelling:
+		return m.styles.Loading.Render(value)
+	default:
+		return m.styles.Status.Render(value)
+	}
+}
+
 func activityLabel(state OperationState) string {
 	switch state {
 	case StateConnecting:
@@ -1254,10 +1552,37 @@ func formatByteCount(value int) string {
 	return fmt.Sprintf("%.1f MiB", float64(value)/(1024*1024))
 }
 
-func progressBar(percent float64, width int) string {
-	filled := int(percent / 100 * float64(width))
-	filled = min(width, max(0, filled))
-	return "[" + strings.Repeat("=", filled) + strings.Repeat(" ", width-filled) + "]"
+func formatTokenCount(value int) string {
+	if value < 0 {
+		value = 0
+	}
+	switch {
+	case value < 1_000:
+		return fmt.Sprintf("%d", value)
+	case value < 1_000_000:
+		return trimCompactDecimal(float64(value)/1_000) + "K"
+	default:
+		return trimCompactDecimal(float64(value)/1_000_000) + "M"
+	}
+}
+
+func formatOptionalTokenCount(value int) string {
+	if value <= 0 {
+		return "unknown"
+	}
+	return formatTokenCount(value)
+}
+
+func trimCompactDecimal(value float64) string {
+	return strings.TrimSuffix(fmt.Sprintf("%.1f", value), ".0")
+}
+
+func roundedContextPercent(report contextledger.Report) int {
+	percent := report.Percent
+	if report.ContextWindow > 0 {
+		percent = float64(report.TotalTokens) / float64(report.ContextWindow) * 100
+	}
+	return min(100, max(0, int(math.Round(percent))))
 }
 
 func padWidth(value string, width int) string {
@@ -1342,4 +1667,20 @@ func truncateColumns(value string, width int) string {
 		runes = runes[:len(runes)-1]
 	}
 	return string(runes) + "..."
+}
+
+func truncateMiddleColumns(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	total := ansi.StringWidth(value)
+	if total <= width {
+		return value
+	}
+	if width <= 3 {
+		return strings.Repeat(".", width)
+	}
+	leftWidth := (width - 3 + 1) / 2
+	rightWidth := width - 3 - leftWidth
+	return ansi.Cut(value, 0, leftWidth) + "..." + ansi.Cut(value, total-rightWidth, total)
 }

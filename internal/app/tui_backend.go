@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"Eylu/internal/agent"
+	"Eylu/internal/buildinfo"
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
@@ -63,7 +64,7 @@ func (r *runtime) runTUI(ctx context.Context, conversation *agent.Conversation, 
 	backend := &tuiBackend{runtime: r, conversation: conversation, manager: manager, opts: opts, skills: registry, skillSession: session, repositoryIndex: repositoryIndex}
 	return ui.Run(backend, ui.Options{
 		Context: ctx, Input: r.stdin, Output: r.stdout, NoAnimation: opts.noAnimation || os.Getenv("TERM") == "dumb",
-		NoColor: os.Getenv("NO_COLOR") != "", Clock: nil,
+		Version: buildinfo.Current().Version, Workspace: r.workspace, NoColor: os.Getenv("NO_COLOR") != "", Clock: nil,
 	})
 }
 

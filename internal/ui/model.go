@@ -137,10 +137,12 @@ func newPlanGate(width int) *planGateState {
 }
 
 type Model struct {
-	backend Backend
-	context context.Context
-	clock   Clock
-	styles  Styles
+	backend   Backend
+	context   context.Context
+	clock     Clock
+	styles    Styles
+	version   string
+	workspace string
 
 	input          textarea.Model
 	viewport       viewport.Model
@@ -177,6 +179,7 @@ type Model struct {
 	filesLoading               bool
 	filesDiagnostic            string
 	queuedMode                 string
+	contextStarted             bool
 	draft                      string
 	promptHistory              []string
 	historyIndex               int
@@ -186,24 +189,25 @@ type Model struct {
 	copyToast                  string
 	copyToastSequence          uint64
 
-	operationID          string
-	operationMode        string
-	eventChannel         chan Event
-	cancel               context.CancelFunc
-	startedAt            time.Time
-	retryAt              time.Time
-	cancelRequested      bool
-	activity             Activity
-	operationUsage       protocol.Usage
-	streamedBytes        int
-	reasoningBytes       int
-	roundReasoningTokens int
-	roundReasoningExact  bool
-	followOutput         bool
-	animation            bool
-	noColor              bool
-	operationSeq         uint64
-	markdown             markdownRenderCache
+	operationID        string
+	operationMode      string
+	eventChannel       chan Event
+	cancel             context.CancelFunc
+	startedAt          time.Time
+	retryAt            time.Time
+	cancelRequested    bool
+	activity           Activity
+	operationUsage     protocol.Usage
+	streamedBytes      int
+	reasoningStartedAt time.Time
+	reasoningElapsed   time.Duration
+	reasoningActive    bool
+	reasoningSeen      bool
+	followOutput       bool
+	animation          bool
+	noColor            bool
+	operationSeq       uint64
+	markdown           markdownRenderCache
 }
 
 type snapshotMsg struct {
@@ -319,7 +323,11 @@ func NewModel(backend Backend, options Options) *Model {
 		viewport: viewport.New(viewport.WithWidth(width), viewport.WithHeight(max(5, height-8))),
 		spinner:  spinner.New(spinner.WithSpinner(spinner.Dot)), modelFilter: filter, approvalReason: approvalReason,
 		width: width, height: height, screen: screenChat, state: StateIdle, followOutput: true, historyIndex: -1,
+		version: strings.TrimSpace(options.Version), workspace: strings.TrimSpace(options.Workspace),
 		animation: !options.NoAnimation, noColor: options.NoColor, clipboardWrite: clipboardWrite,
+	}
+	if model.version == "" {
+		model.version = "dev"
 	}
 	model.viewport.SoftWrap = true
 	model.resize(width, height)
@@ -380,6 +388,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.snapshot = typed.snapshot
 			m.promptHistory = append(m.promptHistory[:0], typed.snapshot.PromptHistory...)
+			if sessionChanged {
+				m.contextStarted = len(typed.snapshot.PromptHistory) > 0
+			} else if len(typed.snapshot.PromptHistory) > 0 || m.busy() {
+				m.contextStarted = true
+			}
 			if sessionChanged || m.historyIndex >= len(m.promptHistory) {
 				m.resetHistoryNavigation()
 			}
@@ -586,6 +599,9 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 	switch event.Kind {
 	case EventState:
 		m.state = event.State
+		if event.State == StateWaitingFirstToken {
+			m.resetReasoningRound()
+		}
 		if event.State == StateRetryBackoff && event.RetryAfter > 0 {
 			m.retryAt = m.clock.Now().Add(event.RetryAfter)
 		}
@@ -601,26 +617,26 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 			if event.Activity.InputTokens > 0 {
 				m.activity.InputTokens = event.Activity.InputTokens
 				m.activity.InputExact = event.Activity.InputExact
-				m.reasoningBytes = 0
-				m.roundReasoningTokens = 0
-				m.roundReasoningExact = false
 			}
 		}
 	case EventReasoningDelta:
 		m.activity.Reasoning = true
 		m.activity.ReasoningKnown = true
-		m.reasoningBytes += len([]byte(event.Delta))
+		m.beginReasoning()
 	case EventTextDelta:
+		m.finishReasoning()
 		m.state = StateStreaming
 		m.streamedBytes += len([]byte(event.Delta))
 		m.appendAgentDelta(event.Delta)
 	case EventToolCallDelta:
+		m.finishReasoning()
 		m.state = StatePreparingTool
 		if event.ToolCallDelta != nil {
 			m.streamedBytes += len([]byte(event.ToolCallDelta.Delta))
 			m.applyToolCallDelta(*event.ToolCallDelta)
 		}
 	case EventToolStart:
+		m.finishReasoning()
 		m.state = StateExecutingTool
 		if event.ToolCall != nil {
 			m.startTool(*event.ToolCall)
@@ -652,6 +668,7 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 			m.snapshot.Context = *event.Context
 		}
 	case EventUsage:
+		m.finishReasoning()
 		if event.Usage != nil && event.Usage.Exact {
 			m.operationUsage.InputTokens += event.Usage.InputTokens
 			m.operationUsage.OutputTokens += event.Usage.OutputTokens
@@ -660,9 +677,6 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 			m.activity.InputTokens = event.Usage.InputTokens
 			m.activity.InputExact = true
 			m.streamedBytes = 0
-			m.reasoningBytes = 0
-			m.roundReasoningTokens = event.Usage.ReasoningTokens
-			m.roundReasoningExact = true
 		}
 	case EventNotice:
 		m.appendNotice(event.Notice, event.Error)
@@ -672,6 +686,31 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		command = tea.Batch(command, waitEventCmd(m.operationID, m.eventChannel))
 	}
 	return m, command
+}
+
+func (m *Model) resetReasoningRound() {
+	m.reasoningStartedAt = time.Time{}
+	m.reasoningElapsed = 0
+	m.reasoningActive = false
+	m.reasoningSeen = false
+}
+
+func (m *Model) beginReasoning() {
+	if m.reasoningActive {
+		return
+	}
+	m.reasoningStartedAt = m.clock.Now()
+	m.reasoningActive = true
+	m.reasoningSeen = true
+}
+
+func (m *Model) finishReasoning() {
+	if !m.reasoningActive {
+		return
+	}
+	m.reasoningElapsed += max(time.Duration(0), m.clock.Now().Sub(m.reasoningStartedAt))
+	m.reasoningStartedAt = time.Time{}
+	m.reasoningActive = false
 }
 
 func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -718,8 +757,15 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case screenContext:
 		if key == "esc" {
 			m.screen = screenChat
+			m.refreshViewport()
 		} else if key == "enter" {
 			m.contextExpand = !m.contextExpand
+			m.refreshViewport()
+			m.viewport.GotoTop()
+		} else {
+			updated, command := m.viewport.Update(message)
+			m.viewport = updated
+			return m, command
 		}
 		return m, nil
 	case screenTasks:
@@ -920,12 +966,11 @@ func (m *Model) startRequest(submission Submission) (tea.Model, tea.Cmd) {
 	m.cancel = cancel
 	m.cancelRequested = false
 	m.startedAt = m.clock.Now()
+	m.contextStarted = true
 	m.activity = Activity{TokenBytesPerToken: 4}
 	m.operationUsage = protocol.Usage{}
 	m.streamedBytes = 0
-	m.reasoningBytes = 0
-	m.roundReasoningTokens = 0
-	m.roundReasoningExact = false
+	m.resetReasoningRound()
 	m.state = StateConnecting
 	m.draft = submission.Text
 	m.input.Reset()
@@ -957,6 +1002,8 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "/context":
 		m.screen = screenContext
+		m.refreshViewport()
+		m.viewport.GotoTop()
 		return m, m.loadSnapshotCmd()
 	case "/tasks":
 		m.screen = screenTasks

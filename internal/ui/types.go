@@ -227,6 +227,8 @@ type Options struct {
 	Context        context.Context
 	Input          io.Reader
 	Output         io.Writer
+	Version        string
+	Workspace      string
 	NoAnimation    bool
 	NoColor        bool
 	Clock          Clock
