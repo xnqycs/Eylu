@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -10,6 +11,24 @@ import (
 
 	"Eylu/internal/protocol"
 )
+
+// ToolResultContent preserves the historical plain-string representation and
+// carries richer MCP result fields when a tool returned them.
+func ToolResultContent(result protocol.ToolResult) string {
+	if len(result.ContentBlocks) == 0 && len(result.StructuredContent) == 0 {
+		return result.Content
+	}
+	value := struct {
+		Content           string                  `json:"content"`
+		ContentBlocks     []protocol.ContentBlock `json:"content_blocks,omitempty"`
+		StructuredContent json.RawMessage         `json:"structured_content,omitempty"`
+	}{Content: result.Content, ContentBlocks: result.ContentBlocks, StructuredContent: result.StructuredContent}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return result.Content
+	}
+	return string(encoded)
+}
 
 type Capabilities struct {
 	TextStreaming bool `json:"text_streaming"`

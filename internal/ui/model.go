@@ -32,6 +32,8 @@ const (
 	screenContext        screenKind = "context"
 	screenTasks          screenKind = "tasks"
 	screenToolDetail     screenKind = "tool_detail"
+	screenMCP            screenKind = "mcp"
+	screenMCPDetail      screenKind = "mcp_detail"
 )
 
 type timelineKind string
@@ -163,7 +165,14 @@ type Model struct {
 	skillCursor                int
 	modelCursor                int
 	toolCursor                 int
+	mcpCursor                  int
+	mcpCatalogCursor           int
+	mcpTab                     int
 	models                     []string
+	mcpServers                 []MCPServerItem
+	mcpLoading                 bool
+	mcpPollScheduled           bool
+	mcpNotice                  string
 	modelManual                bool
 	contextExpand              bool
 	contextWindowConfirm       *contextWindowConfirmState
@@ -250,6 +259,19 @@ type modelsResultMsg struct {
 	models []string
 	err    error
 }
+
+type mcpServersMsg struct {
+	servers []MCPServerItem
+	err     error
+}
+
+type mcpActionResultMsg struct {
+	server string
+	action MCPAction
+	err    error
+}
+
+type mcpRefreshTickMsg struct{}
 
 type modeResultMsg struct {
 	previous string
@@ -437,6 +459,42 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.filesDiagnostic = ""
 		}
 		return m, m.refreshCompletion()
+	case mcpServersMsg:
+		m.mcpLoading = false
+		if typed.err != nil {
+			m.mcpNotice = typed.err.Error()
+		} else {
+			selected := ""
+			if item, ok := m.selectedMCPServer(); ok {
+				selected = item.Name
+			}
+			m.mcpServers = append(m.mcpServers[:0], typed.servers...)
+			m.mcpCursor = 0
+			for index := range m.mcpServers {
+				if m.mcpServers[index].Name == selected {
+					m.mcpCursor = index
+					break
+				}
+			}
+			m.mcpCursor = clampCursor(m.mcpCursor, len(m.mcpServers))
+			m.mcpNotice = ""
+		}
+		m.refreshViewport()
+		return m, m.mcpPollCmd()
+	case mcpActionResultMsg:
+		if typed.err != nil {
+			m.mcpNotice = typed.err.Error()
+		} else {
+			m.mcpNotice = fmt.Sprintf("%s: %s complete", typed.server, typed.action)
+		}
+		m.refreshViewport()
+		return m, m.fetchMCPServersCmd()
+	case mcpRefreshTickMsg:
+		m.mcpPollScheduled = false
+		if m.screen == screenMCP || m.screen == screenMCPDetail {
+			return m, m.fetchMCPServersCmd()
+		}
+		return m, nil
 	case clipboardResultMsg:
 		return m, m.handleClipboardResult(typed)
 	case copyToastExpiredMsg:
@@ -811,6 +869,8 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleContextWindowConfirmKey(message)
 	case screenSkills:
 		return m.handleSkillsKey(key)
+	case screenMCP, screenMCPDetail:
+		return m.handleMCPKey(key)
 	case screenContext:
 		if key == "esc" {
 			m.screen = screenChat
@@ -1080,6 +1140,12 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 	case "/providers":
 		m.screen = screenProviders
 		return m, m.loadSnapshotCmd()
+	case "/mcp":
+		m.screen = screenMCP
+		m.mcpTab = 0
+		m.mcpCatalogCursor = 0
+		m.mcpNotice = ""
+		return m, m.fetchMCPServersCmd()
 	case "/provider":
 		if len(fields) >= 2 && fields[1] == "add" {
 			m.form = newProviderFormModel(ProviderForm{Adapter: "openai_responses"}, m.viewportContentWidth())
@@ -1105,7 +1171,7 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 			return m.requestMode(fields[1])
 		}
 	case "/help":
-		m.appendNotice("/new /compact /tasks /context /skills /skill /providers /provider /model /effort /gradient /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
+		m.appendNotice("/new /compact /tasks /context /skills /skill /providers /provider /model /mcp /effort /gradient /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
 		m.refreshViewport()
 		return m, nil
 	}
@@ -1583,6 +1649,22 @@ func (m *Model) loadSnapshotCmd() tea.Cmd {
 		snapshot, err := m.backend.Snapshot(m.context)
 		return snapshotMsg{snapshot: snapshot, err: err}
 	}
+}
+
+func (m *Model) fetchMCPServersCmd() tea.Cmd {
+	m.mcpLoading = true
+	return func() tea.Msg {
+		servers, err := m.backend.MCPServers(m.context)
+		return mcpServersMsg{servers: servers, err: err}
+	}
+}
+
+func (m *Model) mcpPollCmd() tea.Cmd {
+	if (m.screen != screenMCP && m.screen != screenMCPDetail) || m.mcpPollScheduled {
+		return nil
+	}
+	m.mcpPollScheduled = true
+	return m.clock.Tick(time.Second, func(time.Time) tea.Msg { return mcpRefreshTickMsg{} })
 }
 
 func (m *Model) commandCmd(line string) tea.Cmd {

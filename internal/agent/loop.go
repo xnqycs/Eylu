@@ -30,6 +30,12 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 	if executor == nil {
 		return protocol.ModelResponse{}, fmt.Errorf("tool executor is nil")
 	}
+	baseTools := registryToolsExcluding(executor.Registry, runtime.MCPToolServers)
+	var err error
+	runtime, err = c.refreshMCPRuntime(runtime, executor, baseTools)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
 	maxTurns := options.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = 20
@@ -48,6 +54,12 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		if err := ctx.Err(); err != nil {
 			return protocol.ModelResponse{}, err
 		}
+		runtime, err = c.refreshMCPRuntime(runtime, executor, baseTools)
+		if err != nil {
+			return protocol.ModelResponse{}, err
+		}
+		definitions = executor.Definitions()
+		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 		parallelToolCalls := executor.ParallelLimit() > 1 && runtime.Driver.Capabilities().ParallelTools
 		response, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit)
 		if err != nil {
@@ -76,6 +88,12 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			}
 			seenCalls[call.ID] = struct{}{}
 		}
+		runtime, err = c.refreshMCPRuntime(runtime, executor, baseTools)
+		if err != nil {
+			return last, err
+		}
+		definitions = executor.Definitions()
+		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 		hooks := tool.BatchHooks{}
 		if emit != nil {
 			hooks.OnStart = func(call protocol.ToolCall) error {
@@ -109,6 +127,45 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 	}
 	return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("agent iteration limit exceeded (%d)", maxTurns)}
+}
+
+func (c *Conversation) refreshMCPRuntime(runtime Runtime, executor *tool.Executor, baseTools []tool.Tool) (Runtime, error) {
+	if runtime.MCPState == nil {
+		return runtime, nil
+	}
+	state := filterMCPRuntimeState(runtime.MCPState(), runtime.PermissionMode)
+	registry := tool.NewRegistry()
+	for _, item := range append(append([]tool.Tool(nil), baseTools...), state.Tools...) {
+		if err := registry.Register(item); err != nil {
+			return runtime, fmt.Errorf("refresh MCP tool registry: %w", err)
+		}
+	}
+	executor.Registry = registry
+	runtime.MCPContexts = state.Contexts
+	runtime.MCPToolServers = state.ToolServers
+	runtime.MCPFingerprint = state.Fingerprint
+	if err := c.applyRuntime(runtime); err != nil {
+		return runtime, err
+	}
+	c.rebuildLedger(runtime)
+	return runtime, nil
+}
+
+func registryToolsExcluding(registry *tool.Registry, excluded map[string]string) []tool.Tool {
+	if registry == nil {
+		return nil
+	}
+	definitions := registry.Definitions()
+	items := make([]tool.Tool, 0, len(definitions))
+	for _, definition := range definitions {
+		if excluded[definition.Name] != "" {
+			continue
+		}
+		if item, ok := registry.Get(definition.Name); ok {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 func (c *Conversation) captureTodoListResult(result protocol.ToolResult) {

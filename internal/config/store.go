@@ -73,13 +73,33 @@ type FileProviderRouting struct {
 }
 
 type FileMCPServerConfig struct {
-	Command          *string   `toml:"command,omitempty"`
-	Args             *[]string `toml:"args,omitempty"`
-	Environment      *[]string `toml:"environment,omitempty"`
-	WorkingDirectory *string   `toml:"working_directory,omitempty"`
-	ReadOnlyTools    *[]string `toml:"read_only_tools,omitempty"`
-	TimeoutSeconds   *int      `toml:"timeout_seconds,omitempty"`
-	Disabled         *bool     `toml:"disabled,omitempty"`
+	Transport              *string             `toml:"transport,omitempty"`
+	Enabled                *bool               `toml:"enabled,omitempty"`
+	Required               *bool               `toml:"required,omitempty"`
+	StartupTimeoutSeconds  *int                `toml:"startup_timeout_seconds,omitempty"`
+	CallTimeoutSeconds     *int                `toml:"call_timeout_seconds,omitempty"`
+	AllowTools             *[]string           `toml:"allow_tools,omitempty"`
+	DenyTools              *[]string           `toml:"deny_tools,omitempty"`
+	Command                *string             `toml:"command,omitempty"`
+	Args                   *[]string           `toml:"args,omitempty"`
+	Environment            *[]string           `toml:"environment,omitempty"`
+	WorkingDirectory       *string             `toml:"working_directory,omitempty"`
+	URL                    *string             `toml:"url,omitempty"`
+	Headers                *map[string]string  `toml:"headers,omitempty"`
+	EnvironmentHeaders     *map[string]string  `toml:"environment_headers,omitempty"`
+	BearerTokenEnvironment *string             `toml:"bearer_token_environment,omitempty"`
+	OAuth                  *FileMCPOAuthConfig `toml:"oauth,omitempty"`
+	ReadOnlyTools          *[]string           `toml:"read_only_tools,omitempty"`
+	TimeoutSeconds         *int                `toml:"timeout_seconds,omitempty"`
+	Disabled               *bool               `toml:"disabled,omitempty"`
+}
+
+type FileMCPOAuthConfig struct {
+	Issuer                  *string   `toml:"issuer,omitempty"`
+	ClientID                *string   `toml:"client_id,omitempty"`
+	ClientSecretEnvironment *string   `toml:"client_secret_environment,omitempty"`
+	Scopes                  *[]string `toml:"scopes,omitempty"`
+	RedirectURL             *string   `toml:"redirect_url,omitempty"`
 }
 
 type FileSkillRegistry struct {
@@ -351,10 +371,45 @@ func (s *Store) DeleteSkillRegistry(name string) (Config, error) {
 	})
 }
 
+func (s *Store) MCPServerSource(name string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mcpServerSourceLocked(name)
+}
+
+func (s *Store) SetMCPServerEnabled(name string, enabled bool) (Config, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path, ok := s.mcpServerSourceLocked(name)
+	if !ok {
+		return Config{}, fmt.Errorf("mcp server %q does not exist", name)
+	}
+	return s.updateLocked(path, func(file *FileConfig) {
+		server := file.MCPServers[name]
+		server.Enabled = ptr(enabled)
+		server.Disabled = nil
+		file.MCPServers[name] = server
+	})
+}
+
+func (s *Store) mcpServerSourceLocked(name string) (string, bool) {
+	for index := len(s.paths) - 1; index >= 0; index-- {
+		path := s.paths[index]
+		if _, ok := s.files[path].MCPServers[name]; ok {
+			return path, true
+		}
+	}
+	return "", false
+}
+
 func (s *Store) update(mutator func(*FileConfig)) (Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	file, err := cloneFileConfig(s.files[s.path])
+	return s.updateLocked(s.path, mutator)
+}
+
+func (s *Store) updateLocked(path string, mutator func(*FileConfig)) (Config, error) {
+	file, err := cloneFileConfig(s.files[path])
 	if err != nil {
 		return Config{}, err
 	}
@@ -363,12 +418,12 @@ func (s *Store) update(mutator func(*FileConfig)) (Config, error) {
 	for path, existing := range s.files {
 		files[path] = existing
 	}
-	files[s.path] = file
+	files[path] = file
 	resolved, err := s.resolve(files)
 	if err != nil {
 		return Config{}, err
 	}
-	if err := saveFileConfig(s.path, file); err != nil {
+	if err := saveFileConfig(path, file); err != nil {
 		return Config{}, err
 	}
 	s.files = files
@@ -380,6 +435,9 @@ func (s *Store) resolve(files map[string]FileConfig) (Config, error) {
 	result := Default()
 	for _, path := range s.paths {
 		if file, ok := files[path]; ok {
+			if err := validateFileConfig(file); err != nil {
+				return Config{}, fmt.Errorf("config %s: %w", path, err)
+			}
 			applyFileConfig(&result, file)
 		}
 	}
@@ -388,6 +446,18 @@ func (s *Store) resolve(files map[string]FileConfig) (Config, error) {
 		return Config{}, err
 	}
 	return result, nil
+}
+
+func validateFileConfig(file FileConfig) error {
+	for name, server := range file.MCPServers {
+		if server.Enabled != nil && server.Disabled != nil {
+			return fmt.Errorf("mcp server %q enabled and disabled fields conflict", name)
+		}
+		if server.TimeoutSeconds != nil && (server.StartupTimeoutSeconds != nil || server.CallTimeoutSeconds != nil) {
+			return fmt.Errorf("mcp server %q timeout_seconds conflicts with startup_timeout_seconds or call_timeout_seconds", name)
+		}
+	}
+	return nil
 }
 
 func saveFileConfig(path string, file FileConfig) error {
@@ -489,13 +559,52 @@ func applyFileProvider(provider *ProviderConfig, file FileProviderConfig) {
 }
 
 func applyFileMCPServer(server *MCPServerConfig, file FileMCPServerConfig) {
+	assign(server.Transport, file.Transport, func(value string) { server.Transport = value })
+	if file.Enabled != nil {
+		server.Enabled = *file.Enabled
+		server.Disabled = !*file.Enabled
+	}
+	if file.Disabled != nil {
+		server.Disabled = *file.Disabled
+		server.Enabled = !*file.Disabled
+	}
+	assign(server.Required, file.Required, func(value bool) { server.Required = value })
+	if file.StartupTimeoutSeconds != nil {
+		server.StartupTimeoutSeconds = *file.StartupTimeoutSeconds
+		server.TimeoutSeconds = *file.StartupTimeoutSeconds
+	}
+	if file.TimeoutSeconds != nil {
+		server.TimeoutSeconds = *file.TimeoutSeconds
+		server.StartupTimeoutSeconds = *file.TimeoutSeconds
+	}
+	assign(server.CallTimeoutSeconds, file.CallTimeoutSeconds, func(value int) { server.CallTimeoutSeconds = value })
+	assignSlice(file.AllowTools, func(value []string) { server.AllowTools = value })
+	assignSlice(file.DenyTools, func(value []string) { server.DenyTools = value })
 	assign(server.Command, file.Command, func(value string) { server.Command = value })
 	assignSlice(file.Args, func(value []string) { server.Args = value })
 	assignSlice(file.Environment, func(value []string) { server.Environment = value })
 	assign(server.WorkingDirectory, file.WorkingDirectory, func(value string) { server.WorkingDirectory = value })
+	assign(server.URL, file.URL, func(value string) { server.URL = value })
+	if file.Headers != nil {
+		server.Headers = cloneStringMap(*file.Headers)
+	}
+	if file.EnvironmentHeaders != nil {
+		server.EnvironmentHeaders = cloneStringMap(*file.EnvironmentHeaders)
+	}
+	assign(server.BearerTokenEnvironment, file.BearerTokenEnvironment, func(value string) { server.BearerTokenEnvironment = value })
+	if file.OAuth != nil {
+		if server.OAuth == nil {
+			server.OAuth = &MCPOAuthConfig{}
+		}
+		assign(server.OAuth.Issuer, file.OAuth.Issuer, func(value string) { server.OAuth.Issuer = value })
+		assign(server.OAuth.ClientID, file.OAuth.ClientID, func(value string) { server.OAuth.ClientID = value })
+		assign(server.OAuth.ClientSecretEnvironment, file.OAuth.ClientSecretEnvironment, func(value string) { server.OAuth.ClientSecretEnvironment = value })
+		assignSlice(file.OAuth.Scopes, func(value []string) { server.OAuth.Scopes = value })
+		assign(server.OAuth.RedirectURL, file.OAuth.RedirectURL, func(value string) { server.OAuth.RedirectURL = value })
+	}
 	assignSlice(file.ReadOnlyTools, func(value []string) { server.ReadOnlyTools = value })
-	assign(server.TimeoutSeconds, file.TimeoutSeconds, func(value int) { server.TimeoutSeconds = value })
-	assign(server.Disabled, file.Disabled, func(value bool) { server.Disabled = value })
+	server.Transport = server.EffectiveTransport()
+	server.Enabled = !server.Disabled
 }
 
 func applyFileSkillRegistry(registry *SkillRegistryConfig, file FileSkillRegistry) {
@@ -620,6 +729,31 @@ func fileProvider(provider ProviderConfig) FileProviderConfig {
 
 func fileMCPServer(server MCPServerConfig) FileMCPServerConfig {
 	file := FileMCPServerConfig{}
+	if transport := server.EffectiveTransport(); transport != MCPTransportStdio {
+		file.Transport = ptr(transport)
+	}
+	if !server.IsEnabled() {
+		file.Enabled = ptr(false)
+	}
+	if server.Required {
+		file.Required = ptr(true)
+	}
+	if server.StartupTimeoutSeconds != 0 {
+		file.StartupTimeoutSeconds = ptr(server.StartupTimeoutSeconds)
+	} else if server.TimeoutSeconds != 0 {
+		file.StartupTimeoutSeconds = ptr(server.TimeoutSeconds)
+	}
+	if server.CallTimeoutSeconds != 0 {
+		file.CallTimeoutSeconds = ptr(server.CallTimeoutSeconds)
+	}
+	if server.AllowTools != nil {
+		value := append([]string(nil), server.AllowTools...)
+		file.AllowTools = &value
+	}
+	if server.DenyTools != nil {
+		value := append([]string(nil), server.DenyTools...)
+		file.DenyTools = &value
+	}
 	if server.Command != "" {
 		file.Command = ptr(server.Command)
 	}
@@ -634,15 +768,47 @@ func fileMCPServer(server MCPServerConfig) FileMCPServerConfig {
 	if server.WorkingDirectory != "" {
 		file.WorkingDirectory = ptr(server.WorkingDirectory)
 	}
+	if server.URL != "" {
+		file.URL = ptr(server.URL)
+	}
+	if server.Headers != nil {
+		value := cloneStringMap(server.Headers)
+		file.Headers = &value
+	}
+	if server.EnvironmentHeaders != nil {
+		value := cloneStringMap(server.EnvironmentHeaders)
+		file.EnvironmentHeaders = &value
+	}
+	if server.BearerTokenEnvironment != "" {
+		file.BearerTokenEnvironment = ptr(server.BearerTokenEnvironment)
+	}
+	if server.OAuth != nil {
+		file.OAuth = fileMCPOAuth(*server.OAuth)
+	}
 	if server.ReadOnlyTools != nil {
 		value := append([]string(nil), server.ReadOnlyTools...)
 		file.ReadOnlyTools = &value
 	}
-	if server.TimeoutSeconds != 0 {
-		file.TimeoutSeconds = ptr(server.TimeoutSeconds)
+	return file
+}
+
+func fileMCPOAuth(oauth MCPOAuthConfig) *FileMCPOAuthConfig {
+	file := &FileMCPOAuthConfig{}
+	if oauth.Issuer != "" {
+		file.Issuer = ptr(oauth.Issuer)
 	}
-	if server.Disabled {
-		file.Disabled = ptr(true)
+	if oauth.ClientID != "" {
+		file.ClientID = ptr(oauth.ClientID)
+	}
+	if oauth.ClientSecretEnvironment != "" {
+		file.ClientSecretEnvironment = ptr(oauth.ClientSecretEnvironment)
+	}
+	if oauth.Scopes != nil {
+		value := append([]string(nil), oauth.Scopes...)
+		file.Scopes = &value
+	}
+	if oauth.RedirectURL != "" {
+		file.RedirectURL = ptr(oauth.RedirectURL)
 	}
 	return file
 }

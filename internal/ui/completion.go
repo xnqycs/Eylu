@@ -106,6 +106,7 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 		{label: "/effort", description: "Choose the reasoning effort", insert: "/effort ", expand: true},
 		{label: "/gradient", description: "Toggle the animated theme gradient", insert: "/gradient ", expand: true},
 		{label: "/help", description: "Show available commands", insert: "/help"},
+		{label: "/mcp", description: "Inspect and manage MCP servers", insert: "/mcp"},
 		{label: "/mode", description: "Change permission mode", insert: "/mode "},
 		{label: "/model", description: "Choose the active model", insert: "/model"},
 		{label: "/new", description: "Start a new session", insert: "/new"},

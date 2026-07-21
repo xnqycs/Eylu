@@ -19,7 +19,7 @@
 | 可控的工具权限 | `manual`、`plan`、`auto`、`full` 四种模式覆盖审阅、规划和自动执行 |
 | 长会话管理 | 持久化会话、Prompt 历史、任务状态和上下文账本，支持压缩与恢复 |
 | 多 Provider 路由 | 按任务、能力、上下文窗口、优先级和成本选择模型 |
-| 可扩展能力 | 支持 Agent Skills、签名 Skill 仓库以及 MCP stdio server |
+| 可扩展能力 | 支持 Agent Skills、签名 Skill 仓库以及 MCP stdio、Streamable HTTP、SSE server |
 
 Eylu 提供全屏 TUI，也能以纯文本、JSON 或 JSONL 方式接入脚本和自动化流程。
 
@@ -224,22 +224,55 @@ eylu skills validate ".agents/skills/code-review"
 eylu skills diagnose --output json
 ```
 
-MCP server 通过 stdio 子进程接入，配置放在 Eylu TOML 中：
+MCP server 支持 `stdio`、`streamable_http` 和 `sse` 三种传输，配置放在 Eylu TOML 中：
 
 ```toml
 [mcp_servers.repository]
+transport = "stdio"
+enabled = true
+required = true
 command = "repo-mcp"
 args = ["serve", "--stdio"]
 environment = ["REPO_MCP_TOKEN"]
 working_directory = "."
 read_only_tools = ["search", "inspect"]
-timeout_seconds = 30
+allow_tools = ["search", "inspect", "status"]
+deny_tools = ["status"]
+startup_timeout_seconds = 15
+call_timeout_seconds = 60
+
+[mcp_servers.remote]
+transport = "streamable_http"
+url = "https://mcp.example.com/rpc"
+environment_headers = { "X-API-Key" = "REMOTE_MCP_API_KEY" }
+bearer_token_environment = "REMOTE_MCP_BEARER_TOKEN"
+
+[mcp_servers.remote.oauth]
+issuer = "https://auth.example.com"
+client_id = "eylu"
+client_secret_environment = "REMOTE_MCP_CLIENT_SECRET"
+scopes = ["mcp:tools", "mcp:resources"]
 ```
+
+`sse` server 使用相同的 `url`、Header 和 OAuth 字段。静态 Header 可通过 `headers` 配置；敏感值推荐通过 `environment_headers`、`bearer_token_environment` 或 OAuth 注入。兼容字段 `disabled`、`timeout_seconds`、`read_only_tools` 继续有效。默认启动、调用和 OAuth/交互超时分别为 15、60、30 秒。
 
 ```bash
 eylu mcp list
 eylu mcp inspect repository --output json
+eylu mcp tools repository
+eylu mcp tool repository search
+eylu mcp resources repository
+eylu mcp resource repository "repo://status"
+eylu mcp prompts repository
+eylu mcp prompt repository review --arguments '{"branch":"main"}'
+eylu mcp reconnect repository
+eylu mcp enable repository
+eylu mcp disable repository
+eylu mcp login remote
+eylu mcp logout remote
 ```
+
+TUI 输入 `/mcp` 可打开 server 列表和详情面板，查看工具、资源、提示词、连接状态与诊断，并执行重连、启停和登录操作。目录变更通知会原子更新工具注册表、上下文和缓存指纹。OAuth 凭据保存在 `~/.eylu/mcp_credentials.json`，写入采用文件锁、原子替换及平台权限收紧。
 
 MCP 环境变量按名称白名单转发；只读工具仍需在本地配置中显式声明。
 

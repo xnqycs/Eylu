@@ -16,8 +16,11 @@ import (
 )
 
 const (
-	SchemaVersion       = 1
-	ReasoningEffortAuto = "auto"
+	SchemaVersion              = 1
+	ReasoningEffortAuto        = "auto"
+	MCPTransportStdio          = "stdio"
+	MCPTransportStreamableHTTP = "streamable_http"
+	MCPTransportSSE            = "sse"
 )
 
 var allReasoningEfforts = []string{"auto", "low", "medium", "high", "xhigh", "max", "ultra"}
@@ -57,13 +60,63 @@ type ProviderRouting struct {
 }
 
 type MCPServerConfig struct {
-	Command          string   `toml:"command" json:"command"`
-	Args             []string `toml:"args,omitempty" json:"args,omitempty"`
-	Environment      []string `toml:"environment,omitempty" json:"environment,omitempty"`
-	WorkingDirectory string   `toml:"working_directory,omitempty" json:"working_directory,omitempty"`
-	ReadOnlyTools    []string `toml:"read_only_tools,omitempty" json:"read_only_tools,omitempty"`
-	TimeoutSeconds   int      `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
-	Disabled         bool     `toml:"disabled,omitempty" json:"disabled,omitempty"`
+	Transport              string            `toml:"transport,omitempty" json:"transport"`
+	Enabled                bool              `toml:"enabled,omitempty" json:"enabled"`
+	Required               bool              `toml:"required,omitempty" json:"required,omitempty"`
+	StartupTimeoutSeconds  int               `toml:"startup_timeout_seconds,omitempty" json:"startup_timeout_seconds,omitempty"`
+	CallTimeoutSeconds     int               `toml:"call_timeout_seconds,omitempty" json:"call_timeout_seconds,omitempty"`
+	AllowTools             []string          `toml:"allow_tools,omitempty" json:"allow_tools,omitempty"`
+	DenyTools              []string          `toml:"deny_tools,omitempty" json:"deny_tools,omitempty"`
+	Command                string            `toml:"command,omitempty" json:"command,omitempty"`
+	Args                   []string          `toml:"args,omitempty" json:"args,omitempty"`
+	Environment            []string          `toml:"environment,omitempty" json:"environment,omitempty"`
+	WorkingDirectory       string            `toml:"working_directory,omitempty" json:"working_directory,omitempty"`
+	URL                    string            `toml:"url,omitempty" json:"url,omitempty"`
+	Headers                map[string]string `toml:"headers,omitempty" json:"headers,omitempty"`
+	EnvironmentHeaders     map[string]string `toml:"environment_headers,omitempty" json:"environment_headers,omitempty"`
+	BearerTokenEnvironment string            `toml:"bearer_token_environment,omitempty" json:"bearer_token_environment,omitempty"`
+	OAuth                  *MCPOAuthConfig   `toml:"oauth,omitempty" json:"oauth,omitempty"`
+	ReadOnlyTools          []string          `toml:"read_only_tools,omitempty" json:"read_only_tools,omitempty"`
+	TimeoutSeconds         int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	Disabled               bool              `toml:"disabled,omitempty" json:"disabled,omitempty"`
+}
+
+type MCPOAuthConfig struct {
+	Issuer                  string   `toml:"issuer,omitempty" json:"issuer,omitempty"`
+	ClientID                string   `toml:"client_id,omitempty" json:"client_id,omitempty"`
+	ClientSecretEnvironment string   `toml:"client_secret_environment,omitempty" json:"client_secret_environment,omitempty"`
+	Scopes                  []string `toml:"scopes,omitempty" json:"scopes,omitempty"`
+	RedirectURL             string   `toml:"redirect_url,omitempty" json:"redirect_url,omitempty"`
+}
+
+func (server MCPServerConfig) EffectiveTransport() string {
+	transport := strings.ToLower(strings.TrimSpace(server.Transport))
+	if transport == "" {
+		return MCPTransportStdio
+	}
+	return transport
+}
+
+func (server MCPServerConfig) IsEnabled() bool {
+	return !server.Disabled
+}
+
+func (server MCPServerConfig) StartupTimeout(fallback time.Duration) time.Duration {
+	seconds := server.StartupTimeoutSeconds
+	if seconds <= 0 {
+		seconds = server.TimeoutSeconds
+	}
+	if seconds <= 0 {
+		return fallback
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (server MCPServerConfig) CallTimeout(fallback time.Duration) time.Duration {
+	if server.CallTimeoutSeconds <= 0 {
+		return fallback
+	}
+	return time.Duration(server.CallTimeoutSeconds) * time.Second
 }
 
 type SkillRegistryConfig struct {
@@ -264,7 +317,16 @@ func (c Config) Clone() Config {
 	for name, server := range c.MCPServers {
 		server.Args = append([]string(nil), server.Args...)
 		server.Environment = append([]string(nil), server.Environment...)
+		server.AllowTools = append([]string(nil), server.AllowTools...)
+		server.DenyTools = append([]string(nil), server.DenyTools...)
 		server.ReadOnlyTools = append([]string(nil), server.ReadOnlyTools...)
+		server.Headers = cloneStringMap(server.Headers)
+		server.EnvironmentHeaders = cloneStringMap(server.EnvironmentHeaders)
+		if server.OAuth != nil {
+			oauth := *server.OAuth
+			oauth.Scopes = append([]string(nil), server.OAuth.Scopes...)
+			server.OAuth = &oauth
+		}
 		clone.MCPServers[name] = server
 	}
 	clone.SkillRegistries = make(map[string]SkillRegistryConfig, len(c.SkillRegistries))
@@ -398,39 +460,165 @@ func ValidateProvider(name string, p ProviderConfig) error {
 }
 
 var (
-	mcpNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
-	envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	mcpNamePattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+	envNamePattern    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	headerNamePattern = regexp.MustCompile("^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$")
 )
 
 func validateMCPServer(name string, server MCPServerConfig) error {
 	if !mcpNamePattern.MatchString(name) {
 		return fmt.Errorf("mcp server name %q is invalid", name)
 	}
-	if server.Disabled {
+	if server.Enabled && server.Disabled {
+		return fmt.Errorf("mcp server %q enabled and disabled values conflict", name)
+	}
+	if !server.IsEnabled() {
 		return nil
 	}
-	if strings.TrimSpace(server.Command) == "" {
-		return fmt.Errorf("mcp server %q command is required", name)
+	transport := server.EffectiveTransport()
+	switch transport {
+	case MCPTransportStdio, MCPTransportStreamableHTTP, MCPTransportSSE:
+	default:
+		return fmt.Errorf("mcp server %q transport %q is invalid", name, server.Transport)
 	}
-	if server.TimeoutSeconds < 0 {
-		return fmt.Errorf("mcp server %q timeout cannot be negative", name)
+	if server.StartupTimeoutSeconds < 0 || server.CallTimeoutSeconds < 0 || server.TimeoutSeconds < 0 {
+		return fmt.Errorf("mcp server %q timeouts cannot be negative", name)
 	}
-	seenEnvironment := make(map[string]bool, len(server.Environment))
-	for _, environment := range server.Environment {
+	if server.StartupTimeoutSeconds > 0 && server.TimeoutSeconds > 0 && server.StartupTimeoutSeconds != server.TimeoutSeconds {
+		return fmt.Errorf("mcp server %q startup_timeout_seconds and timeout_seconds conflict", name)
+	}
+	if err := validateMCPEnvironment(name, server.Environment); err != nil {
+		return err
+	}
+	allow, err := validateMCPToolList(name, "allow_tools", server.AllowTools)
+	if err != nil {
+		return err
+	}
+	deny, err := validateMCPToolList(name, "deny_tools", server.DenyTools)
+	if err != nil {
+		return err
+	}
+	for toolName := range allow {
+		if deny[toolName] {
+			return fmt.Errorf("mcp server %q tool %q appears in both allow_tools and deny_tools", name, toolName)
+		}
+	}
+	if _, err := validateMCPToolList(name, "read_only_tools", server.ReadOnlyTools); err != nil {
+		return err
+	}
+
+	switch transport {
+	case MCPTransportStdio:
+		if strings.TrimSpace(server.Command) == "" {
+			return fmt.Errorf("mcp server %q command is required for stdio transport", name)
+		}
+		if server.URL != "" || len(server.Headers) > 0 || len(server.EnvironmentHeaders) > 0 || server.BearerTokenEnvironment != "" || server.OAuth != nil {
+			return fmt.Errorf("mcp server %q contains HTTP fields for stdio transport", name)
+		}
+	case MCPTransportStreamableHTTP, MCPTransportSSE:
+		if server.Command != "" || len(server.Args) > 0 || len(server.Environment) > 0 || server.WorkingDirectory != "" {
+			return fmt.Errorf("mcp server %q contains stdio fields for %s transport", name, transport)
+		}
+		if err := validateMCPRemoteURL(name, "url", server.URL); err != nil {
+			return err
+		}
+		if err := validateMCPHeaders(name, server.Headers, server.EnvironmentHeaders); err != nil {
+			return err
+		}
+		if server.BearerTokenEnvironment != "" && !envNamePattern.MatchString(server.BearerTokenEnvironment) {
+			return fmt.Errorf("mcp server %q bearer_token_environment must be a variable name", name)
+		}
+		if server.OAuth != nil {
+			if err := validateMCPOAuth(name, *server.OAuth); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateMCPEnvironment(name string, values []string) error {
+	seen := make(map[string]bool, len(values))
+	for _, environment := range values {
 		if !envNamePattern.MatchString(environment) {
 			return fmt.Errorf("mcp server %q environment entry %q must be a variable name without a value", name, environment)
 		}
-		if seenEnvironment[environment] {
+		if seen[environment] {
 			return fmt.Errorf("mcp server %q environment entry %q is duplicated", name, environment)
 		}
-		seenEnvironment[environment] = true
+		seen[environment] = true
 	}
-	seenTools := make(map[string]bool, len(server.ReadOnlyTools))
-	for _, toolName := range server.ReadOnlyTools {
-		if strings.TrimSpace(toolName) == "" || seenTools[toolName] {
-			return fmt.Errorf("mcp server %q contains an invalid or duplicate read-only tool name", name)
+	return nil
+}
+
+func validateMCPToolList(name, field string, values []string) (map[string]bool, error) {
+	seen := make(map[string]bool, len(values))
+	for _, toolName := range values {
+		if strings.TrimSpace(toolName) == "" || seen[toolName] {
+			return nil, fmt.Errorf("mcp server %q contains an invalid or duplicate %s tool name", name, field)
 		}
-		seenTools[toolName] = true
+		seen[toolName] = true
+	}
+	return seen, nil
+}
+
+func validateMCPRemoteURL(name, field, value string) error {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && loopbackHost(parsed.Hostname()))) {
+		return fmt.Errorf("mcp server %q %s must use HTTPS or loopback HTTP", name, field)
+	}
+	return nil
+}
+
+func validateMCPHeaders(name string, headers, environmentHeaders map[string]string) error {
+	seen := make(map[string]string, len(headers)+len(environmentHeaders))
+	validate := func(header, value, field string, environment bool) error {
+		if !headerNamePattern.MatchString(header) {
+			return fmt.Errorf("mcp server %q %s contains invalid header name %q", name, field, header)
+		}
+		canonical := strings.ToLower(header)
+		if previous := seen[canonical]; previous != "" {
+			return fmt.Errorf("mcp server %q header %q is duplicated across %s and %s", name, header, previous, field)
+		}
+		seen[canonical] = field
+		if environment {
+			if !envNamePattern.MatchString(value) {
+				return fmt.Errorf("mcp server %q environment header %q must reference a variable name", name, header)
+			}
+		} else if strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("mcp server %q header %q contains a line break", name, header)
+		}
+		return nil
+	}
+	for header, value := range headers {
+		if err := validate(header, value, "headers", false); err != nil {
+			return err
+		}
+	}
+	for header, environment := range environmentHeaders {
+		if err := validate(header, environment, "environment_headers", true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMCPOAuth(name string, oauth MCPOAuthConfig) error {
+	if oauth.Issuer != "" {
+		if err := validateMCPRemoteURL(name, "oauth issuer", oauth.Issuer); err != nil {
+			return err
+		}
+	}
+	if oauth.ClientSecretEnvironment != "" && !envNamePattern.MatchString(oauth.ClientSecretEnvironment) {
+		return fmt.Errorf("mcp server %q oauth client_secret_environment must be a variable name", name)
+	}
+	if _, err := validateMCPToolList(name, "oauth scopes", oauth.Scopes); err != nil {
+		return err
+	}
+	if oauth.RedirectURL != "" {
+		if err := validateMCPRemoteURL(name, "oauth redirect_url", oauth.RedirectURL); err != nil {
+			return err
+		}
 	}
 	return nil
 }

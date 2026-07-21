@@ -214,6 +214,115 @@ func (m *Model) handleSkillsKey(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) handleMCPKey(key string) (tea.Model, tea.Cmd) {
+	if m.screen == screenMCP {
+		switch key {
+		case "esc":
+			m.screen = screenChat
+			m.refreshViewport()
+			return m, nil
+		case "up", "k":
+			m.mcpCursor = clampCursor(m.mcpCursor-1, len(m.mcpServers))
+		case "down", "j":
+			m.mcpCursor = clampCursor(m.mcpCursor+1, len(m.mcpServers))
+		case "enter":
+			if len(m.mcpServers) > 0 {
+				m.screen = screenMCPDetail
+				m.mcpTab = 0
+				m.mcpCatalogCursor = 0
+				m.refreshViewport()
+				m.viewport.GotoTop()
+			}
+			return m, nil
+		case "g":
+			return m, m.fetchMCPServersCmd()
+		default:
+			return m.handleMCPActionKey(key)
+		}
+		m.refreshViewport()
+		return m, nil
+	}
+
+	switch key {
+	case "esc":
+		m.screen = screenMCP
+		m.mcpCatalogCursor = 0
+		m.refreshViewport()
+		m.viewport.GotoTop()
+		return m, nil
+	case "tab":
+		m.mcpTab = (m.mcpTab + 1) % 4
+		m.mcpCatalogCursor = 0
+	case "shift+tab":
+		m.mcpTab = (m.mcpTab + 3) % 4
+		m.mcpCatalogCursor = 0
+	case "1", "2", "3", "4":
+		m.mcpTab = int(key[0] - '1')
+		m.mcpCatalogCursor = 0
+	case "up", "k":
+		m.mcpCatalogCursor = clampCursor(m.mcpCatalogCursor-1, m.selectedMCPCatalogLength())
+	case "down", "j":
+		m.mcpCatalogCursor = clampCursor(m.mcpCatalogCursor+1, m.selectedMCPCatalogLength())
+	case "g":
+		return m, m.fetchMCPServersCmd()
+	default:
+		return m.handleMCPActionKey(key)
+	}
+	m.refreshViewport()
+	return m, nil
+}
+
+func (m *Model) handleMCPActionKey(key string) (tea.Model, tea.Cmd) {
+	action := MCPAction("")
+	switch key {
+	case "r":
+		action = MCPActionReconnect
+	case "e":
+		action = MCPActionEnable
+	case "d":
+		action = MCPActionDisable
+	case "l":
+		action = MCPActionLogin
+	case "o":
+		action = MCPActionLogout
+	}
+	server, ok := m.selectedMCPServer()
+	if action == "" || !ok {
+		return m, nil
+	}
+	m.mcpNotice = server.Name + ": " + string(action) + "..."
+	m.refreshViewport()
+	return m, func() tea.Msg {
+		err := m.backend.MCPAction(m.context, server.Name, action)
+		return mcpActionResultMsg{server: server.Name, action: action, err: err}
+	}
+}
+
+func (m *Model) selectedMCPServer() (MCPServerItem, bool) {
+	if len(m.mcpServers) == 0 {
+		return MCPServerItem{}, false
+	}
+	m.mcpCursor = clampCursor(m.mcpCursor, len(m.mcpServers))
+	return m.mcpServers[m.mcpCursor], true
+}
+
+func (m *Model) selectedMCPCatalogLength() int {
+	server, ok := m.selectedMCPServer()
+	if !ok {
+		return 0
+	}
+	switch m.mcpTab {
+	case 1:
+		return len(server.Tools)
+	case 2:
+		return len(server.Resources)
+	case 3:
+		return len(server.Prompts)
+	default:
+		return 0
+	}
+}
+
 func (m *Model) openProviderForm(item ProviderItem) {
 	m.form = newProviderFormModel(ProviderForm{
 		OriginalName: item.Name, Name: item.Name, BaseURL: item.BaseURL, Model: item.Model,

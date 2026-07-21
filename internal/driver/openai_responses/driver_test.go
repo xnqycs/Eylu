@@ -156,6 +156,36 @@ func TestGenerateMapsToolHistory(t *testing.T) {
 	}
 }
 
+func TestResponsesPreservesRichToolResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		input := body["input"].([]any)
+		output := input[len(input)-1].(map[string]any)
+		var rich map[string]any
+		if err := json.Unmarshal([]byte(output["output"].(string)), &rich); err != nil {
+			t.Fatalf("rich tool result was not JSON: %v; output=%#v", err, output)
+		}
+		if rich["content"] != "legacy text" || rich["structured_content"].(map[string]any)["ok"] != true || rich["content_blocks"].([]any)[0].(map[string]any)["text"] != "block text" {
+			t.Fatalf("rich tool result=%#v", rich)
+		}
+		_, _ = w.Write([]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}`))
+	}))
+	defer server.Close()
+	call := protocol.ToolCall{ID: "call-rich", Name: "fixture", Arguments: json.RawMessage(`{}`)}
+	result := protocol.ToolResult{CallID: call.ID, Content: "legacy text", ContentBlocks: []protocol.ContentBlock{{Type: protocol.ContentText, Text: "block text"}}, StructuredContent: json.RawMessage(`{"ok":true}`)}
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{
+		{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "run"}}},
+		{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}},
+		{Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &result}}},
+	}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRemoteStateSendsOnlyNewInputAndChangedSystemBlocks(t *testing.T) {
 	previous := []protocol.Turn{
 		{ID: "system", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "base"}}},

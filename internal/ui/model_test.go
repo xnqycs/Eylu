@@ -33,6 +33,8 @@ type fakeBackend struct {
 	command       string
 	models        []string
 	files         []FileItem
+	mcpServers    []MCPServerItem
+	mcpActions    []string
 	mode          string
 	selection     ModelSelection
 	contextWindow int
@@ -76,6 +78,140 @@ func (b *fakeBackend) SetContextWindow(_ context.Context, _ string, value int) e
 }
 func (b *fakeBackend) FetchModels(context.Context, string) ([]string, error) {
 	return append([]string(nil), b.models...), b.err
+}
+func (b *fakeBackend) MCPServers(context.Context) ([]MCPServerItem, error) {
+	return append([]MCPServerItem(nil), b.mcpServers...), b.err
+}
+func (b *fakeBackend) MCPAction(_ context.Context, server string, action MCPAction) error {
+	b.mcpActions = append(b.mcpActions, server+":"+string(action))
+	return b.err
+}
+
+func TestMCPPanelListsDetailsCatalogsAndActions(t *testing.T) {
+	statuses := []string{"disabled", "connecting", "connected", "needs_auth", "reconnecting", "disconnected", "error"}
+	servers := make([]MCPServerItem, 0, len(statuses))
+	for index, status := range statuses {
+		servers = append(servers, MCPServerItem{
+			Name: fmt.Sprintf("server-%d", index), Status: status, Transport: "streamable_http", ProtocolVersion: "2025-11-25",
+			ToolCount: 1, ResourceCount: 1, PromptCount: 1,
+		})
+	}
+	servers[0].LastError = "authentication expired"
+	servers[0].Implementation = "fixture-mcp"
+	servers[0].Version = "1.2.3"
+	servers[0].ConnectDurationMS = 42
+	servers[0].Config = `{"url":"https://example.test/mcp","authorization":"[REDACTED]"}`
+	servers[0].Capabilities = `{"tools":{"listChanged":true}}`
+	servers[0].Instructions = "Use this server for fixture data."
+	servers[0].Diagnostics = "last ping 12ms"
+	servers[0].Tools = []MCPToolItem{{Name: "lookup", LocalName: "mcp__server_0__lookup", Description: "Look up a fixture", Annotations: `{"readOnlyHint":true}`, InputSchema: `{"type":"object"}`, OutputSchema: `{"type":"object"}`, Permission: "read", Status: "available"}}
+	servers[0].Resources = []MCPResourceItem{{URI: "fixture://catalog", Name: "catalog", Description: "Fixture catalog", MIMEType: "application/json"}}
+	servers[0].Prompts = []MCPPromptItem{{Name: "summarize", Description: "Summarize fixture data", Arguments: `[{"name":"subject"}]`}}
+	backend := &fakeBackend{mcpServers: servers}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 120, Height: 34})
+
+	_, command := model.executeSlash("/mcp")
+	if model.screen != screenMCP || command == nil {
+		t.Fatalf("screen=%s command=%v", model.screen, command)
+	}
+	_, _ = model.Update(command())
+	listView := ansi.Strip(model.View().Content)
+	for _, expected := range append(statuses, "authentication expired") {
+		if !strings.Contains(listView, expected) {
+			t.Fatalf("MCP list missing %q:\n%s", expected, listView)
+		}
+	}
+
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if model.screen != screenMCPDetail {
+		t.Fatalf("detail screen=%s", model.screen)
+	}
+	detailView := ansi.Strip(model.View().Content)
+	for _, expected := range []string{"fixture-mcp", "1.2.3", "42ms", "[REDACTED]", "listChanged", "fixture data", "last ping"} {
+		if !strings.Contains(detailView, expected) {
+			t.Fatalf("MCP detail missing %q:\n%s", expected, detailView)
+		}
+	}
+
+	for _, catalog := range []struct {
+		key      string
+		expected []string
+	}{
+		{key: "2", expected: []string{"Tools", "lookup", "mcp__server_0__lookup", "readOnlyHint", "available"}},
+		{key: "3", expected: []string{"Resources", "fixture://catalog", "application/json"}},
+		{key: "4", expected: []string{"Prompts", "summarize", "subject"}},
+	} {
+		_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: rune(catalog.key[0]), Text: catalog.key}))
+		view := ansi.Strip(model.View().Content)
+		for _, expected := range catalog.expected {
+			if !strings.Contains(view, expected) {
+				t.Fatalf("MCP catalog %s missing %q:\n%s", catalog.key, expected, view)
+			}
+		}
+	}
+
+	for _, action := range []struct {
+		key  rune
+		name MCPAction
+	}{{'r', MCPActionReconnect}, {'e', MCPActionEnable}, {'d', MCPActionDisable}, {'l', MCPActionLogin}, {'o', MCPActionLogout}} {
+		_, actionCommand := model.handleKey(tea.KeyPressMsg(tea.Key{Code: action.key, Text: string(action.key)}))
+		if actionCommand == nil {
+			t.Fatalf("action %s returned no command", action.name)
+		}
+		_, _ = model.Update(actionCommand())
+	}
+	if got := strings.Join(backend.mcpActions, ","); got != "server-0:reconnect,server-0:enable,server-0:disable,server-0:login,server-0:logout" {
+		t.Fatalf("actions=%q", got)
+	}
+}
+
+func TestMCPPollKeepsSingleTimer(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 7, 21, 0, 0, 0, 0, time.UTC)}
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Clock: clock})
+	_, fetch := model.executeSlash("/mcp")
+	_, poll := model.Update(fetch())
+	if poll == nil || !model.mcpPollScheduled {
+		t.Fatalf("poll=%v scheduled=%t", poll, model.mcpPollScheduled)
+	}
+	if duplicate := model.mcpPollCmd(); duplicate != nil {
+		t.Fatal("a second MCP poll was scheduled while one was pending")
+	}
+	_, nextFetch := model.Update(poll())
+	if nextFetch == nil || model.mcpPollScheduled {
+		t.Fatalf("next fetch=%v scheduled=%t", nextFetch, model.mcpPollScheduled)
+	}
+	_, nextPoll := model.Update(nextFetch())
+	if nextPoll == nil || !model.mcpPollScheduled {
+		t.Fatalf("next poll=%v scheduled=%t", nextPoll, model.mcpPollScheduled)
+	}
+}
+
+func TestMCPPanelFitsNarrowViewport(t *testing.T) {
+	backend := &fakeBackend{mcpServers: []MCPServerItem{{
+		Name: "very-long-server-name-for-narrow-terminals", Status: "reconnecting", Transport: "streamable_http", ProtocolVersion: "2025-11-25",
+		LastError: strings.Repeat("connection diagnostic ", 6), Capabilities: `{"tools":{"listChanged":true},"resources":{"subscribe":true}}`,
+		Tools: []MCPToolItem{{Name: "a_very_long_tool_name", Description: strings.Repeat("description ", 8)}},
+	}}}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 18})
+	_, fetch := model.executeSlash("/mcp")
+	_, _ = model.Update(fetch())
+	assertMCPViewFits := func(label string) {
+		t.Helper()
+		view := ansi.Strip(model.View().Content)
+		if lipgloss.Height(view) != 18 {
+			t.Fatalf("%s height=%d\n%s", label, lipgloss.Height(view), view)
+		}
+		for _, line := range strings.Split(view, "\n") {
+			if lipgloss.Width(line) > 40 {
+				t.Fatalf("%s width=%d line=%q", label, lipgloss.Width(line), line)
+			}
+		}
+	}
+	assertMCPViewFits("list")
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	assertMCPViewFits("detail")
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: '2', Text: "2"}))
+	assertMCPViewFits("tools")
 }
 
 func TestOperationStatesStaleMessagesApprovalAndCancellation(t *testing.T) {

@@ -1,24 +1,32 @@
 package app
 
+//lint:file-ignore SA1019 MCP protocol 2025-11-25 compatibility.
+
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"Eylu/internal/agent"
 	"Eylu/internal/buildinfo"
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
+	"Eylu/internal/logging"
+	"Eylu/internal/mcpclient"
 	"Eylu/internal/metrics"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
@@ -31,6 +39,7 @@ import (
 
 type tuiBackend struct {
 	mu              sync.Mutex
+	mcpMu           sync.Mutex
 	runtime         *runtime
 	conversation    *agent.Conversation
 	manager         *provider.Manager
@@ -161,7 +170,10 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	}
 	modelRuntime.PermissionMode = mode.String()
 	modelRuntime.SkillCatalog = b.skills.Catalog()
-	if err := b.runtime.configureMCPRuntime(ctx, cfg, &modelRuntime); err != nil {
+	confirm := b.confirmTools(operationID, opts.approve, emit)
+	ask := b.askUser(operationID, emit)
+	host := buildMCPHostCallbacks(modelRuntime, confirm, ask, openMCPElicitationURL)
+	if err := b.runtime.configureMCPRuntimeWithHost(ctx, cfg, &modelRuntime, host); err != nil {
 		return err
 	}
 	configureTUIContextRuntime(&modelRuntime, b.runtime.workspace, cfg, operationID, emit)
@@ -184,8 +196,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 			contextEvents(event)
 		}
 	}
-	confirm := b.confirmTools(operationID, opts.approve, emit)
-	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, b.askUser(operationID, emit), &tuiAuditSink{operationID: operationID, emit: emit})
+	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, ask, &tuiAuditSink{operationID: operationID, emit: emit})
 	if err != nil {
 		return err
 	}
@@ -608,6 +619,8 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 		return "", nil
 	}
 	switch fields[0] {
+	case "/mcp":
+		return b.handleTUIMCPCommand(ctx, fields[1:])
 	case "/new":
 		b.mu.Lock()
 		opts := b.opts
@@ -726,6 +739,65 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown command %s", fields[0])
 	}
+}
+
+func (b *tuiBackend) handleTUIMCPCommand(ctx context.Context, fields []string) (string, error) {
+	if len(fields) == 0 {
+		return "MCP panel opened.", nil
+	}
+	b.mcpMu.Lock()
+	defer b.mcpMu.Unlock()
+	manager, _, err := b.loadTUIMCPManager(ctx)
+	if err != nil {
+		return "", err
+	}
+	var value any
+	switch fields[0] {
+	case "complete":
+		if len(fields) != 6 {
+			return "", fmt.Errorf("usage: /mcp complete <server> <prompt|resource> <name-or-uri> <argument> <value>")
+		}
+		ref := &sdkmcp.CompleteReference{}
+		if fields[2] == "prompt" {
+			ref.Type, ref.Name = "ref/prompt", fields[3]
+		} else if fields[2] == "resource" {
+			ref.Type, ref.URI = "ref/resource", fields[3]
+		} else {
+			return "", fmt.Errorf("completion reference must be prompt or resource")
+		}
+		value, err = manager.Complete(ctx, fields[1], &sdkmcp.CompleteParams{Ref: ref, Argument: sdkmcp.CompleteParamsArgument{Name: fields[4], Value: fields[5]}})
+	case "subscribe", "unsubscribe":
+		if len(fields) != 3 {
+			return "", fmt.Errorf("usage: /mcp %s <server> <uri>", fields[0])
+		}
+		if fields[0] == "subscribe" {
+			err = manager.SubscribeResource(ctx, fields[1], fields[2])
+		} else {
+			err = manager.UnsubscribeResource(ctx, fields[1], fields[2])
+		}
+		value = map[string]string{"server": fields[1], "action": fields[0], "uri": fields[2]}
+	case "diagnostics", "events":
+		if len(fields) != 2 {
+			return "", fmt.Errorf("usage: /mcp %s <server>", fields[0])
+		}
+		if fields[0] == "events" {
+			value = b.runtime.mcpEventsForServer(fields[1])
+		} else {
+			var detail mcpclient.ServerDetail
+			detail, err = manager.Inspect(fields[1])
+			value = detail.Diagnostics
+		}
+	default:
+		return "", fmt.Errorf("unknown MCP command %s", fields[0])
+	}
+	if err != nil {
+		return "", errors.New(b.runtime.redact(err.Error()))
+	}
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return b.runtime.redact(string(encoded)), nil
 }
 
 func updateGradientSetting(manager *provider.Manager, value string) (bool, error) {
@@ -961,4 +1033,230 @@ func (b *tuiBackend) FetchModels(ctx context.Context, name string) ([]string, er
 	listCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return provider.NewModelLister(&http.Client{Timeout: timeout}).List(listCtx, snapshot.Config.BaseURL, key, snapshot.Config.Headers)
+}
+
+func (b *tuiBackend) MCPServers(ctx context.Context) ([]ui.MCPServerItem, error) {
+	b.mcpMu.Lock()
+	defer b.mcpMu.Unlock()
+	manager, cfg, err := b.loadTUIMCPManager(ctx)
+	if err != nil {
+		return nil, err
+	}
+	servers := manager.List()
+	result := make([]ui.MCPServerItem, 0, len(servers))
+	for _, server := range servers {
+		detail, inspectErr := manager.Inspect(server.Name)
+		if inspectErr != nil {
+			detail.ServerInfo = server
+		}
+		item := buildTUIMCPServerItem(server, detail, cfg.MCPServers[server.Name], b.runtime.redact)
+		if events := b.runtime.mcpEventsForServer(server.Name); len(events) > 0 {
+			item.Diagnostics = strings.TrimSpace(item.Diagnostics + "\n" + tuiMCPJSON(events, b.runtime.redact))
+		}
+		result = append(result, item)
+	}
+	return result, nil
+}
+
+func (b *tuiBackend) MCPAction(ctx context.Context, name string, action ui.MCPAction) error {
+	b.mcpMu.Lock()
+	defer b.mcpMu.Unlock()
+	manager, cfg, err := b.loadTUIMCPManager(ctx)
+	if err != nil {
+		return err
+	}
+	if _, ok := cfg.MCPServers[name]; !ok {
+		return mcpServerNotFound(name)
+	}
+	switch action {
+	case ui.MCPActionReconnect:
+		err = manager.Reconnect(ctx, name)
+	case ui.MCPActionLogin:
+		err = manager.Login(ctx, name)
+	case ui.MCPActionLogout:
+		err = manager.Logout(ctx, name)
+	case ui.MCPActionEnable, ui.MCPActionDisable:
+		loaded, _, loadErr := b.runtime.loadManager()
+		if loadErr != nil {
+			return loadErr
+		}
+		enabled := action == ui.MCPActionEnable
+		_, updateErr := loaded.Store.SetMCPServerEnabled(name, enabled)
+		if updateErr != nil {
+			return updateErr
+		}
+		if enabled {
+			err = manager.Enable(ctx, name)
+		} else {
+			err = manager.Disable(ctx, name)
+		}
+	default:
+		return fmt.Errorf("unsupported MCP action %q", action)
+	}
+	if err != nil {
+		return errors.New(b.runtime.redact(err.Error()))
+	}
+	return nil
+}
+
+func (b *tuiBackend) loadTUIMCPManager(ctx context.Context) (*mcpclient.Manager, config.Config, error) {
+	if b.runtime == nil {
+		return nil, config.Config{}, errors.New("MCP runtime is unavailable")
+	}
+	if b.manager == nil {
+		return nil, config.Config{}, errors.New("MCP configuration is unavailable")
+	}
+	cfg := b.manager.Config()
+	manager, err := b.runtime.loadMCPWithCurrentHost(ctx, cfg)
+	if err != nil {
+		return nil, config.Config{}, err
+	}
+	return manager, cfg, nil
+}
+
+func buildTUIMCPServerItem(server mcpclient.ServerInfo, detail mcpclient.ServerDetail, cfg config.MCPServerConfig, redact func(string) string) ui.MCPServerItem {
+	redact = tuiMCPRedactor(cfg, redact)
+	item := ui.MCPServerItem{
+		Name: server.Name, Status: string(server.Status), Transport: server.Transport, ProtocolVersion: server.ProtocolVersion,
+		Implementation: server.Implementation, Version: server.Version, ToolCount: server.Tools, ResourceCount: server.Resources,
+		PromptCount: server.Prompts, LastError: redact(server.LastError), ConnectDurationMS: server.ConnectDurationMS,
+		Config: tuiMCPConfigView(cfg, redact), Instructions: redact(detail.Instructions),
+		Capabilities: tuiMCPJSON(detail.Capabilities, redact), Diagnostics: tuiMCPJSON(detail.Diagnostics, redact),
+	}
+	for _, toolItem := range detail.Tools {
+		item.Tools = append(item.Tools, ui.MCPToolItem{
+			Name: redact(toolItem.Name), LocalName: redact(toolItem.LocalName), Description: redact(toolItem.Description),
+			Annotations: tuiMCPJSON(toolItem.Annotations, redact), InputSchema: tuiMCPJSON(toolItem.InputSchema, redact),
+			OutputSchema: tuiMCPJSON(toolItem.OutputSchema, redact), Permission: toolItem.Permission, Status: toolItem.Status,
+		})
+	}
+	for _, resource := range detail.Resources {
+		item.Resources = append(item.Resources, ui.MCPResourceItem{
+			URI: redact(resource.URI), Name: redact(firstNonEmpty(resource.Title, resource.Name)), Description: redact(resource.Description), MIMEType: resource.MIMEType,
+		})
+	}
+	for _, prompt := range detail.Prompts {
+		item.Prompts = append(item.Prompts, ui.MCPPromptItem{
+			Name: redact(firstNonEmpty(prompt.Title, prompt.Name)), Description: redact(prompt.Description), Arguments: tuiMCPJSON(prompt.Arguments, redact),
+		})
+	}
+	return item
+}
+
+func tuiMCPConfigView(server config.MCPServerConfig, redact func(string) string) string {
+	headerNames := make([]string, 0, len(server.Headers))
+	for name := range server.Headers {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	environmentHeaderNames := make([]string, 0, len(server.EnvironmentHeaders))
+	for name := range server.EnvironmentHeaders {
+		environmentHeaderNames = append(environmentHeaderNames, name)
+	}
+	sort.Strings(environmentHeaderNames)
+	view := map[string]any{
+		"transport": server.EffectiveTransport(), "enabled": server.IsEnabled(), "required": server.Required,
+		"startup_timeout_seconds": server.StartupTimeoutSeconds, "call_timeout_seconds": server.CallTimeoutSeconds,
+		"allow_tools": server.AllowTools, "deny_tools": server.DenyTools,
+	}
+	if server.Command != "" {
+		view["command"] = server.Command
+		view["argument_count"] = len(server.Args)
+	}
+	if server.WorkingDirectory != "" {
+		view["working_directory"] = server.WorkingDirectory
+	}
+	if server.URL != "" {
+		view["url"] = tuiMCPSafeURL(server.URL)
+	}
+	if len(headerNames) > 0 {
+		view["header_names"] = headerNames
+	}
+	if len(environmentHeaderNames) > 0 {
+		view["environment_header_names"] = environmentHeaderNames
+	}
+	if server.BearerTokenEnvironment != "" {
+		view["bearer_token_environment"] = server.BearerTokenEnvironment
+	}
+	if server.OAuth != nil {
+		view["oauth"] = map[string]any{
+			"issuer": tuiMCPSafeURL(server.OAuth.Issuer), "client_id": server.OAuth.ClientID,
+			"client_secret_environment": server.OAuth.ClientSecretEnvironment, "scopes": server.OAuth.Scopes,
+			"redirect_url": tuiMCPSafeURL(server.OAuth.RedirectURL),
+		}
+	}
+	return tuiMCPJSON(view, redact)
+}
+
+func tuiMCPRedactor(server config.MCPServerConfig, base func(string) string) func(string) string {
+	secrets := make([]string, 0, len(server.Headers)+len(server.EnvironmentHeaders)+len(server.Environment)+2)
+	for _, value := range server.Headers {
+		secrets = append(secrets, value)
+	}
+	for _, environmentName := range server.EnvironmentHeaders {
+		secrets = append(secrets, os.Getenv(environmentName))
+	}
+	if server.BearerTokenEnvironment != "" {
+		secrets = append(secrets, os.Getenv(server.BearerTokenEnvironment))
+	}
+	if server.OAuth != nil && server.OAuth.ClientSecretEnvironment != "" {
+		secrets = append(secrets, os.Getenv(server.OAuth.ClientSecretEnvironment))
+	}
+	for _, assignment := range server.Environment {
+		if _, value, ok := strings.Cut(assignment, "="); ok {
+			secrets = append(secrets, value)
+		}
+	}
+	return func(value string) string {
+		if base != nil {
+			value = base(value)
+		}
+		return logging.Redact(value, secrets...)
+	}
+}
+
+func tuiMCPSafeURL(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "[REDACTED URL]"
+	}
+	parsed.User = nil
+	if parsed.Opaque != "" {
+		parsed.Opaque = "[REDACTED]"
+	}
+	segments := strings.Split(parsed.Path, "/")
+	for index, segment := range segments {
+		if segment != "" {
+			segments[index] = "[REDACTED]"
+		}
+	}
+	parsed.Path = strings.Join(segments, "/")
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func tuiMCPJSON(value any, redact func(string) string) string {
+	if value == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil || string(encoded) == "null" || string(encoded) == "{}" || string(encoded) == "[]" {
+		return ""
+	}
+	if redact == nil {
+		return string(encoded)
+	}
+	return redact(string(encoded))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
