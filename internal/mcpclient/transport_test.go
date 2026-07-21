@@ -32,9 +32,8 @@ func TestBuildTransportTypes(t *testing.T) {
 				if !ok {
 					t.Fatalf("transport type = %T", transport)
 				}
-				if command.Command.Path != os.Args[0] || command.Command.Dir != workspace {
-					t.Fatalf("command = %#v", command.Command)
-				}
+				assertSameFile(t, "command path", command.Command.Path, os.Args[0])
+				assertSameFile(t, "command directory", command.Command.Dir, workspace)
 			},
 		},
 		{
@@ -87,6 +86,21 @@ func TestBuildTransportTypes(t *testing.T) {
 			}
 			test.check(t, transport)
 		})
+	}
+}
+
+func assertSameFile(t *testing.T, label, got, want string) {
+	t.Helper()
+	gotInfo, err := os.Stat(got)
+	if err != nil {
+		t.Fatalf("stat %s %q: %v", label, got, err)
+	}
+	wantInfo, err := os.Stat(want)
+	if err != nil {
+		t.Fatalf("stat expected %s %q: %v", label, want, err)
+	}
+	if !os.SameFile(gotInfo, wantInfo) {
+		t.Fatalf("%s = %q, want same file as %q", label, got, want)
 	}
 }
 
