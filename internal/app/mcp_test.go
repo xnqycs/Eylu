@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -249,6 +250,70 @@ func waitForMCPState(t *testing.T, appRuntime *runtime, condition func(agent.MCP
 	t.Fatalf("timed out waiting for MCP state: %#v", appRuntime.currentMCPState())
 }
 
+func TestLoadMCPWithCurrentHostCannotReplayStaleHostOverSubmit(t *testing.T) {
+	appRuntime := &runtime{workspace: t.TempDir(), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	oldHost := mcpHostCallbacks{createMessage: func(context.Context, *sdkmcp.CreateMessageRequest) (*sdkmcp.CreateMessageResult, error) {
+		return &sdkmcp.CreateMessageResult{}, nil
+	}}
+	newHost := mcpHostCallbacks{createMessageWithTools: func(context.Context, *sdkmcp.CreateMessageWithToolsRequest) (*sdkmcp.CreateMessageWithToolsResult, error) {
+		return &sdkmcp.CreateMessageWithToolsResult{}, nil
+	}}
+	appRuntime.mcpHost = oldHost
+	cfg := config.Default()
+	cfg.MCPServers = nil
+
+	appRuntime.mcpMu.Lock()
+	loadStarted := make(chan struct{})
+	type loadResult struct {
+		manager *mcpclient.Manager
+		err     error
+	}
+	loaded := make(chan loadResult, 1)
+	go func() {
+		close(loadStarted)
+		manager, err := appRuntime.loadMCPWithCurrentHost(context.Background(), cfg)
+		loaded <- loadResult{manager: manager, err: err}
+	}()
+	<-loadStarted
+	waitForBlockedCurrentHostLoad(t)
+
+	// Publish a newer Submit host while the older TUI poll is queued at the
+	// load-order barrier. The poll must snapshot this value after it enters.
+	appRuntime.mcpHostMu.Lock()
+	appRuntime.mcpHost = newHost
+	appRuntime.mcpHostMu.Unlock()
+	appRuntime.mcpMu.Unlock()
+
+	first := <-loaded
+	if first.err != nil {
+		t.Fatal(first.err)
+	}
+	t.Cleanup(func() { _ = appRuntime.closeMCP() })
+	fromSubmit, err := appRuntime.loadMCPWithHost(context.Background(), cfg, newHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.manager != fromSubmit {
+		t.Fatalf("queued TUI poll installed stale host manager: poll=%p submit=%p", first.manager, fromSubmit)
+	}
+}
+
+func waitForBlockedCurrentHostLoad(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	stackBuffer := make([]byte, 1<<20)
+	for time.Now().Before(deadline) {
+		length := goruntime.Stack(stackBuffer, true)
+		for _, stack := range bytes.Split(stackBuffer[:length], []byte("\n\n")) {
+			if bytes.Contains(stack, []byte("loadMCPWithCurrentHost")) && bytes.Contains(stack, []byte("[sync.Mutex.Lock]")) {
+				return
+			}
+		}
+		goruntime.Gosched()
+	}
+	t.Fatal("current-host load did not reach the load-order barrier")
+}
+
 func conversationHasMCPCategory(report contextledger.Report) bool {
 	for _, category := range report.Categories {
 		if category.Blocks > 0 && (category.Category == contextledger.CategoryMCPInstructions || category.Category == contextledger.CategoryMCPToolSchema || category.Category == contextledger.CategoryMCPResource) {
@@ -400,14 +465,15 @@ func TestMCPCommandsRouteArgumentsAndRedactJSON(t *testing.T) {
 }
 
 func TestMCPInspectRedactsConfigInJSONAndText(t *testing.T) {
-	const secret = "inspect-token-must-stay-secret"
+	secrets := []string{"inspect-token-must-stay-secret", "secrettoken123", "urlpathsecret123", "relativeurlsecret123"}
 	cfg := config.Default()
 	cfg.MCPServers = map[string]config.MCPServerConfig{
 		"fixture": {
 			Disabled: true,
 			Command:  "fixture-command",
-			Args:     []string{"--api-key", secret, "--token=" + secret},
-			URL:      "https://user:" + secret + "@example.test/mcp?api_key=" + secret,
+			Args:     []string{"--api-key", secrets[0], "--token", "--secrettoken123"},
+			URL:      "https://user:" + secrets[0] + "@example.test/urlpathsecret123?api_key=" + secrets[0],
+			OAuth:    &config.MCPOAuthConfig{RedirectURL: "relativeurlsecret123"},
 		},
 	}
 	manager, _, err := mcpclient.Open(context.Background(), cfg.MCPServers, t.TempDir())
@@ -428,10 +494,12 @@ func TestMCPInspectRedactsConfigInJSONAndText(t *testing.T) {
 				t.Fatal(err)
 			}
 			result := stdout.String()
-			if strings.Contains(result, secret) {
-				t.Fatalf("%s inspect exposed secret: %q", output, result)
+			for _, secret := range secrets {
+				if strings.Contains(result, secret) {
+					t.Fatalf("%s inspect exposed %q: %q", output, secret, result)
+				}
 			}
-			for _, expected := range []string{"--api-key", "[REDACTED]"} {
+			for _, expected := range []string{"[REDACTED]"} {
 				if !strings.Contains(result, expected) {
 					t.Fatalf("%s inspect omitted %q: %q", output, expected, result)
 				}
@@ -441,7 +509,7 @@ func TestMCPInspectRedactsConfigInJSONAndText(t *testing.T) {
 }
 
 func TestOAuthEchoedTokenStaysRedactedAcrossManagerCLIAndTUI(t *testing.T) {
-	const token = "oauth-token-must-stay-secret"
+	const token = "oauthtokenmuststaysecret123"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -462,7 +530,7 @@ func TestOAuthEchoedTokenStaysRedactedAcrossManagerCLIAndTUI(t *testing.T) {
 			}
 			response.Header().Set("Content-Type", "application/json")
 			response.WriteHeader(http.StatusBadGateway)
-			_, _ = fmt.Fprintf(response, `{"error":"temporarily_unavailable","error_description":"rejected %s"}`, request.Form.Get("token"))
+			_, _ = fmt.Fprintf(response, `{"error":"%s","error_description":"rejected %s"}`, request.Form.Get("token"), request.Form.Get("token"))
 		default:
 			http.NotFound(response, request)
 		}
@@ -508,7 +576,7 @@ func TestOAuthEchoedTokenStaysRedactedAcrossManagerCLIAndTUI(t *testing.T) {
 		if strings.Contains(combined, token) {
 			t.Fatalf("%s exposed OAuth token: %q", layer, combined)
 		}
-		if !strings.Contains(combined, "502") || !strings.Contains(combined, "temporarily_unavailable") {
+		if !strings.Contains(combined, "502") {
 			t.Fatalf("%s omitted safe diagnostics: %q", layer, combined)
 		}
 	}

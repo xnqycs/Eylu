@@ -918,43 +918,9 @@ func redactedServerConfig(cfg config.MCPServerConfig) map[string]any {
 const redactedConfigValue = "[REDACTED]"
 
 func redactedServerArgs(args []string) []string {
-	redacted := make([]string, 0, len(args))
-	positionalOnly := false
-	for _, argument := range args {
-		if positionalOnly {
-			redacted = append(redacted, redactedConfigValue)
-			continue
-		}
-		if argument == "--" {
-			redacted = append(redacted, argument)
-			positionalOnly = true
-			continue
-		}
-		if strings.HasPrefix(argument, "--") && len(argument) > 2 {
-			name, _, hasValue := strings.Cut(argument, "=")
-			if hasValue {
-				redacted = append(redacted, name+"="+redactedConfigValue)
-			} else {
-				redacted = append(redacted, argument)
-			}
-			continue
-		}
-		if strings.HasPrefix(argument, "-") && len(argument) > 1 {
-			name, _, hasValue := strings.Cut(argument, "=")
-			if hasValue {
-				redacted = append(redacted, name+"="+redactedConfigValue)
-				continue
-			}
-			_, flagSize := utf8.DecodeRuneInString(argument[1:])
-			flagEnd := 1 + flagSize
-			if flagEnd < len(argument) {
-				redacted = append(redacted, argument[:flagEnd]+redactedConfigValue)
-			} else {
-				redacted = append(redacted, argument)
-			}
-			continue
-		}
-		redacted = append(redacted, redactedConfigValue)
+	redacted := make([]string, len(args))
+	for index := range redacted {
+		redacted[index] = redactedConfigValue
 	}
 	return redacted
 }
@@ -968,6 +934,14 @@ func redactedServerURL(raw string) string {
 	if parsed.Opaque != "" {
 		parsed.Opaque = redactedConfigValue
 	}
+	segments := strings.Split(parsed.Path, "/")
+	for index, segment := range segments {
+		if segment != "" {
+			segments[index] = redactedConfigValue
+		}
+	}
+	parsed.Path = strings.Join(segments, "/")
+	parsed.RawPath = ""
 	query, _ := url.ParseQuery(parsed.RawQuery)
 	for key, values := range query {
 		if len(values) == 0 {

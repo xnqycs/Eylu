@@ -81,10 +81,10 @@ func TestProtocolErrorDataPreservesJSONRPCFields(t *testing.T) {
 func TestInspectRedactsServerArgumentsAndURLs(t *testing.T) {
 	secrets := []string{
 		"long-inline-secret", "long-separate-secret", "short-separate-secret", "short-inline-secret",
-		"combined-short-secret", "positional-secret", "after-terminator-secret",
-		"url-user-secret", "url-password-secret", "url-query-secret", "url-tenant-secret", "url-fragment-secret",
+		"combined-short-secret", "positional-secret", "after-terminator-secret", "secrettoken123",
+		"url-user-secret", "url-password-secret", "urlpathsecret123", "url-query-secret", "url-tenant-secret", "url-fragment-secret",
 		"issuer-user-secret", "issuer-password-secret", "issuer-query-secret",
-		"redirect-user-secret", "redirect-password-secret", "redirect-query-secret",
+		"redirectrelativesecret123",
 	}
 	cfg := config.MCPServerConfig{
 		Command: "fixture-command",
@@ -96,13 +96,14 @@ func TestInspectRedactsServerArgumentsAndURLs(t *testing.T) {
 			"-Dcombined-short-secret",
 			"positional-secret",
 			"--", "--after-terminator-secret",
+			"--token", "--secrettoken123",
 		},
-		URL: "https://url-user-secret:url-password-secret@example.test/mcp?api_key=url-query-secret&tenant=url-tenant-secret#url-fragment-secret",
+		URL: "https://url-user-secret:url-password-secret@example.test/urlpathsecret123?api_key=url-query-secret&tenant=url-tenant-secret#url-fragment-secret",
 		OAuth: &config.MCPOAuthConfig{
 			Issuer:      "https://issuer-user-secret:issuer-password-secret@issuer.example.test/oauth?token=issuer-query-secret",
 			ClientID:    "diagnostic-client",
 			Scopes:      []string{"mcp:read"},
-			RedirectURL: "https://redirect-user-secret:redirect-password-secret@localhost/callback?code=redirect-query-secret",
+			RedirectURL: "redirectrelativesecret123",
 		},
 	}
 	manager := &Manager{servers: map[string]*serverRuntime{
@@ -113,14 +114,9 @@ func TestInspectRedactsServerArgumentsAndURLs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantArgs := []string{
-		"--api-key=[REDACTED]",
-		"--token", "[REDACTED]",
-		"-k", "[REDACTED]",
-		"-p=[REDACTED]",
-		"-D[REDACTED]",
-		"[REDACTED]",
-		"--", "[REDACTED]",
+	wantArgs := make([]string, len(cfg.Args))
+	for index := range wantArgs {
+		wantArgs[index] = "[REDACTED]"
 	}
 	gotArgs, ok := detail.Config["args"].([]string)
 	if !ok || strings.Join(gotArgs, "\x00") != strings.Join(wantArgs, "\x00") {
@@ -132,7 +128,7 @@ func TestInspectRedactsServerArgumentsAndURLs(t *testing.T) {
 		t.Fatalf("oauth config = %#v", detail.Config["oauth"])
 	}
 	assertRedactedInspectURL(t, oauth["issuer"], "token")
-	assertRedactedInspectURL(t, oauth["redirect_url"], "code")
+	assertRedactedInspectURL(t, oauth["redirect_url"])
 
 	encoded, err := json.Marshal(detail)
 	if err != nil {
@@ -145,7 +141,7 @@ func TestInspectRedactsServerArgumentsAndURLs(t *testing.T) {
 				t.Fatalf("Inspect output leaked %q: %s", secret, output)
 			}
 		}
-		for _, diagnostic := range []string{"api_key", "tenant", "--api-key", "--token", "-k", "-p", "-D"} {
+		for _, diagnostic := range []string{"api_key", "tenant", "[REDACTED]"} {
 			if !strings.Contains(output, diagnostic) {
 				t.Fatalf("Inspect output omitted diagnostic %q: %s", diagnostic, output)
 			}
@@ -165,6 +161,11 @@ func assertRedactedInspectURL(t *testing.T, value any, queryKeys ...string) {
 	}
 	if parsed.User != nil {
 		t.Fatalf("redacted URL retained userinfo: %q", redacted)
+	}
+	for _, segment := range strings.Split(strings.Trim(parsed.Path, "/"), "/") {
+		if segment != "" && segment != "[REDACTED]" {
+			t.Fatalf("redacted URL path retained segment %q: %q", segment, redacted)
+		}
 	}
 	for _, key := range queryKeys {
 		values, exists := parsed.Query()[key]
@@ -364,13 +365,28 @@ func TestManagerDisableCancelsCallsRemovesCatalogAndEmitsStatus(t *testing.T) {
 	if len(manager.Tools()) != 0 || len(manager.Contexts()) != 0 || manager.List()[0].Status != StatusDisabled {
 		t.Fatalf("tools=%d contexts=%d list=%#v", len(manager.Tools()), len(manager.Contexts()), manager.List())
 	}
-	select {
-	case event := <-events:
-		if event.Kind != EventStatus || event.Status != StatusDisabled {
-			t.Fatalf("event=%#v", event)
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	var observed []Event
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatalf("event stream closed before disabled status; observed=%#v", observed)
+			}
+			observed = append(observed, event)
+			if event.Kind == EventStatus && event.Status == StatusDisabled {
+				return
+			}
+			if event.Kind == EventStatus {
+				t.Fatalf("unexpected status before disabled; event=%#v observed=%#v", event, observed)
+			}
+			if event.Kind == EventDiagnostic && !strings.Contains(strings.ToLower(event.Message), "cancel") {
+				t.Fatalf("unexpected diagnostic before disabled status; event=%#v observed=%#v", event, observed)
+			}
+		case <-deadline.C:
+			t.Fatalf("disable status event was not emitted; observed=%#v", observed)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("disable status event was not emitted")
 	}
 }
 

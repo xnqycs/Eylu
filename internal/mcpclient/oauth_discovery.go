@@ -192,31 +192,8 @@ func (c *OAuthClient) getOAuthJSON(ctx context.Context, endpoint string, destina
 }
 
 func oauthHTTPError(response *http.Response) error {
-	encoded, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-	var payload struct {
-		Error string `json:"error"`
-	}
-	_ = json.Unmarshal(encoded, &payload)
-	code, ok := safeOAuthErrorCode(payload.Error)
-	if !ok {
-		return fmt.Errorf("OAuth endpoint returned HTTP %d", response.StatusCode)
-	}
-	return fmt.Errorf("OAuth endpoint returned HTTP %d: %s", response.StatusCode, code)
-}
-
-func safeOAuthErrorCode(value string) (string, bool) {
-	const maxOAuthErrorCodeBytes = 64
-	if len(value) == 0 || len(value) > maxOAuthErrorCodeBytes {
-		return "", false
-	}
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '_' {
-			continue
-		}
-		return "", false
-	}
-	return value, true
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return fmt.Errorf("OAuth endpoint returned HTTP %d", response.StatusCode)
 }
 
 func ParseResourceMetadataURL(header string) (string, bool) {

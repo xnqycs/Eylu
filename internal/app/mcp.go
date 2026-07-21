@@ -42,10 +42,12 @@ type mcpHostCallbacks struct {
 var openMCPElicitationURL = openExternalURL
 
 func (r *runtime) configureMCPRuntime(ctx context.Context, cfg config.Config, modelRuntime *agent.Runtime) error {
-	r.mcpHostMu.RLock()
-	host := r.mcpHost
-	r.mcpHostMu.RUnlock()
-	return r.configureMCPRuntimeWithHost(ctx, cfg, modelRuntime, host)
+	manager, err := r.loadMCPWithCurrentHost(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	r.applyMCPManager(modelRuntime, manager)
+	return nil
 }
 
 func (r *runtime) configureMCPRuntimeWithHost(ctx context.Context, cfg config.Config, modelRuntime *agent.Runtime, host mcpHostCallbacks) error {
@@ -53,11 +55,15 @@ func (r *runtime) configureMCPRuntimeWithHost(ctx context.Context, cfg config.Co
 	if err != nil {
 		return err
 	}
+	r.applyMCPManager(modelRuntime, manager)
+	return nil
+}
+
+func (r *runtime) applyMCPManager(modelRuntime *agent.Runtime, manager *mcpclient.Manager) {
 	state := mcpStateFromManager(manager)
 	r.storeMCPState(state)
 	applyMCPState(modelRuntime, state)
 	modelRuntime.MCPState = r.currentMCPState
-	return nil
 }
 
 func (r *runtime) loadMCP(ctx context.Context, cfg config.Config) (*mcpclient.Manager, error) {
@@ -65,14 +71,23 @@ func (r *runtime) loadMCP(ctx context.Context, cfg config.Config) (*mcpclient.Ma
 }
 
 func (r *runtime) loadMCPWithCurrentHost(ctx context.Context, cfg config.Config) (*mcpclient.Manager, error) {
+	r.mcpMu.Lock()
+	defer r.mcpMu.Unlock()
 	r.mcpHostMu.RLock()
 	host := r.mcpHost
 	r.mcpHostMu.RUnlock()
-	return r.loadMCPWithHost(ctx, cfg, host)
+	options, capabilityKey := r.mcpOptionsForHost(host)
+	return r.loadMCPLocked(ctx, cfg, options, capabilityKey)
 }
 
 func (r *runtime) loadMCPWithHost(ctx context.Context, cfg config.Config, host mcpHostCallbacks) (*mcpclient.Manager, error) {
+	r.mcpMu.Lock()
+	defer r.mcpMu.Unlock()
 	options, capabilityKey := r.setMCPHost(host)
+	return r.loadMCPLocked(ctx, cfg, options, capabilityKey)
+}
+
+func (r *runtime) loadMCPLocked(ctx context.Context, cfg config.Config, options mcpclient.Options, capabilityKey string) (*mcpclient.Manager, error) {
 	encoded, err := json.Marshal(struct {
 		Workspace string                            `json:"workspace"`
 		Servers   map[string]config.MCPServerConfig `json:"servers"`
@@ -83,8 +98,6 @@ func (r *runtime) loadMCPWithHost(ctx context.Context, cfg config.Config, host m
 	}
 	digest := sha256.Sum256(encoded)
 	key := hex.EncodeToString(digest[:])
-	r.mcpMu.Lock()
-	defer r.mcpMu.Unlock()
 	if r.mcp != nil && r.mcpKey == key {
 		return r.mcp, nil
 	}
@@ -131,6 +144,10 @@ func (r *runtime) setMCPHost(host mcpHostCallbacks) (mcpclient.Options, string) 
 	r.mcpHostMu.Lock()
 	r.mcpHost = host
 	r.mcpHostMu.Unlock()
+	return r.mcpOptionsForHost(host)
+}
+
+func (r *runtime) mcpOptionsForHost(host mcpHostCallbacks) (mcpclient.Options, string) {
 	options := mcpclient.Options{ElicitationForm: host.elicitationForm, ElicitationURL: host.elicitationURL}
 	capabilities := make([]string, 0, 3)
 	if host.createMessageWithTools != nil {

@@ -600,7 +600,7 @@ func TestTUIBackendMCPViewMapsCatalogsAndRedacts(t *testing.T) {
 	cfg := testAppConfig()
 	cfg.MCPServers = map[string]config.MCPServerConfig{
 		"alpha": {
-			Transport: config.MCPTransportStreamableHTTP, Enabled: true, URL: "https://user:url-secret@example.test/mcp?token=query-secret#fragment",
+			Transport: config.MCPTransportStreamableHTTP, Enabled: true, URL: "https://user:url-secret@example.test/path-secret?token=query-secret#fragment",
 			Headers: map[string]string{"Authorization": "stored-secret"}, BearerTokenEnvironment: "MCP_TOKEN",
 		},
 	}
@@ -621,18 +621,21 @@ func TestTUIBackendMCPViewMapsCatalogsAndRedacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	view := string(encoded)
-	for _, expected := range []string{"alpha", "connected", "2025-11-25", "mcp__alpha__search", "fixture://readme", "review", "https://example.test/mcp", "Authorization", "MCP_TOKEN", "[REDACTED]"} {
+	for _, expected := range []string{"alpha", "connected", "2025-11-25", "mcp__alpha__search", "fixture://readme", "review", "https://example.test/", "Authorization", "MCP_TOKEN", "[REDACTED]"} {
 		if !strings.Contains(view, expected) {
 			t.Fatalf("MCP view missing %q: %s", expected, view)
 		}
 	}
-	for _, secret := range []string{"stored-secret", "bearer-secret", "url-secret", "query-secret", "user"} {
+	for _, secret := range []string{"stored-secret", "bearer-secret", "url-secret", "path-secret", "query-secret", "user"} {
 		if strings.Contains(view, secret) {
 			t.Fatalf("MCP view leaked %q: %s", secret, view)
 		}
 	}
 	if strings.Contains(item.Config, `\"Authorization\":\"`) {
 		t.Fatalf("MCP view leaked a credential: %s", view)
+	}
+	if relative := tuiMCPSafeURL("relativeurlsecret123"); strings.Contains(relative, "relativeurlsecret123") {
+		t.Fatalf("MCP view leaked a relative URL: %q", relative)
 	}
 }
 

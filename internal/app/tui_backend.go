@@ -1221,6 +1221,17 @@ func tuiMCPSafeURL(value string) string {
 		return "[REDACTED URL]"
 	}
 	parsed.User = nil
+	if parsed.Opaque != "" {
+		parsed.Opaque = "[REDACTED]"
+	}
+	segments := strings.Split(parsed.Path, "/")
+	for index, segment := range segments {
+		if segment != "" {
+			segments[index] = "[REDACTED]"
+		}
+	}
+	parsed.Path = strings.Join(segments, "/")
+	parsed.RawPath = ""
 	parsed.RawQuery = ""
 	parsed.ForceQuery = false
 	parsed.Fragment = ""

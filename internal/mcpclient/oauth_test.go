@@ -321,12 +321,10 @@ func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.
 			response.Header().Set("Content-Type", "application/json")
 			if hint == "refresh_token" {
 				response.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = fmt.Fprintf(response, `{"error":"temporarily_unavailable","error_description":"rejected %s"}`, token)
-				return
+			} else {
+				response.WriteHeader(http.StatusBadGateway)
 			}
-			response.Header().Set("Content-Type", "text/plain")
-			response.WriteHeader(http.StatusBadGateway)
-			_, _ = fmt.Fprintf(response, "rejected %s", token)
+			_, _ = fmt.Fprintf(response, `{"error":"%s","error_description":"rejected %s"}`, token, token)
 		default:
 			http.NotFound(response, request)
 		}
@@ -339,7 +337,7 @@ func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.
 	hash, _ := options.AuthHash()
 	key, _ := CredentialKey(options.ServerName, options.ResourceURL, hash)
 	credential := OAuthCredential{
-		AccessToken: "access-secret", RefreshToken: "refresh-secret", TokenType: "Bearer",
+		AccessToken: "accesstokensecret456", RefreshToken: "refreshtokensecret123", TokenType: "Bearer",
 		ResourceMetadataURL: server.URL + "/stored-resource-metadata",
 	}
 	if err := store.Put(context.Background(), key, credential); err != nil {
@@ -351,7 +349,7 @@ func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.
 		t.Fatal("Logout error = nil, want aggregated revocation diagnostics")
 	}
 	message := err.Error()
-	for _, expected := range []string{"refresh_token", "503", "temporarily_unavailable", "access_token", "502"} {
+	for _, expected := range []string{"refresh_token", "503", "access_token", "502"} {
 		if !strings.Contains(message, expected) {
 			t.Errorf("Logout error %q omitted %q", message, expected)
 		}
@@ -373,7 +371,7 @@ func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.
 }
 
 func TestOAuthRefreshErrorRedactsEchoedRefreshToken(t *testing.T) {
-	const refreshToken = "refresh-token-must-stay-secret"
+	const refreshToken = "refreshtokenmuststaysecret123"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -394,7 +392,7 @@ func TestOAuthRefreshErrorRedactsEchoedRefreshToken(t *testing.T) {
 			}
 			response.Header().Set("Content-Type", "application/json")
 			response.WriteHeader(http.StatusBadRequest)
-			_, _ = fmt.Fprintf(response, `{"error":"invalid_grant","error_description":"rejected %s"}`, request.Form.Get("refresh_token"))
+			_, _ = fmt.Fprintf(response, `{"error":"%s","error_description":"rejected %s"}`, request.Form.Get("refresh_token"), request.Form.Get("refresh_token"))
 		default:
 			http.NotFound(response, request)
 		}
@@ -419,7 +417,7 @@ func TestOAuthRefreshErrorRedactsEchoedRefreshToken(t *testing.T) {
 		t.Fatal("Token error = nil")
 	}
 	message := err.Error()
-	for _, expected := range []string{"400", "invalid_grant"} {
+	for _, expected := range []string{"400"} {
 		if !strings.Contains(message, expected) {
 			t.Errorf("Token error %q omitted %q", message, expected)
 		}
@@ -430,7 +428,7 @@ func TestOAuthRefreshErrorRedactsEchoedRefreshToken(t *testing.T) {
 }
 
 func TestOAuthCallbackErrorRedactsRemoteQueryText(t *testing.T) {
-	const callbackSecret = "callback-token-must-stay-secret"
+	const callbackSecret = "callbacktokenmuststaysecret123"
 	client := NewOAuthClient(NewCredentialStore(filepath.Join(t.TempDir(), "credentials.json")))
 	client.addPending("expected-state", pendingAuthorization{
 		Verifier: "verifier", RedirectURL: "http://127.0.0.1:32123/oauth/callback", ExpiresAt: time.Now().Add(time.Minute),
@@ -448,16 +446,16 @@ func TestOAuthCallbackErrorRedactsRemoteQueryText(t *testing.T) {
 		t.Fatal("callback error = nil")
 	}
 	message := result.err.Error()
-	if !strings.Contains(message, "access_denied") {
-		t.Fatalf("callback error %q omitted validated OAuth error code", message)
+	if strings.Contains(message, "access_denied") {
+		t.Fatalf("callback error exposed remote error code: %q", message)
 	}
 	if strings.Contains(message, callbackSecret) {
 		t.Fatalf("callback error exposed query text: %q", message)
 	}
 }
 
-func TestOAuthCallbackErrorRejectsUnsafeErrorCode(t *testing.T) {
-	const callbackSecret = "callback-token-must-stay-secret"
+func TestOAuthCallbackErrorRedactsTokenShapedErrorCode(t *testing.T) {
+	const callbackSecret = "callbacktokenmuststaysecret123"
 	client := NewOAuthClient(NewCredentialStore(filepath.Join(t.TempDir(), "credentials.json")))
 	client.addPending("expected-state", pendingAuthorization{
 		Verifier: "verifier", RedirectURL: "http://127.0.0.1:32123/oauth/callback", ExpiresAt: time.Now().Add(time.Minute),
