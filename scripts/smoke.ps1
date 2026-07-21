@@ -42,3 +42,5 @@ foreach ($arguments in @(
         Write-Error "invalid resume invocation unexpectedly succeeded: $arguments"
     }
 }
+
+exit 0
