@@ -61,6 +61,9 @@ func (s *tuiAuditSink) Record(record tool.AuditRecord) {
 }
 
 func (r *runtime) runTUI(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions) error {
+	r.suppressMCPStderr.Store(true)
+	defer r.suppressMCPStderr.Store(false)
+	r.setMCPHost(tuiMCPBootstrapHost())
 	cfg := manager.Config()
 	registry, session, err := r.loadSkillRuntime(ctx, cfg, opts, conversation, nil)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -156,28 +157,61 @@ func TestManagerNeedsAuthStopsReconnectUntilExplicitReconnect(t *testing.T) {
 	}
 	runtime := manager.servers["remote"]
 	runtime.mu.RLock()
-	generation, status := runtime.generation, runtime.status
+	status := runtime.status
 	runtime.mu.RUnlock()
 	if status != StatusNeedsAuth {
 		t.Fatalf("status=%s, want %s", status, StatusNeedsAuth)
 	}
 	before := requests.Load()
-	done := make(chan struct{})
-	go func() {
-		manager.reconnectLoop(runtime, generation)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("needs_auth reconnect loop did not stop")
-	}
 	time.Sleep(50 * time.Millisecond)
 	if after := requests.Load(); after != before {
 		t.Fatalf("needs_auth triggered an automatic retry: before=%d after=%d", before, after)
 	}
 
 	unauthorized.Store(false)
+	if err := manager.Reconnect(context.Background(), "remote"); err != nil {
+		t.Fatal(err)
+	}
+	if detail, err := manager.Inspect("remote"); err != nil || detail.Status != StatusConnected {
+		t.Fatalf("explicit reconnect did not recover: detail=%#v error=%v", detail, err)
+	}
+}
+
+func TestManagerInitialBadGatewayWaitsForExplicitReconnect(t *testing.T) {
+	var failing atomic.Bool
+	failing.Store(true)
+	var requests atomic.Int64
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server {
+		return newPagedProtocolServer()
+	}, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if failing.Load() {
+			http.Error(writer, "temporary failure", http.StatusBadGateway)
+			return
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"remote": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if len(diagnostics) != 1 || !strings.Contains(diagnostics[0].Message, "Bad Gateway") {
+		t.Fatalf("diagnostics=%#v", diagnostics)
+	}
+	before := requests.Load()
+	time.Sleep(250 * time.Millisecond)
+	detail, inspectErr := manager.Inspect("remote")
+	if inspectErr != nil || detail.Status != StatusError || requests.Load() != before {
+		t.Fatalf("failure retried automatically: detail=%#v before=%d after=%d error=%v", detail, before, requests.Load(), inspectErr)
+	}
+
+	failing.Store(false)
 	if err := manager.Reconnect(context.Background(), "remote"); err != nil {
 		t.Fatal(err)
 	}

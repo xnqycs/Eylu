@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -53,12 +55,17 @@ func TestManagerStreamableHTTPJSONAndSSEProtocol(t *testing.T) {
 			if len(diagnostics) != 0 {
 				t.Fatalf("diagnostics=%#v", diagnostics)
 			}
-			detail, err := manager.Inspect("remote")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if detail.ProtocolVersion != "2025-11-25" || detail.ServerInfo.Tools != 2 || len(detail.Resources) != 2 || len(detail.ResourceTemplates) != 2 || len(detail.Prompts) != 2 {
-				t.Fatalf("detail=%#v", detail)
+			deadline := time.Now().Add(2 * time.Second)
+			var detail ServerDetail
+			for {
+				detail, err = manager.Inspect("remote")
+				if err == nil && detail.ProtocolVersion == "2025-11-25" && detail.ServerInfo.Tools == 2 && len(detail.Resources) == 2 && len(detail.ResourceTemplates) == 2 && len(detail.Prompts) == 2 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("detail=%#v error=%v", detail, err)
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
 			result, err := manager.ReadResource(context.Background(), "remote", "fixture://one")
 			if err != nil || len(result.Contents) != 1 || result.Contents[0].Text != "fixture://one" {
@@ -118,7 +125,175 @@ func TestManagerListsOnlyAdvertisedCapabilities(t *testing.T) {
 	}
 }
 
-func TestManagerRebuildsExpiredStreamableHTTPSession(t *testing.T) {
+func TestManagerUsesIndependentTimeoutsForHandshakeAndTools(t *testing.T) {
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "slow-phases", Version: "1.0.0"}, nil)
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "echo", Description: "echo"}, func(context.Context, *sdkmcp.CallToolRequest, struct{}) (*sdkmcp.CallToolResult, struct{}, error) {
+		return nil, struct{}{}, nil
+	})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		var message struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &message)
+		if message.Method == "initialize" || message.Method == "notifications/initialized" || message.Method == "tools/list" {
+			time.Sleep(700 * time.Millisecond)
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	started := time.Now()
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"remote": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 1},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if len(diagnostics) != 0 {
+		t.Fatalf("diagnostics=%#v", diagnostics)
+	}
+	detail, err := manager.Inspect("remote")
+	if err != nil || detail.Status != StatusConnected || detail.ServerInfo.Tools != 1 {
+		t.Fatalf("detail=%#v error=%v", detail, err)
+	}
+	if elapsed := time.Since(started); elapsed < time.Second {
+		t.Fatalf("connection elapsed=%s, test did not cross the shared timeout", elapsed)
+	}
+}
+
+func TestManagerRetriesTransientStartupFailureThreeTimes(t *testing.T) {
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "flaky-startup", Version: "1.0.0"}, nil)
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "echo"}, func(context.Context, *sdkmcp.CallToolRequest, struct{}) (*sdkmcp.CallToolResult, struct{}, error) {
+		return nil, struct{}{}, nil
+	})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	var initializeAttempts atomic.Int32
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		var message struct {
+			Method string
+		}
+		_ = json.Unmarshal(body, &message)
+		if message.Method == "initialize" && initializeAttempts.Add(1) <= maxConnectionRetries {
+			http.Error(writer, "temporary gateway failure", http.StatusBadGateway)
+			return
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"remote": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 2},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if len(diagnostics) != 0 {
+		t.Fatalf("diagnostics=%#v", diagnostics)
+	}
+	if got := initializeAttempts.Load(); got != maxConnectionRetries+1 {
+		t.Fatalf("initialize attempts=%d, want %d", got, maxConnectionRetries+1)
+	}
+	detail, err := manager.Inspect("remote")
+	if err != nil || detail.Status != StatusConnected || detail.ServerInfo.Tools != 1 {
+		t.Fatalf("detail=%#v error=%v", detail, err)
+	}
+}
+
+func TestOpenConnectsMCPServersConcurrently(t *testing.T) {
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "parallel-startup", Version: "1.0.0"}, nil)
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "echo"}, func(context.Context, *sdkmcp.CallToolRequest, struct{}) (*sdkmcp.CallToolResult, struct{}, error) {
+		return nil, struct{}{}, nil
+	})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		var message struct {
+			Method string
+		}
+		_ = json.Unmarshal(body, &message)
+		if message.Method == "initialize" {
+			time.Sleep(600 * time.Millisecond)
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	started := time.Now()
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"one": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 2},
+		"two": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 2},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if len(diagnostics) != 0 {
+		t.Fatalf("diagnostics=%#v", diagnostics)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("server connections ran serially: elapsed=%s", elapsed)
+	}
+}
+
+func TestManagerCloseTreatsSessionDeleteTimeoutAsBestEffort(t *testing.T) {
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "slow-close", Version: "1.0.0"}, nil)
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "echo", Description: "echo"}, func(context.Context, *sdkmcp.CallToolRequest, struct{}) (*sdkmcp.CallToolResult, struct{}, error) {
+		return nil, struct{}{}, nil
+	})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	var deleteRequests atomic.Int32
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodDelete {
+			deleteRequests.Add(1)
+			<-request.Context().Done()
+			return
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"remote": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 5},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 0 {
+		t.Fatalf("open diagnostics=%#v", diagnostics)
+	}
+	started := time.Now()
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close error=%v", err)
+	}
+	if deleteRequests.Load() != 1 {
+		t.Fatalf("DELETE requests=%d, want 1", deleteRequests.Load())
+	}
+	if elapsed := time.Since(started); elapsed > mcpHTTPSessionDeleteTimeout+time.Second {
+		t.Fatalf("close elapsed=%s", elapsed)
+	}
+}
+
+func TestManagerExpiredStreamableHTTPSessionWaitsForExplicitReconnect(t *testing.T) {
 	server := newPagedProtocolServer()
 	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
 	capture := &protocolCapture{handler: handler}
@@ -133,12 +308,170 @@ func TestManagerRebuildsExpiredStreamableHTTPSession(t *testing.T) {
 	defer manager.Close()
 	capture.expireNextResource.Store(true)
 	result, err := manager.ReadResource(context.Background(), "remote", "fixture://one")
-	if err != nil || len(result.Contents) != 1 || result.Contents[0].Text != "fixture://one" {
-		t.Fatalf("resource=%#v error=%v", result, err)
+	if !errors.Is(err, sdkmcp.ErrSessionMissing) || result != nil {
+		t.Fatalf("expired resource=%#v error=%v", result, err)
 	}
 	observed := capture.snapshot()
+	if len(observed.responseSessions) != 1 {
+		t.Fatalf("session rebuilt automatically: %#v", observed.responseSessions)
+	}
+	if detail, err := manager.Inspect("remote"); err != nil || detail.Status != StatusError {
+		t.Fatalf("expired status detail=%#v error=%v", detail, err)
+	}
+
+	if err := manager.Reconnect(context.Background(), "remote"); err != nil {
+		t.Fatal(err)
+	}
+	result, err = manager.ReadResource(context.Background(), "remote", "fixture://one")
+	if err != nil || len(result.Contents) != 1 || result.Contents[0].Text != "fixture://one" {
+		t.Fatalf("reconnected resource=%#v error=%v", result, err)
+	}
+	observed = capture.snapshot()
 	if len(observed.responseSessions) < 2 {
-		t.Fatalf("session was not rebuilt: %#v", observed.responseSessions)
+		t.Fatalf("explicit reconnect did not create a new session: %#v", observed.responseSessions)
+	}
+}
+
+func TestManagerFetchesOptionalCatalogsConcurrentlyAfterTools(t *testing.T) {
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server {
+		return newPagedProtocolServer()
+	}, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	required := map[string]bool{
+		"resources/list": true, "resources/templates/list": true, "prompts/list": true,
+	}
+	started := make(map[string]bool, len(required))
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var mu sync.Mutex
+	var toolsCompleted, optionalBeforeTools atomic.Bool
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		var message struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &message)
+		if message.Method == "tools/list" {
+			time.Sleep(50 * time.Millisecond)
+			handler.ServeHTTP(writer, request)
+			toolsCompleted.Store(true)
+			return
+		}
+		if required[message.Method] {
+			if !toolsCompleted.Load() {
+				optionalBeforeTools.Store(true)
+			}
+			mu.Lock()
+			started[message.Method] = true
+			if len(started) == len(required) {
+				releaseOnce.Do(func() { close(release) })
+			}
+			mu.Unlock()
+			select {
+			case <-release:
+			case <-request.Context().Done():
+				return
+			}
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"remote": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 3},
+	}, t.TempDir())
+	if manager != nil {
+		t.Cleanup(func() { _ = manager.Close() })
+	}
+	if err != nil || len(diagnostics) != 0 {
+		t.Fatalf("open error=%v diagnostics=%#v", err, diagnostics)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var detail ServerDetail
+	for {
+		detail, err = manager.Inspect("remote")
+		if err == nil && detail.Status == StatusConnected && detail.ServerInfo.Tools > 0 && detail.ServerInfo.Resources > 0 && detail.ServerInfo.Prompts > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("detail=%#v error=%v", detail, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if optionalBeforeTools.Load() {
+		t.Fatal("optional catalog request started before tools completed")
+	}
+}
+
+func TestManagerKeepsToolsWhenOptionalCatalogTimesOut(t *testing.T) {
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server {
+		return newPagedProtocolServer()
+	}, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	var templateRequests atomic.Int32
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		var message struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &message)
+		if message.Method == "resources/templates/list" {
+			templateRequests.Add(1)
+			<-request.Context().Done()
+			return
+		}
+		handler.ServeHTTP(writer, request)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	startedAt := time.Now()
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"remote": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 1},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	if len(diagnostics) != 0 {
+		t.Fatalf("open diagnostics=%#v", diagnostics)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 750*time.Millisecond {
+		t.Fatalf("Open waited %s for optional catalogs", elapsed)
+	}
+	detail, err := manager.Inspect("remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Status != StatusConnected || detail.ServerInfo.Tools == 0 {
+		t.Fatalf("detail=%#v", detail)
+	}
+	if detail.LastError != "" {
+		t.Fatalf("last error=%q", detail.LastError)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(detail.Diagnostics) == 0 || !strings.Contains(detail.Diagnostics[len(detail.Diagnostics)-1].Message, "resource templates") {
+		if time.Now().After(deadline) {
+			t.Fatalf("diagnostics=%#v", detail.Diagnostics)
+		}
+		time.Sleep(10 * time.Millisecond)
+		detail, err = manager.Inspect("remote")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := templateRequests.Load()
+	time.Sleep(150 * time.Millisecond)
+	if after := templateRequests.Load(); after != before {
+		t.Fatalf("optional catalog retried automatically: before=%d after=%d", before, after)
 	}
 }
 

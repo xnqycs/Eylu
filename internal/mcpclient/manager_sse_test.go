@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -31,9 +32,17 @@ func TestManagerLegacySSEEndToEnd(t *testing.T) {
 	if len(diagnostics) != 0 {
 		t.Fatalf("diagnostics=%#v", diagnostics)
 	}
-	detail, err := manager.Inspect("legacy")
-	if err != nil || detail.Status != StatusConnected || detail.ServerInfo.Tools != 2 || len(detail.Resources) != 2 || len(detail.ResourceTemplates) != 2 || len(detail.Prompts) != 2 {
-		t.Fatalf("detail=%#v error=%v", detail, err)
+	deadline := time.Now().Add(2 * time.Second)
+	var detail ServerDetail
+	for {
+		detail, err = manager.Inspect("legacy")
+		if err == nil && detail.Status == StatusConnected && detail.ServerInfo.Tools == 2 && len(detail.Resources) == 2 && len(detail.ResourceTemplates) == 2 && len(detail.Prompts) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("detail=%#v error=%v", detail, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	result, err := manager.ReadResource(context.Background(), "legacy", "fixture://two")
 	if err != nil || result.Contents[0].Text != "fixture://two" {

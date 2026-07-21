@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/exec"
@@ -26,6 +27,8 @@ import (
 
 const (
 	mcpCommandTerminateTimeout     = 2 * time.Second
+	mcpHTTPSessionDeleteTimeout    = 2 * time.Second
+	mcpHTTPUserAgent               = "Eylu/1.0.0"
 	legacySSEDefaultReconnectDelay = time.Second
 	legacySSEMaximumReconnectDelay = 30 * time.Second
 	legacySSEMaximumReconnectTries = 5
@@ -57,6 +60,7 @@ func buildTransport(ctx context.Context, name string, cfg config.MCPServerConfig
 		return &sdkmcp.StreamableClientTransport{
 			Endpoint:     cfg.URL,
 			HTTPClient:   httpClient,
+			MaxRetries:   maxConnectionRetries,
 			OAuthHandler: oauthHandlerForConfig(cfg, oauthHandler),
 		}, nil
 	case config.MCPTransportSSE:
@@ -461,12 +465,18 @@ func newMCPHTTPClient(name string, cfg config.MCPServerConfig, oauthHandler auth
 	if err != nil {
 		return nil, err
 	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("initialize MCP cookie jar: %w", err)
+	}
 	return &http.Client{
+		Jar: jar,
 		Transport: &headerRoundTripper{
-			base:         http.DefaultTransport,
-			headers:      headers,
-			secrets:      secrets,
-			oauthHandler: oauthHandler,
+			base:           http.DefaultTransport,
+			headers:        headers,
+			secrets:        secrets,
+			oauthHandler:   oauthHandler,
+			requestTimeout: cfg.StartupTimeout(defaultStartupTimeout),
 		},
 	}, nil
 }
@@ -508,14 +518,27 @@ func configuredMCPHeaders(name string, cfg config.MCPServerConfig) (http.Header,
 }
 
 type headerRoundTripper struct {
-	base         http.RoundTripper
-	headers      http.Header
-	secrets      []string
-	oauthHandler auth.OAuthHandler
+	base           http.RoundTripper
+	headers        http.Header
+	secrets        []string
+	oauthHandler   auth.OAuthHandler
+	requestTimeout time.Duration
 }
 
 func (t *headerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	prepared := request.Clone(request.Context())
+	requestContext := request.Context()
+	cancel := func() {}
+	if request.Method == http.MethodDelete {
+		if _, hasDeadline := requestContext.Deadline(); !hasDeadline {
+			requestContext, cancel = context.WithTimeout(requestContext, mcpHTTPSessionDeleteTimeout)
+		}
+	} else if request.Method == http.MethodPost && t.requestTimeout > 0 {
+		if _, hasDeadline := requestContext.Deadline(); !hasDeadline {
+			requestContext, cancel = context.WithTimeout(requestContext, t.requestTimeout)
+		}
+	}
+	defer cancel()
+	prepared := request.Clone(requestContext)
 	prepared.Header = request.Header.Clone()
 	for header, values := range t.headers {
 		canonical := http.CanonicalHeaderKey(header)
@@ -524,9 +547,12 @@ func (t *headerRoundTripper) RoundTrip(request *http.Request) (*http.Response, e
 		}
 		prepared.Header[canonical] = append([]string(nil), values...)
 	}
+	if prepared.Header.Get("User-Agent") == "" {
+		prepared.Header.Set("User-Agent", mcpHTTPUserAgent)
+	}
 	secrets := append([]string(nil), t.secrets...)
 	if t.oauthHandler != nil {
-		tokenSource, err := t.oauthHandler.TokenSource(request.Context())
+		tokenSource, err := t.oauthHandler.TokenSource(prepared.Context())
 		if err != nil {
 			return nil, redactTransportError(err, secrets)
 		}

@@ -330,6 +330,9 @@ func (m *Model) handleCompletionKey(key string) (bool, tea.Cmd) {
 			return key == "tab", nil
 		}
 		value := m.input.Value()
+		if key == "enter" && !item.execute && !item.expand && value == item.insert {
+			return false, nil
+		}
 		value = value[:m.completion.start] + item.insert + value[m.completion.end:]
 		if key == "enter" && item.execute {
 			m.input.Reset()

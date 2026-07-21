@@ -28,7 +28,7 @@ const (
 	fixedChromeRows        = 5 + activityGapRows
 	minViewportRows        = 4
 	maxTaskPanelItems      = 5
-	bannerViewportRows     = 7
+	bannerViewportRows     = 8
 	colorAnimationInterval = 50 * time.Millisecond
 	colorSpatialFrequency  = 0.24
 	colorTemporalFrequency = 2.0
@@ -198,6 +198,8 @@ func (m *Model) refreshViewport() {
 		content = m.renderMCPServers()
 	case screenMCPDetail:
 		content = m.renderMCPDetail()
+	case screenMCPToolDetail:
+		content = m.renderMCPToolDetail()
 	case screenContext:
 		content = m.renderContext()
 	case screenTasks:
@@ -378,6 +380,10 @@ func (m *Model) renderTimeline() string {
 	var output strings.Builder
 	contentWidth := m.viewportContentWidth()
 	output.WriteString(m.renderBanner())
+	if status := m.renderMCPStartupStatus(); status != "" {
+		output.WriteByte('\n')
+		output.WriteString(status)
+	}
 	if len(m.timeline) > 0 {
 		output.WriteString("\n\n")
 	}
@@ -414,6 +420,17 @@ func (m *Model) renderTimeline() string {
 		timeline += m.renderInlineTaskPanel()
 	}
 	return timeline
+}
+
+func (m *Model) renderMCPStartupStatus() string {
+	if !m.mcpLoading {
+		return ""
+	}
+	prefix := "*"
+	if m.animation {
+		prefix = m.mcpSpinner.View()
+	}
+	return m.styles.Loading.Render(truncateColumns(prefix+" MCP  Loading servers...", m.viewportContentWidth()))
 }
 
 func (m *Model) nextVisibleTimelineKind(index int) (timelineKind, bool) {
@@ -902,7 +919,11 @@ func (m *Model) renderMCPServers() string {
 	width := m.viewportContentWidth()
 	output.WriteString(m.styles.Header.Render("MCP servers") + "\n\n")
 	if m.mcpLoading && len(m.mcpServers) == 0 {
-		output.WriteString(m.styles.Loading.Render("Loading MCP runtime..."))
+		prefix := "*"
+		if m.animation {
+			prefix = m.mcpSpinner.View()
+		}
+		output.WriteString(m.styles.Loading.Render(prefix + " Loading MCP runtime..."))
 		return output.String()
 	}
 	if len(m.mcpServers) == 0 {
@@ -926,7 +947,11 @@ func (m *Model) renderMCPServers() string {
 		}
 	}
 	if m.mcpNotice != "" {
-		output.WriteString("\n" + m.styles.Status.Render(wrapPlain(m.mcpNotice, width)) + "\n")
+		style := m.styles.Status
+		if m.mcpNoticeError {
+			style = m.styles.Error
+		}
+		output.WriteString("\n" + style.Render(wrapPlain(m.mcpNotice, width)) + "\n")
 	}
 	output.WriteString("\n" + m.styles.Muted.Render("Enter details · r reconnect · e enable · d disable · l login · o logout · g refresh · Esc back"))
 	return strings.TrimRight(output.String(), "\n")
@@ -976,9 +1001,17 @@ func (m *Model) renderMCPDetail() string {
 		m.renderMCPServerDetails(&output, server, width)
 	}
 	if m.mcpNotice != "" {
-		output.WriteString("\n" + m.styles.Status.Render(wrapPlain(m.mcpNotice, width)) + "\n")
+		style := m.styles.Status
+		if m.mcpNoticeError {
+			style = m.styles.Error
+		}
+		output.WriteString("\n" + style.Render(wrapPlain(m.mcpNotice, width)) + "\n")
 	}
-	output.WriteString("\n" + m.styles.Muted.Render("1-4/Tab view · r reconnect · e enable · d disable · l login · o logout · g refresh · Esc servers"))
+	footer := "←/→ or 1-4 view · r reconnect · e enable · d disable · l login · o logout · g refresh · Esc servers"
+	if m.mcpTab == 1 && len(server.Tools) > 0 {
+		footer = "Enter tool details · " + footer
+	}
+	output.WriteString("\n" + m.styles.Muted.Render(footer))
 	return strings.TrimRight(output.String(), "\n")
 }
 
@@ -992,10 +1025,8 @@ func (m *Model) renderMCPServerDetails(output *strings.Builder, server MCPServer
 	}
 	m.renderMCPField(output, "Catalog", fmt.Sprintf("%d tools · %d resources · %d prompts", server.ToolCount, server.ResourceCount, server.PromptCount), width)
 	m.renderMCPField(output, "Last error", server.LastError, width)
-	m.renderMCPField(output, "Config", server.Config, width)
 	m.renderMCPField(output, "Capabilities", server.Capabilities, width)
 	m.renderMCPField(output, "Instructions", server.Instructions, width)
-	m.renderMCPField(output, "Diagnostics", server.Diagnostics, width)
 }
 
 func (m *Model) renderMCPTools(output *strings.Builder, server MCPServerItem, width int) {
@@ -1010,15 +1041,25 @@ func (m *Model) renderMCPTools(output *strings.Builder, server MCPServerItem, wi
 		}
 		line := truncateColumns(prefix+item.Name+"  "+item.Status+"  "+item.Permission, width)
 		output.WriteString(line + "\n")
-		if index != m.mcpCatalogCursor {
-			continue
-		}
-		m.renderMCPField(output, "Local name", item.LocalName, width)
-		m.renderMCPField(output, "Description", item.Description, width)
-		m.renderMCPField(output, "Annotations", item.Annotations, width)
-		m.renderMCPField(output, "Input schema", item.InputSchema, width)
-		m.renderMCPField(output, "Output schema", item.OutputSchema, width)
 	}
+}
+
+func (m *Model) renderMCPToolDetail() string {
+	server, item, ok := m.selectedMCPTool()
+	if !ok {
+		return m.styles.Muted.Render("MCP tool is no longer available.\n\nEsc tools")
+	}
+	width := m.viewportContentWidth()
+	var output strings.Builder
+	output.WriteString(m.styles.Header.Render(truncateColumns(server.Name+" / Tool", width)) + "\n\n")
+	output.WriteString(m.styles.Active.Bold(true).Render(truncateColumns(item.Name+"  "+item.Status+"  "+item.Permission, width)) + "\n\n")
+	m.renderMCPField(&output, "Local name", item.LocalName, width)
+	m.renderMCPField(&output, "Description", item.Description, width)
+	m.renderMCPField(&output, "Annotations", item.Annotations, width)
+	m.renderMCPField(&output, "Input schema", item.InputSchema, width)
+	m.renderMCPField(&output, "Output schema", item.OutputSchema, width)
+	output.WriteString("\n" + m.styles.Muted.Render("↑/↓ scroll · g refresh · Esc tools"))
+	return strings.TrimRight(output.String(), "\n")
 }
 
 func (m *Model) renderMCPResources(output *strings.Builder, server MCPServerItem, width int) {

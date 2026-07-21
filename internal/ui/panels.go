@@ -250,10 +250,10 @@ func (m *Model) handleMCPKey(key string) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		m.viewport.GotoTop()
 		return m, nil
-	case "tab":
+	case "right", "tab":
 		m.mcpTab = (m.mcpTab + 1) % 4
 		m.mcpCatalogCursor = 0
-	case "shift+tab":
+	case "left", "shift+tab":
 		m.mcpTab = (m.mcpTab + 3) % 4
 		m.mcpCatalogCursor = 0
 	case "1", "2", "3", "4":
@@ -263,6 +263,13 @@ func (m *Model) handleMCPKey(key string) (tea.Model, tea.Cmd) {
 		m.mcpCatalogCursor = clampCursor(m.mcpCatalogCursor-1, m.selectedMCPCatalogLength())
 	case "down", "j":
 		m.mcpCatalogCursor = clampCursor(m.mcpCatalogCursor+1, m.selectedMCPCatalogLength())
+	case "enter":
+		if m.mcpTab == 1 && m.selectedMCPCatalogLength() > 0 {
+			m.screen = screenMCPToolDetail
+			m.refreshViewport()
+			m.viewport.GotoTop()
+			return m, nil
+		}
 	case "g":
 		return m, m.fetchMCPServersCmd()
 	default:
@@ -270,6 +277,22 @@ func (m *Model) handleMCPKey(key string) (tea.Model, tea.Cmd) {
 	}
 	m.refreshViewport()
 	return m, nil
+}
+
+func (m *Model) handleMCPToolDetailKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch message.String() {
+	case "esc":
+		m.screen = screenMCPDetail
+		m.refreshViewport()
+		m.viewport.GotoTop()
+		return m, nil
+	case "g":
+		return m, m.fetchMCPServersCmd()
+	default:
+		updated, command := m.viewport.Update(message)
+		m.viewport = updated
+		return m, command
+	}
 }
 
 func (m *Model) handleMCPActionKey(key string) (tea.Model, tea.Cmd) {
@@ -291,6 +314,7 @@ func (m *Model) handleMCPActionKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.mcpNotice = server.Name + ": " + string(action) + "..."
+	m.mcpNoticeError = false
 	m.refreshViewport()
 	return m, func() tea.Msg {
 		err := m.backend.MCPAction(m.context, server.Name, action)
@@ -321,6 +345,15 @@ func (m *Model) selectedMCPCatalogLength() int {
 	default:
 		return 0
 	}
+}
+
+func (m *Model) selectedMCPTool() (MCPServerItem, MCPToolItem, bool) {
+	server, ok := m.selectedMCPServer()
+	if !ok || len(server.Tools) == 0 {
+		return MCPServerItem{}, MCPToolItem{}, false
+	}
+	m.mcpCatalogCursor = clampCursor(m.mcpCatalogCursor, len(server.Tools))
+	return server, server.Tools[m.mcpCatalogCursor], true
 }
 
 func (m *Model) openProviderForm(item ProviderItem) {

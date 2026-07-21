@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -71,6 +72,7 @@ type runtime struct {
 	mcpConversations   map[*agent.Conversation]int
 	mcpWatchStop       func()
 	mcpWatchDone       chan struct{}
+	suppressMCPStderr  atomic.Bool
 	environmentCapture func(context.Context, string) environment.Context
 	limitMu            sync.Mutex
 	limitResolver      *provider.LimitResolver

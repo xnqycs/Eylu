@@ -42,7 +42,7 @@ func (t *remoteToolAdapter) Execute(ctx context.Context, raw json.RawMessage) pr
 			return protocol.ToolResult{Content: "invalid MCP tool arguments: " + err.Error(), IsError: true}
 		}
 	}
-	value, err := t.server.withSessionRetry(ctx, func(callCtx context.Context, session *sdkmcp.ClientSession) (any, error) {
+	value, err := t.server.withSessionCall(ctx, func(callCtx context.Context, session *sdkmcp.ClientSession) (any, error) {
 		return session.CallTool(callCtx, &sdkmcp.CallToolParams{Name: t.remote.Name, Arguments: arguments})
 	})
 	if err != nil {
@@ -102,7 +102,7 @@ func (t *resourceTool) Execute(ctx context.Context, raw json.RawMessage) protoco
 	if !allowed {
 		return protocol.ToolResult{Content: "MCP resource URI was not advertised by the server", IsError: true}
 	}
-	value, err := t.server.withSessionRetry(ctx, func(callCtx context.Context, session *sdkmcp.ClientSession) (any, error) {
+	value, err := t.server.withSessionCall(ctx, func(callCtx context.Context, session *sdkmcp.ClientSession) (any, error) {
 		return session.ReadResource(callCtx, &sdkmcp.ReadResourceParams{URI: input.URI})
 	})
 	if err != nil {

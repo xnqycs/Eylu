@@ -36,6 +36,7 @@ type fakeBackend struct {
 	files         []FileItem
 	mcpServers    []MCPServerItem
 	mcpActions    []string
+	mcpCalls      int
 	mode          string
 	selection     ModelSelection
 	contextWindow int
@@ -81,11 +82,115 @@ func (b *fakeBackend) FetchModels(context.Context, string) ([]string, error) {
 	return append([]string(nil), b.models...), b.err
 }
 func (b *fakeBackend) MCPServers(context.Context) ([]MCPServerItem, error) {
+	b.mcpCalls++
 	return append([]MCPServerItem(nil), b.mcpServers...), b.err
 }
 func (b *fakeBackend) MCPAction(_ context.Context, server string, action MCPAction) error {
 	b.mcpActions = append(b.mcpActions, server+":"+string(action))
 	return b.err
+}
+
+func TestStartupLoadsMCPWithAnimatedStatusBelowBanner(t *testing.T) {
+	backend := &fakeBackend{mcpServers: []MCPServerItem{{Name: "search", Status: "connected", ToolCount: 5}}}
+	model := NewModel(backend, Options{NoColor: true, Version: "1.2.3", Workspace: "E:/Eylu", Width: 80, Height: 24})
+	command := model.Init()
+	if command == nil || !model.mcpLoading {
+		t.Fatalf("startup MCP state: command=%v loading=%t", command, model.mcpLoading)
+	}
+	loading := ansi.Strip(model.renderTimeline())
+	if banner, status := strings.Index(loading, "v1.2.3"), strings.Index(loading, "MCP  Loading servers..."); banner < 0 || status <= banner {
+		t.Fatalf("MCP loading status is not below banner:\n%s", loading)
+	}
+
+	batch, ok := command().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init message=%T, want tea.BatchMsg", command())
+	}
+	var serverResult mcpServersMsg
+	serverResultFound := false
+	spinnerBefore := model.mcpSpinner.View()
+	spinnerAdvanced := false
+	for _, item := range batch {
+		message := item()
+		switch typed := message.(type) {
+		case mcpServersMsg:
+			serverResult = typed
+			serverResultFound = true
+		case mcpSpinnerMsg:
+			_, _ = model.Update(typed)
+			spinnerAdvanced = model.mcpSpinner.View() != spinnerBefore
+		}
+	}
+	if backend.mcpCalls != 1 || !serverResultFound || !spinnerAdvanced {
+		t.Fatalf("startup MCP commands: calls=%d result=%t spinner_advanced=%t", backend.mcpCalls, serverResultFound, spinnerAdvanced)
+	}
+	_, _ = model.Update(serverResult)
+	_, _ = model.Update(mcpSpinnerMsg{message: model.mcpSpinner.Tick()})
+	ready := ansi.Strip(model.renderTimeline())
+	if model.mcpLoading || strings.Contains(ready, "MCP  ") || strings.Contains(ready, "Loading servers") {
+		t.Fatalf("completed MCP loading row was not cleared:\n%s", ready)
+	}
+}
+
+func TestStartupMCPFailureClearsBannerAndStaysInConversation(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	_ = model.Init()
+	_, _ = model.Update(mcpServersMsg{servers: []MCPServerItem{{Name: "search", Status: "error", LastError: "tools/list failed"}}})
+	rendered := ansi.Strip(model.renderTimeline())
+	if !strings.Contains(rendered, "MCP search: tools/list failed") {
+		t.Fatalf("startup MCP failure missing from conversation:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Loading servers") || strings.Contains(rendered, "1 failed · /mcp") {
+		t.Fatalf("completed MCP loading row was not cleared:\n%s", rendered)
+	}
+}
+
+func TestMCPBadGatewayNoticeIsConciseAndActionable(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 100, Height: 24})
+	_ = model.Init()
+	_, _ = model.Update(mcpServersMsg{servers: []MCPServerItem{{
+		Name: "tavily-hikari", Status: "error",
+		LastError: `connect MCP server: calling "initialize": rejected by transport: sending "initialize": Bad Gateway`,
+	}}})
+	rendered := ansi.Strip(model.renderTimeline())
+	if !strings.Contains(rendered, "MCP tavily-hikari: HTTP 502 Bad Gateway · /mcp then r to reconnect") {
+		t.Fatalf("actionable gateway notice missing:\n%s", rendered)
+	}
+	if strings.Contains(rendered, `calling "initialize"`) {
+		t.Fatalf("raw gateway error leaked into conversation:\n%s", rendered)
+	}
+}
+
+func TestOpeningMCPDuringStartupDoesNotStartDuplicateLoad(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	_ = model.Init()
+	_, command := model.executeSlash("/mcp")
+	if model.screen != screenMCP || command != nil {
+		t.Fatalf("screen=%s duplicate command=%v", model.screen, command)
+	}
+}
+
+func TestMCPStartupStatusFitsNarrowViewport(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 20})
+	_ = model.Init()
+	status := ansi.Strip(model.renderMCPStartupStatus())
+	if width := lipgloss.Width(status); width > model.viewportContentWidth() {
+		t.Fatalf("MCP status width=%d available=%d status=%q", width, model.viewportContentWidth(), status)
+	}
+}
+
+func TestMCPSpinnerSkipsChatRefreshWhenBannerIsHidden(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoColor: true, Width: 80, Height: 20})
+	_ = model.Init()
+	model.followOutput = false
+	model.timeline = []timelineItem{{kind: timelineMessage, role: "user", text: strings.Repeat("history line\n", 40)}}
+	model.refreshViewport()
+	model.viewport.SetYOffset(bannerViewportRows)
+	before := model.viewport.GetContent()
+	_, _ = model.Update(mcpSpinnerMsg{message: model.mcpSpinner.Tick()})
+	if model.viewport.GetContent() != before {
+		t.Fatal("hidden MCP startup status caused a full chat viewport refresh")
+	}
 }
 
 func TestMCPPanelListsDetailsCatalogsAndActions(t *testing.T) {
@@ -128,17 +233,43 @@ func TestMCPPanelListsDetailsCatalogsAndActions(t *testing.T) {
 		t.Fatalf("detail screen=%s", model.screen)
 	}
 	detailView := ansi.Strip(model.View().Content)
-	for _, expected := range []string{"fixture-mcp", "1.2.3", "42ms", "[REDACTED]", "listChanged", "fixture data", "last ping"} {
+	for _, expected := range []string{"fixture-mcp", "1.2.3", "42ms", "listChanged", "fixture data"} {
 		if !strings.Contains(detailView, expected) {
 			t.Fatalf("MCP detail missing %q:\n%s", expected, detailView)
 		}
+	}
+
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: '2', Text: "2"}))
+	toolsView := ansi.Strip(model.View().Content)
+	for _, expected := range []string{"Tools", "lookup", "available", "read"} {
+		if !strings.Contains(toolsView, expected) {
+			t.Fatalf("MCP tools list missing %q:\n%s", expected, toolsView)
+		}
+	}
+	for _, hidden := range []string{"mcp__server_0__lookup", "readOnlyHint", "Input schema"} {
+		if strings.Contains(toolsView, hidden) {
+			t.Fatalf("MCP tools list leaked detail %q:\n%s", hidden, toolsView)
+		}
+	}
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if model.screen != screenMCPToolDetail {
+		t.Fatalf("tool detail screen=%s", model.screen)
+	}
+	toolDetail := ansi.Strip(model.View().Content)
+	for _, expected := range []string{"lookup", "mcp__server_0__lookup", "readOnlyHint", "Input schema", "Look up a fixture"} {
+		if !strings.Contains(toolDetail, expected) {
+			t.Fatalf("MCP tool detail missing %q:\n%s", expected, toolDetail)
+		}
+	}
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEsc}))
+	if model.screen != screenMCPDetail || model.mcpTab != 1 {
+		t.Fatalf("tool detail back screen=%s tab=%d", model.screen, model.mcpTab)
 	}
 
 	for _, catalog := range []struct {
 		key      string
 		expected []string
 	}{
-		{key: "2", expected: []string{"Tools", "lookup", "mcp__server_0__lookup", "readOnlyHint", "available"}},
 		{key: "3", expected: []string{"Resources", "fixture://catalog", "application/json"}},
 		{key: "4", expected: []string{"Prompts", "summarize", "subject"}},
 	} {
@@ -163,6 +294,65 @@ func TestMCPPanelListsDetailsCatalogsAndActions(t *testing.T) {
 	}
 	if got := strings.Join(backend.mcpActions, ","); got != "server-0:reconnect,server-0:enable,server-0:disable,server-0:login,server-0:logout" {
 		t.Fatalf("actions=%q", got)
+	}
+}
+
+func TestMCPCompletionExecutesExactCommandWithoutTrailingSpace(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.input.SetValue("/mcp")
+	_ = model.refreshCompletion()
+
+	_, command := model.handleChatKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if model.screen != screenMCP || command == nil {
+		t.Fatalf("screen=%s command=%v input=%q completion=%#v", model.screen, command, model.input.Value(), model.completion)
+	}
+}
+
+func TestMCPDetailUsesArrowKeysForTabs(t *testing.T) {
+	backend := &fakeBackend{mcpServers: []MCPServerItem{{Name: "remote", Status: "connected"}}}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	_, fetch := model.executeSlash("/mcp")
+	_, _ = model.Update(fetch())
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+	if model.mcpTab != 1 {
+		t.Fatalf("right selected tab %d, want 1", model.mcpTab)
+	}
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+	if model.mcpTab != 0 {
+		t.Fatalf("left selected tab %d, want 0", model.mcpTab)
+	}
+}
+
+func TestMCPConnectionErrorAppearsOnceInTimelineAndDetailStaysConcise(t *testing.T) {
+	const connectionError = "connect MCP server: context deadline exceeded"
+	backend := &fakeBackend{mcpServers: []MCPServerItem{{
+		Name: "remote", Status: "reconnecting", Transport: "streamable_http", LastError: connectionError,
+		Config: "CONFIG_SENTINEL", Diagnostics: "DIAGNOSTIC_SENTINEL",
+	}}}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 100, Height: 28})
+	_, fetch := model.executeSlash("/mcp")
+	_, _ = model.Update(fetch())
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+
+	detail := ansi.Strip(model.View().Content)
+	if !strings.Contains(detail, connectionError) || strings.Contains(detail, "CONFIG_SENTINEL") || strings.Contains(detail, "DIAGNOSTIC_SENTINEL") {
+		t.Fatalf("unexpected MCP detail:\n%s", detail)
+	}
+	if len(model.timeline) != 1 || !model.timeline[0].err || !strings.Contains(model.timeline[0].text, connectionError) {
+		t.Fatalf("timeline=%#v", model.timeline)
+	}
+
+	_, _ = model.Update(mcpServersMsg{servers: backend.mcpServers})
+	if len(model.timeline) != 1 {
+		t.Fatalf("repeated poll duplicated MCP error: %#v", model.timeline)
+	}
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEsc}))
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEsc}))
+	if timeline := ansi.Strip(model.renderTimeline()); !strings.Contains(timeline, connectionError) {
+		t.Fatalf("MCP error missing from chat timeline:\n%s", timeline)
 	}
 }
 

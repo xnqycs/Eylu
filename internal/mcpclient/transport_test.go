@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -54,6 +55,12 @@ func TestBuildTransportTypes(t *testing.T) {
 				if streamable.Endpoint != "https://mcp.example.test/rpc" || streamable.HTTPClient == nil || streamable.HTTPClient.Timeout != 0 {
 					t.Fatalf("streamable transport = %#v", streamable)
 				}
+				if streamable.HTTPClient.Jar == nil {
+					t.Fatal("streamable HTTP client has no cookie jar")
+				}
+				if streamable.MaxRetries != maxConnectionRetries {
+					t.Fatalf("streamable retries = %d, want %d", streamable.MaxRetries, maxConnectionRetries)
+				}
 				if streamable.OAuthHandler != oauthHandler {
 					t.Fatal("streamable OAuth handler was not passed to the SDK")
 				}
@@ -89,6 +96,59 @@ func TestBuildTransportTypes(t *testing.T) {
 			}
 			test.check(t, transport)
 		})
+	}
+}
+
+func TestMCPHTTPClientPreservesLoadBalancerCookie(t *testing.T) {
+	var mu sync.Mutex
+	var requests int
+	var preserved bool
+	httpServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		requests++
+		if requests == 1 {
+			http.SetCookie(writer, &http.Cookie{Name: "AWSALB", Value: "sticky-session", Path: "/"})
+		} else if cookie, err := request.Cookie("AWSALB"); err == nil && cookie.Value == "sticky-session" {
+			preserved = true
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(httpServer.Close)
+
+	client, err := newMCPHTTPClient("remote", config.MCPServerConfig{Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.Transport.(*headerRoundTripper).base = httpServer.Client().Transport
+	for range 2 {
+		response, requestErr := client.Get(httpServer.URL)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		_ = response.Body.Close()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !preserved {
+		t.Fatal("load balancer cookie was not sent with the second request")
+	}
+}
+
+func TestHeaderRoundTripperBoundsSessionDelete(t *testing.T) {
+	roundTripper := &headerRoundTripper{base: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		deadline, ok := request.Context().Deadline()
+		if !ok || time.Until(deadline) > 3*time.Second {
+			t.Fatalf("DELETE deadline=%v present=%v", deadline, ok)
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Header: make(http.Header), Body: http.NoBody, Request: request}, nil
+	})}
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, "https://mcp.example.test/rpc", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roundTripper.RoundTrip(request); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -143,6 +203,7 @@ func TestHTTPTransportInjectsHeadersWithoutReplacingSDKHeaders(t *testing.T) {
 		"Mcp-Session-Id":       "sdk-session",
 		"MCP-Protocol-Version": "sdk-version",
 		"Last-Event-ID":        "sdk-event",
+		"User-Agent":           mcpHTTPUserAgent,
 	} {
 		if value := got.Get(header); value != want {
 			t.Errorf("%s = %q, want %q", header, value, want)

@@ -3,6 +3,7 @@ package mcpclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -19,6 +20,12 @@ import (
 	"Eylu/internal/protocol"
 	"Eylu/internal/tool"
 )
+
+func TestDefaultStartupTimeoutAllowsSlowRemoteHandshake(t *testing.T) {
+	if defaultStartupTimeout < 60*time.Second {
+		t.Fatalf("default startup timeout = %s, want at least 60s", defaultStartupTimeout)
+	}
+}
 
 func TestMCPHelperProcess(t *testing.T) {
 	if os.Getenv("EYLU_MCP_HELPER") != "1" {
@@ -199,13 +206,19 @@ func TestManagerConnectsToolsResourcesAndPolicy(t *testing.T) {
 	if len(diagnostics) != 0 || len(manager.Servers()) != 1 || len(manager.Contexts()) != 1 || manager.Fingerprint() == "" {
 		t.Fatalf("servers=%#v contexts=%#v diagnostics=%#v", manager.Servers(), manager.Contexts(), diagnostics)
 	}
-	serverContext := manager.Contexts()[0]
-	if !strings.Contains(serverContext.Instructions, "deterministic") || !strings.Contains(serverContext.ResourceCatalog, "fixture://secret") || len(serverContext.ToolDefinitions) != 4 {
-		t.Fatalf("context = %#v", serverContext)
-	}
-	detail, err := manager.Inspect("fixture")
-	if err != nil || detail.Status != StatusConnected || len(detail.ResourceTemplates) != 1 || len(detail.Prompts) != 1 || len(detail.Resources) != 1 {
-		t.Fatalf("detail=%#v error=%v", detail, err)
+	deadline := time.Now().Add(2 * time.Second)
+	var serverContext Context
+	var detail ServerDetail
+	for {
+		serverContext = manager.Contexts()[0]
+		detail, err = manager.Inspect("fixture")
+		if err == nil && strings.Contains(serverContext.Instructions, "deterministic") && strings.Contains(serverContext.ResourceCatalog, "fixture://secret") && len(serverContext.ToolDefinitions) == 4 && len(detail.ResourceTemplates) == 1 && len(detail.Prompts) == 1 && len(detail.Resources) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("context=%#v detail=%#v error=%v", serverContext, detail, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	prompt, err := manager.GetPrompt(context.Background(), "fixture", "greet", map[string]string{"name": "Eylu"})
 	if err != nil || len(prompt.Messages) != 1 {
@@ -329,6 +342,27 @@ func TestManagerRequiredFailureStopsStartup(t *testing.T) {
 	}, t.TempDir())
 	if err == nil || manager != nil || len(diagnostics) != 1 || !strings.Contains(err.Error(), "required MCP server") {
 		t.Fatalf("manager=%#v diagnostics=%#v error=%v", manager, diagnostics, err)
+	}
+}
+
+func TestRetryableConnectionErrorClassification(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "bad gateway", err: errors.New("initialize: HTTP 502 Bad Gateway"), want: true},
+		{name: "timeout", err: context.DeadlineExceeded, want: true},
+		{name: "connection reset", err: errors.New("read tcp: connection reset by peer"), want: true},
+		{name: "forbidden", err: errors.New("HTTP 403 Forbidden"), want: false},
+		{name: "configuration", err: errors.New("environment variable MCP_TOKEN is required"), want: false},
+		{name: "canceled", err: context.Canceled, want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := retryableConnectionError(context.Background(), context.Background(), testCase.err); got != testCase.want {
+				t.Fatalf("retryableConnectionError(%v)=%t, want %t", testCase.err, got, testCase.want)
+			}
+		})
 	}
 }
 

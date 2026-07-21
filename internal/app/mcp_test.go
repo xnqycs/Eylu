@@ -34,6 +34,22 @@ import (
 
 type appMCPHostDriver struct{}
 
+func TestMCPDiagnosticsDoNotWriteThroughActiveTUI(t *testing.T) {
+	var stderr bytes.Buffer
+	appRuntime := &runtime{stderr: &stderr}
+	appRuntime.writeMCPDiagnostic("[mcp] %s\n", "visible")
+	if !strings.Contains(stderr.String(), "visible") {
+		t.Fatalf("CLI diagnostic=%q", stderr.String())
+	}
+
+	stderr.Reset()
+	appRuntime.suppressMCPStderr.Store(true)
+	appRuntime.writeMCPDiagnostic("[mcp] %s\n", "hidden")
+	if stderr.Len() != 0 {
+		t.Fatalf("TUI diagnostic leaked to stderr: %q", stderr.String())
+	}
+}
+
 func (appMCPHostDriver) Name() string { return "app-mcp-host" }
 func (appMCPHostDriver) Capabilities() driver.Capabilities {
 	return driver.Capabilities{}
@@ -295,6 +311,36 @@ func TestLoadMCPWithCurrentHostCannotReplayStaleHostOverSubmit(t *testing.T) {
 	}
 	if first.manager != fromSubmit {
 		t.Fatalf("queued TUI poll installed stale host manager: poll=%p submit=%p", first.manager, fromSubmit)
+	}
+}
+
+func TestTUIBootstrapHostReusesManagerForFirstToolCapableSubmit(t *testing.T) {
+	appRuntime := &runtime{workspace: t.TempDir(), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	cfg := config.Default()
+	cfg.MCPServers = nil
+	appRuntime.setMCPHost(tuiMCPBootstrapHost())
+
+	initial, err := appRuntime.loadMCPWithCurrentHost(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = appRuntime.closeMCP() })
+	realHost := mcpHostCallbacks{
+		createMessageWithTools: func(context.Context, *sdkmcp.CreateMessageWithToolsRequest) (*sdkmcp.CreateMessageWithToolsResult, error) {
+			return &sdkmcp.CreateMessageWithToolsResult{}, nil
+		},
+		elicitation: func(context.Context, *sdkmcp.ElicitRequest) (*sdkmcp.ElicitResult, error) {
+			return &sdkmcp.ElicitResult{}, nil
+		},
+		elicitationForm: true,
+		elicitationURL:  true,
+	}
+	afterSubmit, err := appRuntime.loadMCPWithHost(context.Background(), cfg, realHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterSubmit != initial {
+		t.Fatalf("first TUI submit replaced MCP manager: initial=%p after=%p", initial, afterSubmit)
 	}
 }
 

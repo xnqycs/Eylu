@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,6 +42,7 @@ type OAuthCredential struct {
 
 type CredentialStore struct {
 	path string
+	mu   sync.Mutex
 }
 
 // CredentialTransaction provides read/write access while CredentialStore holds
@@ -176,6 +178,8 @@ func (s *CredentialStore) Transaction(ctx context.Context, action func(*Credenti
 	if action == nil {
 		return errors.New("MCP credential transaction callback is required")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.withLock(ctx, func() error {
 		file, err := s.readUnlocked()
 		if err != nil {

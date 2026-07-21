@@ -43,6 +43,13 @@ func TestManagerHostCallbacksUtilitiesAndCompletion(t *testing.T) {
 	}
 	events, unsubscribe := manager.SubscribeEvents(16)
 	defer unsubscribe()
+	loggingDeadline := time.Now().Add(2 * time.Second)
+	for !containsPrefix(capture.snapshot().methods, "logging/setlevel") {
+		if time.Now().After(loggingDeadline) {
+			t.Fatalf("logging level was not configured in the background; methods=%#v", capture.snapshot().methods)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	registry := tool.NewRegistry(manager.Tools()...)
 	for name, contains := range map[string]string{
 		"mcp__host__roots":   "file://",

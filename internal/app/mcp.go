@@ -39,6 +39,19 @@ type mcpHostCallbacks struct {
 	elicitationURL         bool
 }
 
+func tuiMCPBootstrapHost() mcpHostCallbacks {
+	return mcpHostCallbacks{
+		createMessageWithTools: func(context.Context, *sdkmcp.CreateMessageWithToolsRequest) (*sdkmcp.CreateMessageWithToolsResult, error) {
+			return nil, errors.New("MCP sampling is unavailable while the TUI is starting")
+		},
+		elicitation: func(context.Context, *sdkmcp.ElicitRequest) (*sdkmcp.ElicitResult, error) {
+			return nil, errors.New("MCP elicitation is unavailable while the TUI is starting")
+		},
+		elicitationForm: true,
+		elicitationURL:  true,
+	}
+}
+
 var openMCPElicitationURL = openExternalURL
 
 func (r *runtime) configureMCPRuntime(ctx context.Context, cfg config.Config, modelRuntime *agent.Runtime) error {
@@ -111,7 +124,7 @@ func (r *runtime) loadMCPLocked(ctx context.Context, cfg config.Config, options 
 	r.mcp, r.mcpKey = manager, key
 	r.startMCPWatcherLocked(manager)
 	for _, diagnostic := range diagnostics {
-		fmt.Fprintf(r.stderr, "[mcp] server=%s error=%s\n", r.redact(diagnostic.Server), r.redact(diagnostic.Message))
+		r.writeMCPDiagnostic("[mcp] server=%s error=%s\n", r.redact(diagnostic.Server), r.redact(diagnostic.Message))
 	}
 	return manager, nil
 }
@@ -208,10 +221,17 @@ func (r *runtime) startMCPWatcherLocked(manager *mcpclient.Manager) {
 			case mcpclient.EventCatalogChanged, mcpclient.EventResourceUpdate, mcpclient.EventStatus:
 				r.storeMCPState(mcpStateFromManager(manager))
 			case mcpclient.EventDiagnostic:
-				fmt.Fprintf(r.stderr, "[mcp] server=%s diagnostic=%s\n", r.redact(event.Server), r.redact(event.Message))
+				r.writeMCPDiagnostic("[mcp] server=%s diagnostic=%s\n", r.redact(event.Server), r.redact(event.Message))
 			}
 		}
 	}()
+}
+
+func (r *runtime) writeMCPDiagnostic(format string, values ...any) {
+	if r.suppressMCPStderr.Load() || r.stderr == nil {
+		return
+	}
+	fmt.Fprintf(r.stderr, format, values...)
 }
 
 func (r *runtime) storeMCPEvent(event mcpclient.Event) {

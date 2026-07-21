@@ -34,6 +34,7 @@ const (
 	screenToolDetail     screenKind = "tool_detail"
 	screenMCP            screenKind = "mcp"
 	screenMCPDetail      screenKind = "mcp_detail"
+	screenMCPToolDetail  screenKind = "mcp_tool_detail"
 )
 
 type timelineKind string
@@ -150,6 +151,7 @@ type Model struct {
 	input          textarea.Model
 	viewport       viewport.Model
 	spinner        spinner.Model
+	mcpSpinner     spinner.Model
 	modelFilter    textinput.Model
 	form           providerFormModel
 	completion     completionState
@@ -174,6 +176,8 @@ type Model struct {
 	mcpLoading                 bool
 	mcpPollScheduled           bool
 	mcpNotice                  string
+	mcpNoticeError             bool
+	mcpReportedErrors          map[string]string
 	modelManual                bool
 	contextExpand              bool
 	contextWindowConfirm       *contextWindowConfirmState
@@ -275,6 +279,8 @@ type mcpActionResultMsg struct {
 
 type mcpRefreshTickMsg struct{}
 
+type mcpSpinnerMsg struct{ message tea.Msg }
+
 type modeResultMsg struct {
 	previous string
 	next     string
@@ -355,7 +361,8 @@ func NewModel(backend Backend, options Options) *Model {
 	model := &Model{
 		backend: backend, context: baseContext, clock: clock, styles: styles, input: input,
 		viewport: viewport.New(viewport.WithWidth(width), viewport.WithHeight(max(5, height-8))),
-		spinner:  spinner.New(spinner.WithSpinner(spinner.Dot)), modelFilter: filter, approvalReason: approvalReason,
+		spinner:  spinner.New(spinner.WithSpinner(spinner.Dot)), mcpSpinner: spinner.New(spinner.WithSpinner(spinner.Dot)),
+		modelFilter: filter, approvalReason: approvalReason,
 		width: width, height: height, screen: screenChat, state: StateIdle, followOutput: true, historyIndex: -1,
 		version: strings.TrimSpace(options.Version), workspace: strings.TrimSpace(options.Workspace),
 		animation: !options.NoAnimation, noColor: options.NoColor, clipboardWrite: clipboardWrite,
@@ -402,7 +409,10 @@ func Run(backend Backend, options Options) error {
 }
 
 func (m *Model) Init() tea.Cmd {
-	commands := []tea.Cmd{m.input.Focus(), m.loadSnapshotCmd()}
+	commands := []tea.Cmd{m.input.Focus(), m.loadSnapshotCmd(), m.fetchMCPServersCmd()}
+	if command := m.mcpSpinnerTickCmd(); command != nil {
+		commands = append(commands, command)
+	}
 	if command := m.colorAnimationTickCmd(); command != nil {
 		commands = append(commands, command)
 	}
@@ -441,6 +451,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.promptHistory = append(m.promptHistory[:0], typed.snapshot.PromptHistory...)
 			if sessionChanged {
+				m.mcpReportedErrors = nil
 				m.hydrateHistory(typed.snapshot.History)
 				m.followOutput = true
 				m.contextStarted = len(typed.snapshot.History) > 0 || len(typed.snapshot.PromptHistory) > 0
@@ -472,7 +483,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.mcpLoading = false
 		if typed.err != nil {
 			m.mcpNotice = typed.err.Error()
+			m.mcpNoticeError = true
+			m.reportMCPError("", mcpErrorNotice("", typed.err.Error()))
 		} else {
+			delete(m.mcpReportedErrors, "")
+			m.reportMCPServerErrors(typed.servers)
 			selected := ""
 			if item, ok := m.selectedMCPServer(); ok {
 				selected = item.Name
@@ -487,14 +502,18 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.mcpCursor = clampCursor(m.mcpCursor, len(m.mcpServers))
 			m.mcpNotice = ""
+			m.mcpNoticeError = false
 		}
 		m.refreshViewport()
 		return m, m.mcpPollCmd()
 	case mcpActionResultMsg:
 		if typed.err != nil {
 			m.mcpNotice = typed.err.Error()
+			m.mcpNoticeError = true
+			m.reportMCPError(typed.server, mcpErrorNotice(typed.server, typed.err.Error()))
 		} else {
 			m.mcpNotice = fmt.Sprintf("%s: %s complete", typed.server, typed.action)
+			m.mcpNoticeError = false
 		}
 		m.refreshViewport()
 		return m, m.fetchMCPServersCmd()
@@ -504,6 +523,16 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.fetchMCPServersCmd()
 		}
 		return m, nil
+	case mcpSpinnerMsg:
+		if !m.mcpLoading || !m.animation {
+			return m, nil
+		}
+		updated, command := m.mcpSpinner.Update(typed.message)
+		m.mcpSpinner = updated
+		if (m.screen == screenChat && m.viewport.YOffset() < bannerViewportRows) || m.screen == screenMCP {
+			m.refreshViewport()
+		}
+		return m, wrapMCPSpinnerCmd(command)
 	case clipboardResultMsg:
 		return m, m.handleClipboardResult(typed)
 	case copyToastExpiredMsg:
@@ -880,6 +909,8 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleSkillsKey(key)
 	case screenMCP, screenMCPDetail:
 		return m.handleMCPKey(key)
+	case screenMCPToolDetail:
+		return m.handleMCPToolDetailKey(message)
 	case screenContext:
 		if key == "esc" {
 			m.screen = screenChat
@@ -1154,6 +1185,11 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 		m.mcpTab = 0
 		m.mcpCatalogCursor = 0
 		m.mcpNotice = ""
+		m.mcpNoticeError = false
+		if m.mcpLoading {
+			m.refreshViewport()
+			return m, nil
+		}
 		return m, m.fetchMCPServersCmd()
 	case "/provider":
 		if len(fields) >= 2 && fields[1] == "add" {
@@ -1649,6 +1685,13 @@ func wrapOperationCmd(operationID string, command tea.Cmd) tea.Cmd {
 	return func() tea.Msg { return operationSpinnerMsg{operationID: operationID, message: command()} }
 }
 
+func wrapMCPSpinnerCmd(command tea.Cmd) tea.Cmd {
+	if command == nil {
+		return nil
+	}
+	return func() tea.Msg { return mcpSpinnerMsg{message: command()} }
+}
+
 func (m *Model) transitionAfter(operationID string, state OperationState) tea.Cmd {
 	return m.clock.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return transitionMsg{operationID: operationID, state: state} })
 }
@@ -1668,8 +1711,15 @@ func (m *Model) fetchMCPServersCmd() tea.Cmd {
 	}
 }
 
+func (m *Model) mcpSpinnerTickCmd() tea.Cmd {
+	if !m.mcpLoading || !m.animation {
+		return nil
+	}
+	return func() tea.Msg { return mcpSpinnerMsg{message: m.mcpSpinner.Tick()} }
+}
+
 func (m *Model) mcpPollCmd() tea.Cmd {
-	if (m.screen != screenMCP && m.screen != screenMCPDetail) || m.mcpPollScheduled {
+	if (m.screen != screenMCP && m.screen != screenMCPDetail && m.screen != screenMCPToolDetail) || m.mcpPollScheduled {
 		return nil
 	}
 	m.mcpPollScheduled = true
@@ -1734,6 +1784,45 @@ func (m *Model) appendNotice(text string, isError bool) {
 	if strings.TrimSpace(text) != "" {
 		m.timeline = append(m.timeline, timelineItem{kind: timelineNotice, text: text, err: isError})
 	}
+}
+
+func (m *Model) reportMCPServerErrors(servers []MCPServerItem) {
+	active := make(map[string]bool, len(servers))
+	for _, server := range servers {
+		active[server.Name] = true
+		if strings.TrimSpace(server.LastError) == "" {
+			delete(m.mcpReportedErrors, server.Name)
+			continue
+		}
+		m.reportMCPError(server.Name, mcpErrorNotice(server.Name, server.LastError))
+	}
+	for server := range m.mcpReportedErrors {
+		if server != "" && !active[server] {
+			delete(m.mcpReportedErrors, server)
+		}
+	}
+}
+
+func (m *Model) reportMCPError(server, message string) {
+	if m.mcpReportedErrors == nil {
+		m.mcpReportedErrors = make(map[string]string)
+	}
+	if m.mcpReportedErrors[server] == message {
+		return
+	}
+	m.mcpReportedErrors[server] = message
+	m.appendNotice(message, true)
+}
+
+func mcpErrorNotice(server, message string) string {
+	prefix := "MCP"
+	if server != "" {
+		prefix += " " + server
+	}
+	if strings.Contains(strings.ToLower(message), "bad gateway") {
+		return prefix + ": HTTP 502 Bad Gateway · /mcp then r to reconnect"
+	}
+	return prefix + ": " + message
 }
 
 func (m *Model) completeTool(result *protocol.ToolResult) {

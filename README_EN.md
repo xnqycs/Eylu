@@ -267,7 +267,7 @@ working_directory = "."
 read_only_tools = ["search", "inspect"]
 allow_tools = ["search", "inspect", "status"]
 deny_tools = ["status"]
-startup_timeout_seconds = 15
+startup_timeout_seconds = 60
 call_timeout_seconds = 60
 
 [mcp_servers.remote]
@@ -283,7 +283,7 @@ client_secret_environment = "REMOTE_MCP_CLIENT_SECRET"
 scopes = ["mcp:tools", "mcp:resources"]
 ```
 
-An `sse` server uses the same `url`, header, and OAuth fields. Static headers can be set with `headers`; inject sensitive values through `environment_headers`, `bearer_token_environment`, or OAuth. The compatibility fields `disabled`, `timeout_seconds`, and `read_only_tools` remain supported. Startup, call, and OAuth/interaction timeouts default to 15, 60, and 30 seconds.
+An `sse` server uses the same `url`, header, and OAuth fields. Static headers can be configured directly with `headers = { Authorization = "Bearer token" }`; sensitive values can also be injected through `environment_headers`, `bearer_token_environment`, or OAuth. The compatibility fields `disabled`, `timeout_seconds`, and `read_only_tools` remain supported. Startup, call, and OAuth/interaction timeouts default to 60, 60, and 30 seconds. Up to four servers connect concurrently. Each Streamable HTTP handshake POST and tool discovery receive their own startup timeout; HTTP clients retain server cookies and send a stable User-Agent. A server becomes connected as soon as tools are ready, while logging level, resources, resource templates, and prompts load in the background. Optional catalog failures are recorded as diagnostics while connected tools remain available. Transient connection failures retry up to three times; authentication, configuration, and user cancellation failures stop immediately. After retries are exhausted, use `reconnect`; session cleanup on exit has a two-second bound.
 
 ```bash
 eylu mcp list
@@ -301,7 +301,7 @@ eylu mcp login remote
 eylu mcp logout remote
 ```
 
-Enter `/mcp` in the TUI to open the server list and detail panel. It exposes tools, resources, prompts, connection state, diagnostics, reconnect, enable/disable, and login actions. Catalog notifications atomically refresh the tool registry, context, and cache fingerprint. OAuth credentials are stored in `~/.eylu/mcp_credentials.json` with file locking, atomic replacement, and platform-specific permission hardening.
+After the TUI starts, a spinner below the banner shows MCP loading progress and its row is cleared when loading reaches either terminal state. Enter `/mcp` to open the server list and detail panel directly. Use the left/right arrow keys or number keys to switch between details, tools, resources, and prompts. The Tools tab shows a selectable list; press Enter for tool details and Esc to return. The first TUI request reuses the MCP manager created at startup. Connection errors appear in the content area and remain in chat history; after automatic retries are exhausted, an HTTP 502 includes a manual reconnect hint. Background diagnostics do not write through the input area. Catalog notifications atomically refresh the tool registry, context, and cache fingerprint. OAuth credentials are stored in `~/.eylu/mcp_credentials.json` with file locking, atomic replacement, and platform-specific permission hardening.
 
 MCP environment variables are forwarded through a name allowlist. Read-only tools must also be declared explicitly in the local configuration.
 

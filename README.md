@@ -238,7 +238,7 @@ working_directory = "."
 read_only_tools = ["search", "inspect"]
 allow_tools = ["search", "inspect", "status"]
 deny_tools = ["status"]
-startup_timeout_seconds = 15
+startup_timeout_seconds = 60
 call_timeout_seconds = 60
 
 [mcp_servers.remote]
@@ -254,7 +254,7 @@ client_secret_environment = "REMOTE_MCP_CLIENT_SECRET"
 scopes = ["mcp:tools", "mcp:resources"]
 ```
 
-`sse` server 使用相同的 `url`、Header 和 OAuth 字段。静态 Header 可通过 `headers` 配置；敏感值推荐通过 `environment_headers`、`bearer_token_environment` 或 OAuth 注入。兼容字段 `disabled`、`timeout_seconds`、`read_only_tools` 继续有效。默认启动、调用和 OAuth/交互超时分别为 15、60、30 秒。
+`sse` server 使用相同的 `url`、Header 和 OAuth 字段。静态 Header 可通过 `headers = { Authorization = "Bearer token" }` 直接配置；敏感值也可通过 `environment_headers`、`bearer_token_environment` 或 OAuth 注入。兼容字段 `disabled`、`timeout_seconds`、`read_only_tools` 继续有效。默认启动、调用和 OAuth/交互超时分别为 60、60、30 秒。多个 server 最多并行连接 4 个。Streamable HTTP 握手中的每个 POST 和工具目录分别应用启动期限，HTTP 客户端会保存服务端 Cookie 并发送稳定 User-Agent。工具目录就绪后 server 即进入 connected；日志级别、资源、资源模板与提示词在后台加载，可选目录失败会记录诊断并保留已连接的工具。临时连接错误最多自动重试 3 次，认证、配置和用户取消错误会直接结束；重试耗尽后可执行 `reconnect`。退出时的会话清理采用 2 秒有界等待。
 
 ```bash
 eylu mcp list
@@ -272,7 +272,7 @@ eylu mcp login remote
 eylu mcp logout remote
 ```
 
-TUI 输入 `/mcp` 可打开 server 列表和详情面板，查看工具、资源、提示词、连接状态与诊断，并执行重连、启停和登录操作。目录变更通知会原子更新工具注册表、上下文和缓存指纹。OAuth 凭据保存在 `~/.eylu/mcp_credentials.json`，写入采用文件锁、原子替换及平台权限收紧。
+TUI 启动后会在 MCP 加载期间于 Banner 下展示 spinner，加载进入成功或失败终态后自动清除该行；输入 `/mcp` 可直接打开 server 列表和详情面板，使用左右方向键或数字键切换详情、工具、资源和提示词。Tools 页只显示可选列表，按 Enter 进入工具详情，按 Esc 返回。TUI 首轮请求会复用启动时建立的 MCP manager。连接错误显示在内容区域并同步保留到聊天历史，HTTP 502 在自动重试耗尽后提供手动重连提示，后台诊断不会穿透到输入区。目录变更通知会原子更新工具注册表、上下文和缓存指纹。OAuth 凭据保存在 `~/.eylu/mcp_credentials.json`，写入采用文件锁、原子替换及平台权限收紧。
 
 MCP 环境变量按名称白名单转发；只读工具仍需在本地配置中显式声明。
 
