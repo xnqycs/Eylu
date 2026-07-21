@@ -885,18 +885,18 @@ func redactedServerConfig(cfg config.MCPServerConfig) map[string]any {
 		result["command"] = cfg.Command
 	}
 	if len(cfg.Args) > 0 {
-		result["args"] = append([]string(nil), cfg.Args...)
+		result["args"] = redactedServerArgs(cfg.Args)
 	}
 	if cfg.WorkingDirectory != "" {
 		result["working_directory"] = cfg.WorkingDirectory
 	}
 	if cfg.URL != "" {
-		result["url"] = cfg.URL
+		result["url"] = redactedServerURL(cfg.URL)
 	}
 	if len(cfg.Headers) > 0 {
 		headers := make(map[string]string, len(cfg.Headers))
 		for name := range cfg.Headers {
-			headers[name] = "[REDACTED]"
+			headers[name] = redactedConfigValue
 		}
 		result["headers"] = headers
 	}
@@ -907,9 +907,83 @@ func redactedServerConfig(cfg config.MCPServerConfig) map[string]any {
 		result["bearer_token_environment"] = cfg.BearerTokenEnvironment
 	}
 	if cfg.OAuth != nil {
-		result["oauth"] = map[string]any{"issuer": cfg.OAuth.Issuer, "client_id": cfg.OAuth.ClientID, "scopes": cfg.OAuth.Scopes, "redirect_url": cfg.OAuth.RedirectURL}
+		result["oauth"] = map[string]any{
+			"issuer": redactedServerURL(cfg.OAuth.Issuer), "client_id": cfg.OAuth.ClientID,
+			"scopes": cfg.OAuth.Scopes, "redirect_url": redactedServerURL(cfg.OAuth.RedirectURL),
+		}
 	}
 	return result
+}
+
+const redactedConfigValue = "[REDACTED]"
+
+func redactedServerArgs(args []string) []string {
+	redacted := make([]string, 0, len(args))
+	positionalOnly := false
+	for _, argument := range args {
+		if positionalOnly {
+			redacted = append(redacted, redactedConfigValue)
+			continue
+		}
+		if argument == "--" {
+			redacted = append(redacted, argument)
+			positionalOnly = true
+			continue
+		}
+		if strings.HasPrefix(argument, "--") && len(argument) > 2 {
+			name, _, hasValue := strings.Cut(argument, "=")
+			if hasValue {
+				redacted = append(redacted, name+"="+redactedConfigValue)
+			} else {
+				redacted = append(redacted, argument)
+			}
+			continue
+		}
+		if strings.HasPrefix(argument, "-") && len(argument) > 1 {
+			name, _, hasValue := strings.Cut(argument, "=")
+			if hasValue {
+				redacted = append(redacted, name+"="+redactedConfigValue)
+				continue
+			}
+			_, flagSize := utf8.DecodeRuneInString(argument[1:])
+			flagEnd := 1 + flagSize
+			if flagEnd < len(argument) {
+				redacted = append(redacted, argument[:flagEnd]+redactedConfigValue)
+			} else {
+				redacted = append(redacted, argument)
+			}
+			continue
+		}
+		redacted = append(redacted, redactedConfigValue)
+	}
+	return redacted
+}
+
+func redactedServerURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return redactedConfigValue
+	}
+	parsed.User = nil
+	if parsed.Opaque != "" {
+		parsed.Opaque = redactedConfigValue
+	}
+	query, _ := url.ParseQuery(parsed.RawQuery)
+	for key, values := range query {
+		if len(values) == 0 {
+			query[key] = []string{redactedConfigValue}
+			continue
+		}
+		for index := range values {
+			values[index] = redactedConfigValue
+		}
+	}
+	parsed.RawQuery = query.Encode()
+	if parsed.Fragment != "" || parsed.RawFragment != "" {
+		parsed.Fragment = redactedConfigValue
+		parsed.RawFragment = ""
+	}
+	return parsed.String()
 }
 
 func (m *Manager) ServerTools(name string) ([]ToolInfo, error) {

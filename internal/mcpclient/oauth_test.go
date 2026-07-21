@@ -314,14 +314,19 @@ func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.
 				t.Errorf("parse revoke form: %v", err)
 			}
 			hint := request.Form.Get("token_type_hint")
+			token := request.Form.Get("token")
 			mu.Lock()
 			attempts = append(attempts, hint)
 			mu.Unlock()
+			response.Header().Set("Content-Type", "application/json")
 			if hint == "refresh_token" {
-				http.Error(response, "refresh revocation unavailable", http.StatusServiceUnavailable)
+				response.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = fmt.Fprintf(response, `{"error":"temporarily_unavailable","error_description":"rejected %s"}`, token)
 				return
 			}
-			http.Error(response, "access revocation unavailable", http.StatusBadGateway)
+			response.Header().Set("Content-Type", "text/plain")
+			response.WriteHeader(http.StatusBadGateway)
+			_, _ = fmt.Fprintf(response, "rejected %s", token)
 		default:
 			http.NotFound(response, request)
 		}
@@ -346,7 +351,7 @@ func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.
 		t.Fatal("Logout error = nil, want aggregated revocation diagnostics")
 	}
 	message := err.Error()
-	for _, expected := range []string{"refresh_token", "503", "access_token", "502"} {
+	for _, expected := range []string{"refresh_token", "503", "temporarily_unavailable", "access_token", "502"} {
 		if !strings.Contains(message, expected) {
 			t.Errorf("Logout error %q omitted %q", message, expected)
 		}
@@ -364,6 +369,113 @@ func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.
 	}
 	if _, err := store.Get(context.Background(), key); !errors.Is(err, ErrCredentialsNotFound) {
 		t.Fatalf("credential remained after failed revocations: %v", err)
+	}
+}
+
+func TestOAuthRefreshErrorRedactsEchoedRefreshToken(t *testing.T) {
+	const refreshToken = "refresh-token-must-stay-secret"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/.well-known/oauth-protected-resource/mcp":
+			writeFixtureJSON(t, response, map[string]any{
+				"resource": server.URL + "/mcp", "authorization_servers": []string{server.URL + "/issuer"},
+			})
+		case "/.well-known/oauth-authorization-server/issuer":
+			writeFixtureJSON(t, response, map[string]any{
+				"issuer": server.URL + "/issuer", "authorization_endpoint": server.URL + "/authorize", "token_endpoint": server.URL + "/token",
+			})
+		case "/token":
+			if err := request.ParseForm(); err != nil {
+				t.Errorf("parse refresh form: %v", err)
+			}
+			if got := request.Form.Get("refresh_token"); got != refreshToken {
+				t.Errorf("refresh token = %q", got)
+			}
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprintf(response, `{"error":"invalid_grant","error_description":"rejected %s"}`, request.Form.Get("refresh_token"))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	store := NewCredentialStore(filepath.Join(t.TempDir(), "mcp_credentials.json"))
+	client := NewOAuthClient(store, WithOAuthHTTPClient(server.Client()))
+	options := OAuthOptions{ServerName: "fixture", ResourceURL: server.URL + "/mcp", ClientID: "pre-registered"}
+	key, err := client.credentialKey(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), key, OAuthCredential{
+		AccessToken: "expired-access", RefreshToken: refreshToken, TokenType: "Bearer", Expiry: time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Token(context.Background(), options)
+	if err == nil {
+		t.Fatal("Token error = nil")
+	}
+	message := err.Error()
+	for _, expected := range []string{"400", "invalid_grant"} {
+		if !strings.Contains(message, expected) {
+			t.Errorf("Token error %q omitted %q", message, expected)
+		}
+	}
+	if strings.Contains(message, refreshToken) {
+		t.Fatalf("Token error exposed refresh token: %q", message)
+	}
+}
+
+func TestOAuthCallbackErrorRedactsRemoteQueryText(t *testing.T) {
+	const callbackSecret = "callback-token-must-stay-secret"
+	client := NewOAuthClient(NewCredentialStore(filepath.Join(t.TempDir(), "credentials.json")))
+	client.addPending("expected-state", pendingAuthorization{
+		Verifier: "verifier", RedirectURL: "http://127.0.0.1:32123/oauth/callback", ExpiresAt: time.Now().Add(time.Minute),
+	})
+	results := make(chan oauthCallbackResult, 1)
+	handler := client.oauthCallbackHandler(results)
+	requestURL := "http://127.0.0.1:32123/oauth/callback?state=expected-state&error=access_denied&error_description=" + url.QueryEscape(callbackSecret)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, requestURL, nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("callback status = %d", response.Code)
+	}
+	result := <-results
+	if result.err == nil {
+		t.Fatal("callback error = nil")
+	}
+	message := result.err.Error()
+	if !strings.Contains(message, "access_denied") {
+		t.Fatalf("callback error %q omitted validated OAuth error code", message)
+	}
+	if strings.Contains(message, callbackSecret) {
+		t.Fatalf("callback error exposed query text: %q", message)
+	}
+}
+
+func TestOAuthCallbackErrorRejectsUnsafeErrorCode(t *testing.T) {
+	const callbackSecret = "callback-token-must-stay-secret"
+	client := NewOAuthClient(NewCredentialStore(filepath.Join(t.TempDir(), "credentials.json")))
+	client.addPending("expected-state", pendingAuthorization{
+		Verifier: "verifier", RedirectURL: "http://127.0.0.1:32123/oauth/callback", ExpiresAt: time.Now().Add(time.Minute),
+	})
+	results := make(chan oauthCallbackResult, 1)
+	handler := client.oauthCallbackHandler(results)
+	requestURL := "http://127.0.0.1:32123/oauth/callback?state=expected-state&error=" + url.QueryEscape(callbackSecret)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, requestURL, nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("callback status = %d", response.Code)
+	}
+	result := <-results
+	if result.err == nil {
+		t.Fatal("callback error = nil")
+	}
+	if message := result.err.Error(); strings.Contains(message, callbackSecret) {
+		t.Fatalf("callback error exposed unsafe error code: %q", message)
 	}
 }
 

@@ -179,12 +179,12 @@ func (c *OAuthClient) oauthCallbackHandler(results chan<- oauthCallbackResult) h
 			return
 		}
 		result := oauthCallbackResult{pending: pending}
-		if oauthError := request.URL.Query().Get("error"); oauthError != "" {
-			description := strings.TrimSpace(request.URL.Query().Get("error_description"))
-			if description != "" {
-				oauthError += ": " + description
+		if remoteError := request.URL.Query().Get("error"); remoteError != "" {
+			if oauthError, ok := safeOAuthErrorCode(remoteError); ok {
+				result.err = fmt.Errorf("OAuth authorization failed: %s", oauthError)
+			} else {
+				result.err = errors.New("OAuth authorization failed")
 			}
-			result.err = fmt.Errorf("OAuth authorization failed: %s", oauthError)
 		} else {
 			result.code = request.URL.Query().Get("code")
 			result.issuer = request.URL.Query().Get("iss")

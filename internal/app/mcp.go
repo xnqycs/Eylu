@@ -64,6 +64,13 @@ func (r *runtime) loadMCP(ctx context.Context, cfg config.Config) (*mcpclient.Ma
 	return r.loadMCPWithHost(ctx, cfg, mcpHostCallbacks{})
 }
 
+func (r *runtime) loadMCPWithCurrentHost(ctx context.Context, cfg config.Config) (*mcpclient.Manager, error) {
+	r.mcpHostMu.RLock()
+	host := r.mcpHost
+	r.mcpHostMu.RUnlock()
+	return r.loadMCPWithHost(ctx, cfg, host)
+}
+
 func (r *runtime) loadMCPWithHost(ctx context.Context, cfg config.Config, host mcpHostCallbacks) (*mcpclient.Manager, error) {
 	options, capabilityKey := r.setMCPHost(host)
 	encoded, err := json.Marshal(struct {

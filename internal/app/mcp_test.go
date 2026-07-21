@@ -28,6 +28,7 @@ import (
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 	"Eylu/internal/tool"
+	"Eylu/internal/ui"
 )
 
 type appMCPHostDriver struct{}
@@ -63,10 +64,12 @@ type appMCPHostProbe struct {
 func TestAppMCPHostAndLiveCatalogUseRealManagerPath(t *testing.T) {
 	var capabilitiesMu sync.Mutex
 	var capabilities *sdkmcp.ClientCapabilities
+	initializedSessions := 0
 	var subscribedURI string
 	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "app-host-fixture", Version: "1.0.0"}, &sdkmcp.ServerOptions{
 		InitializedHandler: func(_ context.Context, request *sdkmcp.InitializedRequest) {
 			capabilitiesMu.Lock()
+			initializedSessions++
 			capabilities = request.ClientCapabilities()
 			capabilitiesMu.Unlock()
 		},
@@ -130,6 +133,7 @@ func TestAppMCPHostAndLiveCatalogUseRealManagerPath(t *testing.T) {
 	if err := appRuntime.configureMCPRuntimeWithHost(context.Background(), cfg, &modelRuntime, host); err != nil {
 		t.Fatal(err)
 	}
+	initialManager := appRuntime.mcp
 	registry := tool.NewRegistry(appRuntime.currentMCPState().Tools...)
 	probe, ok := registry.Get("mcp__host__host_probe")
 	if !ok {
@@ -153,6 +157,25 @@ func TestAppMCPHostAndLiveCatalogUseRealManagerPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	tui := &tuiBackend{runtime: appRuntime, manager: providerManager}
+	servers, err := tui.MCPServers(context.Background())
+	if err != nil || len(servers) != 1 || servers[0].Name != "host" {
+		t.Fatalf("TUI MCP poll servers=%#v error=%v", servers, err)
+	}
+	capabilitiesMu.Lock()
+	initializedCount := initializedSessions
+	capabilitiesMu.Unlock()
+	if appRuntime.mcp != initialManager || initializedCount != 1 {
+		t.Fatalf("TUI poll replaced MCP manager/session: manager_same=%t initialized=%d", appRuntime.mcp == initialManager, initializedCount)
+	}
+	polledRegistry := tool.NewRegistry(appRuntime.currentMCPState().Tools...)
+	polledProbe, ok := polledRegistry.Get("mcp__host__host_probe")
+	if !ok {
+		t.Fatalf("TUI poll removed active MCP tools: %#v", polledRegistry.Definitions())
+	}
+	polledResult := polledProbe.Execute(context.Background(), json.RawMessage(`{}`))
+	if polledResult.IsError || !strings.Contains(polledResult.Content, "sampled by current provider") {
+		t.Fatalf("sampling after TUI poll=%#v", polledResult)
+	}
 	completed, err := tui.handleTUIMCPCommand(context.Background(), []string{"complete", "host", "prompt", "fixture", "name", "E"})
 	if err != nil || !strings.Contains(completed, "Eylu") {
 		t.Fatalf("TUI completion=%q error=%v", completed, err)
@@ -374,6 +397,155 @@ func TestMCPCommandsRouteArgumentsAndRedactJSON(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMCPInspectRedactsConfigInJSONAndText(t *testing.T) {
+	const secret = "inspect-token-must-stay-secret"
+	cfg := config.Default()
+	cfg.MCPServers = map[string]config.MCPServerConfig{
+		"fixture": {
+			Disabled: true,
+			Command:  "fixture-command",
+			Args:     []string{"--api-key", secret, "--token=" + secret},
+			URL:      "https://user:" + secret + "@example.test/mcp?api_key=" + secret,
+		},
+	}
+	manager, _, err := mcpclient.Open(context.Background(), cfg.MCPServers, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	for _, output := range []string{"json", "text"} {
+		t.Run(output, func(t *testing.T) {
+			var stdout bytes.Buffer
+			appRuntime := &runtime{stdout: &stdout, stderr: &bytes.Buffer{}, output: output}
+			command := appRuntime.mcpCommandWithBackend(context.Background(), func(context.Context) (mcpCommandBackend, error) {
+				return &managerMCPCommandBackend{manager: manager}, nil
+			}, nil)
+			command.SetArgs([]string{"inspect", "fixture"})
+			if err := command.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			result := stdout.String()
+			if strings.Contains(result, secret) {
+				t.Fatalf("%s inspect exposed secret: %q", output, result)
+			}
+			for _, expected := range []string{"--api-key", "[REDACTED]"} {
+				if !strings.Contains(result, expected) {
+					t.Fatalf("%s inspect omitted %q: %q", output, expected, result)
+				}
+			}
+		})
+	}
+}
+
+func TestOAuthEchoedTokenStaysRedactedAcrossManagerCLIAndTUI(t *testing.T) {
+	const token = "oauth-token-must-stay-secret"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/.well-known/oauth-protected-resource/mcp":
+			response.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"resource": server.URL + "/mcp", "authorization_servers": []string{server.URL + "/issuer"},
+			})
+		case "/.well-known/oauth-authorization-server/issuer":
+			response.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"issuer": server.URL + "/issuer", "authorization_endpoint": server.URL + "/authorize",
+				"token_endpoint": server.URL + "/token", "revocation_endpoint": server.URL + "/revoke",
+			})
+		case "/revoke":
+			if err := request.ParseForm(); err != nil {
+				t.Errorf("parse revoke form: %v", err)
+			}
+			response.Header().Set("Content-Type", "application/json")
+			response.WriteHeader(http.StatusBadGateway)
+			_, _ = fmt.Fprintf(response, `{"error":"temporarily_unavailable","error_description":"rejected %s"}`, request.Form.Get("token"))
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	workspace := t.TempDir()
+	cfg := config.Default()
+	cfg.MCPServers = map[string]config.MCPServerConfig{
+		"oauth": {
+			Disabled: true, Transport: config.MCPTransportStreamableHTTP, URL: server.URL + "/mcp",
+			OAuth: &config.MCPOAuthConfig{Issuer: server.URL + "/issuer", ClientID: "fixture-client"},
+		},
+	}
+	store := mcpclient.NewCredentialStore(filepath.Join(t.TempDir(), "credentials.json"))
+	oauthClient := mcpclient.NewOAuthClient(store, mcpclient.WithOAuthHTTPClient(server.Client()))
+	manager, _, err := mcpclient.OpenWithOptions(context.Background(), cfg.MCPServers, workspace, mcpclient.Options{OAuthClient: oauthClient})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	oauthOptions := mcpclient.OAuthOptions{ServerName: "oauth", ResourceURL: server.URL + "/mcp", Issuer: server.URL + "/issuer", ClientID: "fixture-client"}
+	authHash, err := oauthOptions.AuthHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialKey, err := mcpclient.CredentialKey(oauthOptions.ServerName, oauthOptions.ResourceURL, authHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedCredential := func() {
+		t.Helper()
+		if err := store.Put(context.Background(), credentialKey, mcpclient.OAuthCredential{AccessToken: token, TokenType: "Bearer"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertSafeError := func(layer string, err error, diagnostics ...string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s error = nil", layer)
+		}
+		combined := err.Error() + "\n" + strings.Join(diagnostics, "\n")
+		if strings.Contains(combined, token) {
+			t.Fatalf("%s exposed OAuth token: %q", layer, combined)
+		}
+		if !strings.Contains(combined, "502") || !strings.Contains(combined, "temporarily_unavailable") {
+			t.Fatalf("%s omitted safe diagnostics: %q", layer, combined)
+		}
+	}
+
+	seedCredential()
+	assertSafeError("manager", manager.Logout(context.Background(), "oauth"))
+
+	seedCredential()
+	var cliOut, cliErr bytes.Buffer
+	cliRuntime := &runtime{stdout: &cliOut, stderr: &cliErr, output: "json"}
+	command := cliRuntime.mcpCommandWithBackend(context.Background(), func(context.Context) (mcpCommandBackend, error) {
+		return &managerMCPCommandBackend{manager: manager}, nil
+	}, nil)
+	command.SetArgs([]string{"logout", "oauth"})
+	command.SetOut(&cliOut)
+	command.SetErr(&cliErr)
+	assertSafeError("CLI", command.Execute(), cliOut.String(), cliErr.String())
+
+	seedCredential()
+	providerManager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	appRuntime := &runtime{workspace: workspace, stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	loadedManager, err := appRuntime.loadMCP(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loadedManager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	appRuntime.mcpMu.Lock()
+	appRuntime.mcp = manager
+	appRuntime.mcpMu.Unlock()
+	t.Cleanup(func() { _ = appRuntime.closeMCP() })
+	tui := &tuiBackend{runtime: appRuntime, manager: providerManager}
+	assertSafeError("TUI", tui.MCPAction(context.Background(), "oauth", ui.MCPActionLogout))
 }
 
 func TestMCPEnableDisableUseConfigurationStore(t *testing.T) {

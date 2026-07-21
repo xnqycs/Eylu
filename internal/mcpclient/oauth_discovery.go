@@ -194,27 +194,29 @@ func (c *OAuthClient) getOAuthJSON(ctx context.Context, endpoint string, destina
 func oauthHTTPError(response *http.Response) error {
 	encoded, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 	var payload struct {
-		Error            string `json:"error"`
-		ErrorDescription string `json:"error_description"`
+		Error string `json:"error"`
 	}
 	_ = json.Unmarshal(encoded, &payload)
-	detail := strings.TrimSpace(payload.Error)
-	if payload.ErrorDescription != "" {
-		if detail != "" {
-			detail += ": "
-		}
-		detail += strings.TrimSpace(payload.ErrorDescription)
-	}
-	if detail == "" {
-		detail = strings.TrimSpace(string(encoded))
-	}
-	if len(detail) > 512 {
-		detail = detail[:512]
-	}
-	if detail == "" {
+	code, ok := safeOAuthErrorCode(payload.Error)
+	if !ok {
 		return fmt.Errorf("OAuth endpoint returned HTTP %d", response.StatusCode)
 	}
-	return fmt.Errorf("OAuth endpoint returned HTTP %d: %s", response.StatusCode, detail)
+	return fmt.Errorf("OAuth endpoint returned HTTP %d: %s", response.StatusCode, code)
+}
+
+func safeOAuthErrorCode(value string) (string, bool) {
+	const maxOAuthErrorCodeBytes = 64
+	if len(value) == 0 || len(value) > maxOAuthErrorCodeBytes {
+		return "", false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '_' {
+			continue
+		}
+		return "", false
+	}
+	return value, true
 }
 
 func ParseResourceMetadataURL(header string) (string, bool) {

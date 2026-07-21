@@ -1107,7 +1107,7 @@ func (b *tuiBackend) loadTUIMCPManager(ctx context.Context) (*mcpclient.Manager,
 		return nil, config.Config{}, errors.New("MCP configuration is unavailable")
 	}
 	cfg := b.manager.Config()
-	manager, err := b.runtime.loadMCP(ctx, cfg)
+	manager, err := b.runtime.loadMCPWithCurrentHost(ctx, cfg)
 	if err != nil {
 		return nil, config.Config{}, err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +75,110 @@ func TestProtocolErrorDataPreservesJSONRPCFields(t *testing.T) {
 	}
 	if string(encoded) != `{"field":"path"}` {
 		t.Fatalf("protocol error data payload = %s", encoded)
+	}
+}
+
+func TestInspectRedactsServerArgumentsAndURLs(t *testing.T) {
+	secrets := []string{
+		"long-inline-secret", "long-separate-secret", "short-separate-secret", "short-inline-secret",
+		"combined-short-secret", "positional-secret", "after-terminator-secret",
+		"url-user-secret", "url-password-secret", "url-query-secret", "url-tenant-secret", "url-fragment-secret",
+		"issuer-user-secret", "issuer-password-secret", "issuer-query-secret",
+		"redirect-user-secret", "redirect-password-secret", "redirect-query-secret",
+	}
+	cfg := config.MCPServerConfig{
+		Command: "fixture-command",
+		Args: []string{
+			"--api-key=long-inline-secret",
+			"--token", "long-separate-secret",
+			"-k", "short-separate-secret",
+			"-p=short-inline-secret",
+			"-Dcombined-short-secret",
+			"positional-secret",
+			"--", "--after-terminator-secret",
+		},
+		URL: "https://url-user-secret:url-password-secret@example.test/mcp?api_key=url-query-secret&tenant=url-tenant-secret#url-fragment-secret",
+		OAuth: &config.MCPOAuthConfig{
+			Issuer:      "https://issuer-user-secret:issuer-password-secret@issuer.example.test/oauth?token=issuer-query-secret",
+			ClientID:    "diagnostic-client",
+			Scopes:      []string{"mcp:read"},
+			RedirectURL: "https://redirect-user-secret:redirect-password-secret@localhost/callback?code=redirect-query-secret",
+		},
+	}
+	manager := &Manager{servers: map[string]*serverRuntime{
+		"fixture": {name: "fixture", config: cfg, status: StatusDisconnected},
+	}}
+
+	detail, err := manager.Inspect("fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs := []string{
+		"--api-key=[REDACTED]",
+		"--token", "[REDACTED]",
+		"-k", "[REDACTED]",
+		"-p=[REDACTED]",
+		"-D[REDACTED]",
+		"[REDACTED]",
+		"--", "[REDACTED]",
+	}
+	gotArgs, ok := detail.Config["args"].([]string)
+	if !ok || strings.Join(gotArgs, "\x00") != strings.Join(wantArgs, "\x00") {
+		t.Fatalf("redacted args = %#v, want %#v", gotArgs, wantArgs)
+	}
+	assertRedactedInspectURL(t, detail.Config["url"], "api_key", "tenant")
+	oauth, ok := detail.Config["oauth"].(map[string]any)
+	if !ok {
+		t.Fatalf("oauth config = %#v", detail.Config["oauth"])
+	}
+	assertRedactedInspectURL(t, oauth["issuer"], "token")
+	assertRedactedInspectURL(t, oauth["redirect_url"], "code")
+
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := fmt.Sprintf("%+v", detail)
+	for _, output := range []string{string(encoded), text} {
+		for _, secret := range secrets {
+			if strings.Contains(output, secret) {
+				t.Fatalf("Inspect output leaked %q: %s", secret, output)
+			}
+		}
+		for _, diagnostic := range []string{"api_key", "tenant", "--api-key", "--token", "-k", "-p", "-D"} {
+			if !strings.Contains(output, diagnostic) {
+				t.Fatalf("Inspect output omitted diagnostic %q: %s", diagnostic, output)
+			}
+		}
+	}
+}
+
+func assertRedactedInspectURL(t *testing.T, value any, queryKeys ...string) {
+	t.Helper()
+	redacted, ok := value.(string)
+	if !ok {
+		t.Fatalf("redacted URL = %#v", value)
+	}
+	parsed, err := url.Parse(redacted)
+	if err != nil {
+		t.Fatalf("parse redacted URL %q: %v", redacted, err)
+	}
+	if parsed.User != nil {
+		t.Fatalf("redacted URL retained userinfo: %q", redacted)
+	}
+	for _, key := range queryKeys {
+		values, exists := parsed.Query()[key]
+		if !exists || len(values) == 0 {
+			t.Fatalf("redacted URL omitted query key %q: %q", key, redacted)
+		}
+		for _, value := range values {
+			if value != "[REDACTED]" {
+				t.Fatalf("redacted URL query %q = %q", key, value)
+			}
+		}
+	}
+	if parsed.Fragment != "[REDACTED]" && parsed.Fragment != "" {
+		t.Fatalf("redacted URL fragment = %q", parsed.Fragment)
 	}
 }
 
