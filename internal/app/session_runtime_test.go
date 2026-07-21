@@ -468,15 +468,141 @@ func TestLineInteractiveSecondInterruptDuringRequestPrintsResumeInstruction(t *t
 	}
 }
 
+func TestLineInteractiveProviderEditPromptInterruptPrintsResumeInstruction(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.Default()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "original-model"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := manager.Get("work")
+	harness := startLineInterruptHarness(t, workspace, manager)
+
+	mainRead := waitForInteractiveReadChannel(t, harness.runtime, nil)
+	harness.write(t, "/provider edit work\n")
+	waitForInteractiveReadChannel(t, harness.runtime, mainRead)
+	harness.interruptAndWait(t)
+
+	after, _ := manager.Get("work")
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("provider changed after interrupted prompt: before=%+v after=%+v", before, after)
+	}
+	harness.assertResumeInstruction(t)
+}
+
+func TestLineInteractiveModelConfirmationInterruptPrintsResumeInstruction(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.Default()
+	cfg.ModelMetadata.Enabled = false
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "original-model"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := startLineInterruptHarness(t, workspace, manager)
+
+	mainRead := waitForInteractiveReadChannel(t, harness.runtime, nil)
+	harness.write(t, "/model replacement-model\n")
+	waitForInteractiveReadChannel(t, harness.runtime, mainRead)
+	harness.interruptAndWait(t)
+
+	harness.assertResumeInstruction(t)
+}
+
+func TestLineInteractiveNestedModelConfirmationInterruptPrintsResumeInstruction(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := config.Default()
+	cfg.ModelMetadata.Enabled = false
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.com/v1", Model: "original-model"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := startLineInterruptHarness(t, workspace, manager)
+
+	mainRead := waitForInteractiveReadChannel(t, harness.runtime, nil)
+	harness.write(t, "/model replacement-model\n")
+	confirmationRead := waitForInteractiveReadChannel(t, harness.runtime, mainRead)
+	harness.write(t, "n\n")
+	waitForInteractiveReadChannel(t, harness.runtime, confirmationRead)
+	harness.interruptAndWait(t)
+
+	harness.assertResumeInstruction(t)
+}
+
+type lineInterruptHarness struct {
+	runtime      *runtime
+	conversation *agent.Conversation
+	writer       *io.PipeWriter
+	interrupts   chan os.Signal
+	done         chan error
+	stdout       *bytes.Buffer
+}
+
+func startLineInterruptHarness(t *testing.T, workspace string, manager *provider.Manager) *lineInterruptHarness {
+	t.Helper()
+	conversation := agent.NewConversationWithEnvironment(environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: "2026-07-21"})
+	reader, writer := io.Pipe()
+	stdout := &bytes.Buffer{}
+	runtime := &runtime{stdin: reader, stdout: stdout, stderr: &bytes.Buffer{}, output: "text", workspace: workspace, trustPrompted: make(map[string]bool)}
+	interrupts := make(chan os.Signal, 2)
+	done := make(chan error, 1)
+	harness := &lineInterruptHarness{runtime: runtime, conversation: conversation, writer: writer, interrupts: interrupts, done: done, stdout: stdout}
+	t.Cleanup(func() {
+		_ = writer.Close()
+		_ = reader.Close()
+	})
+	go func() {
+		done <- runtime.finishInteractive(conversation, runtime.runLineInteractive(context.Background(), conversation, manager, chatOptions{}, interrupts))
+	}()
+	return harness
+}
+
+func (h *lineInterruptHarness) write(t *testing.T, input string) {
+	t.Helper()
+	if _, err := io.WriteString(h.writer, input); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h *lineInterruptHarness) interruptAndWait(t *testing.T) {
+	t.Helper()
+	h.interrupts <- os.Interrupt
+	select {
+	case err := <-h.done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("child prompt interrupt did not exit line interactive mode")
+	}
+}
+
+func (h *lineInterruptHarness) assertResumeInstruction(t *testing.T) {
+	t.Helper()
+	if !strings.HasSuffix(h.stdout.String(), "Resume this session with:\neylu --resume "+h.conversation.SessionID()+"\n") {
+		t.Fatalf("stdout = %q", h.stdout.String())
+	}
+}
+
 func waitForInteractiveRead(t *testing.T, runtime *runtime) {
+	t.Helper()
+	waitForInteractiveReadChannel(t, runtime, nil)
+}
+
+func waitForInteractiveReadChannel(t *testing.T, runtime *runtime, previous chan inputLineResult) chan inputLineResult {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		runtime.inputMu.Lock()
-		started := runtime.inputRead != nil
+		current := runtime.inputRead
 		runtime.inputMu.Unlock()
-		if started {
-			return
+		if current != nil && current != previous {
+			return current
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("line interactive input read did not start")

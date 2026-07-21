@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -17,7 +20,7 @@ import (
 	"Eylu/internal/tool"
 )
 
-func (r *runtime) loadSkillRuntime(cfg config.Config, opts chatOptions, conversation *agent.Conversation) (*skill.Registry, *skill.Session, error) {
+func (r *runtime) loadSkillRuntime(ctx context.Context, cfg config.Config, opts chatOptions, conversation *agent.Conversation, interrupts <-chan os.Signal) (*skill.Registry, *skill.Session, error) {
 	trustStore, err := skill.OpenTrustStore("")
 	if err != nil {
 		return nil, nil, &protocol.Error{Code: protocol.ErrConfig, Message: "open workspace trust store", Cause: err}
@@ -37,7 +40,10 @@ func (r *runtime) loadSkillRuntime(cfg config.Config, opts chatOptions, conversa
 		trusted := opts.trustSkills
 		if !trusted && isTerminal(r.stdin) && !r.trustPrompted[r.workspace] {
 			r.trustPrompted[r.workspace] = true
-			trusted = r.confirmSkillTrust(r.workspace)
+			trusted, err = r.confirmSkillTrust(ctx, r.workspace, interrupts)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 		if trusted {
 			if err := trustStore.Trust(r.workspace); err != nil {
@@ -62,15 +68,18 @@ func (r *runtime) loadSkillRuntime(cfg config.Config, opts chatOptions, conversa
 	return registry, session, nil
 }
 
-func (r *runtime) confirmSkillTrust(workspace string) bool {
+func (r *runtime) confirmSkillTrust(ctx context.Context, workspace string, interrupts <-chan os.Signal) (bool, error) {
 	absolute, _ := filepath.Abs(workspace)
 	fmt.Fprintf(r.stderr, "Project skills can inject instructions and reference scripts. Trust project skills in %s? [y/N]: ", absolute)
-	reader := r.inputReader
+	reader := r.currentInputReader()
 	if reader == nil {
 		reader = bufio.NewReader(r.stdin)
 	}
-	answer, _ := reader.ReadString('\n')
-	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes")
+	answer, err := r.readInteractiveLineWithInterrupts(ctx, reader, interrupts)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes"), nil
 }
 
 func (r *runtime) skillsCommand(ctx context.Context) *cobra.Command {
@@ -189,8 +198,8 @@ func (r *runtime) discoverForCommand() (config.Config, *skill.Registry, error) {
 	return loaded.Config, registry, err
 }
 
-func (r *runtime) handleSkillsSlash(conversation *agent.Conversation, cfg config.Config, opts chatOptions) error {
-	registry, _, err := r.loadSkillRuntime(cfg, opts, conversation)
+func (r *runtime) handleSkillsSlash(ctx context.Context, conversation *agent.Conversation, cfg config.Config, opts chatOptions, interrupts <-chan os.Signal) error {
+	registry, _, err := r.loadSkillRuntime(ctx, cfg, opts, conversation, interrupts)
 	if err != nil {
 		return err
 	}
@@ -200,8 +209,8 @@ func (r *runtime) handleSkillsSlash(conversation *agent.Conversation, cfg config
 	return nil
 }
 
-func (r *runtime) activateSkillSlash(conversation *agent.Conversation, cfg config.Config, opts chatOptions, name string) error {
-	registry, session, err := r.loadSkillRuntime(cfg, opts, conversation)
+func (r *runtime) activateSkillSlash(ctx context.Context, conversation *agent.Conversation, cfg config.Config, opts chatOptions, name string, interrupts <-chan os.Signal) error {
+	registry, session, err := r.loadSkillRuntime(ctx, cfg, opts, conversation, interrupts)
 	if err != nil {
 		return err
 	}
@@ -210,7 +219,7 @@ func (r *runtime) activateSkillSlash(conversation *agent.Conversation, cfg confi
 	}
 	activationTool := tool.NewActivateSkill(registry, session)
 	input, _ := json.Marshal(map[string]string{"name": name})
-	result := activationTool.Execute(context.Background(), input)
+	result := activationTool.Execute(ctx, input)
 	if result.IsError {
 		return &protocol.Error{Code: protocol.ErrTool, Message: result.Content}
 	}

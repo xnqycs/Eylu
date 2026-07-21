@@ -53,7 +53,7 @@ func (s *tuiAuditSink) Record(record tool.AuditRecord) {
 
 func (r *runtime) runTUI(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions) error {
 	cfg := manager.Config()
-	registry, session, err := r.loadSkillRuntime(cfg, opts, conversation)
+	registry, session, err := r.loadSkillRuntime(ctx, cfg, opts, conversation, nil)
 	if err != nil {
 		return err
 	}

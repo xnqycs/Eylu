@@ -56,6 +56,7 @@ type runtime struct {
 	inputMu            sync.Mutex
 	inputReader        *bufio.Reader
 	inputRead          chan inputLineResult
+	inputInterrupts    <-chan os.Signal
 	trustPrompted      map[string]bool
 	session            *sessionRuntime
 	metrics            *metrics.Collector
@@ -304,7 +305,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 			fmt.Fprintf(r.stderr, "[context] budget input=%d reserve=%d window=%d percent=%.1f\n", event.InputTokens, event.OutputReserve, event.ContextWindow, event.Percent)
 		}
 	}
-	skillRegistry, skillSession, err := r.loadSkillRuntime(cfg, opts, conversation)
+	skillRegistry, skillSession, err := r.loadSkillRuntime(ctx, cfg, opts, conversation, nil)
 	if err != nil {
 		return err
 	}
@@ -495,7 +496,7 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 		if !isTerminal(r.stdin) {
 			return tool.Confirmation{}, nil
 		}
-		reader := r.inputReader
+		reader := r.currentInputReader()
 		if reader == nil {
 			reader = bufio.NewReader(r.stdin)
 		}

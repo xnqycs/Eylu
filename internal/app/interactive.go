@@ -62,8 +62,19 @@ func (r *runtime) runInteractiveFrontend(ctx context.Context, conversation *agen
 
 func (r *runtime) runLineInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, interrupts <-chan os.Signal) error {
 	reader := bufio.NewReader(r.stdin)
+	r.inputMu.Lock()
 	r.inputReader = reader
-	defer func() { r.inputReader = nil }()
+	r.inputInterrupts = interrupts
+	r.inputMu.Unlock()
+	defer func() {
+		r.inputMu.Lock()
+		if r.inputReader == reader {
+			r.inputReader = nil
+			r.inputRead = nil
+			r.inputInterrupts = nil
+		}
+		r.inputMu.Unlock()
+	}()
 	fmt.Fprintf(r.stdout, "Eylu session %s\nType /help for commands.\n", conversation.SessionID())
 	for {
 		fmt.Fprint(r.stdout, "> ")
@@ -187,12 +198,12 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		r.printProviders(manager)
 		return nil
 	case "/skills":
-		return r.handleSkillsSlash(conversation, manager.Config(), *opts)
+		return r.handleSkillsSlash(ctx, conversation, manager.Config(), *opts, r.synchronousInputInterrupts())
 	case "/skill":
 		if len(fields) != 2 {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /skill <name>"}
 		}
-		if err := r.activateSkillSlash(conversation, manager.Config(), *opts, fields[1]); err != nil {
+		if err := r.activateSkillSlash(ctx, conversation, manager.Config(), *opts, fields[1], r.synchronousInputInterrupts()); err != nil {
 			return err
 		}
 		if r.session != nil {
@@ -299,7 +310,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 }
 
 func (r *runtime) askUser(ctx context.Context, request protocol.AskRequest) (protocol.AskResponse, error) {
-	reader := r.inputReader
+	reader := r.currentInputReader()
 	if reader == nil {
 		reader = bufio.NewReader(r.stdin)
 	}
@@ -352,6 +363,18 @@ func (r *runtime) askUser(ctx context.Context, request protocol.AskRequest) (pro
 
 func (r *runtime) readInteractiveLine(ctx context.Context, reader *bufio.Reader) (string, error) {
 	return r.readInteractiveLineWithInterrupts(ctx, reader, nil)
+}
+
+func (r *runtime) synchronousInputInterrupts() <-chan os.Signal {
+	r.inputMu.Lock()
+	defer r.inputMu.Unlock()
+	return r.inputInterrupts
+}
+
+func (r *runtime) currentInputReader() *bufio.Reader {
+	r.inputMu.Lock()
+	defer r.inputMu.Unlock()
+	return r.inputReader
 }
 
 func (r *runtime) readInteractiveLineWithInterrupts(ctx context.Context, reader *bufio.Reader, interrupts <-chan os.Signal) (string, error) {
@@ -476,9 +499,18 @@ func (r *runtime) handleProviderSlash(ctx context.Context, reader *bufio.Reader,
 		if !ok {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", fields[2])}
 		}
-		baseURL := promptLine(reader, r.stdout, "API base URL", current.BaseURL)
-		model := promptLine(reader, r.stdout, "Model ID", current.Model)
-		adapter := promptLine(reader, r.stdout, "Adapter", current.Adapter)
+		baseURL, err := r.promptLine(ctx, reader, r.stdout, "API base URL", current.BaseURL)
+		if err != nil {
+			return err
+		}
+		model, err := r.promptLine(ctx, reader, r.stdout, "Model ID", current.Model)
+		if err != nil {
+			return err
+		}
+		adapter, err := r.promptLine(ctx, reader, r.stdout, "Adapter", current.Adapter)
+		if err != nil {
+			return err
+		}
 		patch := config.ProviderPatch{BaseURL: config.SetValue(baseURL), Model: config.SetValue(model), Adapter: config.SetValue(adapter)}
 		resetFrom := ""
 		if currentEffort := config.EffectiveReasoningEffort(current.ReasoningEffort); config.ValidateReasoningEffort(model, currentEffort) != nil {
@@ -511,7 +543,7 @@ func (r *runtime) confirmModelContextWindow(ctx context.Context, reader *bufio.R
 	detected := snapshot.Limits.ContextWindow
 	for {
 		fmt.Fprintf(r.stdout, "Detected context window for %s: %d tokens (source: %s). Is this correct? [Y/n]: ", snapshot.Config.Model, detected, snapshot.Limits.Source)
-		answer, err := reader.ReadString('\n')
+		answer, err := r.readInteractiveLineWithInterrupts(ctx, reader, r.synchronousInputInterrupts())
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		if err != nil && !errors.Is(err, io.EOF) {
 			return provider.Snapshot{}, err
@@ -530,7 +562,10 @@ func (r *runtime) confirmModelContextWindow(ctx context.Context, reader *bufio.R
 			continue
 		}
 		if value <= 0 {
-			input := promptLine(reader, r.stdout, "Context window tokens", "")
+			input, inputErr := r.promptLine(ctx, reader, r.stdout, "Context window tokens", "")
+			if inputErr != nil {
+				return provider.Snapshot{}, inputErr
+			}
 			parsed, parseErr := strconv.Atoi(strings.TrimSpace(input))
 			if parseErr != nil || parsed <= 0 {
 				fmt.Fprintln(r.stdout, "Context window must be a positive integer.")
