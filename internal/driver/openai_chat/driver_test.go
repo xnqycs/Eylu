@@ -191,6 +191,34 @@ func TestChatMapsToolHistory(t *testing.T) {
 	}
 }
 
+func TestChatPreservesRichToolResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		var rich map[string]any
+		if err := json.Unmarshal([]byte(body.Messages[len(body.Messages)-1].Content), &rich); err != nil {
+			t.Fatalf("rich tool result was not JSON: %v; content=%q", err, body.Messages[len(body.Messages)-1].Content)
+		}
+		if rich["content"] != "legacy text" || rich["structured_content"].(map[string]any)["count"] != float64(2) || rich["content_blocks"].([]any)[0].(map[string]any)["text"] != "block text" {
+			t.Fatalf("rich tool result=%#v", rich)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+	call := protocol.ToolCall{ID: "call-rich", Name: "fixture", Arguments: json.RawMessage(`{}`)}
+	result := protocol.ToolResult{CallID: call.ID, Content: "legacy text", ContentBlocks: []protocol.ContentBlock{{Type: protocol.ContentText, Text: "block text"}}, StructuredContent: json.RawMessage(`{"count":2}`)}
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{
+		{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "run"}}},
+		{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}},
+		{Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &result}}},
+	}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestChatContextErrorPrecedesResponseStart(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)

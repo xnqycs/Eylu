@@ -1,20 +1,243 @@
 package app
 
+//lint:file-ignore SA1019 MCP protocol 2025-11-25 compatibility.
+
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/spf13/cobra"
+
+	"Eylu/internal/agent"
+	"Eylu/internal/config"
+	contextledger "Eylu/internal/context"
+	"Eylu/internal/driver"
 	"Eylu/internal/mcpclient"
+	"Eylu/internal/policy"
+	"Eylu/internal/protocol"
+	"Eylu/internal/provider"
+	"Eylu/internal/tool"
 )
 
+type appMCPHostDriver struct{}
+
+func (appMCPHostDriver) Name() string { return "app-mcp-host" }
+func (appMCPHostDriver) Capabilities() driver.Capabilities {
+	return driver.Capabilities{}
+}
+func (appMCPHostDriver) Generate(context.Context, driver.Request, driver.EmitFunc) (protocol.ModelResponse, error) {
+	return protocol.ModelResponse{Turn: protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "sampled by current provider"}}}, Stop: protocol.StopCompleted}, nil
+}
+
+type blockingAppMCPDriver struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*blockingAppMCPDriver) Name() string                      { return "blocking-app-mcp" }
+func (*blockingAppMCPDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
+func (d *blockingAppMCPDriver) Generate(context.Context, driver.Request, driver.EmitFunc) (protocol.ModelResponse, error) {
+	close(d.started)
+	<-d.release
+	return protocol.ModelResponse{Turn: protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "done"}}}, Stop: protocol.StopCompleted}, nil
+}
+
+type appMCPHostProbe struct {
+	Roots  string `json:"roots"`
+	Sample string `json:"sample"`
+	Form   string `json:"form"`
+	URL    string `json:"url"`
+}
+
+func TestAppMCPHostAndLiveCatalogUseRealManagerPath(t *testing.T) {
+	var capabilitiesMu sync.Mutex
+	var capabilities *sdkmcp.ClientCapabilities
+	var subscribedURI string
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "app-host-fixture", Version: "1.0.0"}, &sdkmcp.ServerOptions{
+		InitializedHandler: func(_ context.Context, request *sdkmcp.InitializedRequest) {
+			capabilitiesMu.Lock()
+			capabilities = request.ClientCapabilities()
+			capabilitiesMu.Unlock()
+		},
+		CompletionHandler: func(_ context.Context, request *sdkmcp.CompleteRequest) (*sdkmcp.CompleteResult, error) {
+			return &sdkmcp.CompleteResult{Completion: sdkmcp.CompletionResultDetails{Values: []string{request.Params.Argument.Value + "ylu"}, Total: 1}}, nil
+		},
+		SubscribeHandler: func(_ context.Context, request *sdkmcp.SubscribeRequest) error {
+			subscribedURI = request.Params.URI
+			return nil
+		},
+		UnsubscribeHandler: func(_ context.Context, request *sdkmcp.UnsubscribeRequest) error {
+			subscribedURI = "unsubscribed:" + request.Params.URI
+			return nil
+		},
+	})
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "host_probe"}, func(ctx context.Context, request *sdkmcp.CallToolRequest, _ struct{}) (*sdkmcp.CallToolResult, appMCPHostProbe, error) {
+		roots, err := request.Session.ListRoots(ctx, nil)
+		if err != nil {
+			return nil, appMCPHostProbe{}, err
+		}
+		sampled, err := request.Session.CreateMessage(ctx, &sdkmcp.CreateMessageParams{MaxTokens: 32, Messages: []*sdkmcp.SamplingMessage{{Role: sdkmcp.Role("user"), Content: &sdkmcp.TextContent{Text: "sample"}}}})
+		if err != nil {
+			return nil, appMCPHostProbe{}, err
+		}
+		form, err := request.Session.Elicit(ctx, &sdkmcp.ElicitParams{Mode: "form", Message: "Provide name", RequestedSchema: map[string]any{"type": "object", "properties": map[string]any{"name": map[string]any{"type": "string"}}, "required": []string{"name"}}})
+		if err != nil {
+			return nil, appMCPHostProbe{}, err
+		}
+		urlResult, err := request.Session.Elicit(ctx, &sdkmcp.ElicitParams{Mode: "url", Message: "Open account", URL: "https://example.test/account", ElicitationID: "url-1"})
+		if err != nil {
+			return nil, appMCPHostProbe{}, err
+		}
+		return nil, appMCPHostProbe{Roots: roots.Roots[0].URI, Sample: sampled.Content.(*sdkmcp.TextContent).Text, Form: form.Content["name"].(string), URL: urlResult.Action}, nil
+	})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+
+	workspace := t.TempDir()
+	appRuntime := &runtime{workspace: workspace, stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, trustPrompted: make(map[string]bool)}
+	conversation := agent.NewConversation()
+	detach := appRuntime.attachMCPConversation(conversation)
+	defer detach()
+	defer appRuntime.closeMCP()
+	cfg := config.Default()
+	cfg.MCPServers = map[string]config.MCPServerConfig{"host": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 5}}
+	modelRuntime := agent.Runtime{Provider: provider.Snapshot{Name: "current", Config: config.ProviderConfig{Model: "current-model", BaseURL: "https://provider.test"}}, Driver: appMCPHostDriver{}, PermissionMode: "full"}
+	confirmations := 0
+	confirm := func(context.Context, policy.Request, policy.Outcome) (tool.Confirmation, error) {
+		confirmations++
+		return tool.Confirmation{Approved: true}, nil
+	}
+	ask := func(_ context.Context, request protocol.AskRequest) (protocol.AskResponse, error) {
+		if len(request.Questions) != 1 || request.Questions[0].ID != "name" {
+			t.Fatalf("questions=%#v", request.Questions)
+		}
+		return protocol.AskResponse{Answers: map[string][]string{"name": {"Eylu"}}}, nil
+	}
+	opened := ""
+	host := buildMCPHostCallbacks(modelRuntime, confirm, ask, func(target string) error { opened = target; return nil })
+	if err := appRuntime.configureMCPRuntimeWithHost(context.Background(), cfg, &modelRuntime, host); err != nil {
+		t.Fatal(err)
+	}
+	registry := tool.NewRegistry(appRuntime.currentMCPState().Tools...)
+	probe, ok := registry.Get("mcp__host__host_probe")
+	if !ok {
+		t.Fatalf("real app manager tools=%#v", registry.Definitions())
+	}
+	result := probe.Execute(context.Background(), json.RawMessage(`{}`))
+	if result.IsError || !strings.Contains(result.Content, "sampled by current provider") || !strings.Contains(result.Content, "Eylu") || !strings.Contains(result.Content, "file://") || !strings.Contains(result.Content, `"url":"accept"`) {
+		t.Fatalf("probe result=%#v", result)
+	}
+	if opened != "https://example.test/account" || confirmations != 3 {
+		t.Fatalf("opened=%q confirmations=%d", opened, confirmations)
+	}
+	capabilitiesMu.Lock()
+	initializedCapabilities := capabilities
+	capabilitiesMu.Unlock()
+	if initializedCapabilities == nil || initializedCapabilities.RootsV2 == nil || initializedCapabilities.Sampling == nil || initializedCapabilities.Elicitation == nil || initializedCapabilities.Elicitation.Form == nil || initializedCapabilities.Elicitation.URL == nil {
+		t.Fatalf("client capabilities=%#v", initializedCapabilities)
+	}
+	providerManager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	tui := &tuiBackend{runtime: appRuntime, manager: providerManager}
+	completed, err := tui.handleTUIMCPCommand(context.Background(), []string{"complete", "host", "prompt", "fixture", "name", "E"})
+	if err != nil || !strings.Contains(completed, "Eylu") {
+		t.Fatalf("TUI completion=%q error=%v", completed, err)
+	}
+	if _, err := tui.handleTUIMCPCommand(context.Background(), []string{"subscribe", "host", "fixture://host"}); err != nil || subscribedURI != "fixture://host" {
+		t.Fatalf("TUI subscribe uri=%q error=%v", subscribedURI, err)
+	}
+	if _, err := tui.handleTUIMCPCommand(context.Background(), []string{"unsubscribe", "host", "fixture://host"}); err != nil || subscribedURI != "unsubscribed:fixture://host" {
+		t.Fatalf("TUI unsubscribe uri=%q error=%v", subscribedURI, err)
+	}
+
+	server.AddTool(&sdkmcp.Tool{Name: "added", InputSchema: map[string]any{"type": "object"}}, func(context.Context, *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+		return &sdkmcp.CallToolResult{Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: "added"}}}, nil
+	})
+	waitForMCPState(t, appRuntime, func(state agent.MCPRuntimeState) bool { return state.ToolServers["mcp__host__added"] == "host" })
+	updated := appRuntime.currentMCPState()
+	if updated.Fingerprint == modelRuntime.MCPFingerprint || !conversationHasMCPCategory(conversation.ContextReport()) {
+		t.Fatalf("updated fingerprint=%q initial=%q context=%#v", updated.Fingerprint, modelRuntime.MCPFingerprint, conversation.ContextReport())
+	}
+	if err := appRuntime.mcp.Disable(context.Background(), "host"); err != nil {
+		t.Fatal(err)
+	}
+	waitForMCPState(t, appRuntime, func(state agent.MCPRuntimeState) bool {
+		return len(state.Tools) == 0 && state.Fingerprint != updated.Fingerprint
+	})
+	if conversationHasMCPCategory(conversation.ContextReport()) {
+		t.Fatalf("MCP context remained after disable: %#v", conversation.ContextReport())
+	}
+	blocking := &blockingAppMCPDriver{started: make(chan struct{}), release: make(chan struct{})}
+	busyConversation := agent.NewConversation()
+	detachBusy := appRuntime.attachMCPConversation(busyConversation)
+	defer detachBusy()
+	runDone := make(chan error, 1)
+	go func() {
+		_, runErr := busyConversation.Run(context.Background(), "block", agent.Runtime{Provider: provider.Snapshot{Name: "busy", Config: config.ProviderConfig{Model: "busy"}}, Driver: blocking, PermissionMode: "full"}, &tool.Executor{Registry: tool.NewRegistry(), Policy: policy.AllowAllChecker{}}, agent.LoopOptions{MaxTurns: 1}, false, nil)
+		runDone <- runErr
+	}()
+	<-blocking.started
+	stored := make(chan struct{})
+	go func() { appRuntime.storeMCPState(agent.MCPRuntimeState{}); close(stored) }()
+	select {
+	case <-stored:
+	case <-time.After(time.Second):
+		t.Fatal("storeMCPState blocked on an active conversation")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- appRuntime.closeMCP() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closeMCP blocked while a conversation was active")
+	}
+	close(blocking.release)
+	if err := <-runDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForMCPState(t *testing.T, appRuntime *runtime, condition func(agent.MCPRuntimeState) bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition(appRuntime.currentMCPState()) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for MCP state: %#v", appRuntime.currentMCPState())
+}
+
+func conversationHasMCPCategory(report contextledger.Report) bool {
+	for _, category := range report.Categories {
+		if category.Blocks > 0 && (category.Category == contextledger.CategoryMCPInstructions || category.Category == contextledger.CategoryMCPToolSchema || category.Category == contextledger.CategoryMCPResource) {
+			return true
+		}
+	}
+	return false
+}
+
 type fakeMCPCommandBackend struct {
-	calls []string
+	calls  []string
+	events []mcpclient.Event
 }
 
 func (f *fakeMCPCommandBackend) Servers() ([]mcpclient.ServerInfo, string) {
@@ -64,7 +287,7 @@ func (f *fakeMCPCommandBackend) Resource(_ context.Context, server, uri string) 
 
 func (f *fakeMCPCommandBackend) Prompts(name string) ([]mcpclient.PromptInfo, error) {
 	f.calls = append(f.calls, "prompts:"+name)
-	return []mcpclient.PromptInfo{{Name: "review", Description: "review code"}}, nil
+	return []mcpclient.PromptInfo{{Name: "review", Description: "review code", Arguments: []*sdkmcp.PromptArgument{{Name: "language"}}}}, nil
 }
 
 func (f *fakeMCPCommandBackend) Prompt(_ context.Context, server, name string, arguments map[string]string) (any, error) {
@@ -73,10 +296,34 @@ func (f *fakeMCPCommandBackend) Prompt(_ context.Context, server, name string, a
 	return map[string]any{"description": "stored-secret", "messages": []any{}}, nil
 }
 
+func (f *fakeMCPCommandBackend) Complete(_ context.Context, server string, params *sdkmcp.CompleteParams) (any, error) {
+	f.calls = append(f.calls, fmt.Sprintf("complete:%s:%s:%s:%s", server, params.Ref.Type, params.Argument.Name, params.Argument.Value))
+	return &sdkmcp.CompleteResult{Completion: sdkmcp.CompletionResultDetails{Values: []string{"completed"}, Total: 1}}, nil
+}
+
+func (f *fakeMCPCommandBackend) SubscribeResource(_ context.Context, server, uri string) error {
+	f.calls = append(f.calls, "subscribe:"+server+":"+uri)
+	return nil
+}
+
+func (f *fakeMCPCommandBackend) UnsubscribeResource(_ context.Context, server, uri string) error {
+	f.calls = append(f.calls, "unsubscribe:"+server+":"+uri)
+	return nil
+}
+
+func (f *fakeMCPCommandBackend) SubscribeEvents(int) (<-chan mcpclient.Event, func()) {
+	events := make(chan mcpclient.Event, len(f.events))
+	for _, event := range f.events {
+		events <- event
+	}
+	close(events)
+	return events, func() {}
+}
+
 func TestMCPCommandRegistersManagementSurface(t *testing.T) {
 	runtime := &runtime{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, output: "text"}
 	command := runtime.mcpCommand(context.Background())
-	want := []string{"disable", "enable", "inspect", "list", "login", "logout", "prompt", "prompts", "reconnect", "resource", "resources", "tool", "tools"}
+	want := []string{"complete", "diagnostics", "disable", "enable", "events", "inspect", "list", "login", "logout", "prompt", "prompts", "reconnect", "resource", "resources", "subscribe", "tool", "tools", "unsubscribe"}
 	got := make([]string, 0, len(command.Commands()))
 	for _, child := range command.Commands() {
 		got = append(got, child.Name())
@@ -100,8 +347,12 @@ func TestMCPCommandsRouteArgumentsAndRedactJSON(t *testing.T) {
 		{args: []string{"logout", "alpha"}, wantCall: "logout:alpha"},
 		{args: []string{"resources", "alpha"}, wantCall: "resources:alpha"},
 		{args: []string{"resource", "alpha", "fixture://readme"}, wantCall: "resource:alpha:fixture://readme"},
+		{args: []string{"subscribe", "alpha", "fixture://readme"}, wantCall: "subscribe:alpha:fixture://readme"},
+		{args: []string{"unsubscribe", "alpha", "fixture://readme"}, wantCall: "unsubscribe:alpha:fixture://readme"},
 		{args: []string{"prompts", "alpha"}, wantCall: "prompts:alpha"},
 		{args: []string{"prompt", "alpha", "review", "--arguments", `{"language":"go"}`}, wantCall: `prompt:alpha:review:{"language":"go"}`},
+		{args: []string{"prompt", "alpha", "review", "language=go"}, wantCall: `prompt:alpha:review:{"language":"go"}`},
+		{args: []string{"complete", "alpha", "prompt", "review", "language", "g"}, wantCall: "complete:alpha:ref/prompt:language:g"},
 	}
 	for _, testCase := range tests {
 		t.Run(strings.Join(testCase.args, "_"), func(t *testing.T) {
@@ -161,6 +412,35 @@ func TestMCPPromptRejectsNonStringArguments(t *testing.T) {
 	command.SetArgs([]string{"prompt", "alpha", "review", "--arguments", `{"count":1}`})
 	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "arguments") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestMCPPromptCompletesArgumentNamesAndEventsRemainObservable(t *testing.T) {
+	backend := &fakeMCPCommandBackend{events: []mcpclient.Event{{Kind: mcpclient.EventLogging, Server: "alpha", Message: "stored-secret log", Data: map[string]any{"level": "info"}}}}
+	var stdout bytes.Buffer
+	appRuntime := &runtime{stdout: &stdout, stderr: &bytes.Buffer{}, output: "json", apiKeys: []string{"stored-secret"}}
+	command := appRuntime.mcpCommandWithBackend(context.Background(), func(context.Context) (mcpCommandBackend, error) { return backend, nil }, nil)
+	var prompt *cobra.Command
+	for _, child := range command.Commands() {
+		if child.Name() == "prompt" {
+			prompt = child
+			break
+		}
+	}
+	if prompt == nil || prompt.ValidArgsFunction == nil {
+		t.Fatal("prompt argument completion is unavailable")
+	}
+	values, directive := prompt.ValidArgsFunction(prompt, []string{"alpha", "review"}, "lan")
+	if len(values) != 1 || values[0] != "language=" || directive&cobra.ShellCompDirectiveNoSpace == 0 {
+		t.Fatalf("completion values=%v directive=%v", values, directive)
+	}
+	backend.calls = nil
+	command.SetArgs([]string{"events", "--wait", "50ms"})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), `"kind":"logging"`) || strings.Contains(stdout.String(), "stored-secret") {
+		t.Fatalf("events output=%q", stdout.String())
 	}
 }
 

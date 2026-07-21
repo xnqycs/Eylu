@@ -290,6 +290,140 @@ func TestOAuthLogoutRevokesBeforeClearing(t *testing.T) {
 	}
 }
 
+func TestOAuthLogoutAggregatesRevocationFailuresAndClearsCredentials(t *testing.T) {
+	var server *httptest.Server
+	var mu sync.Mutex
+	var attempts []string
+	server = httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/stored-resource-metadata":
+			writeFixtureJSON(t, response, map[string]any{
+				"resource": server.URL + "/mcp", "authorization_servers": []string{server.URL + "/issuer"},
+			})
+		case "/.well-known/oauth-protected-resource/mcp":
+			http.Error(response, "stored resource metadata URL was ignored", http.StatusTeapot)
+		case "/.well-known/oauth-authorization-server/issuer":
+			writeFixtureJSON(t, response, map[string]any{
+				"issuer":                 server.URL + "/issuer",
+				"authorization_endpoint": server.URL + "/authorize",
+				"token_endpoint":         server.URL + "/token",
+				"revocation_endpoint":    server.URL + "/revoke",
+			})
+		case "/revoke":
+			if err := request.ParseForm(); err != nil {
+				t.Errorf("parse revoke form: %v", err)
+			}
+			hint := request.Form.Get("token_type_hint")
+			mu.Lock()
+			attempts = append(attempts, hint)
+			mu.Unlock()
+			if hint == "refresh_token" {
+				http.Error(response, "refresh revocation unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(response, "access revocation unavailable", http.StatusBadGateway)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	store := NewCredentialStore(filepath.Join(t.TempDir(), "mcp_credentials.json"))
+	client := NewOAuthClient(store, WithOAuthHTTPClient(server.Client()))
+	options := OAuthOptions{ServerName: "fixture", ResourceURL: server.URL + "/mcp", ClientID: "pre-registered"}
+	hash, _ := options.AuthHash()
+	key, _ := CredentialKey(options.ServerName, options.ResourceURL, hash)
+	credential := OAuthCredential{
+		AccessToken: "access-secret", RefreshToken: "refresh-secret", TokenType: "Bearer",
+		ResourceMetadataURL: server.URL + "/stored-resource-metadata",
+	}
+	if err := store.Put(context.Background(), key, credential); err != nil {
+		t.Fatal(err)
+	}
+
+	err := client.Logout(context.Background(), options)
+	if err == nil {
+		t.Fatal("Logout error = nil, want aggregated revocation diagnostics")
+	}
+	message := err.Error()
+	for _, expected := range []string{"refresh_token", "503", "access_token", "502"} {
+		if !strings.Contains(message, expected) {
+			t.Errorf("Logout error %q omitted %q", message, expected)
+		}
+	}
+	for _, secret := range []string{credential.AccessToken, credential.RefreshToken} {
+		if strings.Contains(message, secret) {
+			t.Errorf("Logout error exposed token %q", secret)
+		}
+	}
+	mu.Lock()
+	gotAttempts := append([]string(nil), attempts...)
+	mu.Unlock()
+	if strings.Join(gotAttempts, ",") != "refresh_token,access_token" {
+		t.Fatalf("revocation attempts = %v", gotAttempts)
+	}
+	if _, err := store.Get(context.Background(), key); !errors.Is(err, ErrCredentialsNotFound) {
+		t.Fatalf("credential remained after failed revocations: %v", err)
+	}
+}
+
+func TestOAuthLogoutClearsCredentialsWhenDiscoveryFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		http.Error(response, "metadata unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	store := NewCredentialStore(filepath.Join(t.TempDir(), "mcp_credentials.json"))
+	client := NewOAuthClient(store, WithOAuthHTTPClient(server.Client()))
+	options := OAuthOptions{ServerName: "fixture", ResourceURL: server.URL + "/mcp", ClientID: "pre-registered"}
+	hash, _ := options.AuthHash()
+	key, _ := CredentialKey(options.ServerName, options.ResourceURL, hash)
+	if err := store.Put(context.Background(), key, OAuthCredential{AccessToken: "access", RefreshToken: "refresh", TokenType: "Bearer"}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := client.Logout(context.Background(), options)
+	if err == nil || !strings.Contains(err.Error(), "discover") || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("Logout error = %v, want discovery diagnostic", err)
+	}
+	if _, err := store.Get(context.Background(), key); !errors.Is(err, ErrCredentialsNotFound) {
+		t.Fatalf("credential remained after failed discovery: %v", err)
+	}
+}
+
+func TestOAuthLogoutWaitsForLocalCleanupAfterCancellation(t *testing.T) {
+	store := NewCredentialStore(filepath.Join(t.TempDir(), "mcp_credentials.json"))
+	client := NewOAuthClient(store)
+	options := OAuthOptions{ServerName: "fixture", ResourceURL: "http://127.0.0.1:1/mcp", ClientID: "pre-registered"}
+	hash, _ := options.AuthHash()
+	key, _ := CredentialKey(options.ServerName, options.ResourceURL, hash)
+	if err := store.Put(context.Background(), key, OAuthCredential{AccessToken: "access", TokenType: "Bearer"}); err != nil {
+		t.Fatal(err)
+	}
+
+	unlock, err := acquireCredentialFileLock(context.Background(), store.Path()+".lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = unlock()
+		close(released)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = client.Logout(ctx, options)
+	<-released
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Logout error = %v, want context cancellation diagnostic", err)
+	}
+	if _, err := store.Get(context.Background(), key); !errors.Is(err, ErrCredentialsNotFound) {
+		t.Fatalf("credential remained after canceled logout: %v", err)
+	}
+}
+
 func TestOAuthDiscoveryRejectsMismatchedResourceMetadata(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		writeFixtureJSON(t, response, map[string]any{"resource": "https://attacker.example/mcp", "authorization_servers": []string{"https://login.example"}})

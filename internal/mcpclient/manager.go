@@ -164,6 +164,8 @@ type Options struct {
 	CreateMessageHandler          func(context.Context, *sdkmcp.CreateMessageRequest) (*sdkmcp.CreateMessageResult, error)
 	CreateMessageWithToolsHandler func(context.Context, *sdkmcp.CreateMessageWithToolsRequest) (*sdkmcp.CreateMessageWithToolsResult, error)
 	ElicitationHandler            func(context.Context, *sdkmcp.ElicitRequest) (*sdkmcp.ElicitResult, error)
+	ElicitationForm               bool
+	ElicitationURL                bool
 	OAuthClient                   *OAuthClient
 }
 
@@ -194,6 +196,7 @@ type serverRuntime struct {
 	client          *sdkmcp.Client
 	callCtx         context.Context
 	cancelCalls     context.CancelFunc
+	cancelConnect   context.CancelFunc
 	cancelTransport context.CancelFunc
 	generation      uint64
 	readOnly        map[string]bool
@@ -284,42 +287,63 @@ func (m *Manager) connect(ctx context.Context, name string, targetStatus ServerS
 	}
 	runtime.connectMu.Lock()
 	defer runtime.connectMu.Unlock()
+	m.mu.RLock()
 	runtime.mu.Lock()
+	if m.closed {
+		runtime.mu.Unlock()
+		m.mu.RUnlock()
+		return errors.New("MCP manager is closed")
+	}
 	if !runtime.config.IsEnabled() {
 		runtime.status = StatusDisabled
 		runtime.mu.Unlock()
+		m.mu.RUnlock()
 		m.publish(Event{Kind: EventStatus, Server: name, Status: StatusDisabled})
 		return nil
 	}
+	attemptGeneration := runtime.generation
+	cfg := runtime.config
+	connectCtx, cancelConnect := context.WithTimeout(ctx, cfg.StartupTimeout(defaultStartupTimeout))
+	stopManagerCancel := context.AfterFunc(m.ctx, cancelConnect)
+	runtime.cancelConnect = cancelConnect
 	runtime.status = targetStatus
 	runtime.lastError = ""
-	cfg := runtime.config
 	runtime.mu.Unlock()
+	m.mu.RUnlock()
+	defer func() {
+		stopManagerCancel()
+		cancelConnect()
+		runtime.mu.Lock()
+		runtime.cancelConnect = nil
+		runtime.mu.Unlock()
+	}()
 	m.publish(Event{Kind: EventStatus, Server: name, Status: targetStatus})
 
-	connectCtx, cancel := context.WithTimeout(ctx, cfg.StartupTimeout(defaultStartupTimeout))
-	defer cancel()
 	started := time.Now()
 
 	var oauthHandler sdkauth.OAuthHandler
 	if cfg.OAuth != nil {
 		oauthClient, oauthErr := m.oauthClient()
 		if oauthErr != nil {
-			return m.connectionFailed(runtime, oauthErr)
+			return m.connectionFailed(runtime, attemptGeneration, oauthErr)
 		}
 		handler, handlerErr := oauthClient.SDKHandler(connectCtx, oauthOptions(name, cfg))
 		if handlerErr != nil && !errors.Is(handlerErr, ErrCredentialsNotFound) {
-			return m.connectionFailed(runtime, handlerErr)
+			return m.connectionFailed(runtime, attemptGeneration, handlerErr)
 		}
 		oauthHandler = handler
 	}
 	transport, err := buildTransport(connectCtx, name, cfg, m.workspace, oauthHandler)
 	if err != nil {
-		return m.connectionFailed(runtime, err)
+		return m.connectionFailed(runtime, attemptGeneration, err)
 	}
 	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "eylu", Version: "1.0.0"}, m.clientOptions(name))
 	if root, rootErr := workspaceRoot(m.workspace); rootErr == nil {
 		client.AddRoots(root)
+	}
+	sessionOptions, err := pinnedClientSessionOptions()
+	if err != nil {
+		return m.connectionFailed(runtime, attemptGeneration, err)
 	}
 	var cancelTransport context.CancelFunc
 	var session *sdkmcp.ClientSession
@@ -332,7 +356,7 @@ func (m *Manager) connect(ctx context.Context, name string, targetStatus ServerS
 		}
 		connected := make(chan connectResult, 1)
 		go func() {
-			value, connectErr := client.Connect(sessionCtx, transport, nil)
+			value, connectErr := client.Connect(sessionCtx, transport, sessionOptions)
 			connected <- connectResult{session: value, err: connectErr}
 		}()
 		select {
@@ -344,13 +368,13 @@ func (m *Manager) connect(ctx context.Context, name string, targetStatus ServerS
 			err = errors.Join(connectCtx.Err(), result.err)
 		}
 	} else {
-		session, err = client.Connect(connectCtx, transport, nil)
+		session, err = client.Connect(connectCtx, transport, sessionOptions)
 	}
 	if err != nil {
 		if cancelTransport != nil {
 			cancelTransport()
 		}
-		return m.connectionFailed(runtime, fmt.Errorf("connect MCP server: %w", err))
+		return m.connectionFailed(runtime, attemptGeneration, fmt.Errorf("connect MCP server: %w", err))
 	}
 	initialized := session.InitializeResult()
 	if initialized == nil || initialized.ServerInfo == nil {
@@ -358,7 +382,7 @@ func (m *Manager) connect(ctx context.Context, name string, targetStatus ServerS
 			cancelTransport()
 		}
 		_ = session.Close()
-		return m.connectionFailed(runtime, errors.New("MCP server returned incomplete initialization metadata"))
+		return m.connectionFailed(runtime, attemptGeneration, errors.New("MCP server returned incomplete initialization metadata"))
 	}
 	if initialized.Capabilities != nil && initialized.Capabilities.Logging != nil {
 		if logErr := session.SetLoggingLevel(connectCtx, &sdkmcp.SetLoggingLevelParams{Level: sdkmcp.LoggingLevel("debug")}); logErr != nil {
@@ -366,19 +390,29 @@ func (m *Manager) connect(ctx context.Context, name string, targetStatus ServerS
 				cancelTransport()
 			}
 			_ = session.Close()
-			return m.connectionFailed(runtime, fmt.Errorf("set MCP logging level: %w", logErr))
+			return m.connectionFailed(runtime, attemptGeneration, fmt.Errorf("set MCP logging level: %w", logErr))
 		}
 	}
-	snapshot, err := m.fetchCatalog(connectCtx, runtime, session, initialized.ProtocolVersion, initialized.Instructions)
+	snapshot, err := m.fetchCatalog(connectCtx, runtime, session, initialized.Capabilities, initialized.ProtocolVersion, initialized.Instructions)
 	if err != nil {
 		if cancelTransport != nil {
 			cancelTransport()
 		}
 		_ = session.Close()
-		return m.connectionFailed(runtime, err)
+		return m.connectionFailed(runtime, attemptGeneration, err)
 	}
 
+	m.mu.RLock()
 	runtime.mu.Lock()
+	if m.closed || runtime.generation != attemptGeneration || !runtime.config.IsEnabled() {
+		runtime.mu.Unlock()
+		m.mu.RUnlock()
+		if cancelTransport != nil {
+			cancelTransport()
+		}
+		_ = session.Close()
+		return context.Canceled
+	}
 	oldSession := runtime.session
 	oldCancelTransport := runtime.cancelTransport
 	if runtime.cancelCalls != nil {
@@ -400,6 +434,7 @@ func (m *Manager) connect(ctx context.Context, name string, targetStatus ServerS
 	runtime.capabilities = initialized.Capabilities
 	runtime.applySnapshot(snapshot)
 	runtime.mu.Unlock()
+	m.mu.RUnlock()
 	if oldSession != nil && oldSession != session {
 		if oldCancelTransport != nil {
 			oldCancelTransport()
@@ -412,17 +447,24 @@ func (m *Manager) connect(ctx context.Context, name string, targetStatus ServerS
 	return nil
 }
 
-func (m *Manager) connectionFailed(runtime *serverRuntime, err error) error {
+func (m *Manager) connectionFailed(runtime *serverRuntime, generation uint64, err error) error {
 	status := StatusError
 	if isAuthorizationError(err) {
 		status = StatusNeedsAuth
 	}
 	diagnostic := Diagnostic{Server: runtime.name, Message: err.Error(), Time: time.Now().UTC()}
+	m.mu.RLock()
 	runtime.mu.Lock()
+	if m.closed || runtime.generation != generation || !runtime.config.IsEnabled() {
+		runtime.mu.Unlock()
+		m.mu.RUnlock()
+		return err
+	}
 	runtime.status = status
 	runtime.lastError = err.Error()
 	runtime.diagnostics = appendLimitedDiagnostics(runtime.diagnostics, diagnostic)
 	runtime.mu.Unlock()
+	m.mu.RUnlock()
 	m.rebuildCatalog()
 	m.publish(Event{Kind: EventDiagnostic, Server: runtime.name, Status: status, Message: err.Error()})
 	return err
@@ -445,8 +487,18 @@ func isAuthorizationError(err error) bool {
 }
 
 func (m *Manager) clientOptions(name string) *sdkmcp.ClientOptions {
+	capabilities := &sdkmcp.ClientCapabilities{RootsV2: &sdkmcp.RootCapabilities{ListChanged: true}}
+	if m.options.ElicitationHandler != nil && (m.options.ElicitationForm || m.options.ElicitationURL) {
+		capabilities.Elicitation = &sdkmcp.ElicitationCapabilities{}
+		if m.options.ElicitationForm {
+			capabilities.Elicitation.Form = &sdkmcp.FormElicitationCapabilities{}
+		}
+		if m.options.ElicitationURL {
+			capabilities.Elicitation.URL = &sdkmcp.URLElicitationCapabilities{}
+		}
+	}
 	options := &sdkmcp.ClientOptions{
-		Capabilities:                  &sdkmcp.ClientCapabilities{RootsV2: &sdkmcp.RootCapabilities{ListChanged: true}},
+		Capabilities:                  capabilities,
 		CreateMessageHandler:          m.options.CreateMessageHandler,
 		CreateMessageWithToolsHandler: m.options.CreateMessageWithToolsHandler,
 		ElicitationHandler:            m.options.ElicitationHandler,
@@ -483,65 +535,71 @@ func workspaceRoot(workspace string) (*sdkmcp.Root, error) {
 	return &sdkmcp.Root{URI: (&url.URL{Scheme: "file", Path: path}).String(), Name: filepath.Base(absolute)}, nil
 }
 
-func (m *Manager) fetchCatalog(ctx context.Context, runtime *serverRuntime, session *sdkmcp.ClientSession, protocolVersion, instructions string) (catalogSnapshot, error) {
+func (m *Manager) fetchCatalog(ctx context.Context, runtime *serverRuntime, session *sdkmcp.ClientSession, capabilities *sdkmcp.ServerCapabilities, protocolVersion, instructions string) (catalogSnapshot, error) {
 	runtime.mu.RLock()
 	cfg := runtime.config
 	runtime.mu.RUnlock()
 	snapshot := catalogSnapshot{}
 	readOnly := stringSet(cfg.ReadOnlyTools)
-	for remote, listErr := range session.Tools(ctx, nil) {
-		if listErr != nil {
-			return catalogSnapshot{}, fmt.Errorf("list MCP tools: %w", listErr)
+	if capabilities != nil && capabilities.Tools != nil {
+		for remote, listErr := range session.Tools(ctx, nil) {
+			if listErr != nil {
+				return catalogSnapshot{}, fmt.Errorf("list MCP tools: %w", listErr)
+			}
+			if !toolAllowed(remote.Name, cfg.AllowTools, cfg.DenyTools) {
+				continue
+			}
+			if len(snapshot.tools) >= maxToolsPerServer {
+				return catalogSnapshot{}, fmt.Errorf("MCP tool limit exceeds %d", maxToolsPerServer)
+			}
+			definition, localName, convertErr := convertToolDefinition(runtime.name, remote)
+			if convertErr != nil {
+				return catalogSnapshot{}, convertErr
+			}
+			permission := "write"
+			if readOnly[remote.Name] {
+				permission = "read"
+			}
+			snapshot.tools = append(snapshot.tools, remote)
+			snapshot.toolInfo = append(snapshot.toolInfo, ToolInfo{
+				Name: remote.Name, LocalName: localName, Description: remote.Description,
+				Annotations: definition.Annotations, InputSchema: cloneRaw(definition.InputSchema), OutputSchema: cloneRaw(definition.OutputSchema),
+				Permission: permission, Status: "available",
+			})
+			snapshot.toolAdapters = append(snapshot.toolAdapters, &remoteToolAdapter{server: runtime, remote: remote, definition: definition, readOnly: readOnly[remote.Name]})
+			snapshot.context.ToolDefinitions = append(snapshot.context.ToolDefinitions, definition)
 		}
-		if !toolAllowed(remote.Name, cfg.AllowTools, cfg.DenyTools) {
-			continue
-		}
-		if len(snapshot.tools) >= maxToolsPerServer {
-			return catalogSnapshot{}, fmt.Errorf("MCP tool limit exceeds %d", maxToolsPerServer)
-		}
-		definition, localName, convertErr := convertToolDefinition(runtime.name, remote)
-		if convertErr != nil {
-			return catalogSnapshot{}, convertErr
-		}
-		permission := "write"
-		if readOnly[remote.Name] {
-			permission = "read"
-		}
-		snapshot.tools = append(snapshot.tools, remote)
-		snapshot.toolInfo = append(snapshot.toolInfo, ToolInfo{
-			Name: remote.Name, LocalName: localName, Description: remote.Description,
-			Annotations: definition.Annotations, InputSchema: cloneRaw(definition.InputSchema), OutputSchema: cloneRaw(definition.OutputSchema),
-			Permission: permission, Status: "available",
-		})
-		snapshot.toolAdapters = append(snapshot.toolAdapters, &remoteToolAdapter{server: runtime, remote: remote, definition: definition, readOnly: readOnly[remote.Name]})
-		snapshot.context.ToolDefinitions = append(snapshot.context.ToolDefinitions, definition)
 	}
-	for resource, listErr := range session.Resources(ctx, nil) {
-		if listErr != nil {
-			return catalogSnapshot{}, fmt.Errorf("list MCP resources: %w", listErr)
+	if capabilities != nil && capabilities.Resources != nil {
+		for resource, listErr := range session.Resources(ctx, nil) {
+			if listErr != nil {
+				return catalogSnapshot{}, fmt.Errorf("list MCP resources: %w", listErr)
+			}
+			if len(snapshot.resources) >= maxResourcesPerServer {
+				return catalogSnapshot{}, fmt.Errorf("MCP resource limit exceeds %d", maxResourcesPerServer)
+			}
+			snapshot.resources = append(snapshot.resources, resource)
 		}
-		if len(snapshot.resources) >= maxResourcesPerServer {
-			return catalogSnapshot{}, fmt.Errorf("MCP resource limit exceeds %d", maxResourcesPerServer)
+		for template, listErr := range session.ResourceTemplates(ctx, nil) {
+			if listErr != nil {
+				return catalogSnapshot{}, fmt.Errorf("list MCP resource templates: %w", listErr)
+			}
+			if len(snapshot.templates) >= maxResourceTemplatesPerServer {
+				return catalogSnapshot{}, fmt.Errorf("MCP resource template limit exceeds %d", maxResourceTemplatesPerServer)
+			}
+			snapshot.templates = append(snapshot.templates, template)
 		}
-		snapshot.resources = append(snapshot.resources, resource)
 	}
-	for template, listErr := range session.ResourceTemplates(ctx, nil) {
-		if listErr != nil {
-			return catalogSnapshot{}, fmt.Errorf("list MCP resource templates: %w", listErr)
+	if capabilities != nil && capabilities.Prompts != nil {
+		for prompt, listErr := range session.Prompts(ctx, nil) {
+			if listErr != nil {
+				return catalogSnapshot{}, fmt.Errorf("list MCP prompts: %w", listErr)
+			}
+			if len(snapshot.prompts) >= maxPromptsPerServer {
+				return catalogSnapshot{}, fmt.Errorf("MCP prompt limit exceeds %d", maxPromptsPerServer)
+			}
+			snapshot.prompts = append(snapshot.prompts, prompt)
 		}
-		if len(snapshot.templates) >= maxResourceTemplatesPerServer {
-			return catalogSnapshot{}, fmt.Errorf("MCP resource template limit exceeds %d", maxResourceTemplatesPerServer)
-		}
-		snapshot.templates = append(snapshot.templates, template)
-	}
-	for prompt, listErr := range session.Prompts(ctx, nil) {
-		if listErr != nil {
-			return catalogSnapshot{}, fmt.Errorf("list MCP prompts: %w", listErr)
-		}
-		if len(snapshot.prompts) >= maxPromptsPerServer {
-			return catalogSnapshot{}, fmt.Errorf("MCP prompt limit exceeds %d", maxPromptsPerServer)
-		}
-		snapshot.prompts = append(snapshot.prompts, prompt)
 	}
 	if len(snapshot.resources) > 0 {
 		resourceAdapter, definition, convertErr := newResourceToolForResources(runtime, snapshot.resources)
@@ -606,7 +664,7 @@ func (m *Manager) refresh(name string) error {
 	defer runtime.refreshMu.Unlock()
 	runtime.mu.RLock()
 	session := runtime.session
-	protocolVersion, instructions := runtime.protocolVersion, runtime.instructions
+	capabilities, protocolVersion, instructions := runtime.capabilities, runtime.protocolVersion, runtime.instructions
 	timeout := runtime.config.CallTimeout(defaultCallTimeout)
 	status := runtime.status
 	runtime.mu.RUnlock()
@@ -615,7 +673,7 @@ func (m *Manager) refresh(name string) error {
 	}
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
 	defer cancel()
-	snapshot, err := m.fetchCatalog(ctx, runtime, session, protocolVersion, instructions)
+	snapshot, err := m.fetchCatalog(ctx, runtime, session, capabilities, protocolVersion, instructions)
 	if err != nil {
 		return err
 	}
@@ -649,13 +707,20 @@ func (m *Manager) monitor(runtime *serverRuntime, session *sdkmcp.ClientSession,
 	if runtime.cancelCalls != nil {
 		runtime.cancelCalls()
 	}
-	runtime.status = StatusDisconnected
+	status := StatusDisconnected
+	if err != nil && isAuthorizationError(err) {
+		status = StatusNeedsAuth
+	}
+	runtime.status = status
 	if err != nil {
 		runtime.lastError = err.Error()
 	}
 	runtime.mu.Unlock()
 	m.rebuildCatalog()
-	m.publish(Event{Kind: EventStatus, Server: runtime.name, Status: StatusDisconnected, Message: errorString(err)})
+	m.publish(Event{Kind: EventStatus, Server: runtime.name, Status: status, Message: errorString(err)})
+	if status == StatusNeedsAuth {
+		return
+	}
 	m.reconnectLoop(runtime, generation)
 }
 
@@ -663,7 +728,7 @@ func (m *Manager) reconnectLoop(runtime *serverRuntime, generation uint64) {
 	delay := initialReconnectDelay
 	for {
 		runtime.mu.Lock()
-		if runtime.generation != generation || !runtime.config.IsEnabled() {
+		if runtime.generation != generation || !runtime.config.IsEnabled() || runtime.status == StatusNeedsAuth {
 			runtime.mu.Unlock()
 			return
 		}
@@ -679,6 +744,12 @@ func (m *Manager) reconnectLoop(runtime *serverRuntime, generation uint64) {
 		case <-timer.C:
 		}
 		if err := m.connect(m.ctx, runtime.name, StatusReconnecting); err == nil {
+			return
+		}
+		runtime.mu.RLock()
+		stop := runtime.generation != generation || !runtime.config.IsEnabled() || runtime.status == StatusNeedsAuth
+		runtime.mu.RUnlock()
+		if stop {
 			return
 		}
 		delay = min(delay*2, maximumReconnectDelay)
@@ -1073,6 +1144,10 @@ func (m *Manager) disconnect(name string, status ServerStatus) error {
 	runtime.mu.Lock()
 	session := runtime.session
 	runtime.session = nil
+	if runtime.cancelConnect != nil {
+		runtime.cancelConnect()
+		runtime.cancelConnect = nil
+	}
 	if runtime.cancelTransport != nil {
 		runtime.cancelTransport()
 		runtime.cancelTransport = nil
@@ -1161,14 +1236,15 @@ func (m *Manager) Logout(ctx context.Context, name string) error {
 	if cfg.OAuth == nil {
 		return errors.New("MCP server does not configure OAuth")
 	}
-	client, err := m.oauthClient()
-	if err != nil {
-		return err
+	client, clientErr := m.oauthClient()
+	var logoutErr error
+	if clientErr != nil {
+		logoutErr = clientErr
+	} else {
+		logoutErr = client.Logout(ctx, oauthOptions(name, cfg))
 	}
-	if err := client.Logout(ctx, oauthOptions(name, cfg)); err != nil {
-		return err
-	}
-	return m.disconnect(name, StatusNeedsAuth)
+	disconnectErr := m.disconnect(name, StatusNeedsAuth)
+	return errors.Join(logoutErr, disconnectErr)
 }
 
 func (m *Manager) SubscribeEvents(buffer int) (<-chan Event, func()) {
@@ -1193,21 +1269,20 @@ func (m *Manager) unsubscribe(id uint64) {
 	m.mu.Lock()
 	channel := m.subscribers[id]
 	delete(m.subscribers, id)
-	m.mu.Unlock()
 	if channel != nil {
 		close(channel)
 	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) publish(event Event) {
 	event.Time = time.Now().UTC()
 	m.mu.RLock()
-	channels := make([]chan Event, 0, len(m.subscribers))
-	for _, channel := range m.subscribers {
-		channels = append(channels, channel)
+	defer m.mu.RUnlock()
+	if m.closed {
+		return
 	}
-	m.mu.RUnlock()
-	for _, channel := range channels {
+	for _, channel := range m.subscribers {
 		select {
 		case channel <- event:
 		default:
@@ -1259,9 +1334,8 @@ func (m *Manager) Close() error {
 	for _, runtime := range m.servers {
 		runtimes = append(runtimes, runtime)
 	}
-	channels := make([]chan Event, 0, len(m.subscribers))
 	for _, channel := range m.subscribers {
-		channels = append(channels, channel)
+		close(channel)
 	}
 	m.subscribers = nil
 	m.tools, m.contexts = nil, nil
@@ -1271,6 +1345,10 @@ func (m *Manager) Close() error {
 		runtime.mu.Lock()
 		session := runtime.session
 		runtime.session = nil
+		if runtime.cancelConnect != nil {
+			runtime.cancelConnect()
+			runtime.cancelConnect = nil
+		}
 		if runtime.cancelTransport != nil {
 			runtime.cancelTransport()
 			runtime.cancelTransport = nil
@@ -1286,9 +1364,6 @@ func (m *Manager) Close() error {
 				closeErrors = append(closeErrors, fmt.Errorf("close MCP server %s: %w", runtime.name, err))
 			}
 		}
-	}
-	for _, channel := range channels {
-		close(channel)
 	}
 	return errors.Join(closeErrors...)
 }

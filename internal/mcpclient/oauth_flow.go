@@ -477,16 +477,13 @@ func (c *OAuthClient) Logout(ctx context.Context, options OAuthOptions) error {
 	result := c.refreshes.DoChan("logout:"+key, func() (any, error) {
 		return nil, c.logoutUnderLock(ctx, key, options)
 	})
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case outcome := <-result:
-		return outcome.Err
-	}
+	outcome := <-result
+	return outcome.Err
 }
 
 func (c *OAuthClient) logoutUnderLock(ctx context.Context, key string, options OAuthOptions) error {
-	return c.store.Transaction(ctx, func(transaction *CredentialTransaction) error {
+	var diagnostics []error
+	transactionErr := c.store.Transaction(context.WithoutCancel(ctx), func(transaction *CredentialTransaction) error {
 		credential, err := transaction.Get(key)
 		if errors.Is(err, ErrCredentialsNotFound) {
 			return nil
@@ -496,32 +493,40 @@ func (c *OAuthClient) logoutUnderLock(ctx context.Context, key string, options O
 		}
 		resource, err := NormalizeResourceURL(options.ResourceURL)
 		if err != nil {
-			return err
-		}
-		options.ResourceURL = resource
-		metadata, err := c.Discover(ctx, options)
-		if err != nil {
-			return err
-		}
-		if endpoint := metadata.AuthorizationServer.RevocationEndpoint; endpoint != "" {
-			clientID, clientSecret, _, credentialsErr := oauthClientCredentials(options, credential)
-			if credentialsErr != nil {
-				return credentialsErr
+			diagnostics = append(diagnostics, fmt.Errorf("normalize MCP OAuth resource for logout: %w", err))
+		} else {
+			options.ResourceURL = resource
+			if options.ResourceMetadataURL == "" && credential.ResourceMetadataURL != "" {
+				options.ResourceMetadataURL = credential.ResourceMetadataURL
 			}
-			for _, token := range []struct {
-				value string
-				hint  string
-			}{{credential.RefreshToken, "refresh_token"}, {credential.AccessToken, "access_token"}} {
-				if token.value == "" {
-					continue
-				}
-				if err := c.revokeToken(ctx, endpoint, clientID, clientSecret, token.value, token.hint); err != nil {
-					return err
+			metadata, discoveryErr := c.Discover(ctx, options)
+			if discoveryErr != nil {
+				diagnostics = append(diagnostics, fmt.Errorf("discover MCP OAuth revocation endpoint: %w", discoveryErr))
+			} else if endpoint := metadata.AuthorizationServer.RevocationEndpoint; endpoint != "" {
+				clientID, clientSecret, _, credentialsErr := oauthClientCredentials(options, credential)
+				if credentialsErr != nil {
+					diagnostics = append(diagnostics, fmt.Errorf("resolve MCP OAuth client credentials for revocation: %w", credentialsErr))
+				} else {
+					for _, token := range []struct {
+						value string
+						hint  string
+					}{{credential.RefreshToken, "refresh_token"}, {credential.AccessToken, "access_token"}} {
+						if token.value == "" {
+							continue
+						}
+						if err := c.revokeToken(ctx, endpoint, clientID, clientSecret, token.value, token.hint); err != nil {
+							diagnostics = append(diagnostics, err)
+						}
+					}
 				}
 			}
 		}
 		return transaction.Delete(key)
 	})
+	if transactionErr != nil {
+		diagnostics = append(diagnostics, fmt.Errorf("clear local MCP OAuth credentials: %w", transactionErr))
+	}
+	return errors.Join(diagnostics...)
 }
 
 func (c *OAuthClient) revokeToken(ctx context.Context, endpoint, clientID, clientSecret, token, hint string) error {

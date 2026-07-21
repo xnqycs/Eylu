@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -64,7 +67,7 @@ func TestBuildTransportTypes(t *testing.T) {
 				OAuth:     &config.MCPOAuthConfig{},
 			},
 			check: func(t *testing.T, transport sdkmcp.Transport) {
-				sse, ok := transport.(*sdkmcp.SSEClientTransport)
+				sse, ok := transport.(*resumableSSEClientTransport)
 				if !ok {
 					t.Fatalf("transport type = %T", transport)
 				}
@@ -154,7 +157,7 @@ func TestSSETransportInjectsOAuthHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sse := transport.(*sdkmcp.SSEClientTransport)
+	sse := transport.(*resumableSSEClientTransport)
 	roundTripper := sse.HTTPClient.Transport.(*headerRoundTripper)
 	capture := &captureRoundTripper{}
 	roundTripper.base = capture
@@ -167,6 +170,74 @@ func TestSSETransportInjectsOAuthHeader(t *testing.T) {
 	}
 	if got := capture.request.Header.Get("Authorization"); got != "Bearer oauth-secret" {
 		t.Fatalf("Authorization = %q", got)
+	}
+}
+
+func TestLegacySSEDecoderTracksResumeMetadata(t *testing.T) {
+	decoder := newLegacySSEDecoder(strings.NewReader(": keepalive\r\nid: event-7\r\nretry: 25\r\nevent: message\r\ndata: first\r\ndata: second\r\n\r\n"))
+	event, err := decoder.next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.name != "message" || !event.idSet || event.id != "event-7" || !event.retrySet || event.retry.String() != "25ms" || string(event.data) != "first\nsecond" {
+		t.Fatalf("event = %#v", event)
+	}
+	if _, err := decoder.next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("second decode error = %v, want EOF", err)
+	}
+	clamped, err := newLegacySSEDecoder(strings.NewReader("retry: 60000\n\n")).next()
+	if err != nil || clamped.retry != legacySSEMaximumReconnectDelay {
+		t.Fatalf("clamped retry = %v, error = %v", clamped.retry, err)
+	}
+}
+
+func TestResumableSSEConnectionCloseStopsReader(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	body := &closeTrackingReadCloser{ReadCloser: reader, closed: make(chan struct{})}
+	transport := &resumableSSEClientTransport{
+		Endpoint: "https://mcp.example.test/events",
+		HTTPClient: &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       body,
+				Request:    request,
+			}, nil
+		})},
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(writer, "event: endpoint\ndata: /messages\n\n")
+		writeDone <- err
+	}()
+	connection, err := transport.Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+
+	var wait sync.WaitGroup
+	for range 8 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if err := connection.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+	wait.Wait()
+	select {
+	case <-body.closed:
+	case <-time.After(time.Second):
+		t.Fatal("SSE response body was not closed")
+	}
+	if _, err := connection.Read(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after Close = %v, want EOF", err)
 	}
 }
 
@@ -253,4 +324,15 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+type closeTrackingReadCloser struct {
+	io.ReadCloser
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeTrackingReadCloser) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.ReadCloser.Close()
 }

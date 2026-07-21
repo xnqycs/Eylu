@@ -16,6 +16,7 @@ import (
 	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
+	"Eylu/internal/tool"
 )
 
 const SystemPrompt = `You are Eylu, a terminal programming agent working in a local repository. Follow the user's request, preserve unrelated files, report failures accurately, and keep responses concise. Tool availability and local permission policy are authoritative. Act through tools early and keep pre-tool narration brief. Inspect only files relevant to the change. Use write_file for complete new files and focused edit_file calls for updates. Emit independent tool calls together in the same response. Keep calls with data, file, or state dependencies in separate rounds.`
@@ -42,12 +43,51 @@ type Runtime struct {
 	MCPContexts           []MCPContext
 	MCPToolServers        map[string]string
 	MCPFingerprint        string
+	MCPState              func() MCPRuntimeState
 }
 
 type MCPContext struct {
 	Server          string
 	Instructions    string
 	ResourceCatalog string
+}
+
+// MCPRuntimeState is one atomic view of the live MCP catalog consumed by an
+// agent request. App hosts may replace this snapshot while a tool loop runs.
+type MCPRuntimeState struct {
+	Tools       []tool.Tool
+	Contexts    []MCPContext
+	ToolServers map[string]string
+	Fingerprint string
+}
+
+func cloneMCPRuntimeState(state MCPRuntimeState) MCPRuntimeState {
+	cloned := MCPRuntimeState{
+		Tools: append([]tool.Tool(nil), state.Tools...), Contexts: append([]MCPContext(nil), state.Contexts...),
+		ToolServers: make(map[string]string, len(state.ToolServers)), Fingerprint: state.Fingerprint,
+	}
+	for name, server := range state.ToolServers {
+		cloned.ToolServers[name] = server
+	}
+	return cloned
+}
+
+func filterMCPRuntimeState(state MCPRuntimeState, mode string) MCPRuntimeState {
+	profile := ProfileForMode(mode)
+	filtered := cloneMCPRuntimeState(state)
+	filtered.Tools = filtered.Tools[:0]
+	filtered.ToolServers = make(map[string]string)
+	for _, item := range state.Tools {
+		definition := item.Definition()
+		if !profile.AllowsTool(definition.Name, item.Risk()) {
+			continue
+		}
+		filtered.Tools = append(filtered.Tools, item)
+		if server := state.ToolServers[definition.Name]; server != "" {
+			filtered.ToolServers[definition.Name] = server
+		}
+	}
+	return filtered
 }
 
 type ProtectedSkill struct {
@@ -260,6 +300,41 @@ func (c *Conversation) applyRuntime(runtime Runtime) error {
 		c.systemPrompt = promptForRuntime(mode)
 	}
 	return nil
+}
+
+// ApplyMCPRuntime refreshes the idle conversation ledger as soon as the app
+// observes an MCP catalog event. Active loops also read the same state at
+// generation and execution boundaries.
+func (c *Conversation) ApplyMCPRuntime(state MCPRuntimeState) {
+	if !c.mu.TryLock() {
+		return
+	}
+	defer c.mu.Unlock()
+	state = filterMCPRuntimeState(state, c.lastRuntime.PermissionMode)
+	previousServers := c.lastRuntime.MCPToolServers
+	c.lastRuntime.MCPContexts = append([]MCPContext(nil), state.Contexts...)
+	c.lastRuntime.MCPToolServers = cloneToolServers(state.ToolServers)
+	c.lastRuntime.MCPFingerprint = state.Fingerprint
+	_ = c.applyRuntime(c.lastRuntime)
+	definitions := make([]protocol.ToolDefinition, 0, len(c.toolDefinitions)+len(state.Tools))
+	for _, definition := range c.toolDefinitions {
+		if previousServers[definition.Name] == "" {
+			definitions = append(definitions, definition)
+		}
+	}
+	for _, item := range state.Tools {
+		definitions = append(definitions, item.Definition())
+	}
+	c.toolDefinitions = definitions
+	c.rebuildLedger(c.lastRuntime)
+}
+
+func cloneToolServers(servers map[string]string) map[string]string {
+	cloned := make(map[string]string, len(servers))
+	for name, server := range servers {
+		cloned[name] = server
+	}
+	return cloned
 }
 
 func (c *Conversation) appendUser(prompt string) {

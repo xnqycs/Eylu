@@ -62,6 +62,15 @@ type runtime struct {
 	metrics            *metrics.Collector
 	mcp                *mcpclient.Manager
 	mcpKey             string
+	mcpMu              sync.Mutex
+	mcpHostMu          sync.RWMutex
+	mcpHost            mcpHostCallbacks
+	mcpStateMu         sync.RWMutex
+	mcpState           agent.MCPRuntimeState
+	mcpEvents          []mcpclient.Event
+	mcpConversations   map[*agent.Conversation]int
+	mcpWatchStop       func()
+	mcpWatchDone       chan struct{}
 	environmentCapture func(context.Context, string) environment.Context
 	limitMu            sync.Mutex
 	limitResolver      *provider.LimitResolver
@@ -243,6 +252,8 @@ func (r *runtime) prepareManager(ctx context.Context, opts chatOptions) (*provid
 }
 
 func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
+	detachMCP := r.attachMCPConversation(conversation)
+	defer detachMCP()
 	conversation.RecordPrompt(prompt)
 	cfg := manager.Config()
 	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
@@ -284,7 +295,13 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	modelRuntime.MaxToolContextBytes = cfg.MaxToolContextBytes
 	modelRuntime.SkillCatalogPageBytes = cfg.SkillCatalogPageBytes
 	modelRuntime.MaxSummaryBytes = cfg.MaxSummaryBytes
-	if err := r.configureMCPRuntime(ctx, cfg, &modelRuntime); err != nil {
+	confirm := r.confirmTools(opts.approve)
+	var ask tool.AskFunc
+	if r.output == "text" && isTerminal(r.stdin) {
+		ask = r.askUser
+	}
+	host := buildMCPHostCallbacks(modelRuntime, confirm, ask, openMCPElicitationURL)
+	if err := r.configureMCPRuntimeWithHost(ctx, cfg, &modelRuntime, host); err != nil {
 		return err
 	}
 	var observation *metrics.Observation
@@ -335,11 +352,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	if r.output == "jsonl" {
 		audit = &toolAuditWriter{writer: r.stdout, jsonl: true}
 	}
-	var ask tool.AskFunc
-	if r.output == "text" && isTerminal(r.stdin) {
-		ask = r.askUser
-	}
-	executor, err := r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, r.confirmTools(opts.approve), ask, audit)
+	executor, err := r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, confirm, ask, audit)
 	if err != nil {
 		return err
 	}
@@ -467,9 +480,7 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	if ask != nil {
 		registered = append(registered, tool.NewAsk(ask))
 	}
-	if r.mcp != nil {
-		registered = append(registered, r.mcp.Tools()...)
-	}
+	registered = append(registered, r.currentMCPState().Tools...)
 	if skillRegistry != nil && len(skillRegistry.Active()) > 0 {
 		registered = append(registered, tool.NewActivateSkill(skillRegistry, skillSession), tool.NewReadSkillResource(skillSession))
 	}

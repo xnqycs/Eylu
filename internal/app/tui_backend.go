@@ -1,5 +1,7 @@
 package app
 
+//lint:file-ignore SA1019 MCP protocol 2025-11-25 compatibility.
+
 import (
 	"context"
 	"encoding/json"
@@ -15,6 +17,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"Eylu/internal/agent"
 	"Eylu/internal/buildinfo"
@@ -166,7 +170,10 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	}
 	modelRuntime.PermissionMode = mode.String()
 	modelRuntime.SkillCatalog = b.skills.Catalog()
-	if err := b.runtime.configureMCPRuntime(ctx, cfg, &modelRuntime); err != nil {
+	confirm := b.confirmTools(operationID, opts.approve, emit)
+	ask := b.askUser(operationID, emit)
+	host := buildMCPHostCallbacks(modelRuntime, confirm, ask, openMCPElicitationURL)
+	if err := b.runtime.configureMCPRuntimeWithHost(ctx, cfg, &modelRuntime, host); err != nil {
 		return err
 	}
 	configureTUIContextRuntime(&modelRuntime, b.runtime.workspace, cfg, operationID, emit)
@@ -189,8 +196,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 			contextEvents(event)
 		}
 	}
-	confirm := b.confirmTools(operationID, opts.approve, emit)
-	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, b.askUser(operationID, emit), &tuiAuditSink{operationID: operationID, emit: emit})
+	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, ask, &tuiAuditSink{operationID: operationID, emit: emit})
 	if err != nil {
 		return err
 	}
@@ -613,6 +619,8 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 		return "", nil
 	}
 	switch fields[0] {
+	case "/mcp":
+		return b.handleTUIMCPCommand(ctx, fields[1:])
 	case "/new":
 		b.mu.Lock()
 		opts := b.opts
@@ -731,6 +739,65 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown command %s", fields[0])
 	}
+}
+
+func (b *tuiBackend) handleTUIMCPCommand(ctx context.Context, fields []string) (string, error) {
+	if len(fields) == 0 {
+		return "MCP panel opened.", nil
+	}
+	b.mcpMu.Lock()
+	defer b.mcpMu.Unlock()
+	manager, _, err := b.loadTUIMCPManager(ctx)
+	if err != nil {
+		return "", err
+	}
+	var value any
+	switch fields[0] {
+	case "complete":
+		if len(fields) != 6 {
+			return "", fmt.Errorf("usage: /mcp complete <server> <prompt|resource> <name-or-uri> <argument> <value>")
+		}
+		ref := &sdkmcp.CompleteReference{}
+		if fields[2] == "prompt" {
+			ref.Type, ref.Name = "ref/prompt", fields[3]
+		} else if fields[2] == "resource" {
+			ref.Type, ref.URI = "ref/resource", fields[3]
+		} else {
+			return "", fmt.Errorf("completion reference must be prompt or resource")
+		}
+		value, err = manager.Complete(ctx, fields[1], &sdkmcp.CompleteParams{Ref: ref, Argument: sdkmcp.CompleteParamsArgument{Name: fields[4], Value: fields[5]}})
+	case "subscribe", "unsubscribe":
+		if len(fields) != 3 {
+			return "", fmt.Errorf("usage: /mcp %s <server> <uri>", fields[0])
+		}
+		if fields[0] == "subscribe" {
+			err = manager.SubscribeResource(ctx, fields[1], fields[2])
+		} else {
+			err = manager.UnsubscribeResource(ctx, fields[1], fields[2])
+		}
+		value = map[string]string{"server": fields[1], "action": fields[0], "uri": fields[2]}
+	case "diagnostics", "events":
+		if len(fields) != 2 {
+			return "", fmt.Errorf("usage: /mcp %s <server>", fields[0])
+		}
+		if fields[0] == "events" {
+			value = b.runtime.mcpEventsForServer(fields[1])
+		} else {
+			var detail mcpclient.ServerDetail
+			detail, err = manager.Inspect(fields[1])
+			value = detail.Diagnostics
+		}
+	default:
+		return "", fmt.Errorf("unknown MCP command %s", fields[0])
+	}
+	if err != nil {
+		return "", errors.New(b.runtime.redact(err.Error()))
+	}
+	encoded, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return b.runtime.redact(string(encoded)), nil
 }
 
 func updateGradientSetting(manager *provider.Manager, value string) (bool, error) {
@@ -982,7 +1049,11 @@ func (b *tuiBackend) MCPServers(ctx context.Context) ([]ui.MCPServerItem, error)
 		if inspectErr != nil {
 			detail.ServerInfo = server
 		}
-		result = append(result, buildTUIMCPServerItem(server, detail, cfg.MCPServers[server.Name], b.runtime.redact))
+		item := buildTUIMCPServerItem(server, detail, cfg.MCPServers[server.Name], b.runtime.redact)
+		if events := b.runtime.mcpEventsForServer(server.Name); len(events) > 0 {
+			item.Diagnostics = strings.TrimSpace(item.Diagnostics + "\n" + tuiMCPJSON(events, b.runtime.redact))
+		}
+		result = append(result, item)
 	}
 	return result, nil
 }

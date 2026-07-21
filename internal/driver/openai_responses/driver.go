@@ -283,7 +283,7 @@ func appendResponseInput(body *requestBody, turns []protocol.Turn) {
 			case part.Kind == protocol.PartToolCall && part.ToolCall != nil:
 				body.Input = append(body.Input, functionCallInput{Type: "function_call", CallID: part.ToolCall.ID, Name: part.ToolCall.Name, Arguments: string(part.ToolCall.Arguments)})
 			case part.Kind == protocol.PartToolResult && part.ToolResult != nil:
-				body.Input = append(body.Input, functionCallOutput{Type: "function_call_output", CallID: part.ToolResult.CallID, Output: part.ToolResult.Content})
+				body.Input = append(body.Input, functionCallOutput{Type: "function_call_output", CallID: part.ToolResult.CallID, Output: driver.ToolResultContent(*part.ToolResult)})
 			}
 		}
 	}

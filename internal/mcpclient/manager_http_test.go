@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +18,17 @@ import (
 
 	"Eylu/internal/config"
 )
+
+func TestPinnedClientSessionOptions(t *testing.T) {
+	options, err := pinnedClientSessionOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := reflect.ValueOf(options).Elem()
+	if value.NumField() != 1 || value.Field(0).String() != mcpProtocolVersion {
+		t.Fatalf("protocol option=%#v", options)
+	}
+}
 
 func TestManagerStreamableHTTPJSONAndSSEProtocol(t *testing.T) {
 	for _, jsonResponse := range []bool{true, false} {
@@ -54,7 +65,7 @@ func TestManagerStreamableHTTPJSONAndSSEProtocol(t *testing.T) {
 				t.Fatalf("resource=%#v error=%v", result, err)
 			}
 			observed := capture.snapshot()
-			if !observed.staticHeader || !observed.protocol20251125 || len(observed.responseSessions) == 0 || len(observed.requestSessions) == 0 {
+			if !observed.staticHeader || !observed.protocol20251125 || observed.initializeProtocol != mcpProtocolVersion || observed.serverDiscover || len(observed.responseSessions) == 0 || len(observed.requestSessions) == 0 {
 				t.Fatalf("transport capture=%#v", observed)
 			}
 			wantContentType := "text/event-stream"
@@ -65,6 +76,45 @@ func TestManagerStreamableHTTPJSONAndSSEProtocol(t *testing.T) {
 				t.Fatalf("content types=%#v, want %s", observed.contentTypes, wantContentType)
 			}
 		})
+	}
+}
+
+func TestManagerListsOnlyAdvertisedCapabilities(t *testing.T) {
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "tools-only", Version: "1.0.0"}, nil)
+	type input struct {
+		Value string `json:"value"`
+	}
+	sdkmcp.AddTool(server, &sdkmcp.Tool{Name: "echo", Description: "echo"}, func(_ context.Context, _ *sdkmcp.CallToolRequest, value input) (*sdkmcp.CallToolResult, input, error) {
+		return nil, value, nil
+	})
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, &sdkmcp.StreamableHTTPOptions{JSONResponse: true})
+	capture := &protocolCapture{handler: handler}
+	httpServer := httptest.NewServer(capture)
+	defer httpServer.Close()
+
+	manager, diagnostics, err := Open(context.Background(), map[string]config.MCPServerConfig{
+		"tools-only": {Transport: config.MCPTransportStreamableHTTP, URL: httpServer.URL, StartupTimeoutSeconds: 5},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	if len(diagnostics) != 0 {
+		t.Fatalf("diagnostics=%#v", diagnostics)
+	}
+	detail, err := manager.Inspect("tools-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.ServerInfo.Tools != 1 || len(detail.Resources) != 0 || len(detail.ResourceTemplates) != 0 || len(detail.Prompts) != 0 {
+		t.Fatalf("detail=%#v", detail)
+	}
+	observed := capture.snapshot()
+	for _, method := range observed.methods {
+		switch method {
+		case "resources/list", "resources/templates/list", "prompts/list":
+			t.Fatalf("called unadvertised method %q; methods=%#v", method, observed.methods)
+		}
 	}
 }
 
@@ -120,17 +170,23 @@ type protocolCapture struct {
 	mu                 sync.Mutex
 	staticHeader       bool
 	protocol20251125   bool
+	initializeProtocol string
+	serverDiscover     bool
 	responseSessions   map[string]struct{}
 	requestSessions    map[string]struct{}
 	contentTypes       []string
+	methods            []string
 }
 
 type protocolCaptureSnapshot struct {
-	staticHeader     bool
-	protocol20251125 bool
-	responseSessions []string
-	requestSessions  []string
-	contentTypes     []string
+	staticHeader       bool
+	protocol20251125   bool
+	initializeProtocol string
+	serverDiscover     bool
+	responseSessions   []string
+	requestSessions    []string
+	contentTypes       []string
+	methods            []string
 }
 
 func (c *protocolCapture) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -140,20 +196,26 @@ func (c *protocolCapture) ServeHTTP(writer http.ResponseWriter, request *http.Re
 		request.Body = io.NopCloser(bytes.NewReader(body))
 	}
 	var rpc struct {
-		ID     json.RawMessage `json:"id"`
-		Method string          `json:"method"`
+		Method string `json:"method"`
+		Params struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		} `json:"params"`
 	}
 	_ = json.Unmarshal(body, &rpc)
-	if rpc.Method == "server/discover" {
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(writer, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"legacy protocol fixture"}}`, rpc.ID)
-		return
-	}
 	if rpc.Method == "resources/read" && c.expireNextResource.CompareAndSwap(true, false) {
 		http.Error(writer, "expired session", http.StatusNotFound)
 		return
 	}
 	c.mu.Lock()
+	if rpc.Method != "" {
+		c.methods = append(c.methods, rpc.Method)
+	}
+	if rpc.Method == "initialize" {
+		c.initializeProtocol = rpc.Params.ProtocolVersion
+	}
+	if rpc.Method == "server/discover" {
+		c.serverDiscover = true
+	}
 	if request.Header.Get("X-Eylu-Test") == "present" {
 		c.staticHeader = true
 	}
@@ -187,7 +249,11 @@ func (c *protocolCapture) recordResponse(header http.Header) {
 func (c *protocolCapture) snapshot() protocolCaptureSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	result := protocolCaptureSnapshot{staticHeader: c.staticHeader, protocol20251125: c.protocol20251125, contentTypes: append([]string(nil), c.contentTypes...)}
+	result := protocolCaptureSnapshot{
+		staticHeader: c.staticHeader, protocol20251125: c.protocol20251125,
+		initializeProtocol: c.initializeProtocol, serverDiscover: c.serverDiscover,
+		contentTypes: append([]string(nil), c.contentTypes...), methods: append([]string(nil), c.methods...),
+	}
 	for session := range c.responseSessions {
 		result.responseSessions = append(result.responseSessions, session)
 	}

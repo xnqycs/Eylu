@@ -48,6 +48,8 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) (returnE
 }
 
 func (r *runtime) runInteractiveFrontend(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, useTUI bool) (returnErr error) {
+	detachMCP := r.attachMCPConversation(conversation)
+	defer detachMCP()
 	defer func() {
 		returnErr = r.finishInteractive(conversation, returnErr)
 	}()

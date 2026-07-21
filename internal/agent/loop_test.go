@@ -271,3 +271,99 @@ func TestAgentLoopRunsReturnedBatchWithoutDriverParallelCapability(t *testing.T)
 		t.Fatalf("response=%#v ready=%d request=%#v error=%v", response, parallelTool.ready.Load(), model.lastRequest, err)
 	}
 }
+
+type namedMCPTool struct {
+	name  string
+	calls *atomic.Int32
+}
+
+func (t namedMCPTool) Definition() protocol.ToolDefinition {
+	return protocol.ToolDefinition{Name: t.name, Description: t.name, InputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+func (namedMCPTool) Risk() policy.Risk { return policy.RiskRead }
+func (t namedMCPTool) Execute(context.Context, json.RawMessage) protocol.ToolResult {
+	t.calls.Add(1)
+	return protocol.ToolResult{Content: t.name + " executed"}
+}
+
+type changingMCPDriver struct {
+	requests []driver.Request
+	change   func()
+}
+
+func (*changingMCPDriver) Name() string { return "changing-mcp" }
+func (*changingMCPDriver) Capabilities() driver.Capabilities {
+	return driver.Capabilities{ToolCalling: true}
+}
+func (d *changingMCPDriver) Generate(_ context.Context, request driver.Request, _ driver.EmitFunc) (protocol.ModelResponse, error) {
+	d.requests = append(d.requests, request)
+	switch len(d.requests) {
+	case 1:
+		d.change()
+		call := protocol.ToolCall{ID: "removed-call", Name: "mcp__fixture__removed", Arguments: json.RawMessage(`{}`)}
+		return protocol.ModelResponse{Turn: protocol.Turn{ID: "removed", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}}, Stop: protocol.StopToolUse}, nil
+	case 2:
+		call := protocol.ToolCall{ID: "added-call", Name: "mcp__fixture__added", Arguments: json.RawMessage(`{}`)}
+		return protocol.ModelResponse{Turn: protocol.Turn{ID: "added", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}}, Stop: protocol.StopToolUse}, nil
+	default:
+		return protocol.ModelResponse{Turn: protocol.Turn{ID: "complete", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "done"}}}, Stop: protocol.StopCompleted}, nil
+	}
+}
+
+func TestAgentLoopAtomicallyRefreshesMCPToolsAndContext(t *testing.T) {
+	var removedCalls, addedCalls atomic.Int32
+	removed := namedMCPTool{name: "mcp__fixture__removed", calls: &removedCalls}
+	added := namedMCPTool{name: "mcp__fixture__added", calls: &addedCalls}
+	var stateMu sync.RWMutex
+	state := MCPRuntimeState{
+		Tools:       []tool.Tool{removed},
+		Contexts:    []MCPContext{{Server: "fixture", Instructions: "old instructions", ResourceCatalog: "old resource"}},
+		ToolServers: map[string]string{"mcp__fixture__removed": "fixture"},
+		Fingerprint: "old-fingerprint",
+	}
+	driver := &changingMCPDriver{change: func() {
+		stateMu.Lock()
+		state = MCPRuntimeState{
+			Tools:       []tool.Tool{added},
+			Contexts:    []MCPContext{{Server: "fixture", Instructions: "new instructions", ResourceCatalog: "new resource"}},
+			ToolServers: map[string]string{"mcp__fixture__added": "fixture"},
+			Fingerprint: "new-fingerprint",
+		}
+		stateMu.Unlock()
+	}}
+	runtime := testRuntime(driver, 1)
+	runtime.MCPContexts = []MCPContext{{Server: "fixture", Instructions: "old instructions", ResourceCatalog: "old resource"}}
+	runtime.MCPToolServers = map[string]string{"mcp__fixture__removed": "fixture"}
+	runtime.MCPFingerprint = "old-fingerprint"
+	runtime.MCPState = func() MCPRuntimeState {
+		stateMu.RLock()
+		defer stateMu.RUnlock()
+		return cloneMCPRuntimeState(state)
+	}
+	executor := &tool.Executor{Registry: tool.NewRegistry(echoTool{}, removed), Policy: policy.AllowAllChecker{}}
+	conversation := NewConversation()
+	response, err := conversation.Run(context.Background(), "refresh MCP", runtime, executor, LoopOptions{MaxTurns: 4}, false, nil)
+	if err != nil || response.Turn.ID != "complete" {
+		t.Fatalf("response=%#v error=%v", response, err)
+	}
+	if removedCalls.Load() != 0 || addedCalls.Load() != 1 {
+		t.Fatalf("removed calls=%d added calls=%d", removedCalls.Load(), addedCalls.Load())
+	}
+	if names := definitionNames(driver.requests[0].Model.Tools); !strings.Contains(names, "mcp__fixture__removed") || strings.Contains(names, "mcp__fixture__added") {
+		t.Fatalf("first definitions=%s", names)
+	}
+	if names := definitionNames(driver.requests[1].Model.Tools); strings.Contains(names, "mcp__fixture__removed") || !strings.Contains(names, "mcp__fixture__added") {
+		t.Fatalf("second definitions=%s", names)
+	}
+	if text := requestText(driver.requests[1].Model.Turns); !strings.Contains(text, "new instructions") || !strings.Contains(text, "new resource") || !strings.Contains(text, "unknown tool") {
+		t.Fatalf("refreshed request=%q", text)
+	}
+}
+
+func definitionNames(definitions []protocol.ToolDefinition) string {
+	names := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		names = append(names, definition.Name)
+	}
+	return strings.Join(names, ",")
+}
