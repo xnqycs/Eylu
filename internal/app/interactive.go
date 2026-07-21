@@ -20,6 +20,7 @@ import (
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 	"Eylu/internal/tool"
+	"Eylu/internal/ui"
 )
 
 var errQuit = errors.New("quit")
@@ -77,7 +78,11 @@ func (r *runtime) runLineInteractive(ctx context.Context, conversation *agent.Co
 		}
 		r.inputMu.Unlock()
 	}()
-	fmt.Fprintf(r.stdout, "Eylu session %s\nType /help for commands.\n", conversation.SessionID())
+	fmt.Fprintf(r.stdout, "Eylu session %s\n", conversation.SessionID())
+	if err := printInteractiveHistory(r.stdout, conversationHistory(conversation.ExportState())); err != nil {
+		return err
+	}
+	fmt.Fprintln(r.stdout, "Type /help for commands.")
 	for {
 		fmt.Fprint(r.stdout, "> ")
 		line, readErr := r.readInteractiveLineWithInterrupts(ctx, reader, interrupts)
@@ -115,6 +120,51 @@ func (r *runtime) runLineInteractive(ctx context.Context, conversation *agent.Co
 			return nil
 		}
 	}
+}
+
+func printInteractiveHistory(writer io.Writer, history []ui.HistoryItem) error {
+	visible := make([]ui.HistoryItem, 0, len(history))
+	for _, item := range history {
+		if item.Kind == ui.HistoryTool && item.ToolCall != nil && item.ToolCall.Name == "todolist" {
+			continue
+		}
+		visible = append(visible, item)
+	}
+	if len(visible) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(writer, "Restored conversation history:"); err != nil {
+		return err
+	}
+	for _, item := range visible {
+		switch item.Kind {
+		case ui.HistoryMessage:
+			if _, err := fmt.Fprintf(writer, "[%s]\n%s\n\n", item.Role, item.Text); err != nil {
+				return err
+			}
+		case ui.HistoryTool:
+			name, callID := "unknown_tool", ""
+			if item.ToolCall != nil {
+				name, callID = item.ToolCall.Name, item.ToolCall.ID
+			}
+			status := "interrupted"
+			truncated := false
+			if item.ToolResult != nil {
+				status = "done"
+				if item.ToolResult.IsError {
+					status = "failed"
+				}
+				truncated = item.ToolResult.Truncated
+				if callID == "" {
+					callID = item.ToolResult.CallID
+				}
+			}
+			if _, err := fmt.Fprintf(writer, "[tool] %s status=%s call_id=%s truncated=%t\n\n", name, status, callID, truncated); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (r *runtime) finishInteractive(conversation *agent.Conversation, runErr error) error {

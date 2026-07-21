@@ -213,6 +213,21 @@ type MCPServerItem struct {
 	Prompts           []MCPPromptItem   `json:"prompts,omitempty"`
 }
 
+type HistoryKind string
+
+const (
+	HistoryMessage HistoryKind = "message"
+	HistoryTool    HistoryKind = "tool"
+)
+
+type HistoryItem struct {
+	Kind       HistoryKind          `json:"kind"`
+	Role       protocol.Role        `json:"role,omitempty"`
+	Text       string               `json:"text,omitempty"`
+	ToolCall   *protocol.ToolCall   `json:"tool_call,omitempty"`
+	ToolResult *protocol.ToolResult `json:"tool_result,omitempty"`
+}
+
 type Snapshot struct {
 	SessionID                 string               `json:"session_id"`
 	Workspace                 string               `json:"workspace"`
@@ -227,6 +242,7 @@ type Snapshot struct {
 	Skills                    []SkillItem          `json:"skills"`
 	TodoList                  protocol.TodoList    `json:"todo_list,omitzero"`
 	PromptHistory             []string             `json:"prompt_history"`
+	History                   []HistoryItem        `json:"history"`
 }
 
 type ProviderForm struct {

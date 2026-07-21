@@ -182,7 +182,7 @@ eylu --resume auth-review
 eylu chat --resume auth-review
 ```
 
-`--resume <session-id>` loads an existing session from the current workspace exactly. An invalid, missing, damaged, or cross-workspace ID returns a non-zero exit code and leaves session storage unchanged. Interactive text sessions print a directly executable resume command when they exit.
+`--resume <session-id>` loads an existing session from the current workspace exactly. An invalid, missing, damaged, or cross-workspace ID returns a non-zero exit code and leaves session storage unchanged. TUI and interactive `--no-tui` sessions show restored messages and tool history at the latest content; one-shot calls with a prompt continue to print only the new response. Interactive text sessions print a directly executable resume command when they exit.
 
 `--session <id>` keeps its open-or-create semantics for named sessions:
 

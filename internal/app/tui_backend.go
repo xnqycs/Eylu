@@ -109,7 +109,7 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		SessionID: b.conversation.SessionID(), Workspace: b.runtime.workspace, Mode: mode, Provider: active.Name, Model: active.Config.Model,
 		ReasoningEffort: effort, SupportedReasoningEfforts: config.SupportedReasoningEfforts(active.Config.Model),
 		GradientEnabled: cfg.GradientEnabled,
-		Context:         b.conversation.ContextReport(), TodoList: state.TodoList, PromptHistory: append([]string{}, state.PromptHistory...),
+		Context:         b.conversation.ContextReport(), TodoList: state.TodoList, PromptHistory: append([]string{}, state.PromptHistory...), History: conversationHistory(state),
 	}
 	managerActive, _ := b.manager.Active()
 	for _, item := range b.manager.List() {
@@ -128,6 +128,96 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		}
 	}
 	return snapshot, nil
+}
+
+func conversationHistory(state agent.ConversationState) []ui.HistoryItem {
+	history := make([]ui.HistoryItem, 0, len(state.Turns))
+	toolIndexes := make(map[string]int)
+	for _, turn := range state.Turns {
+		switch turn.Role {
+		case protocol.RoleUser, protocol.RoleAgent:
+			var text strings.Builder
+			flushText := func() {
+				value := text.String()
+				text.Reset()
+				if turn.Role == protocol.RoleUser {
+					value = visibleUserMessage(value)
+				}
+				if strings.TrimSpace(value) == "" {
+					return
+				}
+				history = append(history, ui.HistoryItem{Kind: ui.HistoryMessage, Role: turn.Role, Text: value})
+			}
+			for _, part := range turn.Parts {
+				switch {
+				case part.Kind == protocol.PartText:
+					text.WriteString(part.Text)
+				case part.Kind == protocol.PartToolCall && part.ToolCall != nil:
+					flushText()
+					call := cloneHistoryToolCall(part.ToolCall)
+					history = append(history, ui.HistoryItem{Kind: ui.HistoryTool, ToolCall: call})
+					if call.ID != "" {
+						toolIndexes[call.ID] = len(history) - 1
+					}
+				}
+			}
+			flushText()
+		case protocol.RoleTool:
+			for _, part := range turn.Parts {
+				if part.Kind != protocol.PartToolResult || part.ToolResult == nil {
+					continue
+				}
+				result := cloneHistoryToolResult(part.ToolResult)
+				if index, ok := toolIndexes[result.CallID]; ok {
+					history[index].ToolResult = result
+					continue
+				}
+				call := &protocol.ToolCall{ID: result.CallID, Name: "unknown_tool", Arguments: json.RawMessage(`{}`)}
+				history = append(history, ui.HistoryItem{Kind: ui.HistoryTool, ToolCall: call, ToolResult: result})
+			}
+		}
+	}
+	return history
+}
+
+func visibleUserMessage(prompt string) string {
+	switch {
+	case strings.HasPrefix(prompt, legacyPlanFeedbackPrefix):
+		prompt = strings.TrimPrefix(prompt, legacyPlanFeedbackPrefix)
+	case strings.Contains(prompt, legacyUserRequestStart) && strings.HasSuffix(prompt, legacyUserRequestEnd):
+		start := strings.Index(prompt, legacyUserRequestStart) + len(legacyUserRequestStart)
+		prompt = prompt[start : len(prompt)-len(legacyUserRequestEnd)]
+	}
+	return strings.TrimSpace(prompt)
+}
+
+func cloneHistoryToolCall(source *protocol.ToolCall) *protocol.ToolCall {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.Arguments = append(json.RawMessage(nil), source.Arguments...)
+	return &cloned
+}
+
+func cloneHistoryToolResult(source *protocol.ToolResult) *protocol.ToolResult {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.ContentBlocks = append([]protocol.ContentBlock(nil), source.ContentBlocks...)
+	cloned.StructuredContent = append(json.RawMessage(nil), source.StructuredContent...)
+	if source.Metadata != nil {
+		cloned.Metadata = make(map[string]any, len(source.Metadata))
+		for key, value := range source.Metadata {
+			cloned.Metadata[key] = value
+		}
+	}
+	if source.TodoList != nil {
+		list := cloneProtocolTodoList(*source.TodoList)
+		cloned.TodoList = &list
+	}
+	return &cloned
 }
 
 func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission ui.Submission, emit func(ui.Event)) (returnErr error) {

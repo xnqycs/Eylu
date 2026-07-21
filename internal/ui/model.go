@@ -76,6 +76,7 @@ type toolView struct {
 	preparing            bool
 	running              bool
 	isError              bool
+	interrupted          bool
 	truncated            bool
 	durationMS           int64
 	exitCode             int
@@ -188,6 +189,7 @@ type Model struct {
 	filesLoading               bool
 	filesDiagnostic            string
 	queuedMode                 string
+	pendingCommandNotice       string
 	contextStarted             bool
 	draft                      string
 	promptHistory              []string
@@ -414,6 +416,8 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case snapshotMsg:
 		var colorCommand tea.Cmd
+		pendingNotice := m.pendingCommandNotice
+		m.pendingCommandNotice = ""
 		if typed.err != nil {
 			m.appendNotice(typed.err.Error(), true)
 		} else {
@@ -437,13 +441,18 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.promptHistory = append(m.promptHistory[:0], typed.snapshot.PromptHistory...)
 			if sessionChanged {
-				m.contextStarted = len(typed.snapshot.PromptHistory) > 0
+				m.hydrateHistory(typed.snapshot.History)
+				m.followOutput = true
+				m.contextStarted = len(typed.snapshot.History) > 0 || len(typed.snapshot.PromptHistory) > 0
 			} else if len(typed.snapshot.PromptHistory) > 0 || m.busy() {
 				m.contextStarted = true
 			}
 			if sessionChanged || m.historyIndex >= len(m.promptHistory) {
 				m.resetHistoryNavigation()
 			}
+		}
+		if pendingNotice != "" {
+			m.appendNotice(pendingNotice, false)
 		}
 		m.refreshViewport()
 		return m, colorCommand
@@ -559,7 +568,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if typed.err != nil {
 			m.appendNotice(typed.err.Error(), true)
 		} else if typed.text != "" {
-			m.appendNotice(typed.text, false)
+			m.pendingCommandNotice = typed.text
 		}
 		m.screen = screenChat
 		m.refreshViewport()
@@ -1682,6 +1691,43 @@ func (m *Model) appendAgentDelta(delta string) {
 		m.timeline = append(m.timeline, timelineItem{kind: timelineMessage, role: "agent"})
 	}
 	m.timeline[len(m.timeline)-1].text += delta
+}
+
+func (m *Model) hydrateHistory(history []HistoryItem) {
+	m.timeline = make([]timelineItem, 0, len(history))
+	m.toolCursor = -1
+	m.clearSelection()
+	for _, item := range history {
+		switch item.Kind {
+		case HistoryMessage:
+			role := string(item.Role)
+			if (role == string(protocol.RoleUser) || role == string(protocol.RoleAgent)) && strings.TrimSpace(item.Text) != "" {
+				m.timeline = append(m.timeline, timelineItem{kind: timelineMessage, role: role, text: item.Text})
+			}
+		case HistoryTool:
+			view := &toolView{interrupted: item.ToolResult == nil}
+			if item.ToolCall != nil {
+				view.name = item.ToolCall.Name
+				view.callID = item.ToolCall.ID
+				view.replaceArguments(string(item.ToolCall.Arguments))
+			}
+			if view.name == "" {
+				view.name = "unknown_tool"
+			}
+			if item.ToolResult != nil {
+				view.callID = item.ToolResult.CallID
+				view.content = item.ToolResult.Content
+				view.isError = item.ToolResult.IsError
+				view.truncated = item.ToolResult.Truncated
+				if item.ToolResult.TodoList != nil {
+					list := cloneUITodoList(*item.ToolResult.TodoList)
+					view.todoList = &list
+				}
+			}
+			updateFileToolPreview(view)
+			m.timeline = append(m.timeline, timelineItem{kind: timelineTool, tool: view})
+		}
+	}
 }
 
 func (m *Model) appendNotice(text string, isError bool) {

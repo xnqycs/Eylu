@@ -333,7 +333,51 @@ func TestTextInteractiveExitPathsPrintResumeInstruction(t *testing.T) {
 			if !strings.HasSuffix(stdout.String(), "Resume this session with:\neylu --resume resume-me\n") {
 				t.Fatalf("stdout = %q", stdout.String())
 			}
+			if strings.Contains(stdout.String(), "Restored conversation history:") {
+				t.Fatalf("empty session printed a history section: %q", stdout.String())
+			}
 		})
+	}
+}
+
+func TestTextInteractiveResumePrintsVisibleHistoryBeforePrompt(t *testing.T) {
+	call := protocol.ToolCall{ID: "call-bash", Name: "bash", Arguments: json.RawMessage(`{"command":"exit 1"}`)}
+	conversation, err := agent.RestoreConversation(agent.ConversationState{
+		SessionID: "resume-history", PermissionMode: "manual",
+		Turns: []protocol.Turn{
+			{ID: "user", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "question"}}},
+			{ID: "agent", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartReasoning, Text: "PRIVATE_REASONING"}, {Kind: protocol.PartText, Text: "answer"}, {Kind: protocol.PartToolCall, ToolCall: &call}}},
+			{ID: "tool", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: "call-bash", Content: "exit status 1", IsError: true}}}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	runtime := &runtime{stdin: strings.NewReader("/quit\n"), stdout: &stdout, stderr: &bytes.Buffer{}, output: "text"}
+	if err := runtime.runInteractiveFrontend(context.Background(), conversation, nil, chatOptions{noTUI: true, resumeSet: true, resumeID: "resume-history"}, false); err != nil {
+		t.Fatal(err)
+	}
+	output := stdout.String()
+	expected := []string{
+		"Eylu session resume-history",
+		"Restored conversation history:",
+		"[user]\nquestion",
+		"[agent]\nanswer",
+		"[tool] bash status=failed call_id=call-bash truncated=false",
+		"Type /help for commands.",
+		"> ",
+	}
+	position := -1
+	for _, fragment := range expected {
+		next := strings.Index(output[position+1:], fragment)
+		if next < 0 {
+			t.Fatalf("history output missing %q: %q", fragment, output)
+		}
+		position += next + 1
+	}
+	if strings.Contains(output, "PRIVATE_REASONING") {
+		t.Fatalf("history output leaked reasoning: %q", output)
 	}
 }
 

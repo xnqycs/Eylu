@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1798,6 +1799,50 @@ func TestPromptHistoryNavigationPreservesDraftAndVisualBoundaries(t *testing.T) 
 	_, _ = model.Update(snapshotMsg{snapshot: Snapshot{SessionID: "new-session", PromptHistory: []string{}}})
 	if len(model.promptHistory) != 0 || model.historyIndex != -1 {
 		t.Fatalf("new session history=%#v index=%d", model.promptHistory, model.historyIndex)
+	}
+}
+
+func TestSnapshotHydratesHistoryAtBottomWithoutDuplicatingLiveTimeline(t *testing.T) {
+	call := protocol.ToolCall{ID: "call-read", Name: "read_file", Arguments: json.RawMessage(`{"path":"README.md"}`)}
+	pendingCall := protocol.ToolCall{ID: "call-pending", Name: "bash", Arguments: json.RawMessage(`{"command":"go test ./..."}`)}
+	backend := &fakeBackend{snapshot: Snapshot{SessionID: "restored", History: []HistoryItem{
+		{Kind: HistoryMessage, Role: protocol.RoleUser, Text: strings.Repeat("old question\n", 20)},
+		{Kind: HistoryMessage, Role: protocol.RoleAgent, Text: "old answer"},
+		{Kind: HistoryTool, ToolCall: &call, ToolResult: &protocol.ToolResult{CallID: "call-read", Content: "restored tool output"}},
+		{Kind: HistoryTool, ToolCall: &pendingCall},
+	}}}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 50, Height: 16})
+	_, _ = model.Update(snapshotMsg{snapshot: backend.snapshot})
+	view := ansi.Strip(model.renderTimeline())
+	if len(model.timeline) != 4 || !strings.Contains(view, "old question") || !strings.Contains(view, "old answer") || !strings.Contains(view, "> read_file  done") || !strings.Contains(view, "> bash  interrupted") {
+		t.Fatalf("timeline=%#v\n%s", model.timeline, view)
+	}
+	if model.timeline[2].tool.arguments != string(call.Arguments) || model.timeline[2].tool.content != "restored tool output" {
+		t.Fatalf("restored tool detail=%#v", model.timeline[2].tool)
+	}
+	if !model.viewport.AtBottom() || !model.followOutput {
+		t.Fatalf("viewport bottom=%t follow=%t offset=%d", model.viewport.AtBottom(), model.followOutput, model.viewport.YOffset())
+	}
+	model.appendNotice("live notice", false)
+	_, _ = model.Update(snapshotMsg{snapshot: backend.snapshot})
+	if len(model.timeline) != 5 || model.timeline[4].text != "live notice" {
+		t.Fatalf("same-session snapshot replaced live timeline: %#v", model.timeline)
+	}
+}
+
+func TestSessionChangeReplacesHistoryBeforeAppendingCommandNotice(t *testing.T) {
+	backend := &fakeBackend{snapshot: Snapshot{SessionID: "old", History: []HistoryItem{{Kind: HistoryMessage, Role: protocol.RoleUser, Text: "old history"}}}}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 60, Height: 16})
+	_, _ = model.Update(snapshotMsg{snapshot: backend.snapshot})
+	backend.snapshot = Snapshot{SessionID: "new"}
+	_, command := model.Update(commandResultMsg{text: "Closed session old. New session new."})
+	if command == nil {
+		t.Fatal("command result did not request a refreshed snapshot")
+	}
+	_, _ = model.Update(command())
+	view := ansi.Strip(model.renderTimeline())
+	if strings.Contains(view, "old history") || !strings.Contains(view, "Closed session old. New session new.") || len(model.timeline) != 1 {
+		t.Fatalf("timeline=%#v\n%s", model.timeline, view)
 	}
 }
 

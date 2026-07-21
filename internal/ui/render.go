@@ -524,6 +524,8 @@ func (m *Model) renderTool(tool *toolView) string {
 		state = "running"
 	} else if tool.isError {
 		state = "failed"
+	} else if tool.interrupted {
+		state = "interrupted"
 	}
 	duration := ""
 	if tool.durationMS > 0 {

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- 修复恢复会话后的空历史视图：TUI 和 `--no-tui` 交互模式回显用户、助手与工具历史，TUI 默认定位到最新内容。
+
+## v1.0.0-rc.2 - 2026-07-21
+
+- 增强上下文压缩与手动触发能力：支持 `/compact`，改进压缩预算、摘要恢复、工具调用原子组保留和 TUI 压缩反馈。
+- 增强工具调用并行调度：在 Driver 与工具均声明并行能力时并发执行连续只读工具，保持稳定结果顺序并完善取消、超时与 panic 隔离。
+- 将 `--resume` 调整为按 session ID 精确恢复，补齐缺失、损坏、跨工作区、空 ID 等严格错误处理和交互退出恢复提示。
+- 完成 MCP 客户端能力：覆盖 stdio、Streamable HTTP、SSE、OAuth、会话恢复、动态目录、tools/resources/prompts、roots/sampling/elicitation 与 CLI/TUI 管理。
+- 完善中英文使用文档、发布说明和跨平台 smoke 校验。
+
 ## v1.0.0-rc.1 - 2026-07-20
 
 - 重构 TUI 启动与运行反馈：加入加宽粗体斜体 Eylu 字符画、版本和工作目录 Banner；增加默认关闭的 `/gradient` On/Off 选择器及 `gradient_enabled` 持久化配置，启用后 Banner 与底部状态栏以约 20 FPS 显示主题强调色的逐字符 ANSI 真彩单色流光；新启动或 `/new` 后在首个 Prompt 前将 Context 展示为 100% 可用，之后按真实剩余/已用比例和友好状态短句展示；activity 行将 reasoning token 改为 `thinking` 与整秒 `thought for` 用时；`/context` 增加 Signal Strip、分类聚合和可滚动详情；连续工具组与后续消息之间增加留白。
