@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -377,6 +378,49 @@ func TestRootChatValidationAndSubcommandDispatch(t *testing.T) {
 			t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
 	})
+}
+
+func TestExplicitEmptyResumeFailsBeforeModelRequest(t *testing.T) {
+	home := isolateUserState(t)
+	workspace := t.TempDir()
+	stateRoot := filepath.Join(home, "state", "sessions")
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		writeResponsesCompleted(w, `{"id":"unexpected","output":[{"type":"message","content":[{"type":"output_text","text":"unexpected"}]}]}`)
+	}))
+	defer server.Close()
+	t.Setenv("EYLU_API_KEY", "empty-resume-secret")
+	configPath := filepath.Join(workspace, "config.toml")
+	testCases := []struct {
+		name string
+		args []string
+	}{
+		{name: "root equals", args: []string{"--config", configPath, "--workspace", workspace, "--base-url", server.URL + "/v1", "--model", "test", "--resume=", "prompt"}},
+		{name: "root separate empty", args: []string{"--config", configPath, "--workspace", workspace, "--base-url", server.URL + "/v1", "--model", "test", "--resume", "", "prompt"}},
+		{name: "chat equals", args: []string{"--config", configPath, "--workspace", workspace, "chat", "prompt", "--base-url", server.URL + "/v1", "--model", "test", "--resume="}},
+		{name: "chat separate empty", args: []string{"--config", configPath, "--workspace", workspace, "chat", "prompt", "--base-url", server.URL + "/v1", "--model", "test", "--resume", ""}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			before := readSessionStore(t, stateRoot)
+			var stdout, stderr bytes.Buffer
+			code := Execute(context.Background(), testCase.args, strings.NewReader(""), &stdout, &stderr)
+			if code != exitConfig || !strings.Contains(stderr.String(), "resume session ID is required") {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+			if requests.Load() != 0 {
+				t.Fatalf("model requests = %d", requests.Load())
+			}
+			after := readSessionStore(t, stateRoot)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatal("empty resume modified session storage")
+			}
+		})
+	}
 }
 
 func TestChatToolLoopReadsAndBuilds(t *testing.T) {

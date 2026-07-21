@@ -41,7 +41,7 @@ func (r *runtime) openConversation(ctx context.Context, manager *provider.Manage
 	}
 	workspace := r.workspace
 	id := opts.sessionID
-	resuming := opts.resumeID != ""
+	resuming := opts.resumeSet || opts.resumeID != ""
 	if resuming {
 		id = opts.resumeID
 	}

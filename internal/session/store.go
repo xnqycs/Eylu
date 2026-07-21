@@ -209,6 +209,7 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 	diagnostics := make([]Diagnostic, 0)
 	snapshotPath := filepath.Join(directory, "snapshot.json")
 	data, readErr := os.ReadFile(snapshotPath)
+	snapshotMissing := errors.Is(readErr, os.ErrNotExist)
 	if readErr == nil {
 		var header struct {
 			Version int `json:"version"`
@@ -230,6 +231,14 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 	}
 	snapshot.SessionID = id
 	eventsPath := filepath.Join(directory, "events.jsonl")
+	_, eventsStatErr := os.Stat(eventsPath)
+	eventsMissing := errors.Is(eventsStatErr, os.ErrNotExist)
+	if eventsStatErr != nil && !eventsMissing {
+		return Snapshot{}, diagnostics, eventsStatErr
+	}
+	if !repairEventTail && snapshotMissing && eventsMissing {
+		return Snapshot{}, diagnostics, fmt.Errorf("session %q has no snapshot or event log", id)
+	}
 	events, eventDiagnostics, validEventBytes, err := readEventsDetailed(eventsPath, id)
 	diagnostics = append(diagnostics, eventDiagnostics...)
 	if err != nil {

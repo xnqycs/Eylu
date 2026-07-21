@@ -54,14 +54,24 @@ func (r *runtime) runInteractiveFrontend(ctx context.Context, conversation *agen
 	if useTUI {
 		return r.runTUI(ctx, conversation, manager, opts)
 	}
+	interrupts := make(chan os.Signal, 2)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	return r.runLineInteractive(ctx, conversation, manager, opts, interrupts)
+}
+
+func (r *runtime) runLineInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, interrupts <-chan os.Signal) error {
 	reader := bufio.NewReader(r.stdin)
 	r.inputReader = reader
 	defer func() { r.inputReader = nil }()
 	fmt.Fprintf(r.stdout, "Eylu session %s\nType /help for commands.\n", conversation.SessionID())
 	for {
 		fmt.Fprint(r.stdout, "> ")
-		line, readErr := r.readInteractiveLine(ctx, reader)
+		line, readErr := r.readInteractiveLineWithInterrupts(ctx, reader, interrupts)
 		line = strings.TrimSpace(line)
+		if errors.Is(readErr, errQuit) {
+			return nil
+		}
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return readErr
 		}
@@ -80,7 +90,7 @@ func (r *runtime) runInteractiveFrontend(ctx context.Context, conversation *agen
 				r.printError(commandErr)
 			}
 		} else {
-			commandErr := r.sendInteractive(ctx, conversation, manager, line, opts)
+			commandErr := r.sendInteractive(ctx, conversation, manager, line, opts, interrupts)
 			if errors.Is(commandErr, errQuit) {
 				return nil
 			}
@@ -102,12 +112,9 @@ func (r *runtime) finishInteractive(conversation *agent.Conversation, runErr err
 	return nil
 }
 
-func (r *runtime) sendInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
+func (r *runtime) sendInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions, interrupts <-chan os.Signal) error {
 	requestCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	interrupts := make(chan os.Signal, 2)
-	signal.Notify(interrupts, os.Interrupt)
-	defer signal.Stop(interrupts)
 	result := make(chan error, 1)
 	go func() {
 		result <- r.sendPrompt(requestCtx, conversation, manager, prompt, opts)
@@ -344,6 +351,10 @@ func (r *runtime) askUser(ctx context.Context, request protocol.AskRequest) (pro
 }
 
 func (r *runtime) readInteractiveLine(ctx context.Context, reader *bufio.Reader) (string, error) {
+	return r.readInteractiveLineWithInterrupts(ctx, reader, nil)
+}
+
+func (r *runtime) readInteractiveLineWithInterrupts(ctx context.Context, reader *bufio.Reader, interrupts <-chan os.Signal) (string, error) {
 	r.inputMu.Lock()
 	pending := r.inputRead
 	if pending == nil {
@@ -366,6 +377,8 @@ func (r *runtime) readInteractiveLine(ctx context.Context, reader *bufio.Reader)
 		return result.line, result.err
 	case <-ctx.Done():
 		return "", ctx.Err()
+	case <-interrupts:
+		return "", errQuit
 	}
 }
 

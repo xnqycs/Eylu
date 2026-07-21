@@ -95,7 +95,8 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.resumeSet = cmd.Flags().Changed("resume")
 			return r.executeChatCommand(ctx, args, opts)
 		},
 		PersistentPreRunE: func(*cobra.Command, []string) error {
@@ -140,6 +141,7 @@ type chatOptions struct {
 	noTUI            bool
 	sessionID        string
 	resumeID         string
+	resumeSet        bool
 	routeMode        string
 	task             string
 	requireReasoning bool
@@ -151,7 +153,8 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 		Use:   "chat [prompt]",
 		Short: "send a prompt to the active model",
 		Args:  cobra.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.resumeSet = cmd.Flags().Changed("resume")
 			return r.executeChatCommand(ctx, args, opts)
 		},
 	}
@@ -160,6 +163,9 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 }
 
 func (r *runtime) executeChatCommand(ctx context.Context, args []string, opts chatOptions) error {
+	if opts.resumeSet && opts.resumeID == "" {
+		return &protocol.Error{Code: protocol.ErrConfig, Message: "resume session ID is required"}
+	}
 	terminal := isTerminal(r.stdin)
 	if len(args) == 0 && terminal {
 		return r.runInteractive(ctx, opts)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -248,6 +249,9 @@ func TestResumeConversationFailuresLeaveStoreUnchanged(t *testing.T) {
 	if err := os.WriteFile(damagedPath, []byte("{damaged"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Mkdir(filepath.Join(home, "state", "sessions", "empty-session"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	testCases := []struct {
 		name      string
@@ -257,6 +261,7 @@ func TestResumeConversationFailuresLeaveStoreUnchanged(t *testing.T) {
 		{name: "invalid", resumeID: "../escape", errorText: "invalid session ID"},
 		{name: "missing", resumeID: "missing-session", errorText: "does not exist"},
 		{name: "damaged", resumeID: "damaged-session", errorText: "damaged"},
+		{name: "empty directory", resumeID: "empty-session", errorText: "no snapshot or event log"},
 		{name: "other workspace", resumeID: "other-workspace", errorText: "belongs to workspace"},
 	}
 	for _, testCase := range testCases {
@@ -273,6 +278,37 @@ func TestResumeConversationFailuresLeaveStoreUnchanged(t *testing.T) {
 				t.Fatalf("failed resume %q modified session storage", testCase.resumeID)
 			}
 		})
+	}
+}
+
+func TestNamedSessionRecoversEmptySessionDirectory(t *testing.T) {
+	home := isolateUserState(t)
+	workspace := t.TempDir()
+	store, err := session.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(home, "state", "sessions", "named-empty")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ActiveProvider = "test"
+	cfg.Providers["test"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "model"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &runtime{workspace: workspace, stderr: &bytes.Buffer{}, environmentCapture: func(context.Context, string) environment.Context {
+		return environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: "2026-07-21"}
+	}}
+	conversation, err := runtime.openConversation(context.Background(), manager, &chatOptions{sessionID: "named-empty"})
+	if err != nil || conversation.SessionID() != "named-empty" {
+		t.Fatalf("conversation=%v error=%v", conversation, err)
+	}
+	stored, diagnostics, err := store.Load("named-empty")
+	if err != nil || len(diagnostics) != 0 || stored.SessionID != "named-empty" || stored.Environment.WorkingDirectory != workspace {
+		t.Fatalf("stored=%#v diagnostics=%#v error=%v", stored, diagnostics, err)
 	}
 }
 
@@ -348,6 +384,104 @@ func TestSecondInteractiveInterruptPrintsResumeInstruction(t *testing.T) {
 	}
 	if stdout.String() != "Resume this session with:\neylu --resume interrupt-resume\n" {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestLineInteractiveIdleInterruptPrintsResumeInstruction(t *testing.T) {
+	conversation, err := agent.RestoreConversation(agent.ConversationState{SessionID: "idle-interrupt", PermissionMode: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	interrupts := make(chan os.Signal, 1)
+	var stdout bytes.Buffer
+	runtime := &runtime{stdin: reader, stdout: &stdout, stderr: &bytes.Buffer{}, output: "text"}
+	done := make(chan error, 1)
+	go func() {
+		done <- runtime.finishInteractive(conversation, runtime.runLineInteractive(context.Background(), conversation, nil, chatOptions{}, interrupts))
+	}()
+	waitForInteractiveRead(t, runtime)
+	interrupts <- os.Interrupt
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle interrupt did not exit line interactive mode")
+	}
+	if !strings.HasSuffix(stdout.String(), "Resume this session with:\neylu --resume idle-interrupt\n") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestLineInteractiveSecondInterruptDuringRequestPrintsResumeInstruction(t *testing.T) {
+	isolateUserState(t)
+	t.Setenv("EYLU_API_KEY", "interrupt-secret")
+	workspace := t.TempDir()
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(requestStarted)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	cfg := config.Default()
+	cfg.ActiveProvider = "test"
+	cfg.Providers["test"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "model"}
+	manager, err := provider.NewManager(filepath.Join(workspace, "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := agent.NewConversationWithEnvironment(environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: "2026-07-21"})
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	interrupts := make(chan os.Signal, 2)
+	var stdout, stderr bytes.Buffer
+	runtime := &runtime{stdin: reader, stdout: &stdout, stderr: &stderr, output: "text", workspace: workspace, trustPrompted: make(map[string]bool)}
+	done := make(chan error, 1)
+	go func() {
+		done <- runtime.finishInteractive(conversation, runtime.runLineInteractive(context.Background(), conversation, manager, chatOptions{}, interrupts))
+	}()
+	if _, err := io.WriteString(writer, "wait for interrupt\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("model request did not start")
+	}
+	interrupts <- os.Interrupt
+	interrupts <- os.Interrupt
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second request interrupt did not exit line interactive mode")
+	}
+	if !strings.Contains(stderr.String(), "Press Ctrl-C again to exit") || !strings.HasSuffix(stdout.String(), "Resume this session with:\neylu --resume "+conversation.SessionID()+"\n") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func waitForInteractiveRead(t *testing.T, runtime *runtime) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		runtime.inputMu.Lock()
+		started := runtime.inputRead != nil
+		runtime.inputMu.Unlock()
+		if started {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("line interactive input read did not start")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
