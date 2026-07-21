@@ -19,7 +19,7 @@ A terminal programming agent for local codebases. Eylu understands code in your 
 | Controlled tool permissions | `manual`, `plan`, `auto`, and `full` modes cover review, planning, and automated execution workflows |
 | Persistent sessions | Saves prompts, task state, and the context ledger, with compression and session recovery |
 | Multi-provider routing | Selects models by task, capability, context window, priority, and cost |
-| Extensible capabilities | Supports Agent Skills, signed Skill registries, and MCP stdio servers |
+| Extensible capabilities | Supports Agent Skills, signed Skill registries, and MCP stdio, Streamable HTTP, and SSE servers |
 
 Eylu provides a full-screen TUI and can also integrate with scripts and automation through text, JSON, or JSONL output.
 
@@ -250,22 +250,55 @@ eylu skills validate ".agents/skills/code-review"
 eylu skills diagnose --output json
 ```
 
-MCP servers connect through stdio child processes and are configured in Eylu TOML:
+MCP servers support the `stdio`, `streamable_http`, and `sse` transports and are configured in Eylu TOML:
 
 ```toml
 [mcp_servers.repository]
+transport = "stdio"
+enabled = true
+required = true
 command = "repo-mcp"
 args = ["serve", "--stdio"]
 environment = ["REPO_MCP_TOKEN"]
 working_directory = "."
 read_only_tools = ["search", "inspect"]
-timeout_seconds = 30
+allow_tools = ["search", "inspect", "status"]
+deny_tools = ["status"]
+startup_timeout_seconds = 15
+call_timeout_seconds = 60
+
+[mcp_servers.remote]
+transport = "streamable_http"
+url = "https://mcp.example.com/rpc"
+environment_headers = { "X-API-Key" = "REMOTE_MCP_API_KEY" }
+bearer_token_environment = "REMOTE_MCP_BEARER_TOKEN"
+
+[mcp_servers.remote.oauth]
+issuer = "https://auth.example.com"
+client_id = "eylu"
+client_secret_environment = "REMOTE_MCP_CLIENT_SECRET"
+scopes = ["mcp:tools", "mcp:resources"]
 ```
+
+An `sse` server uses the same `url`, header, and OAuth fields. Static headers can be set with `headers`; inject sensitive values through `environment_headers`, `bearer_token_environment`, or OAuth. The compatibility fields `disabled`, `timeout_seconds`, and `read_only_tools` remain supported. Startup, call, and OAuth/interaction timeouts default to 15, 60, and 30 seconds.
 
 ```bash
 eylu mcp list
 eylu mcp inspect repository --output json
+eylu mcp tools repository
+eylu mcp tool repository search
+eylu mcp resources repository
+eylu mcp resource repository "repo://status"
+eylu mcp prompts repository
+eylu mcp prompt repository review --arguments '{"branch":"main"}'
+eylu mcp reconnect repository
+eylu mcp enable repository
+eylu mcp disable repository
+eylu mcp login remote
+eylu mcp logout remote
 ```
+
+Enter `/mcp` in the TUI to open the server list and detail panel. It exposes tools, resources, prompts, connection state, diagnostics, reconnect, enable/disable, and login actions. Catalog notifications atomically refresh the tool registry, context, and cache fingerprint. OAuth credentials are stored in `~/.eylu/mcp_credentials.json` with file locking, atomic replacement, and platform-specific permission hardening.
 
 MCP environment variables are forwarded through a name allowlist. Read-only tools must also be declared explicitly in the local configuration.
 

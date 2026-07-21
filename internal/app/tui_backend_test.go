@@ -23,6 +23,7 @@ import (
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
 	"Eylu/internal/environment"
+	"Eylu/internal/mcpclient"
 	"Eylu/internal/metrics"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
@@ -591,6 +592,47 @@ func TestTruncateReferenceContentHonorsUTF8ByteLimit(t *testing.T) {
 		if !clipped || len([]byte(truncated)) > limit || !utf8.ValidString(truncated) {
 			t.Fatalf("limit=%d bytes=%d clipped=%t valid=%t value=%q", limit, len([]byte(truncated)), clipped, utf8.ValidString(truncated), truncated)
 		}
+	}
+}
+
+func TestTUIBackendMCPViewMapsCatalogsAndRedacts(t *testing.T) {
+	t.Setenv("MCP_TOKEN", "bearer-secret")
+	cfg := testAppConfig()
+	cfg.MCPServers = map[string]config.MCPServerConfig{
+		"alpha": {
+			Transport: config.MCPTransportStreamableHTTP, Enabled: true, URL: "https://user:url-secret@example.test/mcp?token=query-secret#fragment",
+			Headers: map[string]string{"Authorization": "stored-secret"}, BearerTokenEnvironment: "MCP_TOKEN",
+		},
+	}
+	redact := func(value string) string { return strings.ReplaceAll(value, "stored-secret", "[REDACTED]") }
+	server := mcpclient.ServerInfo{
+		Name: "alpha", Status: mcpclient.StatusConnected, Transport: config.MCPTransportStreamableHTTP,
+		ProtocolVersion: "2025-11-25", Tools: 1, Resources: 1, Prompts: 1,
+	}
+	detail := mcpclient.ServerDetail{
+		ServerInfo: server, Instructions: "stored-secret",
+		Tools:     []mcpclient.ToolInfo{{Name: "search", LocalName: "mcp__alpha__search", Description: "stored-secret", Status: "available"}},
+		Resources: []mcpclient.ResourceInfo{{URI: "fixture://readme", Name: "readme", MIMEType: "text/plain"}},
+		Prompts:   []mcpclient.PromptInfo{{Name: "review", Description: "review code"}},
+	}
+	item := buildTUIMCPServerItem(server, detail, cfg.MCPServers["alpha"], redact)
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := string(encoded)
+	for _, expected := range []string{"alpha", "connected", "2025-11-25", "mcp__alpha__search", "fixture://readme", "review", "https://example.test/mcp", "Authorization", "MCP_TOKEN", "[REDACTED]"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("MCP view missing %q: %s", expected, view)
+		}
+	}
+	for _, secret := range []string{"stored-secret", "bearer-secret", "url-secret", "query-secret", "user"} {
+		if strings.Contains(view, secret) {
+			t.Fatalf("MCP view leaked %q: %s", secret, view)
+		}
+	}
+	if strings.Contains(item.Config, `\"Authorization\":\"`) {
+		t.Fatalf("MCP view leaked a credential: %s", view)
 	}
 }
 

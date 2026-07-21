@@ -158,6 +158,61 @@ type FileItem struct {
 	Size int64  `json:"size"`
 }
 
+type MCPAction string
+
+const (
+	MCPActionReconnect MCPAction = "reconnect"
+	MCPActionEnable    MCPAction = "enable"
+	MCPActionDisable   MCPAction = "disable"
+	MCPActionLogin     MCPAction = "login"
+	MCPActionLogout    MCPAction = "logout"
+)
+
+type MCPToolItem struct {
+	Name         string `json:"name"`
+	LocalName    string `json:"local_name,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Annotations  string `json:"annotations,omitempty"`
+	InputSchema  string `json:"input_schema,omitempty"`
+	OutputSchema string `json:"output_schema,omitempty"`
+	Permission   string `json:"permission,omitempty"`
+	Status       string `json:"status,omitempty"`
+}
+
+type MCPResourceItem struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	MIMEType    string `json:"mime_type,omitempty"`
+}
+
+type MCPPromptItem struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Arguments   string `json:"arguments,omitempty"`
+}
+
+type MCPServerItem struct {
+	Name              string            `json:"name"`
+	Status            string            `json:"status"`
+	Transport         string            `json:"transport,omitempty"`
+	ProtocolVersion   string            `json:"protocol_version,omitempty"`
+	Implementation    string            `json:"implementation,omitempty"`
+	Version           string            `json:"version,omitempty"`
+	ToolCount         int               `json:"tool_count"`
+	ResourceCount     int               `json:"resource_count"`
+	PromptCount       int               `json:"prompt_count"`
+	LastError         string            `json:"last_error,omitempty"`
+	ConnectDurationMS int64             `json:"connect_duration_ms,omitempty"`
+	Config            string            `json:"config,omitempty"`
+	Capabilities      string            `json:"capabilities,omitempty"`
+	Instructions      string            `json:"instructions,omitempty"`
+	Diagnostics       string            `json:"diagnostics,omitempty"`
+	Tools             []MCPToolItem     `json:"tools,omitempty"`
+	Resources         []MCPResourceItem `json:"resources,omitempty"`
+	Prompts           []MCPPromptItem   `json:"prompts,omitempty"`
+}
+
 type Snapshot struct {
 	SessionID                 string               `json:"session_id"`
 	Workspace                 string               `json:"workspace"`
@@ -212,6 +267,8 @@ type Backend interface {
 	SetModel(context.Context, string, string) (ModelSelection, error)
 	SetContextWindow(context.Context, string, int) error
 	FetchModels(context.Context, string) ([]string, error)
+	MCPServers(context.Context) ([]MCPServerItem, error)
+	MCPAction(context.Context, string, MCPAction) error
 }
 
 type Clock interface {

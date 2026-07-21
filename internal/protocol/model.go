@@ -54,6 +54,63 @@ type ToolCallDelta struct {
 	Done        bool   `json:"done,omitempty"`
 }
 
+type ContentType string
+
+const (
+	ContentText             ContentType = "text"
+	ContentImage            ContentType = "image"
+	ContentAudio            ContentType = "audio"
+	ContentEmbeddedResource ContentType = "resource"
+	ContentResourceLink     ContentType = "resource_link"
+)
+
+type ToolAnnotations struct {
+	Title           string `json:"title,omitempty"`
+	ReadOnlyHint    bool   `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
+	IdempotentHint  bool   `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
+}
+
+type ContentAnnotations struct {
+	Audience     []string `json:"audience,omitempty"`
+	Priority     float64  `json:"priority,omitempty"`
+	LastModified string   `json:"lastModified,omitempty"`
+}
+
+type Icon struct {
+	Source   string   `json:"src"`
+	MIMEType string   `json:"mimeType,omitempty"`
+	Sizes    []string `json:"sizes,omitempty"`
+	Theme    string   `json:"theme,omitempty"`
+}
+
+type ResourceContents struct {
+	URI      string         `json:"uri"`
+	MIMEType string         `json:"mimeType,omitempty"`
+	Text     string         `json:"text,omitempty"`
+	Blob     []byte         `json:"blob,omitempty"`
+	Meta     map[string]any `json:"_meta,omitempty"`
+}
+
+// ContentBlock mirrors the MCP content variants while ToolResult.Content keeps
+// the legacy text rendering consumed by existing drivers and sessions.
+type ContentBlock struct {
+	Type        ContentType         `json:"type"`
+	Text        string              `json:"text,omitempty"`
+	Data        []byte              `json:"data,omitempty"`
+	MIMEType    string              `json:"mimeType,omitempty"`
+	Resource    *ResourceContents   `json:"resource,omitempty"`
+	URI         string              `json:"uri,omitempty"`
+	Name        string              `json:"name,omitempty"`
+	Title       string              `json:"title,omitempty"`
+	Description string              `json:"description,omitempty"`
+	Size        *int64              `json:"size,omitempty"`
+	Icons       []Icon              `json:"icons,omitempty"`
+	Meta        map[string]any      `json:"_meta,omitempty"`
+	Annotations *ContentAnnotations `json:"annotations,omitempty"`
+}
+
 type TodoStatus string
 
 const (
@@ -100,18 +157,22 @@ type AskResponse struct {
 }
 
 type ToolResult struct {
-	CallID    string         `json:"call_id"`
-	Content   string         `json:"content"`
-	IsError   bool           `json:"is_error,omitempty"`
-	Truncated bool           `json:"truncated,omitempty"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	TodoList  *TodoList      `json:"todo_list,omitempty"`
+	CallID            string          `json:"call_id"`
+	Content           string          `json:"content"`
+	ContentBlocks     []ContentBlock  `json:"content_blocks,omitempty"`
+	StructuredContent json.RawMessage `json:"structured_content,omitempty"`
+	IsError           bool            `json:"is_error,omitempty"`
+	Truncated         bool            `json:"truncated,omitempty"`
+	Metadata          map[string]any  `json:"metadata,omitempty"`
+	TodoList          *TodoList       `json:"todo_list,omitempty"`
 }
 
 type ToolDefinition struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name         string           `json:"name"`
+	Description  string           `json:"description"`
+	InputSchema  json.RawMessage  `json:"input_schema"`
+	OutputSchema json.RawMessage  `json:"output_schema,omitempty"`
+	Annotations  *ToolAnnotations `json:"annotations,omitempty"`
 }
 
 type ModelRequest struct {

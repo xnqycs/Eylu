@@ -194,6 +194,10 @@ func (m *Model) refreshViewport() {
 		content = m.renderContextWindowConfirmation()
 	case screenSkills:
 		content = m.renderSkills()
+	case screenMCP:
+		content = m.renderMCPServers()
+	case screenMCPDetail:
+		content = m.renderMCPDetail()
 	case screenContext:
 		content = m.renderContext()
 	case screenTasks:
@@ -889,6 +893,182 @@ func (m *Model) renderSkills() string {
 		}
 	}
 	return output.String()
+}
+
+func (m *Model) renderMCPServers() string {
+	var output strings.Builder
+	width := m.viewportContentWidth()
+	output.WriteString(m.styles.Header.Render("MCP servers") + "\n\n")
+	if m.mcpLoading && len(m.mcpServers) == 0 {
+		output.WriteString(m.styles.Loading.Render("Loading MCP runtime..."))
+		return output.String()
+	}
+	if len(m.mcpServers) == 0 {
+		output.WriteString(m.styles.Muted.Render("No configured MCP servers."))
+	} else {
+		for index, item := range m.mcpServers {
+			cursor := "  "
+			if index == m.mcpCursor {
+				cursor = "> "
+			}
+			protocolVersion := item.ProtocolVersion
+			if protocolVersion == "" {
+				protocolVersion = "-"
+			}
+			line := fmt.Sprintf("%s%-20s %-13s %-17s %-10s T:%d R:%d P:%d", cursor, item.Name, item.Status, item.Transport, protocolVersion, item.ToolCount, item.ResourceCount, item.PromptCount)
+			line = truncateColumns(line, width)
+			output.WriteString(m.renderMCPStatus(item.Status, line) + "\n")
+			if item.LastError != "" {
+				output.WriteString(m.styles.Error.Render(truncateColumns("    "+item.LastError, width)) + "\n")
+			}
+		}
+	}
+	if m.mcpNotice != "" {
+		output.WriteString("\n" + m.styles.Status.Render(wrapPlain(m.mcpNotice, width)) + "\n")
+	}
+	output.WriteString("\n" + m.styles.Muted.Render("Enter details · r reconnect · e enable · d disable · l login · o logout · g refresh · Esc back"))
+	return strings.TrimRight(output.String(), "\n")
+}
+
+func (m *Model) renderMCPStatus(status, value string) string {
+	switch status {
+	case "connected":
+		return m.styles.Active.Render(value)
+	case "connecting", "reconnecting":
+		return m.styles.Loading.Render(value)
+	case "needs_auth":
+		return m.styles.Header.Render(value)
+	case "error":
+		return m.styles.Error.Render(value)
+	default:
+		return m.styles.Muted.Render(value)
+	}
+}
+
+func (m *Model) renderMCPDetail() string {
+	server, ok := m.selectedMCPServer()
+	if !ok {
+		return m.styles.Muted.Render("MCP server is no longer configured.\n\nEsc back")
+	}
+	width := m.viewportContentWidth()
+	var output strings.Builder
+	title := server.Name + "  " + server.Status
+	output.WriteString(m.styles.Header.Render(truncateColumns(title, width)) + "\n")
+	tabs := []string{"1 Details", "2 Tools", "3 Resources", "4 Prompts"}
+	for index := range tabs {
+		if index == m.mcpTab {
+			tabs[index] = m.styles.Active.Bold(true).Render(tabs[index])
+		} else {
+			tabs[index] = m.styles.Muted.Render(tabs[index])
+		}
+	}
+	output.WriteString(strings.Join(tabs, "  ") + "\n\n")
+	switch m.mcpTab {
+	case 1:
+		m.renderMCPTools(&output, server, width)
+	case 2:
+		m.renderMCPResources(&output, server, width)
+	case 3:
+		m.renderMCPPrompts(&output, server, width)
+	default:
+		m.renderMCPServerDetails(&output, server, width)
+	}
+	if m.mcpNotice != "" {
+		output.WriteString("\n" + m.styles.Status.Render(wrapPlain(m.mcpNotice, width)) + "\n")
+	}
+	output.WriteString("\n" + m.styles.Muted.Render("1-4/Tab view · r reconnect · e enable · d disable · l login · o logout · g refresh · Esc servers"))
+	return strings.TrimRight(output.String(), "\n")
+}
+
+func (m *Model) renderMCPServerDetails(output *strings.Builder, server MCPServerItem, width int) {
+	implementation := strings.Trim(strings.Join([]string{server.Implementation, server.Version}, " "), " ")
+	m.renderMCPField(output, "Transport", server.Transport, width)
+	m.renderMCPField(output, "Protocol", server.ProtocolVersion, width)
+	m.renderMCPField(output, "Implementation", implementation, width)
+	if server.ConnectDurationMS > 0 {
+		m.renderMCPField(output, "Connected in", fmt.Sprintf("%dms", server.ConnectDurationMS), width)
+	}
+	m.renderMCPField(output, "Catalog", fmt.Sprintf("%d tools · %d resources · %d prompts", server.ToolCount, server.ResourceCount, server.PromptCount), width)
+	m.renderMCPField(output, "Last error", server.LastError, width)
+	m.renderMCPField(output, "Config", server.Config, width)
+	m.renderMCPField(output, "Capabilities", server.Capabilities, width)
+	m.renderMCPField(output, "Instructions", server.Instructions, width)
+	m.renderMCPField(output, "Diagnostics", server.Diagnostics, width)
+}
+
+func (m *Model) renderMCPTools(output *strings.Builder, server MCPServerItem, width int) {
+	if len(server.Tools) == 0 {
+		output.WriteString(m.styles.Muted.Render("No tools reported."))
+		return
+	}
+	for index, item := range server.Tools {
+		prefix := "  "
+		if index == m.mcpCatalogCursor {
+			prefix = "> "
+		}
+		line := truncateColumns(prefix+item.Name+"  "+item.Status+"  "+item.Permission, width)
+		output.WriteString(line + "\n")
+		if index != m.mcpCatalogCursor {
+			continue
+		}
+		m.renderMCPField(output, "Local name", item.LocalName, width)
+		m.renderMCPField(output, "Description", item.Description, width)
+		m.renderMCPField(output, "Annotations", item.Annotations, width)
+		m.renderMCPField(output, "Input schema", item.InputSchema, width)
+		m.renderMCPField(output, "Output schema", item.OutputSchema, width)
+	}
+}
+
+func (m *Model) renderMCPResources(output *strings.Builder, server MCPServerItem, width int) {
+	if len(server.Resources) == 0 {
+		output.WriteString(m.styles.Muted.Render("No resources reported."))
+		return
+	}
+	for index, item := range server.Resources {
+		prefix := "  "
+		if index == m.mcpCatalogCursor {
+			prefix = "> "
+		}
+		output.WriteString(truncateColumns(prefix+item.Name+"  "+item.URI, width) + "\n")
+		if index == m.mcpCatalogCursor {
+			m.renderMCPField(output, "MIME type", item.MIMEType, width)
+			m.renderMCPField(output, "Description", item.Description, width)
+		}
+	}
+}
+
+func (m *Model) renderMCPPrompts(output *strings.Builder, server MCPServerItem, width int) {
+	if len(server.Prompts) == 0 {
+		output.WriteString(m.styles.Muted.Render("No prompts reported."))
+		return
+	}
+	for index, item := range server.Prompts {
+		prefix := "  "
+		if index == m.mcpCatalogCursor {
+			prefix = "> "
+		}
+		output.WriteString(truncateColumns(prefix+item.Name, width) + "\n")
+		if index == m.mcpCatalogCursor {
+			m.renderMCPField(output, "Description", item.Description, width)
+			m.renderMCPField(output, "Arguments", item.Arguments, width)
+		}
+	}
+}
+
+func (m *Model) renderMCPField(output *strings.Builder, label, value string, width int) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	prefix := label + "  "
+	available := max(1, width-lipgloss.Width(prefix))
+	lines := strings.Split(wrapPlain(value, available), "\n")
+	for index, line := range lines {
+		if index == 0 {
+			output.WriteString(m.styles.Muted.Render(prefix) + line + "\n")
+		} else {
+			output.WriteString(strings.Repeat(" ", lipgloss.Width(prefix)) + line + "\n")
+		}
+	}
 }
 
 func (m *Model) renderContext() string {

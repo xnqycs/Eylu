@@ -32,7 +32,7 @@
 - 增加按任务、能力、上下文窗口、优先级和估算成本选择 Provider 的确定性自动路由；支持 `--route`、`--task` 与 `--require-reasoning`。
 - 增加首 token、总耗时、工具成功率、压缩次数、token usage 和估算成本指标，并将同一 request ID 传入工具审计。
 - 在 Driver 声明并行能力时并发执行连续的显式只读工具，提供并发上限、稳定结果顺序、取消收敛和 panic 隔离。
-- 基于官方 Go SDK 增加 MCP stdio 客户端，接入 instructions、tools 与 resources；环境变量按名称白名单转发，只读权限需本地显式配置。
+- 基于官方 Go SDK 增加完整 MCP 客户端：支持 stdio、Streamable HTTP、SSE、OAuth、会话恢复、动态目录、tools/resources/prompts、roots/sampling/elicitation，以及 CLI/TUI 管理；环境变量按名称白名单转发，只读权限需本地显式配置。
 - 增加 Ed25519 签名 Skill 仓库、包和目录双 SHA-256 校验、安装/更新/验签、user/project/team 范围与团队锁文件。
 - 增加版本元数据、GoReleaser 六平台归档、SHA-256 checksums、Sigstore keyless 签名、三平台 CI 和发布工作流。
 

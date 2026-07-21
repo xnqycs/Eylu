@@ -334,6 +334,170 @@ func TestMCPServerValidationAndClone(t *testing.T) {
 	}
 }
 
+func TestMCPServerTransportsValidationAndClone(t *testing.T) {
+	cfg := Default()
+	cfg.MCPServers["local"] = MCPServerConfig{
+		Transport: MCPTransportStdio, Enabled: true, Required: true,
+		StartupTimeoutSeconds: 10, CallTimeoutSeconds: 30,
+		AllowTools: []string{"search", "read"}, DenyTools: []string{"write"},
+		Command: "mcp-server", Args: []string{"--stdio"}, Environment: []string{"MCP_TOKEN"}, WorkingDirectory: ".",
+	}
+	cfg.MCPServers["remote"] = MCPServerConfig{
+		Transport: MCPTransportStreamableHTTP, Enabled: true,
+		URL:                    "https://mcp.example.test/rpc",
+		Headers:                map[string]string{"X-Client": "eylu"},
+		EnvironmentHeaders:     map[string]string{"Authorization": "MCP_AUTHORIZATION"},
+		BearerTokenEnvironment: "MCP_BEARER_TOKEN",
+		OAuth: &MCPOAuthConfig{
+			Issuer: "https://auth.example.test", ClientID: "eylu",
+			ClientSecretEnvironment: "MCP_CLIENT_SECRET", Scopes: []string{"mcp:tools"},
+			RedirectURL: "http://127.0.0.1:8765/callback",
+		},
+	}
+	cfg.MCPServers["events"] = MCPServerConfig{
+		Transport: MCPTransportSSE, Enabled: true, URL: "http://127.0.0.1:9000/sse",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	clone := cfg.Clone()
+	remote := clone.MCPServers["remote"]
+	remote.Headers["X-Client"] = "changed"
+	remote.EnvironmentHeaders["Authorization"] = "OTHER"
+	remote.OAuth.Scopes[0] = "changed"
+	if cfg.MCPServers["remote"].Headers["X-Client"] != "eylu" || cfg.MCPServers["remote"].EnvironmentHeaders["Authorization"] != "MCP_AUTHORIZATION" || cfg.MCPServers["remote"].OAuth.Scopes[0] != "mcp:tools" {
+		t.Fatal("MCP remote configuration was shared by Clone")
+	}
+	roundTripPath := filepath.Join(t.TempDir(), "config.toml")
+	if err := Save(roundTripPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := Load(LoadOptions{ExplicitPath: roundTripPath, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRemote := roundTrip.Config.MCPServers["remote"]
+	if !gotRemote.Enabled || gotRemote.Transport != MCPTransportStreamableHTTP || gotRemote.BearerTokenEnvironment != "MCP_BEARER_TOKEN" || gotRemote.EnvironmentHeaders["Authorization"] != "MCP_AUTHORIZATION" || gotRemote.OAuth == nil || gotRemote.OAuth.RedirectURL != "http://127.0.0.1:8765/callback" {
+		t.Fatalf("MCP remote configuration did not round-trip: %#v", gotRemote)
+	}
+
+	for name, candidate := range map[string]MCPServerConfig{
+		"bad-transport":  {Transport: "websocket", Enabled: true, URL: "https://example.test"},
+		"stdio-url":      {Transport: MCPTransportStdio, Enabled: true, Command: "server", URL: "https://example.test"},
+		"remote-command": {Transport: MCPTransportStreamableHTTP, Enabled: true, URL: "https://example.test", Command: "server"},
+		"remote-url":     {Transport: MCPTransportSSE, Enabled: true, URL: "/relative"},
+		"tool-overlap":   {Transport: MCPTransportStdio, Enabled: true, Command: "server", AllowTools: []string{"search"}, DenyTools: []string{"search"}},
+		"auth-env":       {Transport: MCPTransportStreamableHTTP, Enabled: true, URL: "https://example.test", BearerTokenEnvironment: "TOKEN=value"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := Default()
+			invalid.MCPServers["server"] = candidate
+			if err := invalid.Validate(); err == nil {
+				t.Fatalf("configuration passed validation: %#v", candidate)
+			}
+		})
+	}
+}
+
+func TestMCPServerLegacyCompatibilityAndConflicts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	legacy := "version = 1\n\n[mcp_servers.local]\ncommand = 'server'\ntimeout_seconds = 12\nread_only_tools = ['search']\ndisabled = false\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := loaded.Config.MCPServers["local"]
+	if server.Transport != MCPTransportStdio || !server.Enabled || !server.IsEnabled() || server.StartupTimeoutSeconds != 12 || server.TimeoutSeconds != 12 || len(server.ReadOnlyTools) != 1 {
+		t.Fatalf("legacy MCP server was not normalized: %#v", server)
+	}
+
+	conflicts := []string{
+		"enabled = true\ndisabled = false\ncommand = 'server'",
+		"startup_timeout_seconds = 10\ntimeout_seconds = 10\ncommand = 'server'",
+		"call_timeout_seconds = 10\ntimeout_seconds = 10\ncommand = 'server'",
+	}
+	for index, fields := range conflicts {
+		t.Run(string(rune('a'+index)), func(t *testing.T) {
+			conflictPath := filepath.Join(t.TempDir(), "config.toml")
+			data := "version = 1\n\n[mcp_servers.local]\n" + fields + "\n"
+			if err := os.WriteFile(conflictPath, []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(LoadOptions{ExplicitPath: conflictPath, Workspace: t.TempDir()}); err == nil || !strings.Contains(err.Error(), "conflict") {
+				t.Fatalf("conflict error = %v", err)
+			}
+		})
+	}
+}
+
+func TestMCPServerRoundTripAndEnabledSourcePersistence(t *testing.T) {
+	workspace := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	userPath := filepath.Join(home, ".eylu", "config.toml")
+	projectPath := filepath.Join(workspace, ".eylu", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	user := "version = 1\n\n[mcp_servers.remote]\ntransport = 'streamable_http'\nurl = 'https://mcp.example.test/rpc'\nrequired = true\nstartup_timeout_seconds = 8\ncall_timeout_seconds = 45\nallow_tools = ['search']\nheaders = { X-Client = 'eylu' }\nenvironment_headers = { Authorization = 'MCP_AUTHORIZATION' }\nbearer_token_environment = 'MCP_TOKEN'\n\n[mcp_servers.remote.oauth]\nissuer = 'https://auth.example.test'\nscopes = ['mcp:tools']\n"
+	if err := os.WriteFile(userPath, []byte(user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(projectPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectPath, []byte("version = 1\npermission_mode = 'manual'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := loaded.Config.MCPServers["remote"]
+	if server.Transport != MCPTransportStreamableHTTP || !server.Enabled || !server.IsEnabled() || !server.Required || server.CallTimeoutSeconds != 45 || server.OAuth == nil || server.OAuth.Issuer != "https://auth.example.test" {
+		t.Fatalf("remote MCP config = %#v", server)
+	}
+	updated, err := loaded.Store.SetMCPServerEnabled("remote", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.MCPServers["remote"].IsEnabled() {
+		t.Fatal("MCP server remained enabled")
+	}
+	userData, err := os.ReadFile(userPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectData, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(userData), "enabled = false") || strings.Contains(string(projectData), "mcp_servers") {
+		t.Fatalf("enabled state persisted to wrong source:\nuser=%s\nproject=%s", userData, projectData)
+	}
+	if source, ok := loaded.Store.MCPServerSource("remote"); !ok || source != userPath {
+		t.Fatalf("MCP server source = %q, %t", source, ok)
+	}
+	updated, err = loaded.Store.SetMCPServerEnabled("remote", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.MCPServers["remote"].Enabled || !updated.MCPServers["remote"].IsEnabled() {
+		t.Fatal("MCP server remained disabled")
+	}
+	userData, err = os.ReadFile(userPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(userData), "enabled = true") {
+		t.Fatalf("enabled state was not persisted: %s", userData)
+	}
+}
+
 func TestSkillRegistryValidationAndClone(t *testing.T) {
 	publicKey := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
 	cfg := Default()
