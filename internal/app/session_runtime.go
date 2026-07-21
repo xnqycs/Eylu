@@ -41,23 +41,25 @@ func (r *runtime) openConversation(ctx context.Context, manager *provider.Manage
 	}
 	workspace := r.workspace
 	id := opts.sessionID
-	if opts.resume {
-		latest, found, latestErr := store.Latest(workspace)
-		if latestErr != nil {
-			return nil, sessionProtocolError("find recent session", latestErr)
-		}
-		if !found {
-			return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "no resumable session exists for this workspace"}
-		}
-		id = latest.SessionID
+	resuming := opts.resumeSet || opts.resumeID != ""
+	if resuming {
+		id = opts.resumeID
 	}
 	if id != "" && !session.ValidID(id) {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("invalid session ID %q", id)}
 	}
 
 	if id != "" {
-		stored, diagnostics, loadErr := store.Load(id)
+		load := store.LoadRecovering
+		if resuming {
+			load = store.Load
+		}
+		stored, diagnostics, loadErr := load(id)
 		if loadErr == nil {
+			if resuming && len(diagnostics) > 0 {
+				diagnostic := diagnostics[0]
+				return nil, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("load session %s: %s: %s", id, diagnostic.Path, diagnostic.Message)}
+			}
 			if stored.Workspace != "" && !sameWorkspace(stored.Workspace, workspace) {
 				return nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("session %s belongs to workspace %s; select it with --workspace", id, stored.Workspace)}
 			}
@@ -100,6 +102,9 @@ func (r *runtime) openConversation(ctx context.Context, manager *provider.Manage
 				fmt.Fprintf(r.stderr, "[session] %s: %s\n", diagnostic.Path, diagnostic.Message)
 			}
 			return conversation, nil
+		}
+		if resuming && errors.Is(loadErr, os.ErrNotExist) {
+			return nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("session %q does not exist", id), Cause: loadErr}
 		}
 		if !errors.Is(loadErr, os.ErrNotExist) {
 			return nil, sessionProtocolError("load session", loadErr)

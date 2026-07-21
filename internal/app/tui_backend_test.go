@@ -477,7 +477,7 @@ func TestTUIAskTodoAndSessionRestoreSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry, skillSession, err := appRuntime.loadSkillRuntime(cfg, opts, conversation)
+	registry, skillSession, err := appRuntime.loadSkillRuntime(context.Background(), cfg, opts, conversation, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

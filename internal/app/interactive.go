@@ -29,7 +29,7 @@ type inputLineResult struct {
 	err  error
 }
 
-func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
+func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) (returnErr error) {
 	manager, err := r.prepareManager(ctx, opts)
 	if err != nil {
 		return err
@@ -43,17 +43,46 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 		return err
 	}
 	conversation.ApplyProviderSnapshot(probed)
-	if !opts.noTUI && isTerminal(r.stdout) && !strings.EqualFold(os.Getenv("TERM"), "dumb") && r.output == "text" {
+	useTUI := !opts.noTUI && isTerminal(r.stdout) && !strings.EqualFold(os.Getenv("TERM"), "dumb") && r.output == "text"
+	return r.runInteractiveFrontend(ctx, conversation, manager, opts, useTUI)
+}
+
+func (r *runtime) runInteractiveFrontend(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, useTUI bool) (returnErr error) {
+	defer func() {
+		returnErr = r.finishInteractive(conversation, returnErr)
+	}()
+	if useTUI {
 		return r.runTUI(ctx, conversation, manager, opts)
 	}
+	interrupts := make(chan os.Signal, 2)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
+	return r.runLineInteractive(ctx, conversation, manager, opts, interrupts)
+}
+
+func (r *runtime) runLineInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, interrupts <-chan os.Signal) error {
 	reader := bufio.NewReader(r.stdin)
+	r.inputMu.Lock()
 	r.inputReader = reader
-	defer func() { r.inputReader = nil }()
+	r.inputInterrupts = interrupts
+	r.inputMu.Unlock()
+	defer func() {
+		r.inputMu.Lock()
+		if r.inputReader == reader {
+			r.inputReader = nil
+			r.inputRead = nil
+			r.inputInterrupts = nil
+		}
+		r.inputMu.Unlock()
+	}()
 	fmt.Fprintf(r.stdout, "Eylu session %s\nType /help for commands.\n", conversation.SessionID())
 	for {
 		fmt.Fprint(r.stdout, "> ")
-		line, readErr := r.readInteractiveLine(ctx, reader)
+		line, readErr := r.readInteractiveLineWithInterrupts(ctx, reader, interrupts)
 		line = strings.TrimSpace(line)
+		if errors.Is(readErr, errQuit) {
+			return nil
+		}
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return readErr
 		}
@@ -64,20 +93,20 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 			continue
 		}
 		if strings.HasPrefix(line, "/") {
-			err = r.handleSlashCommand(ctx, reader, line, conversation, manager, &opts)
-			if errors.Is(err, errQuit) {
+			commandErr := r.handleSlashCommand(ctx, reader, line, conversation, manager, &opts)
+			if errors.Is(commandErr, errQuit) {
 				return nil
 			}
-			if err != nil {
-				r.printError(err)
+			if commandErr != nil {
+				r.printError(commandErr)
 			}
 		} else {
-			err = r.sendInteractive(ctx, conversation, manager, line, opts)
-			if errors.Is(err, errQuit) {
+			commandErr := r.sendInteractive(ctx, conversation, manager, line, opts, interrupts)
+			if errors.Is(commandErr, errQuit) {
 				return nil
 			}
-			if err != nil {
-				r.printError(err)
+			if commandErr != nil {
+				r.printError(commandErr)
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
@@ -86,16 +115,25 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 	}
 }
 
-func (r *runtime) sendInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
+func (r *runtime) finishInteractive(conversation *agent.Conversation, runErr error) error {
+	if runErr != nil || r.output != "text" {
+		return runErr
+	}
+	fmt.Fprintf(r.stdout, "Resume this session with:\neylu --resume %s\n", conversation.SessionID())
+	return nil
+}
+
+func (r *runtime) sendInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions, interrupts <-chan os.Signal) error {
 	requestCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	interrupts := make(chan os.Signal, 2)
-	signal.Notify(interrupts, os.Interrupt)
-	defer signal.Stop(interrupts)
 	result := make(chan error, 1)
 	go func() {
 		result <- r.sendPrompt(requestCtx, conversation, manager, prompt, opts)
 	}()
+	return r.waitForInteractiveResult(cancel, result, interrupts)
+}
+
+func (r *runtime) waitForInteractiveResult(cancel context.CancelFunc, result <-chan error, interrupts <-chan os.Signal) error {
 	cancelled := false
 	for {
 		select {
@@ -160,12 +198,12 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		r.printProviders(manager)
 		return nil
 	case "/skills":
-		return r.handleSkillsSlash(conversation, manager.Config(), *opts)
+		return r.handleSkillsSlash(ctx, conversation, manager.Config(), *opts, r.synchronousInputInterrupts())
 	case "/skill":
 		if len(fields) != 2 {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: "usage: /skill <name>"}
 		}
-		if err := r.activateSkillSlash(conversation, manager.Config(), *opts, fields[1]); err != nil {
+		if err := r.activateSkillSlash(ctx, conversation, manager.Config(), *opts, fields[1], r.synchronousInputInterrupts()); err != nil {
 			return err
 		}
 		if r.session != nil {
@@ -272,7 +310,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 }
 
 func (r *runtime) askUser(ctx context.Context, request protocol.AskRequest) (protocol.AskResponse, error) {
-	reader := r.inputReader
+	reader := r.currentInputReader()
 	if reader == nil {
 		reader = bufio.NewReader(r.stdin)
 	}
@@ -324,6 +362,22 @@ func (r *runtime) askUser(ctx context.Context, request protocol.AskRequest) (pro
 }
 
 func (r *runtime) readInteractiveLine(ctx context.Context, reader *bufio.Reader) (string, error) {
+	return r.readInteractiveLineWithInterrupts(ctx, reader, nil)
+}
+
+func (r *runtime) synchronousInputInterrupts() <-chan os.Signal {
+	r.inputMu.Lock()
+	defer r.inputMu.Unlock()
+	return r.inputInterrupts
+}
+
+func (r *runtime) currentInputReader() *bufio.Reader {
+	r.inputMu.Lock()
+	defer r.inputMu.Unlock()
+	return r.inputReader
+}
+
+func (r *runtime) readInteractiveLineWithInterrupts(ctx context.Context, reader *bufio.Reader, interrupts <-chan os.Signal) (string, error) {
 	r.inputMu.Lock()
 	pending := r.inputRead
 	if pending == nil {
@@ -346,6 +400,8 @@ func (r *runtime) readInteractiveLine(ctx context.Context, reader *bufio.Reader)
 		return result.line, result.err
 	case <-ctx.Done():
 		return "", ctx.Err()
+	case <-interrupts:
+		return "", errQuit
 	}
 }
 
@@ -443,9 +499,18 @@ func (r *runtime) handleProviderSlash(ctx context.Context, reader *bufio.Reader,
 		if !ok {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("provider %q does not exist", fields[2])}
 		}
-		baseURL := promptLine(reader, r.stdout, "API base URL", current.BaseURL)
-		model := promptLine(reader, r.stdout, "Model ID", current.Model)
-		adapter := promptLine(reader, r.stdout, "Adapter", current.Adapter)
+		baseURL, err := r.promptLine(ctx, reader, r.stdout, "API base URL", current.BaseURL)
+		if err != nil {
+			return err
+		}
+		model, err := r.promptLine(ctx, reader, r.stdout, "Model ID", current.Model)
+		if err != nil {
+			return err
+		}
+		adapter, err := r.promptLine(ctx, reader, r.stdout, "Adapter", current.Adapter)
+		if err != nil {
+			return err
+		}
 		patch := config.ProviderPatch{BaseURL: config.SetValue(baseURL), Model: config.SetValue(model), Adapter: config.SetValue(adapter)}
 		resetFrom := ""
 		if currentEffort := config.EffectiveReasoningEffort(current.ReasoningEffort); config.ValidateReasoningEffort(model, currentEffort) != nil {
@@ -478,7 +543,7 @@ func (r *runtime) confirmModelContextWindow(ctx context.Context, reader *bufio.R
 	detected := snapshot.Limits.ContextWindow
 	for {
 		fmt.Fprintf(r.stdout, "Detected context window for %s: %d tokens (source: %s). Is this correct? [Y/n]: ", snapshot.Config.Model, detected, snapshot.Limits.Source)
-		answer, err := reader.ReadString('\n')
+		answer, err := r.readInteractiveLineWithInterrupts(ctx, reader, r.synchronousInputInterrupts())
 		answer = strings.ToLower(strings.TrimSpace(answer))
 		if err != nil && !errors.Is(err, io.EOF) {
 			return provider.Snapshot{}, err
@@ -497,7 +562,10 @@ func (r *runtime) confirmModelContextWindow(ctx context.Context, reader *bufio.R
 			continue
 		}
 		if value <= 0 {
-			input := promptLine(reader, r.stdout, "Context window tokens", "")
+			input, inputErr := r.promptLine(ctx, reader, r.stdout, "Context window tokens", "")
+			if inputErr != nil {
+				return provider.Snapshot{}, inputErr
+			}
 			parsed, parseErr := strconv.Atoi(strings.TrimSpace(input))
 			if parseErr != nil || parsed <= 0 {
 				fmt.Fprintln(r.stdout, "Context window must be a positive integer.")

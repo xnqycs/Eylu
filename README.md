@@ -146,17 +146,20 @@ eylu providers add work-chat --adapter openai_chat --base-url "https://api.examp
 eylu --no-tui "检查当前项目并给出风险清单"
 ```
 
-### 恢复当前工作区的最近会话
+### 按 ID 恢复会话
 
 ```bash
-eylu --resume
+eylu --resume auth-review
+eylu chat --resume auth-review
 ```
 
-也可以使用稳定 ID 管理会话：
+`--resume <session-id>` 精确加载当前工作区中已存在的会话；ID 无效、缺失、损坏或属于其他工作区时返回非零退出码，会话存储保持原样。交互式文本会话退出后会打印可直接执行的恢复命令。
+
+`--session <id>` 保留“打开已有会话或按 ID 创建会话”的用途：
 
 ```bash
 eylu "审查认证模块" --session auth-review
-eylu "继续修复" --session auth-review
+eylu --resume auth-review "继续修复"
 eylu sessions list
 eylu sessions show auth-review --output json
 ```
