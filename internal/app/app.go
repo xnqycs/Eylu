@@ -56,6 +56,7 @@ type runtime struct {
 	inputMu            sync.Mutex
 	inputReader        *bufio.Reader
 	inputRead          chan inputLineResult
+	inputInterrupts    <-chan os.Signal
 	trustPrompted      map[string]bool
 	session            *sessionRuntime
 	metrics            *metrics.Collector
@@ -95,7 +96,8 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.resumeSet = cmd.Flags().Changed("resume")
 			return r.executeChatCommand(ctx, args, opts)
 		},
 		PersistentPreRunE: func(*cobra.Command, []string) error {
@@ -139,7 +141,8 @@ type chatOptions struct {
 	noAnimation      bool
 	noTUI            bool
 	sessionID        string
-	resume           bool
+	resumeID         string
+	resumeSet        bool
 	routeMode        string
 	task             string
 	requireReasoning bool
@@ -151,7 +154,8 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 		Use:   "chat [prompt]",
 		Short: "send a prompt to the active model",
 		Args:  cobra.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.resumeSet = cmd.Flags().Changed("resume")
 			return r.executeChatCommand(ctx, args, opts)
 		},
 	}
@@ -160,6 +164,9 @@ func (r *runtime) chatCommand(ctx context.Context) *cobra.Command {
 }
 
 func (r *runtime) executeChatCommand(ctx context.Context, args []string, opts chatOptions) error {
+	if opts.resumeSet && opts.resumeID == "" {
+		return &protocol.Error{Code: protocol.ErrConfig, Message: "resume session ID is required"}
+	}
 	terminal := isTerminal(r.stdin)
 	if len(args) == 0 && terminal {
 		return r.runInteractive(ctx, opts)
@@ -192,7 +199,7 @@ func bindChatFlags(cmd *cobra.Command, opts *chatOptions) {
 	cmd.Flags().BoolVar(&opts.noAnimation, "no-animation", false, "disable terminal animations")
 	cmd.Flags().BoolVar(&opts.noTUI, "no-tui", false, "use the line-oriented interactive interface")
 	cmd.Flags().StringVar(&opts.sessionID, "session", "", "create or open a session ID")
-	cmd.Flags().BoolVar(&opts.resume, "resume", false, "resume the most recent session in this workspace")
+	cmd.Flags().StringVar(&opts.resumeID, "resume", "", "resume an existing session ID")
 	cmd.Flags().StringVar(&opts.routeMode, "route", "", "provider routing mode: fixed or auto")
 	cmd.Flags().StringVar(&opts.task, "task", "", "routing task: general, coding, review, debugging, testing, or documentation")
 	cmd.Flags().BoolVar(&opts.requireReasoning, "require-reasoning", false, "require a driver with reasoning support")
@@ -298,7 +305,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 			fmt.Fprintf(r.stderr, "[context] budget input=%d reserve=%d window=%d percent=%.1f\n", event.InputTokens, event.OutputReserve, event.ContextWindow, event.Percent)
 		}
 	}
-	skillRegistry, skillSession, err := r.loadSkillRuntime(cfg, opts, conversation)
+	skillRegistry, skillSession, err := r.loadSkillRuntime(ctx, cfg, opts, conversation, nil)
 	if err != nil {
 		return err
 	}
@@ -489,7 +496,7 @@ func (r *runtime) confirmTools(approve bool) tool.ConfirmFunc {
 		if !isTerminal(r.stdin) {
 			return tool.Confirmation{}, nil
 		}
-		reader := r.inputReader
+		reader := r.currentInputReader()
 		if reader == nil {
 			reader = bufio.NewReader(r.stdin)
 		}

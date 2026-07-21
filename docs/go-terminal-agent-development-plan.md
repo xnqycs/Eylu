@@ -869,7 +869,7 @@ Driver state             0         0     0.0%
 **实现任务**：
 
 - `eylu chat --session <id>` 创建或打开指定会话。
-- `eylu chat --resume` 恢复最近会话；`eylu sessions list|show|delete` 管理会话。
+- `eylu chat --resume <session-id>` 精确恢复指定会话；`eylu sessions list|show|delete` 管理会话。
 - `/new` 追加 `SessionClosed` 事件，刷新当前快照，再创建带新 ID 的空 session；旧 session 保留在列表中。
 - 事件追加写入，定期生成快照；崩溃恢复时重放快照后的事件。
 - 保存 Skill catalog 快照与激活事件，包括名称、来源、入口、digest 和触发方；恢复时重新校验入口并明确报告内容变化或缺失。

@@ -175,17 +175,20 @@ Run `eylu` after configuration to enter the TUI. `EYLU_API_KEY` overrides the ke
 eylu --no-tui "Inspect the current project and list its risks"
 ```
 
-### Resume the latest session in the current workspace
+### Resume a session by ID
 
 ```bash
-eylu --resume
+eylu --resume auth-review
+eylu chat --resume auth-review
 ```
 
-You can also manage sessions with a stable ID:
+`--resume <session-id>` loads an existing session from the current workspace exactly. An invalid, missing, damaged, or cross-workspace ID returns a non-zero exit code and leaves session storage unchanged. Interactive text sessions print a directly executable resume command when they exit.
+
+`--session <id>` keeps its open-or-create semantics for named sessions:
 
 ```bash
 eylu "Review the authentication module" --session auth-review
-eylu "Continue the fix" --session auth-review
+eylu --resume auth-review "Continue the fix"
 eylu sessions list
 eylu sessions show auth-review --output json
 ```

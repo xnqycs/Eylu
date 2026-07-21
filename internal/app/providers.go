@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -269,14 +271,26 @@ func (r *runtime) providerModelsCommand(ctx context.Context) *cobra.Command {
 }
 
 func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error {
-	reader := bufio.NewReader(r.stdin)
+	reader := r.currentInputReader()
+	if reader == nil {
+		reader = bufio.NewReader(r.stdin)
+	}
 	fmt.Fprintln(r.stdout, "Eylu provider setup")
-	name := promptLine(reader, r.stdout, "Provider name", "default")
-	baseURL := promptLine(reader, r.stdout, "API base URL", "https://api.openai.com/v1")
+	name, err := r.promptLine(ctx, reader, r.stdout, "Provider name", "default")
+	if err != nil {
+		return err
+	}
+	baseURL, err := r.promptLine(ctx, reader, r.stdout, "API base URL", "https://api.openai.com/v1")
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(r.stdout, "API key for %s: ", hostOnly(baseURL))
-	secret, err := readSecret(r.stdin, reader)
+	secret, err := r.readSecret(ctx, r.stdin, reader)
 	fmt.Fprintln(r.stdout)
 	if err != nil {
+		if errors.Is(err, errQuit) || errors.Is(err, context.Canceled) {
+			return err
+		}
 		return &protocol.Error{Code: protocol.ErrCredential, Message: "read API key", Cause: err}
 	}
 	model := ""
@@ -286,7 +300,10 @@ func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error 
 		for index, item := range models {
 			fmt.Fprintf(r.stdout, "  %d. %s\n", index+1, item)
 		}
-		choice := promptLine(reader, r.stdout, "Model number or model ID", models[0])
+		choice, promptErr := r.promptLine(ctx, reader, r.stdout, "Model number or model ID", models[0])
+		if promptErr != nil {
+			return promptErr
+		}
 		if number, parseErr := strconv.Atoi(choice); parseErr == nil && number > 0 && number <= len(models) {
 			model = models[number-1]
 		} else {
@@ -296,7 +313,10 @@ func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error 
 		if listErr != nil {
 			fmt.Fprintf(r.stderr, "Model discovery failed: %s\n", logging.Redact(listErr.Error(), secret))
 		}
-		model = promptLine(reader, r.stdout, "Model ID", "")
+		model, err = r.promptLine(ctx, reader, r.stdout, "Model ID", "")
+		if err != nil {
+			return err
+		}
 	}
 	if model == "" {
 		return &protocol.Error{Code: protocol.ErrConfig, Message: "model ID is required"}
@@ -316,31 +336,84 @@ func (r *runtime) onboard(ctx context.Context, manager *provider.Manager) error 
 	return nil
 }
 
-func promptLine(reader *bufio.Reader, out ioWriter, label, fallback string) string {
+func (r *runtime) promptLine(ctx context.Context, reader *bufio.Reader, out ioWriter, label, fallback string) (string, error) {
 	if fallback != "" {
 		fmt.Fprintf(out, "%s [%s]: ", label, fallback)
 	} else {
 		fmt.Fprintf(out, "%s: ", label)
 	}
-	value, _ := reader.ReadString('\n')
+	value, err := r.readInteractiveLineWithInterrupts(ctx, reader, r.synchronousInputInterrupts())
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return fallback
+		return fallback, nil
 	}
-	return value
+	return value, nil
 }
 
 type ioWriter interface {
 	Write([]byte) (int, error)
 }
 
-func readSecret(input any, reader *bufio.Reader) (string, error) {
+func (r *runtime) readSecret(ctx context.Context, input any, reader *bufio.Reader) (string, error) {
+	interrupts := r.synchronousInputInterrupts()
 	if file, ok := input.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
-		raw, err := term.ReadPassword(int(file.Fd()))
-		return strings.TrimSpace(string(raw)), err
+		return readTerminalSecret(ctx, file, interrupts)
 	}
-	value, err := reader.ReadString('\n')
+	value, err := r.readInteractiveLineWithInterrupts(ctx, reader, interrupts)
 	return strings.TrimSpace(value), err
+}
+
+func readTerminalSecret(ctx context.Context, file *os.File, interrupts <-chan os.Signal) (string, error) {
+	state, err := term.MakeRaw(int(file.Fd()))
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = term.Restore(int(file.Fd()), state) }()
+
+	secret := make([]byte, 0, 64)
+	for {
+		result := make(chan inputLineResult, 1)
+		go func() {
+			buffer := make([]byte, 1)
+			count, readErr := file.Read(buffer)
+			result <- inputLineResult{line: string(buffer[:count]), err: readErr}
+		}()
+		select {
+		case read := <-result:
+			if len(read.line) > 0 {
+				switch read.line[0] {
+				case '\r', '\n':
+					return strings.TrimSpace(string(secret)), nil
+				case '\b', 0x7f:
+					if len(secret) > 0 {
+						secret = secret[:len(secret)-1]
+					}
+				case 0x03:
+					return "", errQuit
+				case 0x04:
+					if len(secret) == 0 {
+						return "", io.EOF
+					}
+					return strings.TrimSpace(string(secret)), nil
+				default:
+					secret = append(secret, read.line[0])
+				}
+			}
+			if read.err != nil {
+				if errors.Is(read.err, io.EOF) && len(secret) > 0 {
+					return strings.TrimSpace(string(secret)), nil
+				}
+				return "", read.err
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-interrupts:
+			return "", errQuit
+		}
+	}
 }
 
 func isTerminal(input any) bool {

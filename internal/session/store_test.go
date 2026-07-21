@@ -162,6 +162,22 @@ func TestStoreIgnoresDamagedJSONLTail(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
+	damaged, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, diagnostics, err := openTestStore(t, root).Load("recoverable")
+	if err != nil || len(loaded.Turns) != 1 || len(diagnostics) != 1 {
+		t.Fatalf("loaded = %#v, diagnostics = %#v, error = %v", loaded, diagnostics, err)
+	}
+	afterLoad, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterLoad, damaged) {
+		t.Fatal("Load modified the damaged session event log")
+	}
 
 	restarted := openTestStore(t, root)
 	latest, found, err := restarted.Latest(root)
@@ -188,6 +204,32 @@ func TestStoreIgnoresDamagedJSONLTail(t *testing.T) {
 	recovered, diagnostics, err := openTestStore(t, root).Load("recoverable")
 	if err != nil || len(diagnostics) != 0 || len(recovered.Turns) != 2 || recovered.Turns[1].ID != "continued" {
 		t.Fatalf("recovered = %#v, diagnostics = %#v, error = %v", recovered, diagnostics, err)
+	}
+}
+
+func TestStoreStrictLoadRejectsEmptySessionDirectory(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root)
+	directory := filepath.Join(root, "empty-session")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := store.Load("empty-session"); err == nil || !strings.Contains(err.Error(), "no snapshot or event log") {
+		t.Fatalf("strict load error = %v", err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("strict load changed empty directory: entries=%d error=%v", len(entries), err)
+	}
+
+	recovered, diagnostics, err := store.LoadRecovering("empty-session")
+	if err != nil || len(diagnostics) != 0 || recovered.SessionID != "empty-session" || recovered.Sequence != 0 {
+		t.Fatalf("recovering load snapshot=%#v diagnostics=%#v error=%v", recovered, diagnostics, err)
+	}
+	entries, err = os.ReadDir(directory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("recovering load changed empty directory: entries=%d error=%v", len(entries), err)
 	}
 }
 

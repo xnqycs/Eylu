@@ -95,7 +95,7 @@ func (r *runtime) sessionsDeleteCommand() *cobra.Command {
 				return &protocol.Error{Code: protocol.ErrConfig, Message: "session deletion requires confirmation; pass --yes in non-interactive use"}
 			}
 			fmt.Fprintf(r.stderr, "Delete session %s and its attachments? [y/N]: ", id)
-			reader := r.inputReader
+			reader := r.currentInputReader()
 			if reader == nil {
 				reader = bufio.NewReader(r.stdin)
 			}
