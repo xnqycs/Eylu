@@ -162,6 +162,22 @@ func TestStoreIgnoresDamagedJSONLTail(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
+	damaged, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, diagnostics, err := openTestStore(t, root).Load("recoverable")
+	if err != nil || len(loaded.Turns) != 1 || len(diagnostics) != 1 {
+		t.Fatalf("loaded = %#v, diagnostics = %#v, error = %v", loaded, diagnostics, err)
+	}
+	afterLoad, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterLoad, damaged) {
+		t.Fatal("Load modified the damaged session event log")
+	}
 
 	restarted := openTestStore(t, root)
 	latest, found, err := restarted.Latest(root)

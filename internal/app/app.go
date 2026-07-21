@@ -139,7 +139,7 @@ type chatOptions struct {
 	noAnimation      bool
 	noTUI            bool
 	sessionID        string
-	resume           bool
+	resumeID         string
 	routeMode        string
 	task             string
 	requireReasoning bool
@@ -192,7 +192,7 @@ func bindChatFlags(cmd *cobra.Command, opts *chatOptions) {
 	cmd.Flags().BoolVar(&opts.noAnimation, "no-animation", false, "disable terminal animations")
 	cmd.Flags().BoolVar(&opts.noTUI, "no-tui", false, "use the line-oriented interactive interface")
 	cmd.Flags().StringVar(&opts.sessionID, "session", "", "create or open a session ID")
-	cmd.Flags().BoolVar(&opts.resume, "resume", false, "resume the most recent session in this workspace")
+	cmd.Flags().StringVar(&opts.resumeID, "resume", "", "resume an existing session ID")
 	cmd.Flags().StringVar(&opts.routeMode, "route", "", "provider routing mode: fixed or auto")
 	cmd.Flags().StringVar(&opts.task, "task", "", "routing task: general, coding, review, debugging, testing, or documentation")
 	cmd.Flags().BoolVar(&opts.requireReasoning, "require-reasoning", false, "require a driver with reasoning support")

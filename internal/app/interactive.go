@@ -29,7 +29,7 @@ type inputLineResult struct {
 	err  error
 }
 
-func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
+func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) (returnErr error) {
 	manager, err := r.prepareManager(ctx, opts)
 	if err != nil {
 		return err
@@ -43,7 +43,15 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 		return err
 	}
 	conversation.ApplyProviderSnapshot(probed)
-	if !opts.noTUI && isTerminal(r.stdout) && !strings.EqualFold(os.Getenv("TERM"), "dumb") && r.output == "text" {
+	useTUI := !opts.noTUI && isTerminal(r.stdout) && !strings.EqualFold(os.Getenv("TERM"), "dumb") && r.output == "text"
+	return r.runInteractiveFrontend(ctx, conversation, manager, opts, useTUI)
+}
+
+func (r *runtime) runInteractiveFrontend(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, useTUI bool) (returnErr error) {
+	defer func() {
+		returnErr = r.finishInteractive(conversation, returnErr)
+	}()
+	if useTUI {
 		return r.runTUI(ctx, conversation, manager, opts)
 	}
 	reader := bufio.NewReader(r.stdin)
@@ -64,26 +72,34 @@ func (r *runtime) runInteractive(ctx context.Context, opts chatOptions) error {
 			continue
 		}
 		if strings.HasPrefix(line, "/") {
-			err = r.handleSlashCommand(ctx, reader, line, conversation, manager, &opts)
-			if errors.Is(err, errQuit) {
+			commandErr := r.handleSlashCommand(ctx, reader, line, conversation, manager, &opts)
+			if errors.Is(commandErr, errQuit) {
 				return nil
 			}
-			if err != nil {
-				r.printError(err)
+			if commandErr != nil {
+				r.printError(commandErr)
 			}
 		} else {
-			err = r.sendInteractive(ctx, conversation, manager, line, opts)
-			if errors.Is(err, errQuit) {
+			commandErr := r.sendInteractive(ctx, conversation, manager, line, opts)
+			if errors.Is(commandErr, errQuit) {
 				return nil
 			}
-			if err != nil {
-				r.printError(err)
+			if commandErr != nil {
+				r.printError(commandErr)
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
 			return nil
 		}
 	}
+}
+
+func (r *runtime) finishInteractive(conversation *agent.Conversation, runErr error) error {
+	if runErr != nil || r.output != "text" {
+		return runErr
+	}
+	fmt.Fprintf(r.stdout, "Resume this session with:\neylu --resume %s\n", conversation.SessionID())
+	return nil
 }
 
 func (r *runtime) sendInteractive(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
@@ -96,6 +112,10 @@ func (r *runtime) sendInteractive(ctx context.Context, conversation *agent.Conve
 	go func() {
 		result <- r.sendPrompt(requestCtx, conversation, manager, prompt, opts)
 	}()
+	return r.waitForInteractiveResult(cancel, result, interrupts)
+}
+
+func (r *runtime) waitForInteractiveResult(cancel context.CancelFunc, result <-chan error, interrupts <-chan os.Signal) error {
 	cancelled := false
 	for {
 		select {

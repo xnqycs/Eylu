@@ -340,8 +340,24 @@ func TestRootChatValidationAndSubcommandDispatch(t *testing.T) {
 
 	t.Run("session and resume are mutually exclusive", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		code := Execute(context.Background(), []string{"--session", "test", "--resume"}, strings.NewReader(""), &stdout, &stderr)
+		code := Execute(context.Background(), []string{"--session", "test", "--resume", "other"}, strings.NewReader(""), &stdout, &stderr)
 		if code == 0 || !strings.Contains(stderr.String(), "none of the others can be") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+		}
+	})
+
+	t.Run("resume requires a session ID", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := Execute(context.Background(), []string{"--resume"}, strings.NewReader(""), &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "flag needs an argument") {
+			t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+		}
+	})
+
+	t.Run("continue flag is removed", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := Execute(context.Background(), []string{"--continue"}, strings.NewReader(""), &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "unknown flag: --continue") {
 			t.Fatalf("exit=%d stderr=%q", code, stderr.String())
 		}
 	})
@@ -349,7 +365,7 @@ func TestRootChatValidationAndSubcommandDispatch(t *testing.T) {
 	t.Run("help remains help", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		code := Execute(context.Background(), []string{"--help"}, strings.NewReader(""), &stdout, &stderr)
-		if code != 0 || !strings.Contains(stdout.String(), "eylu [prompt] [flags]") || !strings.Contains(stdout.String(), "--model") {
+		if code != 0 || !strings.Contains(stdout.String(), "eylu [prompt] [flags]") || !strings.Contains(stdout.String(), "--model") || !strings.Contains(stdout.String(), "--resume string") {
 			t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
 	})

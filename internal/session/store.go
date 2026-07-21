@@ -190,6 +190,14 @@ func (s *Store) Save(snapshot Snapshot) error {
 }
 
 func (s *Store) Load(id string) (Snapshot, []Diagnostic, error) {
+	return s.load(id, false)
+}
+
+func (s *Store) LoadRecovering(id string) (Snapshot, []Diagnostic, error) {
+	return s.load(id, true)
+}
+
+func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, error) {
 	if !ValidID(id) {
 		return Snapshot{}, nil, fmt.Errorf("invalid session ID %q", id)
 	}
@@ -227,7 +235,7 @@ func (s *Store) Load(id string) (Snapshot, []Diagnostic, error) {
 	if err != nil {
 		return Snapshot{}, diagnostics, err
 	}
-	if len(eventDiagnostics) > 0 {
+	if repairEventTail && len(eventDiagnostics) > 0 {
 		if err := truncateEventTail(eventsPath, validEventBytes); err != nil {
 			return Snapshot{}, diagnostics, fmt.Errorf("repair session event tail: %w", err)
 		}
@@ -263,7 +271,7 @@ func (s *Store) List() ([]SessionInfo, error) {
 		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !ValidID(entry.Name()) {
 			continue
 		}
-		snapshot, diagnostics, loadErr := s.Load(entry.Name())
+		snapshot, diagnostics, loadErr := s.LoadRecovering(entry.Name())
 		info := SessionInfo{SessionID: entry.Name()}
 		if loadErr != nil {
 			info.Diagnostic = loadErr.Error()
