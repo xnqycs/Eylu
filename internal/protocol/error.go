@@ -10,17 +10,18 @@ import (
 type ErrorCode string
 
 const (
-	ErrConfig        ErrorCode = "config_error"
-	ErrCredential    ErrorCode = "credential_error"
-	ErrNetwork       ErrorCode = "network_error"
-	ErrAuth          ErrorCode = "authentication_error"
-	ErrRateLimit     ErrorCode = "rate_limit_error"
-	ErrProvider      ErrorCode = "provider_error"
-	ErrTimeout       ErrorCode = "timeout_error"
-	ErrCancelled     ErrorCode = "cancelled"
-	ErrProtocol      ErrorCode = "protocol_error"
-	ErrTool          ErrorCode = "tool_error"
-	ErrContextWindow ErrorCode = "context_window_error"
+	ErrConfig          ErrorCode = "config_error"
+	ErrCredential      ErrorCode = "credential_error"
+	ErrNetwork         ErrorCode = "network_error"
+	ErrAuth            ErrorCode = "authentication_error"
+	ErrRateLimit       ErrorCode = "rate_limit_error"
+	ErrProvider        ErrorCode = "provider_error"
+	ErrTimeout         ErrorCode = "timeout_error"
+	ErrCancelled       ErrorCode = "cancelled"
+	ErrProtocol        ErrorCode = "protocol_error"
+	ErrTool            ErrorCode = "tool_error"
+	ErrContextWindow   ErrorCode = "context_window_error"
+	ErrUnsupportedTool ErrorCode = "unsupported_tool"
 )
 
 type Error struct {

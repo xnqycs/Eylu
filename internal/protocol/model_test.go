@@ -147,3 +147,55 @@ func TestMCPProtocolFieldsRoundTripWithoutLosingContent(t *testing.T) {
 		t.Fatalf("tool definition changed across JSON round trip:\n got: %#v\nwant: %#v", decoded.Definition, definition)
 	}
 }
+
+func TestWebToolProtocolRoundTripAndFunctionCompatibility(t *testing.T) {
+	legacy, err := json.Marshal(ToolDefinition{Name: "read_file", Description: "Read", InputSchema: json.RawMessage(`{"type":"object"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(legacy, []byte(`"kind"`)) {
+		t.Fatalf("legacy function tool gained a required kind: %s", legacy)
+	}
+
+	want := ToolDefinition{
+		Kind: ToolWebSearch, Name: "web_search", Execution: ExecutionAuto, ToolChoice: ToolChoiceAuto,
+		Fallback: ExecutionClient, AllowedDomains: []string{"example.com"}, BlockedDomains: []string{"private.example.com"},
+		MaxUses: 5, ContextSize: WebContextMedium,
+		UserLocation:    &UserLocation{Country: "CN", Timezone: "Asia/Shanghai"},
+		ProviderOptions: map[string]json.RawMessage{"search_type": json.RawMessage(`"fast"`)},
+	}
+	encoded, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got ToolDefinition
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("web tool changed across JSON round trip:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestWebActivityAndCitationRoundTrip(t *testing.T) {
+	activity := WebActivity{
+		CallID: "web-1", Kind: ToolWebSearch, Query: "Eylu", Action: "search", Status: WebStatusCompleted,
+		Sources:    []WebSource{{URL: "https://example.com", Title: "Example", Snippet: "result"}},
+		DurationMS: 42, Usage: WebUsage{Searches: 1, InputTokens: 10, CostUSD: 0.01},
+		ProviderMetadata:    map[string]json.RawMessage{"request_id": json.RawMessage(`"req-1"`)},
+		RawProviderResponse: json.RawMessage(`{"type":"web_search_call"}`),
+	}
+	citation := URLCitation{CallID: "web-1", URL: "https://example.com", Title: "Example", StartIndex: 0, EndIndex: 4, Summary: "source"}
+	turn := Turn{Parts: []Part{{Kind: PartWebActivity, WebActivity: &activity}, {Kind: PartCitation, Citation: &citation}}}
+	encoded, err := json.Marshal(turn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Turn
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Parts[0].WebActivity, &activity) || !reflect.DeepEqual(got.Parts[1].Citation, &citation) {
+		t.Fatalf("web response parts changed across JSON round trip: %#v", got.Parts)
+	}
+}

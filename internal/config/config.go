@@ -21,21 +21,60 @@ const (
 	MCPTransportStdio          = "stdio"
 	MCPTransportStreamableHTTP = "streamable_http"
 	MCPTransportSSE            = "sse"
+	WebPermissionAsk           = "ask"
+	WebPermissionAllow         = "allow"
+	WebPermissionDeny          = "deny"
 )
 
 var allReasoningEfforts = []string{"auto", "low", "medium", "high", "xhigh", "max", "ultra"}
 
 type ProviderConfig struct {
-	Adapter         string            `toml:"adapter" json:"adapter"`
-	BaseURL         string            `toml:"base_url" json:"base_url"`
-	APIKey          string            `toml:"api_key,omitempty" json:"-"`
-	Model           string            `toml:"model" json:"model"`
-	ReasoningEffort string            `toml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
-	CatalogProvider string            `toml:"catalog_provider,omitempty" json:"catalog_provider,omitempty"`
-	ContextWindow   int               `toml:"context_window,omitempty" json:"context_window,omitempty"`
-	TimeoutSeconds  int               `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
-	Headers         map[string]string `toml:"headers,omitempty" json:"headers,omitempty"`
-	Routing         ProviderRouting   `toml:"routing,omitempty" json:"routing,omitempty"`
+	Adapter         string                 `toml:"adapter" json:"adapter"`
+	BaseURL         string                 `toml:"base_url" json:"base_url"`
+	APIKey          string                 `toml:"api_key,omitempty" json:"-"`
+	Model           string                 `toml:"model" json:"model"`
+	ReasoningEffort string                 `toml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
+	CatalogProvider string                 `toml:"catalog_provider,omitempty" json:"catalog_provider,omitempty"`
+	ContextWindow   int                    `toml:"context_window,omitempty" json:"context_window,omitempty"`
+	TimeoutSeconds  int                    `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	Headers         map[string]string      `toml:"headers,omitempty" json:"headers,omitempty"`
+	Routing         ProviderRouting        `toml:"routing,omitempty" json:"routing,omitempty"`
+	WebTools        WebToolsConfig         `toml:"web_tools,omitempty" json:"web_tools,omitempty"`
+	WebCapabilities WebCapabilityOverrides `toml:"web_capabilities,omitempty" json:"web_capabilities,omitempty"`
+}
+
+type WebToolsConfig struct {
+	Permission string        `toml:"permission,omitempty" json:"permission,omitempty"`
+	Search     WebToolConfig `toml:"search,omitempty" json:"search,omitempty"`
+	Fetch      WebToolConfig `toml:"fetch,omitempty" json:"fetch,omitempty"`
+}
+
+type WebToolConfig struct {
+	Enabled                *bool          `toml:"enabled,omitempty" json:"enabled,omitempty"`
+	Execution              string         `toml:"execution,omitempty" json:"execution,omitempty"`
+	Fallback               string         `toml:"fallback,omitempty" json:"fallback,omitempty"`
+	ClientTool             string         `toml:"client_tool,omitempty" json:"client_tool,omitempty"`
+	DelegatedProvider      string         `toml:"delegated_provider,omitempty" json:"delegated_provider,omitempty"`
+	AllowedDomains         []string       `toml:"allowed_domains,omitempty" json:"allowed_domains,omitempty"`
+	BlockedDomains         []string       `toml:"blocked_domains,omitempty" json:"blocked_domains,omitempty"`
+	MaxUses                int            `toml:"max_uses,omitempty" json:"max_uses,omitempty"`
+	ContextSize            string         `toml:"context_size,omitempty" json:"context_size,omitempty"`
+	Country                string         `toml:"country,omitempty" json:"country,omitempty"`
+	Region                 string         `toml:"region,omitempty" json:"region,omitempty"`
+	City                   string         `toml:"city,omitempty" json:"city,omitempty"`
+	Timezone               string         `toml:"timezone,omitempty" json:"timezone,omitempty"`
+	TrustedNetworkBoundary bool           `toml:"trusted_network_boundary,omitempty" json:"trusted_network_boundary,omitempty"`
+	ProviderOptions        map[string]any `toml:"provider_options,omitempty" json:"provider_options,omitempty"`
+}
+
+type WebCapabilityOverrides struct {
+	HostedWebSearch        *bool `toml:"hosted_web_search,omitempty" json:"hosted_web_search,omitempty"`
+	HostedWebFetch         *bool `toml:"hosted_web_fetch,omitempty" json:"hosted_web_fetch,omitempty"`
+	HostedToolStreaming    *bool `toml:"hosted_tool_streaming,omitempty" json:"hosted_tool_streaming,omitempty"`
+	HostedAndFunctionTools *bool `toml:"hosted_and_function_tools,omitempty" json:"hosted_and_function_tools,omitempty"`
+	SearchDomainFilter     *bool `toml:"search_domain_filter,omitempty" json:"search_domain_filter,omitempty"`
+	SearchLocation         *bool `toml:"search_location,omitempty" json:"search_location,omitempty"`
+	SearchUsageDetails     *bool `toml:"search_usage_details,omitempty" json:"search_usage_details,omitempty"`
 }
 
 type ModelMetadataConfig struct {
@@ -311,6 +350,7 @@ func (c Config) Clone() Config {
 	for name, provider := range c.Providers {
 		provider.Headers = cloneStringMap(provider.Headers)
 		provider.Routing.Tasks = append([]string(nil), provider.Routing.Tasks...)
+		provider.WebTools = cloneWebTools(provider.WebTools)
 		clone.Providers[name] = provider
 	}
 	clone.MCPServers = make(map[string]MCPServerConfig, len(c.MCPServers))
@@ -445,6 +485,9 @@ func ValidateProvider(name string, p ProviderConfig) error {
 	if p.Routing.InputCostPerMillion < 0 || p.Routing.OutputCostPerMillion < 0 {
 		return fmt.Errorf("provider %q routing costs cannot be negative", name)
 	}
+	if err := validateWebTools(name, p.WebTools); err != nil {
+		return err
+	}
 	validTasks := map[string]bool{"general": true, "coding": true, "review": true, "debugging": true, "testing": true, "documentation": true}
 	seenTasks := make(map[string]bool, len(p.Routing.Tasks))
 	for _, task := range p.Routing.Tasks {
@@ -457,6 +500,84 @@ func ValidateProvider(name string, p ProviderConfig) error {
 		seenTasks[task] = true
 	}
 	return nil
+}
+
+func validateWebTools(provider string, web WebToolsConfig) error {
+	if web.Permission != "" && web.Permission != WebPermissionAsk && web.Permission != WebPermissionAllow && web.Permission != WebPermissionDeny {
+		return fmt.Errorf("provider %q web permission %q is invalid", provider, web.Permission)
+	}
+	for name, item := range map[string]WebToolConfig{"search": web.Search, "fetch": web.Fetch} {
+		switch item.Execution {
+		case "", "auto", "hosted", "delegated", "client":
+		default:
+			return fmt.Errorf("provider %q web %s execution %q is invalid", provider, name, item.Execution)
+		}
+		switch item.Fallback {
+		case "", "delegated", "client":
+		default:
+			return fmt.Errorf("provider %q web %s fallback %q is invalid", provider, name, item.Fallback)
+		}
+		if item.MaxUses < 0 {
+			return fmt.Errorf("provider %q web %s max_uses cannot be negative", provider, name)
+		}
+		switch item.ContextSize {
+		case "", "low", "medium", "high":
+		default:
+			return fmt.Errorf("provider %q web %s context_size %q is invalid", provider, name, item.ContextSize)
+		}
+		if item.Execution == "client" && strings.TrimSpace(item.ClientTool) == "" {
+			return fmt.Errorf("provider %q web %s client_tool is required", provider, name)
+		}
+		if item.Execution == "delegated" && strings.TrimSpace(item.DelegatedProvider) == "" {
+			return fmt.Errorf("provider %q web %s delegated_provider is required", provider, name)
+		}
+		if item.Fallback == "client" && strings.TrimSpace(item.ClientTool) == "" {
+			return fmt.Errorf("provider %q web %s client fallback requires client_tool", provider, name)
+		}
+		if item.Fallback == "delegated" && strings.TrimSpace(item.DelegatedProvider) == "" {
+			return fmt.Errorf("provider %q web %s delegated fallback requires delegated_provider", provider, name)
+		}
+	}
+	return nil
+}
+
+func cloneWebTools(source WebToolsConfig) WebToolsConfig {
+	clone := source
+	clone.Search = cloneWebTool(source.Search)
+	clone.Fetch = cloneWebTool(source.Fetch)
+	return clone
+}
+
+func cloneWebTool(source WebToolConfig) WebToolConfig {
+	clone := source
+	if source.Enabled != nil {
+		value := *source.Enabled
+		clone.Enabled = &value
+	}
+	clone.AllowedDomains = append([]string(nil), source.AllowedDomains...)
+	clone.BlockedDomains = append([]string(nil), source.BlockedDomains...)
+	clone.ProviderOptions = cloneAnyMap(source.ProviderOptions)
+	return clone
+}
+
+func cloneAnyMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		switch typed := value.(type) {
+		case map[string]any:
+			clone[key] = cloneAnyMap(typed)
+		case []any:
+			clone[key] = append([]any(nil), typed...)
+		case []string:
+			clone[key] = append([]string(nil), typed...)
+		default:
+			clone[key] = typed
+		}
+	}
+	return clone
 }
 
 var (
