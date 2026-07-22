@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"Eylu/internal/config"
 	"Eylu/internal/driver"
 	"Eylu/internal/policy"
 	"Eylu/internal/protocol"
+	"Eylu/internal/provider"
 	"Eylu/internal/tool"
 )
 
@@ -357,6 +359,122 @@ func TestAgentLoopAtomicallyRefreshesMCPToolsAndContext(t *testing.T) {
 	}
 	if text := requestText(driver.requests[1].Model.Turns); !strings.Contains(text, "new instructions") || !strings.Contains(text, "new resource") || !strings.Contains(text, "unknown tool") {
 		t.Fatalf("refreshed request=%q", text)
+	}
+}
+
+type hostedWebLoopDriver struct {
+	requests         []driver.Request
+	local            bool
+	hostedActivities int
+}
+
+func (d *hostedWebLoopDriver) Name() string { return "hosted_web_loop" }
+func (d *hostedWebLoopDriver) Capabilities() driver.Capabilities {
+	return driver.Capabilities{ToolCalling: true, HostedWebSearch: true, HostedWebFetch: true, HostedAndFunctionTools: !d.local, SearchDomainFilter: true, SearchLocation: true}
+}
+func (d *hostedWebLoopDriver) Generate(_ context.Context, request driver.Request, _ driver.EmitFunc) (protocol.ModelResponse, error) {
+	d.requests = append(d.requests, request)
+	if d.local && len(d.requests) == 1 {
+		call := protocol.ToolCall{ID: "web-1", Name: "web_search", Arguments: json.RawMessage(`{"query":"Eylu"}`)}
+		return protocol.ModelResponse{Turn: protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}}, Stop: protocol.StopToolUse}, nil
+	}
+	if d.local {
+		return protocol.ModelResponse{Turn: protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "client done"}}}, Stop: protocol.StopCompleted}, nil
+	}
+	count := d.hostedActivities
+	if count == 0 {
+		count = 1
+	}
+	parts := make([]protocol.Part, 0, count+1)
+	for index := 0; index < count; index++ {
+		activity := protocol.WebActivity{CallID: fmt.Sprintf("hosted-%d", index+1), Kind: protocol.ToolWebSearch, Status: protocol.WebStatusCompleted}
+		parts = append(parts, protocol.Part{Kind: protocol.PartWebActivity, WebActivity: &activity})
+	}
+	parts = append(parts, protocol.Part{Kind: protocol.PartText, Text: "hosted done"})
+	return protocol.ModelResponse{Turn: protocol.Turn{Role: protocol.RoleAgent, Parts: parts}, Stop: protocol.StopCompleted}, nil
+}
+
+type webClientFixture struct{ calls atomic.Int32 }
+
+func (t *webClientFixture) Definition() protocol.ToolDefinition {
+	return protocol.ToolDefinition{Name: "mcp__web__search", InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`)}
+}
+func (t *webClientFixture) Risk() policy.Risk { return policy.RiskRead }
+func (t *webClientFixture) Execute(_ context.Context, input json.RawMessage) protocol.ToolResult {
+	t.calls.Add(1)
+	return protocol.ToolResult{Content: string(input), Metadata: map[string]any{"mcp_server": "web"}}
+}
+
+func TestAgentLoopPublishesHostedWebToolsWithoutLocalExecution(t *testing.T) {
+	model := &hostedWebLoopDriver{}
+	runtime := Runtime{Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), Model: "model", WebTools: config.WebToolsConfig{Permission: config.WebPermissionAllow}}}, Driver: model, PermissionMode: "full"}
+	executor := &tool.Executor{Registry: tool.NewRegistry(), Policy: policy.AllowAllChecker{}}
+	response, err := NewConversation().Run(context.Background(), "search", runtime, executor, LoopOptions{MaxTurns: 2}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(model.requests) != 1 || len(model.requests[0].Model.Tools) != 2 || model.requests[0].Model.Tools[0].Kind != protocol.ToolWebFetch || response.Turn.Parts[0].WebActivity == nil {
+		t.Fatalf("request=%#v response=%#v", model.requests, response)
+	}
+}
+
+func TestAgentLoopExecutesClientWebFallbackThroughExistingTool(t *testing.T) {
+	enabled := true
+	target := &webClientFixture{}
+	model := &hostedWebLoopDriver{local: true}
+	runtime := Runtime{Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), Model: "model", WebTools: config.WebToolsConfig{
+		Permission: config.WebPermissionAllow,
+		Search:     config.WebToolConfig{Enabled: &enabled, Fallback: "client", ClientTool: target.Definition().Name},
+	}}}, Driver: model, PermissionMode: "full"}
+	executor := &tool.Executor{Registry: tool.NewRegistry(target), Policy: policy.AllowAllChecker{}}
+	response, err := NewConversation().Run(context.Background(), "search", runtime, executor, LoopOptions{MaxTurns: 3}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Turn.Parts[0].Text != "client done" || target.calls.Load() != 1 || len(model.requests) != 2 || model.requests[0].Model.Tools[1].Execution != protocol.ExecutionClient {
+		t.Fatalf("response=%#v calls=%d requests=%#v", response, target.calls.Load(), model.requests)
+	}
+}
+
+type webAuditCapture struct{ records []tool.AuditRecord }
+
+func (capture *webAuditCapture) Record(record tool.AuditRecord) {
+	capture.records = append(capture.records, record)
+}
+
+func TestAgentLoopApprovesAndAuditsHostedWebOncePerSubmission(t *testing.T) {
+	model := &hostedWebLoopDriver{}
+	runtime := Runtime{Provider: provider.Snapshot{Name: "work", Generation: 7, Config: config.ProviderConfig{Adapter: model.Name(), Model: "model", WebTools: config.WebToolsConfig{Permission: config.WebPermissionAsk}}}, Driver: model, PermissionMode: "manual"}
+	audit := &webAuditCapture{}
+	confirmations := 0
+	executor := &tool.Executor{
+		Registry: tool.NewRegistry(), Policy: policy.AllowAllChecker{}, Audit: audit,
+		Confirm: func(_ context.Context, request policy.Request, outcome policy.Outcome) (tool.Confirmation, error) {
+			confirmations++
+			if request.Tool != "hosted_web" || request.Risk != policy.RiskNetwork || outcome.Decision != policy.DecisionConfirm {
+				t.Fatalf("request=%#v outcome=%#v", request, outcome)
+			}
+			return tool.Confirmation{Approved: true}, nil
+		},
+	}
+	if _, err := NewConversation().Run(context.Background(), "search", runtime, executor, LoopOptions{MaxTurns: 2, RequestID: "request-web"}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if confirmations != 1 || len(audit.records) != 1 || audit.records[0].WebBackend != "hosted" || audit.records[0].Risk != policy.RiskNetwork || !audit.records[0].UntrustedWebContent {
+		t.Fatalf("confirmations=%d audit=%#v", confirmations, audit.records)
+	}
+}
+
+func TestAgentLoopRejectsHostedWebActivityBeyondMaxUses(t *testing.T) {
+	enabled := true
+	model := &hostedWebLoopDriver{hostedActivities: 2}
+	runtime := Runtime{Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), Model: "model", WebTools: config.WebToolsConfig{
+		Permission: config.WebPermissionAllow, Search: config.WebToolConfig{Enabled: &enabled, MaxUses: 1},
+	}}}, Driver: model, PermissionMode: "full"}
+	_, err := NewConversation().Run(context.Background(), "search", runtime, &tool.Executor{Registry: tool.NewRegistry(), Policy: policy.AllowAllChecker{}}, LoopOptions{MaxTurns: 2}, false, nil)
+	var typed *protocol.Error
+	if !errors.As(err, &typed) || typed.Code != protocol.ErrTool || !strings.Contains(typed.Message, "max_uses") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

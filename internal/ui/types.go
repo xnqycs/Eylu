@@ -50,6 +50,8 @@ const (
 	EventAsk            EventKind = "ask"
 	EventContext        EventKind = "context"
 	EventUsage          EventKind = "usage"
+	EventWebActivity    EventKind = "web_activity"
+	EventCitation       EventKind = "citation"
 	EventNotice         EventKind = "notice"
 )
 
@@ -75,6 +77,8 @@ type Event struct {
 	Ask           *AskRequest             `json:"-"`
 	Context       *contextledger.Report   `json:"context,omitempty"`
 	Usage         *protocol.Usage         `json:"usage,omitempty"`
+	WebActivity   *protocol.WebActivity   `json:"web_activity,omitempty"`
+	Citation      *protocol.URLCitation   `json:"citation,omitempty"`
 	Notice        string                  `json:"notice,omitempty"`
 	Error         bool                    `json:"error,omitempty"`
 	RetryAfter    time.Duration           `json:"retry_after,omitempty"`
@@ -216,16 +220,20 @@ type MCPServerItem struct {
 type HistoryKind string
 
 const (
-	HistoryMessage HistoryKind = "message"
-	HistoryTool    HistoryKind = "tool"
+	HistoryMessage     HistoryKind = "message"
+	HistoryTool        HistoryKind = "tool"
+	HistoryWebActivity HistoryKind = "web_activity"
+	HistoryCitation    HistoryKind = "citation"
 )
 
 type HistoryItem struct {
-	Kind       HistoryKind          `json:"kind"`
-	Role       protocol.Role        `json:"role,omitempty"`
-	Text       string               `json:"text,omitempty"`
-	ToolCall   *protocol.ToolCall   `json:"tool_call,omitempty"`
-	ToolResult *protocol.ToolResult `json:"tool_result,omitempty"`
+	Kind        HistoryKind           `json:"kind"`
+	Role        protocol.Role         `json:"role,omitempty"`
+	Text        string                `json:"text,omitempty"`
+	ToolCall    *protocol.ToolCall    `json:"tool_call,omitempty"`
+	ToolResult  *protocol.ToolResult  `json:"tool_result,omitempty"`
+	WebActivity *protocol.WebActivity `json:"web_activity,omitempty"`
+	Citation    *protocol.URLCitation `json:"citation,omitempty"`
 }
 
 type Snapshot struct {

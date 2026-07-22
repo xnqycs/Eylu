@@ -480,6 +480,25 @@ func TestParallelToolCompletionKeepsExecutingStateUntilBatchFinishes(t *testing.
 	}
 }
 
+func TestWebActivityAndCitationEventsRenderLifecycle(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-web"
+	model.eventChannel = make(chan Event, 2)
+	running := protocol.WebActivity{CallID: "web-1", Kind: protocol.ToolWebSearch, Query: "Eylu", Status: protocol.WebStatusRunning}
+	completed := running
+	completed.Status = protocol.WebStatusCompleted
+	completed.Sources = []protocol.WebSource{{URL: "https://example.com", Title: "Example"}}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &running})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &completed})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventCitation, Citation: &protocol.URLCitation{URL: "https://example.com", Title: "Example"}})
+	rendered := ansi.Strip(model.renderTimeline())
+	for _, expected := range []string{"Web search · running · Eylu", "Web search · completed · Eylu · 1 sources", "Example · https://example.com"} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("missing %q:\n%s", expected, rendered)
+		}
+	}
+}
+
 func TestToolCompletionIgnoresActiveCardsBeforeCurrentTimelineGroup(t *testing.T) {
 	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
 	model.operationID = "op-current"
@@ -2169,27 +2188,31 @@ func TestPromptHistoryNavigationPreservesDraftAndVisualBoundaries(t *testing.T) 
 func TestSnapshotHydratesHistoryAtBottomWithoutDuplicatingLiveTimeline(t *testing.T) {
 	call := protocol.ToolCall{ID: "call-read", Name: "read_file", Arguments: json.RawMessage(`{"path":"README.md"}`)}
 	pendingCall := protocol.ToolCall{ID: "call-pending", Name: "bash", Arguments: json.RawMessage(`{"command":"go test ./..."}`)}
+	activity := protocol.WebActivity{CallID: "web-1", Kind: protocol.ToolWebSearch, Query: "Eylu", Status: protocol.WebStatusCompleted, Sources: []protocol.WebSource{{URL: "https://example.com"}}}
+	citation := protocol.URLCitation{CallID: "web-1", URL: "https://example.com", Title: "Example"}
 	backend := &fakeBackend{snapshot: Snapshot{SessionID: "restored", History: []HistoryItem{
 		{Kind: HistoryMessage, Role: protocol.RoleUser, Text: strings.Repeat("old question\n", 20)},
 		{Kind: HistoryMessage, Role: protocol.RoleAgent, Text: "old answer"},
+		{Kind: HistoryWebActivity, WebActivity: &activity},
+		{Kind: HistoryCitation, Citation: &citation},
 		{Kind: HistoryTool, ToolCall: &call, ToolResult: &protocol.ToolResult{CallID: "call-read", Content: "restored tool output"}},
 		{Kind: HistoryTool, ToolCall: &pendingCall},
 	}}}
 	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 50, Height: 16})
 	_, _ = model.Update(snapshotMsg{snapshot: backend.snapshot})
 	view := ansi.Strip(model.renderTimeline())
-	if len(model.timeline) != 4 || !strings.Contains(view, "old question") || !strings.Contains(view, "old answer") || !strings.Contains(view, "> read_file  done") || !strings.Contains(view, "> bash  interrupted") {
+	if len(model.timeline) != 6 || !strings.Contains(view, "old question") || !strings.Contains(view, "old answer") || !strings.Contains(view, "Web search · completed · Eylu · 1 sources") || !strings.Contains(view, "Example · https://example.com") || !strings.Contains(view, "> read_file  done") || !strings.Contains(view, "> bash  interrupted") {
 		t.Fatalf("timeline=%#v\n%s", model.timeline, view)
 	}
-	if model.timeline[2].tool.arguments != string(call.Arguments) || model.timeline[2].tool.content != "restored tool output" {
-		t.Fatalf("restored tool detail=%#v", model.timeline[2].tool)
+	if model.timeline[4].tool.arguments != string(call.Arguments) || model.timeline[4].tool.content != "restored tool output" {
+		t.Fatalf("restored tool detail=%#v", model.timeline[4].tool)
 	}
 	if !model.viewport.AtBottom() || !model.followOutput {
 		t.Fatalf("viewport bottom=%t follow=%t offset=%d", model.viewport.AtBottom(), model.followOutput, model.viewport.YOffset())
 	}
 	model.appendNotice("live notice", false)
 	_, _ = model.Update(snapshotMsg{snapshot: backend.snapshot})
-	if len(model.timeline) != 5 || model.timeline[4].text != "live notice" {
+	if len(model.timeline) != 7 || model.timeline[6].text != "live notice" {
 		t.Fatalf("same-session snapshot replaced live timeline: %#v", model.timeline)
 	}
 }

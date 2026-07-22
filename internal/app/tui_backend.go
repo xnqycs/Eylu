@@ -162,6 +162,12 @@ func conversationHistory(state agent.ConversationState) []ui.HistoryItem {
 					if call.ID != "" {
 						toolIndexes[call.ID] = len(history) - 1
 					}
+				case part.Kind == protocol.PartWebActivity && part.WebActivity != nil:
+					flushText()
+					history = append(history, ui.HistoryItem{Kind: ui.HistoryWebActivity, WebActivity: cloneHistoryWebActivity(part.WebActivity)})
+				case part.Kind == protocol.PartCitation && part.Citation != nil:
+					flushText()
+					history = append(history, ui.HistoryItem{Kind: ui.HistoryCitation, Citation: cloneHistoryCitation(part.Citation)})
 				}
 			}
 			flushText()
@@ -221,6 +227,37 @@ func cloneHistoryToolResult(source *protocol.ToolResult) *protocol.ToolResult {
 		cloned.TodoList = &list
 	}
 	return &cloned
+}
+
+func cloneHistoryWebActivity(source *protocol.WebActivity) *protocol.WebActivity {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.Sources = append([]protocol.WebSource(nil), source.Sources...)
+	cloned.RawProviderResponse = append(json.RawMessage(nil), source.RawProviderResponse...)
+	cloned.ProviderMetadata = cloneHistoryMetadata(source.ProviderMetadata)
+	return &cloned
+}
+
+func cloneHistoryCitation(source *protocol.URLCitation) *protocol.URLCitation {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.ProviderMetadata = cloneHistoryMetadata(source.ProviderMetadata)
+	return &cloned
+}
+
+func cloneHistoryMetadata(source map[string]json.RawMessage) map[string]json.RawMessage {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]json.RawMessage, len(source))
+	for key, value := range source {
+		cloned[key] = append(json.RawMessage(nil), value...)
+	}
+	return cloned
 }
 
 func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission ui.Submission, emit func(ui.Event)) (returnErr error) {
@@ -328,6 +365,10 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventToolResult, ToolResult: event.ToolResult})
 		case protocol.EventUsage:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventUsage, Usage: event.Usage})
+		case protocol.EventWebSearchStarted, protocol.EventWebSearchCompleted, protocol.EventWebFetchStarted, protocol.EventWebFetchCompleted:
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventWebActivity, WebActivity: event.WebActivity})
+		case protocol.EventCitation:
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventCitation, Citation: event.Citation})
 		}
 		return nil
 	}

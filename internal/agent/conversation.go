@@ -17,6 +17,7 @@ import (
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 	"Eylu/internal/tool"
+	"Eylu/internal/webtool"
 )
 
 const SystemPrompt = `You are Eylu, a terminal programming agent working in a local repository. Follow the user's request, preserve unrelated files, report failures accurately, and keep responses concise. Tool availability and local permission policy are authoritative. Act through tools early and keep pre-tool narration brief. Inspect only files relevant to the change. Use write_file for complete new files and focused edit_file calls for updates. Emit independent tool calls together in the same response. Keep calls with data, file, or state dependencies in separate rounds.`
@@ -44,6 +45,7 @@ type Runtime struct {
 	MCPToolServers        map[string]string
 	MCPFingerprint        string
 	MCPState              func() MCPRuntimeState
+	WebDelegate           webtool.DelegateFunc
 }
 
 type MCPContext struct {
@@ -366,6 +368,11 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 			ReasoningEffort:   runtime.Provider.Config.ReasoningEffort,
 			ParallelToolCalls: parallelToolCalls,
 			Stream:            stream,
+			Target: driver.CapabilityTarget{
+				Provider: runtime.Provider.Config.CatalogProvider,
+				Protocol: runtime.Provider.Config.Adapter,
+				Model:    runtime.Provider.Config.Model,
+			},
 			Model: protocol.ModelRequest{
 				ProtocolVersion: protocol.Version,
 				Model:           runtime.Provider.Config.Model,
@@ -546,7 +553,30 @@ func cloneTurns(turns []protocol.Turn) []protocol.Turn {
 				}
 				result[index].Parts[partIndex].ToolResult = &toolResult
 			}
+			if part.WebActivity != nil {
+				activity := *part.WebActivity
+				activity.Sources = append([]protocol.WebSource(nil), part.WebActivity.Sources...)
+				activity.ProviderMetadata = cloneRawMessageMap(part.WebActivity.ProviderMetadata)
+				activity.RawProviderResponse = append(json.RawMessage(nil), part.WebActivity.RawProviderResponse...)
+				result[index].Parts[partIndex].WebActivity = &activity
+			}
+			if part.Citation != nil {
+				citation := *part.Citation
+				citation.ProviderMetadata = cloneRawMessageMap(part.Citation.ProviderMetadata)
+				result[index].Parts[partIndex].Citation = &citation
+			}
 		}
 	}
 	return result
+}
+
+func cloneRawMessageMap(source map[string]json.RawMessage) map[string]json.RawMessage {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]json.RawMessage, len(source))
+	for key, value := range source {
+		clone[key] = append(json.RawMessage(nil), value...)
+	}
+	return clone
 }

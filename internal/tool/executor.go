@@ -59,6 +59,14 @@ type AuditRecord struct {
 	AllowedTools        string              `json:"allowed_tools,omitempty"`
 	SkillResource       string              `json:"skill_resource,omitempty"`
 	ResourceBytes       int                 `json:"resource_bytes,omitempty"`
+	WebBackend          string              `json:"web_backend,omitempty"`
+	WebTarget           string              `json:"web_target,omitempty"`
+	WebStatus           string              `json:"web_status,omitempty"`
+	WebSources          int                 `json:"web_sources,omitempty"`
+	WebInputTokens      int                 `json:"web_input_tokens,omitempty"`
+	WebOutputTokens     int                 `json:"web_output_tokens,omitempty"`
+	WebCostUSD          float64             `json:"web_cost_usd,omitempty"`
+	UntrustedWebContent bool                `json:"untrusted_web_content,omitempty"`
 }
 
 type AuditSink interface {
@@ -349,6 +357,11 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 	}
 	policyRequest := policy.Request{Tool: call.Name, Input: call.Arguments, Workspace: e.Workspace, Risk: item.Risk()}
 	outcome := checker.Check(ctx, policyRequest)
+	if override, ok := item.(PolicyOverride); ok {
+		if domainOutcome, applied := override.OverridePolicy(call.Arguments); applied {
+			outcome = domainOutcome
+		}
+	}
 	prepared.outcome = outcome
 	prepared.record.Risk, prepared.record.Decision, prepared.record.Reason = outcome.Risk, outcome.Decision, outcome.Reason
 	prepared.record.Mode, prepared.record.Classification, prepared.record.Warning = outcome.Mode.String(), outcome.Classification, outcome.Warning
@@ -480,6 +493,14 @@ func (e *Executor) finishPrepared(prepared *preparedCall, result protocol.ToolRe
 			prepared.record.AllowedTools, _ = result.Metadata["allowed_tools"].(string)
 			prepared.record.SkillResource, _ = result.Metadata["resource"].(string)
 			prepared.record.ResourceBytes, _ = result.Metadata["bytes"].(int)
+			prepared.record.WebBackend, _ = result.Metadata["web_backend"].(string)
+			prepared.record.WebTarget, _ = result.Metadata["web_target"].(string)
+			prepared.record.WebStatus, _ = result.Metadata["web_status"].(string)
+			prepared.record.WebSources, _ = result.Metadata["citation_count"].(int)
+			prepared.record.WebInputTokens, _ = result.Metadata["web_input_tokens"].(int)
+			prepared.record.WebOutputTokens, _ = result.Metadata["web_output_tokens"].(int)
+			prepared.record.WebCostUSD, _ = result.Metadata["web_cost_usd"].(float64)
+			prepared.record.UntrustedWebContent, _ = result.Metadata["untrusted_web_content"].(bool)
 		}
 		if e != nil && e.Audit != nil {
 			e.Audit.Record(prepared.record)

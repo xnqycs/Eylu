@@ -36,6 +36,20 @@ type providerOptions struct {
 	routingPriority int
 	inputCost       float64
 	outputCost      float64
+	webPermission   string
+	webSearch       string
+	webFetch        string
+	searchFallback  string
+	fetchFallback   string
+	searchClient    string
+	fetchClient     string
+	searchDelegate  string
+	fetchDelegate   string
+	allowedDomains  []string
+	blockedDomains  []string
+	webMaxUses      int
+	webContextSize  string
+	trustedFetch    bool
 }
 
 func (r *runtime) providersCommand(ctx context.Context) *cobra.Command {
@@ -136,6 +150,32 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 			if cmd.Flags().Changed("output-cost") {
 				patch.OutputCost = config.SetValue(opts.outputCost)
 			}
+			if providerWebFlagsChanged(cmd) {
+				web := candidate.WebTools
+				if cmd.Flags().Changed("web-permission") {
+					web.Permission = opts.webPermission
+				}
+				applyWebToolFlags(cmd, "search", opts.webSearch, opts.searchFallback, opts.searchClient, opts.searchDelegate, &web.Search)
+				applyWebToolFlags(cmd, "fetch", opts.webFetch, opts.fetchFallback, opts.fetchClient, opts.fetchDelegate, &web.Fetch)
+				for _, item := range []*config.WebToolConfig{&web.Search, &web.Fetch} {
+					if cmd.Flags().Changed("web-allowed-domain") {
+						item.AllowedDomains = append([]string(nil), opts.allowedDomains...)
+					}
+					if cmd.Flags().Changed("web-blocked-domain") {
+						item.BlockedDomains = append([]string(nil), opts.blockedDomains...)
+					}
+					if cmd.Flags().Changed("web-max-uses") {
+						item.MaxUses = opts.webMaxUses
+					}
+					if cmd.Flags().Changed("web-context-size") {
+						item.ContextSize = opts.webContextSize
+					}
+				}
+				if cmd.Flags().Changed("web-fetch-trusted-network-boundary") {
+					web.Fetch.TrustedNetworkBoundary = opts.trustedFetch
+				}
+				patch.WebTools = config.SetValue(web)
+			}
 			candidate = config.ApplyProviderPatch(candidate, patch)
 			if err := config.ValidateProvider(name, candidate); err != nil {
 				return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
@@ -163,7 +203,7 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "API base URL")
 	cmd.Flags().StringVar(&opts.model, "model", "", "model ID")
 	cmd.Flags().StringVar(&opts.apiKey, "api-key", "", "API key to store in the provider configuration")
-	cmd.Flags().StringVar(&opts.catalogProvider, "catalog-provider", "", "models.dev provider ID")
+	cmd.Flags().StringVar(&opts.catalogProvider, "catalog-provider", "", "provider ID used for model metadata and capability resolution")
 	cmd.Flags().IntVar(&opts.contextWindow, "context-window", 0, "model context window")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 60*time.Second, "request timeout")
 	cmd.Flags().BoolVar(&opts.activate, "activate", true, "make provider active")
@@ -171,7 +211,55 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 	cmd.Flags().IntVar(&opts.routingPriority, "routing-priority", 0, "automatic routing priority")
 	cmd.Flags().Float64Var(&opts.inputCost, "input-cost", 0, "input cost per million tokens")
 	cmd.Flags().Float64Var(&opts.outputCost, "output-cost", 0, "output cost per million tokens")
+	cmd.Flags().StringVar(&opts.webPermission, "web-permission", "ask", "web permission: ask, allow, or deny")
+	cmd.Flags().StringVar(&opts.webSearch, "web-search", "auto", "web search mode: off, auto, hosted, delegated, or client")
+	cmd.Flags().StringVar(&opts.webFetch, "web-fetch", "auto", "web fetch mode: off, auto, hosted, delegated, or client")
+	cmd.Flags().StringVar(&opts.searchFallback, "web-search-fallback", "", "web search fallback: delegated or client")
+	cmd.Flags().StringVar(&opts.fetchFallback, "web-fetch-fallback", "", "web fetch fallback: delegated or client")
+	cmd.Flags().StringVar(&opts.searchClient, "web-search-client-tool", "", "MCP tool used for client web search")
+	cmd.Flags().StringVar(&opts.fetchClient, "web-fetch-client-tool", "", "MCP tool used for client web fetch")
+	cmd.Flags().StringVar(&opts.searchDelegate, "web-search-delegated-provider", "", "provider used for delegated web search")
+	cmd.Flags().StringVar(&opts.fetchDelegate, "web-fetch-delegated-provider", "", "provider used for delegated web fetch")
+	cmd.Flags().StringSliceVar(&opts.allowedDomains, "web-allowed-domain", nil, "allowed web domain (repeatable)")
+	cmd.Flags().StringSliceVar(&opts.blockedDomains, "web-blocked-domain", nil, "blocked web domain (repeatable)")
+	cmd.Flags().IntVar(&opts.webMaxUses, "web-max-uses", 5, "maximum uses per web tool and user submission")
+	cmd.Flags().StringVar(&opts.webContextSize, "web-context-size", "medium", "web context size: low, medium, or high")
+	cmd.Flags().BoolVar(&opts.trustedFetch, "web-fetch-trusted-network-boundary", false, "trust the configured MCP fetch tool network boundary")
 	return cmd
+}
+
+func providerWebFlagsChanged(cmd *cobra.Command) bool {
+	for _, name := range []string{
+		"web-permission", "web-search", "web-fetch", "web-search-fallback", "web-fetch-fallback",
+		"web-search-client-tool", "web-fetch-client-tool", "web-search-delegated-provider", "web-fetch-delegated-provider",
+		"web-allowed-domain", "web-blocked-domain", "web-max-uses", "web-context-size", "web-fetch-trusted-network-boundary",
+	} {
+		if cmd.Flags().Changed(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyWebToolFlags(cmd *cobra.Command, name, mode, fallback, client, delegated string, target *config.WebToolConfig) {
+	if cmd.Flags().Changed("web-" + name) {
+		enabled := mode != "off"
+		target.Enabled = &enabled
+		if enabled {
+			target.Execution = mode
+		} else {
+			target.Execution = ""
+		}
+	}
+	if cmd.Flags().Changed("web-" + name + "-fallback") {
+		target.Fallback = fallback
+	}
+	if cmd.Flags().Changed("web-" + name + "-client-tool") {
+		target.ClientTool = client
+	}
+	if cmd.Flags().Changed("web-" + name + "-delegated-provider") {
+		target.DelegatedProvider = delegated
+	}
 }
 
 func (r *runtime) providerDeleteCommand() *cobra.Command {

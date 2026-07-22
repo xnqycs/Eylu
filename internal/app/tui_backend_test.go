@@ -55,6 +55,8 @@ func TestConversationHistoryBuildsVisibleTimeline(t *testing.T) {
 	writeCall := protocol.ToolCall{ID: "call-write", Name: "write_file", Arguments: json.RawMessage(`{"path":"out.txt","content":"hello"}`)}
 	failCall := protocol.ToolCall{ID: "call-fail", Name: "bash", Arguments: json.RawMessage(`{"command":"exit 1"}`)}
 	pendingCall := protocol.ToolCall{ID: "call-pending", Name: "read_file", Arguments: json.RawMessage(`{"path":"later.txt"}`)}
+	webActivity := protocol.WebActivity{CallID: "web-1", Kind: protocol.ToolWebSearch, Query: "Eylu", Status: protocol.WebStatusCompleted, Sources: []protocol.WebSource{{URL: "https://example.com", Title: "Example"}}}
+	citation := protocol.URLCitation{CallID: "web-1", URL: "https://example.com", Title: "Example"}
 	history := conversationHistory(agent.ConversationState{Turns: []protocol.Turn{
 		{ID: "system", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "PRIVATE_SYSTEM_PROMPT"}}},
 		{ID: "user", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: wrapped}}},
@@ -62,6 +64,8 @@ func TestConversationHistoryBuildsVisibleTimeline(t *testing.T) {
 			{Kind: protocol.PartReasoning, Text: "PRIVATE_REASONING"},
 			{Kind: protocol.PartText, Text: "first "},
 			{Kind: protocol.PartText, Text: "answer"},
+			{Kind: protocol.PartWebActivity, WebActivity: &webActivity},
+			{Kind: protocol.PartCitation, Citation: &citation},
 			{Kind: protocol.PartToolCall, ToolCall: &writeCall},
 			{Kind: protocol.PartToolCall, ToolCall: &failCall},
 			{Kind: protocol.PartToolCall, ToolCall: &pendingCall},
@@ -71,7 +75,7 @@ func TestConversationHistoryBuildsVisibleTimeline(t *testing.T) {
 			{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: "call-fail", Content: "exit status 1", IsError: true, Truncated: true}},
 		}},
 	}})
-	if len(history) != 5 {
+	if len(history) != 7 {
 		t.Fatalf("history=%#v", history)
 	}
 	if history[0].Kind != ui.HistoryMessage || history[0].Role != protocol.RoleUser || history[0].Text != "inspect @secret.txt" {
@@ -80,14 +84,20 @@ func TestConversationHistoryBuildsVisibleTimeline(t *testing.T) {
 	if history[1].Kind != ui.HistoryMessage || history[1].Role != protocol.RoleAgent || history[1].Text != "first answer" {
 		t.Fatalf("agent history=%#v", history[1])
 	}
-	if history[2].ToolCall == nil || history[2].ToolCall.ID != "call-write" || history[2].ToolResult == nil || history[2].ToolResult.Content != "wrote file" {
-		t.Fatalf("completed tool=%#v", history[2])
+	if history[2].Kind != ui.HistoryWebActivity || history[2].WebActivity == nil || history[2].WebActivity.CallID != "web-1" {
+		t.Fatalf("web activity=%#v", history[2])
 	}
-	if history[3].ToolResult == nil || !history[3].ToolResult.IsError || !history[3].ToolResult.Truncated {
-		t.Fatalf("failed tool=%#v", history[3])
+	if history[3].Kind != ui.HistoryCitation || history[3].Citation == nil || history[3].Citation.URL != "https://example.com" {
+		t.Fatalf("citation=%#v", history[3])
 	}
-	if history[4].ToolCall == nil || history[4].ToolCall.ID != "call-pending" || history[4].ToolResult != nil {
-		t.Fatalf("pending tool=%#v", history[4])
+	if history[4].ToolCall == nil || history[4].ToolCall.ID != "call-write" || history[4].ToolResult == nil || history[4].ToolResult.Content != "wrote file" {
+		t.Fatalf("completed tool=%#v", history[4])
+	}
+	if history[5].ToolResult == nil || !history[5].ToolResult.IsError || !history[5].ToolResult.Truncated {
+		t.Fatalf("failed tool=%#v", history[5])
+	}
+	if history[6].ToolCall == nil || history[6].ToolCall.ID != "call-pending" || history[6].ToolResult != nil {
+		t.Fatalf("pending tool=%#v", history[6])
 	}
 	encoded := fmt.Sprintf("%#v", history)
 	for _, hidden := range []string{"PRIVATE_FILE_BODY", "PRIVATE_SYSTEM_PROMPT", "PRIVATE_REASONING"} {
@@ -144,16 +154,20 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 		if !bytes.Contains(body, []byte("Here is useful information about the environment")) || !bytes.Contains(body, []byte("Your model ID is test.")) {
 			t.Fatalf("environment prompt missing from TUI request: %s", body)
 		}
+		if !bytes.Contains(body, []byte(`"type":"web_search"`)) {
+			t.Fatalf("hosted web tool missing from TUI request: %s", body)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_tui\",\"status\":\"in_progress\",\"action\":{\"type\":\"search\",\"query\":\"Eylu\"}}}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"TUI \"}\n\n"))
 		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"works\"}\n\n"))
-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tui\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"TUI works\"}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tui\",\"status\":\"completed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_tui\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"Eylu\"},\"sources\":[{\"url\":\"https://example.com\",\"title\":\"Example\"}]},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"TUI works\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\",\"start_index\":0,\"end_index\":3}]}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"web_search_calls\":1}}}\n\n"))
 	}))
 	defer server.Close()
 	workspace := t.TempDir()
 	cfg := testAppConfig()
 	cfg.ActiveProvider = "work"
-	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test"}
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test", CatalogProvider: "openai", WebTools: config.WebToolsConfig{Permission: config.WebPermissionAllow}}
 	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -176,7 +190,7 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 	var text strings.Builder
 	textEvents := 0
 	inputActivities := 0
-	foundContext, foundActivity, foundUsage := false, false, false
+	foundContext, foundActivity, foundUsage, foundWebStart, foundWebDone, foundCitation := false, false, false, false, false, false
 	for _, event := range events {
 		if event.Kind == ui.EventTextDelta {
 			textEvents++
@@ -188,9 +202,12 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 			inputActivities++
 		}
 		foundUsage = foundUsage || event.Kind == ui.EventUsage && event.Usage != nil && event.Usage.OutputTokens == 2 && event.Usage.Exact
+		foundWebStart = foundWebStart || event.Kind == ui.EventWebActivity && event.WebActivity != nil && event.WebActivity.Status == protocol.WebStatusRunning
+		foundWebDone = foundWebDone || event.Kind == ui.EventWebActivity && event.WebActivity != nil && event.WebActivity.Status == protocol.WebStatusCompleted && len(event.WebActivity.Sources) == 1
+		foundCitation = foundCitation || event.Kind == ui.EventCitation && event.Citation != nil && event.Citation.URL == "https://example.com"
 	}
-	if text.String() != "TUI works" || textEvents != 1 || inputActivities < 2 || !foundContext || !foundActivity || !foundUsage || stdout.Len() != 0 || stderr.Len() != 0 {
-		t.Fatalf("text=%q textEvents=%d inputActivities=%d context=%t activity=%t usage=%t stdout=%q stderr=%q events=%#v", text.String(), textEvents, inputActivities, foundContext, foundActivity, foundUsage, stdout.String(), stderr.String(), events)
+	if text.String() != "TUI works" || textEvents != 1 || inputActivities < 2 || !foundContext || !foundActivity || !foundUsage || !foundWebStart || !foundWebDone || !foundCitation || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("text=%q textEvents=%d inputActivities=%d context=%t activity=%t usage=%t web_start=%t web_done=%t citation=%t stdout=%q stderr=%q events=%#v", text.String(), textEvents, inputActivities, foundContext, foundActivity, foundUsage, foundWebStart, foundWebDone, foundCitation, stdout.String(), stderr.String(), events)
 	}
 }
 

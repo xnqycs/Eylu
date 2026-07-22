@@ -18,6 +18,12 @@ type Tool interface {
 	Execute(context.Context, json.RawMessage) protocol.ToolResult
 }
 
+// PolicyOverride lets a tool apply a domain-specific decision after the
+// workspace policy has classified the call.
+type PolicyOverride interface {
+	OverridePolicy(json.RawMessage) (policy.Outcome, bool)
+}
+
 // ParallelSafe is an explicit opt-in for tools whose executions do not mutate
 // shared state and may run beside other calls from the same model response.
 type ParallelSafe interface {
