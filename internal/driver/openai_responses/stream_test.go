@@ -76,6 +76,61 @@ func TestResponsesStreamTextAndToolArguments(t *testing.T) {
 	})
 }
 
+func TestResponsesStreamEmitsHostedWebLifecycle(t *testing.T) {
+	server := streamServer([]string{
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress","action":{"type":"search","query":"Eylu"}}}`,
+		`{"type":"response.completed","response":{"id":"resp_1","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Eylu"},"sources":[{"url":"https://example.com","title":"Example"}]},{"type":"message","content":[{"type":"output_text","text":"Eylu","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":4}]}]}]}}`,
+	})
+	defer server.Close()
+	request := streamRequest(server.URL)
+	request.Model.Tools = []protocol.ToolDefinition{{Kind: protocol.ToolWebSearch, Execution: protocol.ExecutionHosted}}
+	var events []protocol.EventKind
+	response, err := New(server.Client()).Generate(context.Background(), request, func(event protocol.ModelEvent) error {
+		events = append(events, event.Kind)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Turn.Parts[0].WebActivity == nil || response.Turn.Parts[2].Citation == nil {
+		t.Fatalf("response = %#v", response)
+	}
+	starts, completions, citations := 0, 0, 0
+	for _, kind := range events {
+		switch kind {
+		case protocol.EventWebSearchStarted:
+			starts++
+		case protocol.EventWebSearchCompleted:
+			completions++
+		case protocol.EventCitation:
+			citations++
+		}
+	}
+	if starts != 1 || completions != 1 || citations != 1 {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestResponsesStreamClosesStartedWebCallOnFailure(t *testing.T) {
+	server := streamServer([]string{
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"web_fetch_call","id":"wf_1","status":"in_progress","action":{"type":"open_page","url":"https://example.com"}}}`,
+		`{"type":"response.failed","error":{"message":"fetch failed"}}`,
+	})
+	defer server.Close()
+	request := streamRequest(server.URL)
+	request.Model.Tools = []protocol.ToolDefinition{{Kind: protocol.ToolWebFetch, Execution: protocol.ExecutionHosted}}
+	var terminal *protocol.WebActivity
+	_, err := New(server.Client()).Generate(context.Background(), request, func(event protocol.ModelEvent) error {
+		if event.Kind == protocol.EventWebFetchCompleted {
+			terminal = event.WebActivity
+		}
+		return nil
+	})
+	if err == nil || terminal == nil || terminal.CallID != "wf_1" || terminal.Status != protocol.WebStatusError || terminal.Error != "fetch failed" {
+		t.Fatalf("err=%v terminal=%#v", err, terminal)
+	}
+}
+
 func TestResponsesStreamRequestsReasoningSummaryAndFallsBack(t *testing.T) {
 	t.Run("requests automatic summary", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

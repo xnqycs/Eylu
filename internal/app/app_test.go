@@ -125,6 +125,13 @@ func TestProvidersAddPersistsAPIKeyInConfig(t *testing.T) {
 		"--base-url", "https://example.com/v1",
 		"--model", "test-model",
 		"--api-key", "stored-secret",
+		"--web-permission", "allow",
+		"--web-search", "client",
+		"--web-search-client-tool", "mcp__web__search",
+		"--web-fetch", "delegated",
+		"--web-fetch-delegated-provider", "backup",
+		"--web-max-uses", "3",
+		"--web-context-size", "high",
 	}, strings.NewReader(""), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("exit=%d stderr=%s", code, stderr.String())
@@ -133,8 +140,9 @@ func TestProvidersAddPersistsAPIKeyInConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Config.Providers["work"].APIKey != "stored-secret" {
-		t.Fatalf("provider=%#v", loaded.Config.Providers["work"])
+	provider := loaded.Config.Providers["work"]
+	if provider.APIKey != "stored-secret" || provider.WebTools.Permission != config.WebPermissionAllow || provider.WebTools.Search.Execution != "client" || provider.WebTools.Search.ClientTool != "mcp__web__search" || provider.WebTools.Fetch.DelegatedProvider != "backup" || provider.WebTools.Fetch.MaxUses != 3 || provider.WebTools.Fetch.ContextSize != "high" {
+		t.Fatalf("provider=%#v", provider)
 	}
 	data, err := os.ReadFile(configPath)
 	if err != nil {

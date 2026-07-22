@@ -52,6 +52,7 @@ const (
 	RiskExec    Risk = "exec"
 	RiskHigh    Risk = "high"
 	RiskSession Risk = "session"
+	RiskNetwork Risk = "network"
 )
 
 type Decision string

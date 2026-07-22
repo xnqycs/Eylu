@@ -53,6 +53,63 @@ func TestGenerateTextRequest(t *testing.T) {
 	}
 }
 
+func TestGenerateHostedWebSearchRequestAndResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		tools := body["tools"].([]any)
+		web := tools[0].(map[string]any)
+		filters := web["filters"].(map[string]any)
+		location := web["user_location"].(map[string]any)
+		if web["type"] != "web_search" || web["search_context_size"] != "high" || web["max_uses"] != float64(5) || filters["allowed_domains"].([]any)[0] != "example.com" || location["country"] != "CN" {
+			t.Fatalf("web tool = %#v", web)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_web","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Eylu"},"sources":[{"url":"https://example.com","title":"Example"}]},{"type":"message","content":[{"type":"output_text","text":"Eylu","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":4}]}]}],"usage":{"input_tokens":4,"output_tokens":1,"web_search_calls":1}}`))
+	}))
+	defer server.Close()
+	request := driver.Request{BaseURL: server.URL, Target: driver.CapabilityTarget{Provider: "openai", Protocol: Name, Model: "gpt-web"}, Model: protocol.ModelRequest{
+		Model: "gpt-web", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "search"}}}},
+		Tools: []protocol.ToolDefinition{{Kind: protocol.ToolWebSearch, Name: "web_search", Execution: protocol.ExecutionHosted, AllowedDomains: []string{"example.com"}, MaxUses: 5, ContextSize: protocol.WebContextHigh, UserLocation: &protocol.UserLocation{Country: "CN"}}},
+	}}
+	var events []protocol.EventKind
+	response, err := New(server.Client()).Generate(context.Background(), request, func(event protocol.ModelEvent) error {
+		events = append(events, event.Kind)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Turn.Parts) != 3 || response.Turn.Parts[0].WebActivity == nil || response.Turn.Parts[0].WebActivity.Query != "Eylu" || response.Turn.Parts[2].Citation == nil || response.Turn.Parts[2].Citation.EndIndex != 4 {
+		t.Fatalf("response = %#v", response)
+	}
+	wantEvents := []protocol.EventKind{protocol.EventResponseStart, protocol.EventWebSearchStarted, protocol.EventWebSearchCompleted, protocol.EventTextDelta, protocol.EventCitation, protocol.EventUsage, protocol.EventResponseDone}
+	if len(events) != len(wantEvents) {
+		t.Fatalf("events = %#v", events)
+	}
+	for index := range wantEvents {
+		if events[index] != wantEvents[index] {
+			t.Fatalf("events = %#v", events)
+		}
+	}
+}
+
+func TestGenerateHostedToolRejectionIsUnsupportedTool(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"Unknown tool type: web_search"}}`))
+	}))
+	defer server.Close()
+	_, err := New(server.Client()).Generate(context.Background(), driver.Request{BaseURL: server.URL, Model: protocol.ModelRequest{
+		Model: "custom", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "search"}}}},
+		Tools: []protocol.ToolDefinition{{Kind: protocol.ToolWebSearch, Execution: protocol.ExecutionHosted}},
+	}}, nil)
+	if typed, ok := err.(*protocol.Error); !ok || typed.Code != protocol.ErrUnsupportedTool {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
 func TestGenerateSendsParallelToolCallsAndCachesUnsupportedGateway(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

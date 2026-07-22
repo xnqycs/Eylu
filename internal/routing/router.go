@@ -47,7 +47,7 @@ type Decision struct {
 	Rejected   map[string]string `json:"rejected,omitempty"`
 }
 
-type CapabilityLookup func(adapter string) (driver.Capabilities, bool)
+type CapabilityLookup func(provider.Snapshot) (driver.Capabilities, bool)
 
 func Select(providers []provider.Snapshot, request Request, lookup CapabilityLookup) (Decision, error) {
 	if request.Task == "" {
@@ -57,7 +57,7 @@ func Select(providers []provider.Snapshot, request Request, lookup CapabilityLoo
 	byName := make(map[string]provider.Snapshot, len(providers))
 	for _, snapshot := range providers {
 		byName[snapshot.Name] = snapshot
-		capabilities, known := lookup(snapshot.Config.Adapter)
+		capabilities, known := lookup(snapshot)
 		if !known {
 			decision.Rejected[snapshot.Name] = "driver capabilities are unknown"
 			continue
@@ -178,6 +178,13 @@ func missingCapabilities(available, required driver.Capabilities) string {
 		{"reasoning", required.Reasoning, available.Reasoning},
 		{"image_input", required.ImageInput, available.ImageInput},
 		{"remote_session", required.RemoteSession, available.RemoteSession},
+		{"hosted_web_search", required.HostedWebSearch, available.HostedWebSearch},
+		{"hosted_web_fetch", required.HostedWebFetch, available.HostedWebFetch},
+		{"hosted_tool_streaming", required.HostedToolStreaming, available.HostedToolStreaming},
+		{"hosted_and_function_tools", required.HostedAndFunctionTools, available.HostedAndFunctionTools},
+		{"search_domain_filter", required.SearchDomainFilter, available.SearchDomainFilter},
+		{"search_location", required.SearchLocation, available.SearchLocation},
+		{"search_usage_details", required.SearchUsageDetails, available.SearchUsageDetails},
 	}
 	for _, check := range checks {
 		if check.required && !check.available {

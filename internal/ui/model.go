@@ -831,6 +831,15 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 			m.activity.InputExact = true
 			m.streamedBytes = 0
 		}
+	case EventWebActivity:
+		m.finishReasoning()
+		if event.WebActivity != nil {
+			m.appendNotice(formatWebActivity(*event.WebActivity), event.WebActivity.Status == protocol.WebStatusError)
+		}
+	case EventCitation:
+		if event.Citation != nil {
+			m.appendNotice(formatCitation(*event.Citation), false)
+		}
 	case EventNotice:
 		m.appendNotice(event.Notice, event.Error)
 	}
@@ -839,6 +848,40 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		command = tea.Batch(command, waitEventCmd(m.operationID, m.eventChannel))
 	}
 	return m, command
+}
+
+func formatWebActivity(activity protocol.WebActivity) string {
+	label := "Web search"
+	if activity.Kind == protocol.ToolWebFetch {
+		label = "Web fetch"
+	}
+	status := string(activity.Status)
+	if status == "" {
+		status = string(protocol.WebStatusRunning)
+	}
+	detail := strings.TrimSpace(activity.Query)
+	if detail == "" {
+		detail = strings.TrimSpace(activity.URL)
+	}
+	message := fmt.Sprintf("%s · %s", label, status)
+	if detail != "" {
+		message += " · " + detail
+	}
+	if activity.Status == protocol.WebStatusCompleted {
+		message += fmt.Sprintf(" · %d sources", len(activity.Sources))
+	}
+	if activity.Error != "" {
+		message += " · " + activity.Error
+	}
+	return message
+}
+
+func formatCitation(citation protocol.URLCitation) string {
+	title := strings.TrimSpace(citation.Title)
+	if title == "" {
+		title = "Source"
+	}
+	return title + " · " + citation.URL
 }
 
 func (m *Model) resetReasoningRound() {
@@ -1776,6 +1819,14 @@ func (m *Model) hydrateHistory(history []HistoryItem) {
 			}
 			updateFileToolPreview(view)
 			m.timeline = append(m.timeline, timelineItem{kind: timelineTool, tool: view})
+		case HistoryWebActivity:
+			if item.WebActivity != nil {
+				m.appendNotice(formatWebActivity(*item.WebActivity), item.WebActivity.Status == protocol.WebStatusError)
+			}
+		case HistoryCitation:
+			if item.Citation != nil {
+				m.appendNotice(formatCitation(*item.Citation), false)
+			}
 		}
 	}
 }

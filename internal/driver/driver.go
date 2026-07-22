@@ -31,12 +31,36 @@ func ToolResultContent(result protocol.ToolResult) string {
 }
 
 type Capabilities struct {
-	TextStreaming bool `json:"text_streaming"`
-	ToolCalling   bool `json:"tool_calling"`
-	ParallelTools bool `json:"parallel_tools"`
-	Reasoning     bool `json:"reasoning"`
-	ImageInput    bool `json:"image_input"`
-	RemoteSession bool `json:"remote_session"`
+	TextStreaming          bool `json:"text_streaming"`
+	ToolCalling            bool `json:"tool_calling"`
+	ParallelTools          bool `json:"parallel_tools"`
+	Reasoning              bool `json:"reasoning"`
+	ImageInput             bool `json:"image_input"`
+	RemoteSession          bool `json:"remote_session"`
+	HostedWebSearch        bool `json:"hosted_web_search"`
+	HostedWebFetch         bool `json:"hosted_web_fetch"`
+	HostedToolStreaming    bool `json:"hosted_tool_streaming"`
+	HostedAndFunctionTools bool `json:"hosted_and_function_tools"`
+	SearchDomainFilter     bool `json:"search_domain_filter"`
+	SearchLocation         bool `json:"search_location"`
+	SearchUsageDetails     bool `json:"search_usage_details"`
+}
+
+type CapabilityTarget struct {
+	Provider string
+	Protocol string
+	Model    string
+}
+
+type TargetCapabilityDriver interface {
+	CapabilitiesFor(CapabilityTarget) Capabilities
+}
+
+func CapabilitiesFor(model ModelDriver, target CapabilityTarget) Capabilities {
+	if targeted, ok := model.(TargetCapabilityDriver); ok {
+		return targeted.CapabilitiesFor(target)
+	}
+	return model.Capabilities()
 }
 
 type Request struct {
@@ -46,6 +70,7 @@ type Request struct {
 	ReasoningEffort   string
 	ParallelToolCalls bool
 	Stream            bool
+	Target            CapabilityTarget
 	Model             protocol.ModelRequest
 }
 

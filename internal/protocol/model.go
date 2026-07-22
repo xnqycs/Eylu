@@ -19,17 +19,21 @@ const (
 type PartKind string
 
 const (
-	PartText       PartKind = "text"
-	PartReasoning  PartKind = "reasoning"
-	PartToolCall   PartKind = "tool_call"
-	PartToolResult PartKind = "tool_result"
+	PartText        PartKind = "text"
+	PartReasoning   PartKind = "reasoning"
+	PartToolCall    PartKind = "tool_call"
+	PartToolResult  PartKind = "tool_result"
+	PartWebActivity PartKind = "web_activity"
+	PartCitation    PartKind = "citation"
 )
 
 type Part struct {
-	Kind       PartKind    `json:"kind"`
-	Text       string      `json:"text,omitempty"`
-	ToolCall   *ToolCall   `json:"tool_call,omitempty"`
-	ToolResult *ToolResult `json:"tool_result,omitempty"`
+	Kind        PartKind     `json:"kind"`
+	Text        string       `json:"text,omitempty"`
+	ToolCall    *ToolCall    `json:"tool_call,omitempty"`
+	ToolResult  *ToolResult  `json:"tool_result,omitempty"`
+	WebActivity *WebActivity `json:"web_activity,omitempty"`
+	Citation    *URLCitation `json:"citation,omitempty"`
 }
 
 type Turn struct {
@@ -168,11 +172,21 @@ type ToolResult struct {
 }
 
 type ToolDefinition struct {
-	Name         string           `json:"name"`
-	Description  string           `json:"description"`
-	InputSchema  json.RawMessage  `json:"input_schema"`
-	OutputSchema json.RawMessage  `json:"output_schema,omitempty"`
-	Annotations  *ToolAnnotations `json:"annotations,omitempty"`
+	Name            string                     `json:"name"`
+	Description     string                     `json:"description"`
+	InputSchema     json.RawMessage            `json:"input_schema,omitempty"`
+	OutputSchema    json.RawMessage            `json:"output_schema,omitempty"`
+	Annotations     *ToolAnnotations           `json:"annotations,omitempty"`
+	Kind            ToolKind                   `json:"kind,omitempty"`
+	Execution       ToolExecution              `json:"execution,omitempty"`
+	ToolChoice      ToolChoice                 `json:"tool_choice,omitempty"`
+	Fallback        ToolExecution              `json:"fallback,omitempty"`
+	AllowedDomains  []string                   `json:"allowed_domains,omitempty"`
+	BlockedDomains  []string                   `json:"blocked_domains,omitempty"`
+	MaxUses         int                        `json:"max_uses,omitempty"`
+	ContextSize     WebContextSize             `json:"context_size,omitempty"`
+	UserLocation    *UserLocation              `json:"user_location,omitempty"`
+	ProviderOptions map[string]json.RawMessage `json:"provider_options,omitempty"`
 }
 
 type ModelRequest struct {
@@ -210,15 +224,20 @@ type ModelResponse struct {
 type EventKind string
 
 const (
-	EventResponseStart  EventKind = "response_start"
-	EventReasoningDelta EventKind = "reasoning_delta"
-	EventTextDelta      EventKind = "text_delta"
-	EventToolCallDelta  EventKind = "tool_call_delta"
-	EventToolStart      EventKind = "tool_start"
-	EventToolResult     EventKind = "tool_result"
-	EventUsage          EventKind = "usage"
-	EventResponseDone   EventKind = "response_done"
-	EventError          EventKind = "error"
+	EventResponseStart      EventKind = "response_start"
+	EventReasoningDelta     EventKind = "reasoning_delta"
+	EventTextDelta          EventKind = "text_delta"
+	EventToolCallDelta      EventKind = "tool_call_delta"
+	EventToolStart          EventKind = "tool_start"
+	EventToolResult         EventKind = "tool_result"
+	EventUsage              EventKind = "usage"
+	EventResponseDone       EventKind = "response_done"
+	EventError              EventKind = "error"
+	EventWebSearchStarted   EventKind = "web_search.started"
+	EventWebSearchCompleted EventKind = "web_search.completed"
+	EventWebFetchStarted    EventKind = "web_fetch.started"
+	EventWebFetchCompleted  EventKind = "web_fetch.completed"
+	EventCitation           EventKind = "citation"
 )
 
 type ModelEvent struct {
@@ -230,4 +249,125 @@ type ModelEvent struct {
 	Usage         *Usage         `json:"usage,omitempty"`
 	Response      *ModelResponse `json:"response,omitempty"`
 	Error         *Error         `json:"error,omitempty"`
+	WebActivity   *WebActivity   `json:"web_activity,omitempty"`
+	Citation      *URLCitation   `json:"citation,omitempty"`
+}
+
+type ToolKind string
+
+const (
+	ToolFunction  ToolKind = "function"
+	ToolWebSearch ToolKind = "web_search"
+	ToolWebFetch  ToolKind = "web_fetch"
+)
+
+func (kind ToolKind) Effective() ToolKind {
+	if kind == "" {
+		return ToolFunction
+	}
+	return kind
+}
+
+func (kind ToolKind) IsWeb() bool { return kind == ToolWebSearch || kind == ToolWebFetch }
+
+type ToolExecution string
+
+const (
+	ExecutionAuto      ToolExecution = "auto"
+	ExecutionHosted    ToolExecution = "hosted"
+	ExecutionDelegated ToolExecution = "delegated"
+	ExecutionClient    ToolExecution = "client"
+)
+
+func (execution ToolExecution) Effective() ToolExecution {
+	if execution == "" {
+		return ExecutionAuto
+	}
+	return execution
+}
+
+type ToolChoice string
+
+const (
+	ToolChoiceAuto     ToolChoice = "auto"
+	ToolChoiceRequired ToolChoice = "required"
+	ToolChoiceNone     ToolChoice = "none"
+)
+
+func (choice ToolChoice) Effective() ToolChoice {
+	if choice == "" {
+		return ToolChoiceAuto
+	}
+	return choice
+}
+
+type WebContextSize string
+
+const (
+	WebContextLow    WebContextSize = "low"
+	WebContextMedium WebContextSize = "medium"
+	WebContextHigh   WebContextSize = "high"
+)
+
+func (size WebContextSize) Effective() WebContextSize {
+	if size == "" {
+		return WebContextMedium
+	}
+	return size
+}
+
+type UserLocation struct {
+	Country  string `json:"country,omitempty"`
+	Region   string `json:"region,omitempty"`
+	City     string `json:"city,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+type WebStatus string
+
+const (
+	WebStatusPending   WebStatus = "pending"
+	WebStatusRunning   WebStatus = "running"
+	WebStatusCompleted WebStatus = "completed"
+	WebStatusError     WebStatus = "error"
+)
+
+type WebSource struct {
+	URL     string `json:"url"`
+	Title   string `json:"title,omitempty"`
+	Snippet string `json:"snippet,omitempty"`
+}
+
+type WebUsage struct {
+	Searches     int     `json:"searches,omitempty"`
+	Fetches      int     `json:"fetches,omitempty"`
+	InputTokens  int     `json:"input_tokens,omitempty"`
+	OutputTokens int     `json:"output_tokens,omitempty"`
+	CostUSD      float64 `json:"cost_usd,omitempty"`
+}
+
+type WebActivity struct {
+	CallID              string                     `json:"call_id"`
+	Kind                ToolKind                   `json:"kind"`
+	Query               string                     `json:"query,omitempty"`
+	URL                 string                     `json:"url,omitempty"`
+	Action              string                     `json:"action,omitempty"`
+	Status              WebStatus                  `json:"status"`
+	Sources             []WebSource                `json:"sources,omitempty"`
+	DurationMS          int64                      `json:"duration_ms,omitempty"`
+	Usage               WebUsage                   `json:"usage,omitzero"`
+	ProviderMetadata    map[string]json.RawMessage `json:"provider_metadata,omitempty"`
+	RawProviderResponse json.RawMessage            `json:"raw_provider_response,omitempty"`
+	RawTruncated        bool                       `json:"raw_truncated,omitempty"`
+	Error               string                     `json:"error,omitempty"`
+}
+
+type URLCitation struct {
+	CallID           string                     `json:"call_id,omitempty"`
+	URL              string                     `json:"url"`
+	Title            string                     `json:"title,omitempty"`
+	StartIndex       int                        `json:"start_index,omitempty"`
+	EndIndex         int                        `json:"end_index,omitempty"`
+	Summary          string                     `json:"summary,omitempty"`
+	ProviderMetadata map[string]json.RawMessage `json:"provider_metadata,omitempty"`
 }

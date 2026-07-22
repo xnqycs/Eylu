@@ -2,6 +2,13 @@ package protocol
 
 import "testing"
 
+func TestUnsupportedToolErrorCodeIsStable(t *testing.T) {
+	err := &Error{Code: ErrUnsupportedTool, Message: "web_search is unavailable"}
+	if err.Error() != "unsupported_tool: web_search is unavailable" {
+		t.Fatalf("error = %q", err.Error())
+	}
+}
+
 func TestClassifyProviderHTTPErrorDetectsContextOverflow(t *testing.T) {
 	err := ClassifyProviderHTTPError(400, "This model's maximum context length is 128,000 tokens; your messages used 140000")
 	if err.Code != ErrContextWindow || err.ContextLimit != 128000 || err.Retryable {

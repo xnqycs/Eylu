@@ -169,6 +169,68 @@ func TestProviderReasoningEffortPatch(t *testing.T) {
 	}
 }
 
+func TestProviderWebToolsRoundTripCloneAndPatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := Default()
+	cfg.ActiveProvider = "work"
+	provider := validProvider("https://example.com/v1", "gpt-web")
+	provider.CatalogProvider = "openai"
+	provider.WebTools = WebToolsConfig{
+		Permission: WebPermissionAsk,
+		Search:     WebToolConfig{Enabled: ptr(true), Execution: "auto", Fallback: "client", ClientTool: "mcp__search__query", AllowedDomains: []string{"example.com"}, MaxUses: 5, ContextSize: "medium", ProviderOptions: map[string]any{"search_type": "fast"}},
+		Fetch:      WebToolConfig{Enabled: ptr(false), TrustedNetworkBoundary: true},
+	}
+	provider.WebCapabilities = WebCapabilityOverrides{HostedWebSearch: ptr(true), HostedAndFunctionTools: ptr(false)}
+	cfg.Providers["work"] = provider
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Config.Providers["work"]
+	if got.WebTools.Search.Enabled == nil || !*got.WebTools.Search.Enabled || got.WebTools.Search.ClientTool != "mcp__search__query" || got.WebCapabilities.HostedAndFunctionTools == nil || *got.WebCapabilities.HostedAndFunctionTools {
+		t.Fatalf("web provider config did not round-trip: %#v", got)
+	}
+	clone := loaded.Config.Clone()
+	cloned := clone.Providers["work"]
+	cloned.WebTools.Search.AllowedDomains[0] = "changed.example"
+	cloned.WebTools.Search.ProviderOptions["search_type"] = "deep"
+	clone.Providers["work"] = cloned
+	if loaded.Config.Providers["work"].WebTools.Search.AllowedDomains[0] != "example.com" || loaded.Config.Providers["work"].WebTools.Search.ProviderOptions["search_type"] != "fast" {
+		t.Fatal("web provider config was shared by Clone")
+	}
+	patched := ApplyProviderPatch(provider, ProviderPatch{WebTools: SetValue(WebToolsConfig{Permission: WebPermissionAllow})})
+	if patched.WebTools.Permission != WebPermissionAllow {
+		t.Fatalf("web tools patch was not applied: %#v", patched.WebTools)
+	}
+}
+
+func TestProviderWebToolsValidation(t *testing.T) {
+	base := validProvider("https://example.com/v1", "model")
+	tests := []struct {
+		name string
+		tool WebToolConfig
+	}{
+		{name: "execution", tool: WebToolConfig{Execution: "remote"}},
+		{name: "fallback", tool: WebToolConfig{Fallback: "hosted"}},
+		{name: "max uses", tool: WebToolConfig{MaxUses: -1}},
+		{name: "context size", tool: WebToolConfig{ContextSize: "huge"}},
+		{name: "client target", tool: WebToolConfig{Execution: "client"}},
+		{name: "delegated target", tool: WebToolConfig{Execution: "delegated"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := base
+			candidate.WebTools.Search = tc.tool
+			if err := ValidateProvider("work", candidate); err == nil {
+				t.Fatal("invalid web tool configuration passed validation")
+			}
+		})
+	}
+}
+
 func TestLegacyWorkspaceIsIgnored(t *testing.T) {
 	workspace := t.TempDir()
 	configPath := filepath.Join(t.TempDir(), "config.toml")

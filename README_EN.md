@@ -167,6 +167,62 @@ eylu providers add work-chat --adapter openai_chat --base-url "https://api.examp
 
 Run `eylu` after configuration to enter the TUI. `EYLU_API_KEY` overrides the key stored in the provider for each request.
 
+### Hosted Web Search and Web Fetch
+
+Eylu models `web_search` and `web_fetch` separately from function tools and resolves capabilities by `catalog_provider + adapter + model`. Recognized providers with supported Web capabilities publish the executable tools automatically. Compatible gateways can declare support through `web_capabilities`. Web permission defaults to `ask`, with one approval before hosted tools are exposed for each user submission. `--yes` uses the existing approval path.
+
+| Adapter | Native Web mapping |
+|---|---|
+| `openai_responses` | Responses hosted search/fetch with OpenAI, xAI, and OpenRouter dialects |
+| `openai_chat` | Chat hosted search with OpenRouter, Groq Compound, and Qwen/DashScope options |
+| `anthropic_messages` | Versioned server tools with bounded `pause_turn` continuation inside one request |
+| `gemini_interactions` | `google_search` and `url_context` |
+| `mistral_conversations` | Standard and premium Web search |
+| `perplexity_agent` | `web_search` and `fetch_url` |
+
+Core CLI configuration:
+
+```bash
+eylu providers edit work --catalog-provider openai --web-permission ask --web-search auto --web-fetch auto --web-max-uses 5 --web-context-size medium
+```
+
+The full TOML form supports capability overrides, delegated fallback, and MCP client fallback:
+
+```toml
+[providers.work.web_tools]
+permission = "ask"
+
+[providers.work.web_tools.search]
+enabled = true
+execution = "auto"
+fallback = "delegated"
+delegated_provider = "web-backup"
+allowed_domains = ["example.com"]
+blocked_domains = ["private.example.com"]
+max_uses = 5
+context_size = "medium"
+
+[providers.work.web_tools.fetch]
+enabled = true
+execution = "client"
+client_tool = "mcp__web__fetch"
+trusted_network_boundary = true
+max_uses = 3
+
+[providers.work.web_capabilities]
+hosted_web_search = true
+hosted_web_fetch = true
+hosted_tool_streaming = true
+hosted_and_function_tools = true
+search_domain_filter = true
+search_location = true
+search_usage_details = true
+```
+
+`execution` accepts `auto`, `hosted`, `delegated`, and `client`. `auto` prefers the active model's hosted capability and follows an explicit `fallback` to another configured provider or a named MCP tool. MCP fetch requires `trusted_network_boundary = true`. Eylu validates the initial HTTP(S) URL, credentials, domain rules, and resolved public addresses; the MCP server is responsible for applying equivalent redirect and DNS checks inside that trusted boundary.
+
+Hosted execution sends the query, URL, domain rules, location, and allowlisted provider options to the active provider. Delegated execution sends them to the target provider. Client execution sends canonical `query` or `url` input to the named MCP server. Web content is marked as untrusted input. Activities, citations, Web tokens, cost, and backend details are projected into protocol events, sessions, JSON/JSONL, metrics, and audit records. Existing credential redaction still applies to logs.
+
 ## Common Workflows
 
 ### One-shot request

@@ -22,16 +22,19 @@ func TestObservationAndSummary(t *testing.T) {
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "x"})
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventToolStart})
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &protocol.ToolResult{}})
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventWebSearchStarted, WebActivity: &protocol.WebActivity{CallID: "web-1", Kind: protocol.ToolWebSearch, Status: protocol.WebStatusRunning}})
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventWebSearchCompleted, WebActivity: &protocol.WebActivity{CallID: "web-1", Kind: protocol.ToolWebSearch, Status: protocol.WebStatusCompleted, Usage: protocol.WebUsage{Searches: 1, InputTokens: 7, OutputTokens: 3, CostUSD: 0.01}}})
+	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventCitation, Citation: &protocol.URLCitation{CallID: "web-1", URL: "https://example.com"}})
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &protocol.Usage{InputTokens: 100, OutputTokens: 50, Exact: true}})
 	now = now.Add(2 * time.Second)
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseDone})
 	observation.ObserveContextEvent(contextledger.Event{Kind: contextledger.EventCompression, Compression: &contextledger.CompressionEvent{DurationMS: 250, Strategy: "deterministic_fallback", Usage: protocol.Usage{InputTokens: 20, OutputTokens: 5, Exact: true}}})
 	metric := observation.Finish(protocol.Usage{}, nil)
-	if metric.RequestID != "request" || metric.FirstTokenMS != 3000 || metric.GenerationMS != 2000 || metric.TokensPerSecond != 25 || metric.ToolSuccessRate != 1 || metric.CompressionCount != 1 || metric.CompactionDurationMS != 250 || metric.CompactionFallbacks != 1 || metric.CompactionUsage.OutputTokens != 5 || metric.EstimatedCost != 0.0004 || math.Abs(metric.CompactionCost-0.00006) > 1e-12 {
+	if metric.RequestID != "request" || metric.FirstTokenMS != 3000 || metric.GenerationMS != 2000 || metric.TokensPerSecond != 25 || metric.ToolSuccessRate != 1 || metric.CompressionCount != 1 || metric.CompactionDurationMS != 250 || metric.CompactionFallbacks != 1 || metric.CompactionUsage.OutputTokens != 5 || metric.EstimatedCost != 0.0004 || math.Abs(metric.CompactionCost-0.00006) > 1e-12 || metric.WebActivities != 1 || metric.WebCitations != 1 || metric.WebUsage.Searches != 1 || metric.WebUsage.CostUSD != 0.01 {
 		t.Fatalf("metric = %#v", metric)
 	}
 	summary := collector.Snapshot()
-	if summary.Requests != 1 || summary.ToolCalls != 1 || summary.ToolSuccessRate != 1 || summary.Usage.InputTokens != 100 || summary.EstimatedCost != metric.EstimatedCost {
+	if summary.Requests != 1 || summary.ToolCalls != 1 || summary.ToolSuccessRate != 1 || summary.Usage.InputTokens != 100 || summary.EstimatedCost != metric.EstimatedCost || summary.WebActivities != 1 || summary.WebCitations != 1 || summary.WebUsage.Searches != 1 {
 		t.Fatalf("summary = %#v", summary)
 	}
 }

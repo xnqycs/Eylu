@@ -138,6 +138,62 @@ eylu providers add work-chat --adapter openai_chat --base-url "https://api.examp
 
 配置完成后运行 `eylu` 进入 TUI。`EYLU_API_KEY` 会在请求时覆盖 Provider 中保存的 Key。
 
+### 托管 Web Search 与 Web Fetch
+
+Eylu 将 `web_search`、`web_fetch` 与普通 function tool 分开建模，并根据 `catalog_provider + adapter + model` 解析能力。已识别且支持 Web 能力的 Provider 会自动发布可执行工具；兼容网关可通过 `web_capabilities` 显式声明能力。Web 权限默认是 `ask`，每次用户提交在发布 hosted 工具前确认一次。`--yes` 使用现有审批通道自动批准。
+
+| Adapter | 原生 Web 映射 |
+|---|---|
+| `openai_responses` | Responses hosted search/fetch；支持 OpenAI、xAI 与 OpenRouter 方言 |
+| `openai_chat` | Chat hosted search；支持 OpenRouter、Groq Compound 与 Qwen/DashScope 选项 |
+| `anthropic_messages` | 版本化 server tools，并在单次请求内处理 `pause_turn` 续接 |
+| `gemini_interactions` | `google_search` 与 `url_context` |
+| `mistral_conversations` | standard/premium Web search |
+| `perplexity_agent` | `web_search` 与 `fetch_url` |
+
+核心 CLI 配置示例：
+
+```bash
+eylu providers edit work --catalog-provider openai --web-permission ask --web-search auto --web-fetch auto --web-max-uses 5 --web-context-size medium
+```
+
+完整 TOML 示例包含 hosted 能力覆盖、delegated fallback 和 MCP client fallback：
+
+```toml
+[providers.work.web_tools]
+permission = "ask"
+
+[providers.work.web_tools.search]
+enabled = true
+execution = "auto"
+fallback = "delegated"
+delegated_provider = "web-backup"
+allowed_domains = ["example.com"]
+blocked_domains = ["private.example.com"]
+max_uses = 5
+context_size = "medium"
+
+[providers.work.web_tools.fetch]
+enabled = true
+execution = "client"
+client_tool = "mcp__web__fetch"
+trusted_network_boundary = true
+max_uses = 3
+
+[providers.work.web_capabilities]
+hosted_web_search = true
+hosted_web_fetch = true
+hosted_tool_streaming = true
+hosted_and_function_tools = true
+search_domain_filter = true
+search_location = true
+search_usage_details = true
+```
+
+`execution` 支持 `auto`、`hosted`、`delegated`、`client`。`auto` 优先当前模型的 hosted 能力，并按显式 `fallback` 转入另一个已配置 Provider 或指定 MCP 工具。MCP fetch 必须设置 `trusted_network_boundary = true`；Eylu 会校验初始 HTTP(S) URL、凭据、域名规则及解析后的公网地址，MCP server 负责在可信边界内对重定向和后续 DNS 解析执行同等检查。
+
+Hosted 会把查询、URL、域名规则、位置和允许的 Provider 选项发送给当前 Provider；delegated 会发送给目标 Provider；client 会把 canonical `query` 或 `url` 发送给指定 MCP server。Web 内容统一标记为不可信输入。活动、引用、Web token、费用和 backend 会进入协议事件、会话、JSON/JSONL、指标与审计记录。日志继续应用现有凭据脱敏。
+
 ## 常用工作流
 
 ### 单次请求

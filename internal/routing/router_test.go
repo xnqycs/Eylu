@@ -89,8 +89,8 @@ func providerSnapshot(name, adapter string, contextWindow int, routing config.Pr
 	return provider.Snapshot{Name: name, Generation: 1, Config: config.ProviderConfig{Adapter: adapter, ContextWindow: contextWindow, Routing: routing}}
 }
 
-func testCapabilities(adapter string) (driver.Capabilities, bool) {
-	switch adapter {
+func testCapabilities(snapshot provider.Snapshot) (driver.Capabilities, bool) {
+	switch snapshot.Config.Adapter {
 	case "responses":
 		return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, Reasoning: true}, true
 	case "chat":

@@ -22,8 +22,12 @@ import (
 	"Eylu/internal/config"
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/driver"
+	"Eylu/internal/driver/anthropic_messages"
+	"Eylu/internal/driver/gemini_interactions"
+	"Eylu/internal/driver/mistral_conversations"
 	"Eylu/internal/driver/openai_chat"
 	"Eylu/internal/driver/openai_responses"
+	"Eylu/internal/driver/perplexity_agent"
 	"Eylu/internal/environment"
 	"Eylu/internal/logging"
 	"Eylu/internal/mcpclient"
@@ -34,6 +38,7 @@ import (
 	"Eylu/internal/routing"
 	"Eylu/internal/skill"
 	"Eylu/internal/tool"
+	"Eylu/internal/webtool"
 )
 
 const (
@@ -346,6 +351,14 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 				fmt.Fprintf(r.stderr, "\n[tool] %s call_id=%s\n", event.ToolCall.Name, event.ToolCall.ID)
 			case protocol.EventToolResult:
 				fmt.Fprintf(r.stderr, "[tool] completed call_id=%s error=%t truncated=%t\n", event.ToolResult.CallID, event.ToolResult.IsError, event.ToolResult.Truncated)
+			case protocol.EventWebSearchStarted, protocol.EventWebSearchCompleted, protocol.EventWebFetchStarted, protocol.EventWebFetchCompleted:
+				if event.WebActivity != nil {
+					fmt.Fprintf(r.stderr, "[web] kind=%s status=%s call_id=%s sources=%d\n", event.WebActivity.Kind, event.WebActivity.Status, event.WebActivity.CallID, len(event.WebActivity.Sources))
+				}
+			case protocol.EventCitation:
+				if event.Citation != nil {
+					fmt.Fprintf(r.stderr, "[citation] %s %s\n", event.Citation.Title, event.Citation.URL)
+				}
 			}
 			return nil
 		}
@@ -608,12 +621,22 @@ func (r *runtime) resolveRuntimeForPrompt(ctx context.Context, manager *provider
 		requestTimeout = opts.timeout
 	}
 	httpClient := &http.Client{Timeout: requestTimeout}
-	registry := driver.NewRegistry(openai_responses.New(httpClient), openai_chat.New(httpClient))
+	registry := defaultDriverRegistry(httpClient)
 	modelDriver, err := registry.Get(providerConfig.Adapter)
 	if err != nil {
 		return agent.Runtime{}, nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
-	return agent.Runtime{Provider: snapshot, APIKey: apiKey, Driver: modelDriver, LimitResolver: resolver, Timeout: requestTimeout}, decision, nil
+	return agent.Runtime{
+		Provider: snapshot, APIKey: apiKey, Driver: modelDriver, LimitResolver: resolver, Timeout: requestTimeout,
+		WebDelegate: r.delegatedWebBackend(manager),
+	}, decision, nil
+}
+
+func defaultDriverRegistry(client *http.Client) *driver.Registry {
+	return driver.NewRegistry(
+		openai_responses.New(client), openai_chat.New(client), anthropic_messages.New(client), gemini_interactions.New(client),
+		mistral_conversations.New(client), perplexity_agent.New(client),
+	)
 }
 
 func (r *runtime) resolveCompactionRuntime(ctx context.Context, manager *provider.Manager, conversation *agent.Conversation, opts chatOptions, skillCatalog string) (agent.Runtime, error) {
@@ -735,15 +758,26 @@ func (r *runtime) warnContextLimit(snapshot provider.Snapshot) {
 	fmt.Fprintf(r.stderr, "[context] configured override=%d exceeds detected limit=%d; effective=%d source=%s\n", configured, detected, snapshot.ContextWindowLimit(), snapshot.Limits.Source)
 }
 
-func knownDriverCapabilities(adapter string) (driver.Capabilities, bool) {
-	switch adapter {
+func knownDriverCapabilities(snapshot provider.Snapshot) (driver.Capabilities, bool) {
+	var modelDriver driver.ModelDriver
+	switch snapshot.Config.Adapter {
 	case openai_responses.Name:
-		return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, Reasoning: true, ImageInput: true, RemoteSession: true}, true
+		modelDriver = openai_responses.New(nil)
 	case openai_chat.Name:
-		return driver.Capabilities{TextStreaming: true, ToolCalling: true, ParallelTools: true, ImageInput: true}, true
+		modelDriver = openai_chat.New(nil)
+	case anthropic_messages.Name:
+		modelDriver = anthropic_messages.New(nil)
+	case gemini_interactions.Name:
+		modelDriver = gemini_interactions.New(nil)
+	case mistral_conversations.Name:
+		modelDriver = mistral_conversations.New(nil)
+	case perplexity_agent.Name:
+		modelDriver = perplexity_agent.New(nil)
 	default:
 		return driver.Capabilities{}, false
 	}
+	target := driver.CapabilityTarget{Provider: snapshot.Config.CatalogProvider, Protocol: snapshot.Config.Adapter, Model: snapshot.Config.Model}
+	return webtool.ApplyCapabilityOverrides(driver.CapabilitiesFor(modelDriver, target), snapshot.Config.WebCapabilities), true
 }
 
 func (r *runtime) loadManager() (config.Loaded, *provider.Manager, error) {

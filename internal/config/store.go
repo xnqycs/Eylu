@@ -53,16 +53,18 @@ type FileConfig struct {
 }
 
 type FileProviderConfig struct {
-	Adapter         *string              `toml:"adapter,omitempty"`
-	BaseURL         *string              `toml:"base_url,omitempty"`
-	APIKey          *string              `toml:"api_key,omitempty"`
-	Model           *string              `toml:"model,omitempty"`
-	ReasoningEffort *string              `toml:"reasoning_effort,omitempty"`
-	CatalogProvider *string              `toml:"catalog_provider,omitempty"`
-	ContextWindow   *int                 `toml:"context_window,omitempty"`
-	TimeoutSeconds  *int                 `toml:"timeout_seconds,omitempty"`
-	Headers         *map[string]string   `toml:"headers,omitempty"`
-	Routing         *FileProviderRouting `toml:"routing,omitempty"`
+	Adapter         *string                 `toml:"adapter,omitempty"`
+	BaseURL         *string                 `toml:"base_url,omitempty"`
+	APIKey          *string                 `toml:"api_key,omitempty"`
+	Model           *string                 `toml:"model,omitempty"`
+	ReasoningEffort *string                 `toml:"reasoning_effort,omitempty"`
+	CatalogProvider *string                 `toml:"catalog_provider,omitempty"`
+	ContextWindow   *int                    `toml:"context_window,omitempty"`
+	TimeoutSeconds  *int                    `toml:"timeout_seconds,omitempty"`
+	Headers         *map[string]string      `toml:"headers,omitempty"`
+	Routing         *FileProviderRouting    `toml:"routing,omitempty"`
+	WebTools        *WebToolsConfig         `toml:"web_tools,omitempty"`
+	WebCapabilities *WebCapabilityOverrides `toml:"web_capabilities,omitempty"`
 }
 
 type FileProviderRouting struct {
@@ -147,6 +149,8 @@ type ProviderPatch struct {
 	RoutingPriority ValuePatch[int]
 	InputCost       ValuePatch[float64]
 	OutputCost      ValuePatch[float64]
+	WebTools        ValuePatch[WebToolsConfig]
+	WebCapabilities ValuePatch[WebCapabilityOverrides]
 }
 
 func (patch ProviderPatch) Empty() bool { return reflect.ValueOf(patch).IsZero() }
@@ -186,6 +190,12 @@ func SparseProviderPatch(provider ProviderConfig) ProviderPatch {
 	if provider.Routing.OutputCostPerMillion != 0 {
 		patch.OutputCost = SetValue(provider.Routing.OutputCostPerMillion)
 	}
+	if !reflect.ValueOf(provider.WebTools).IsZero() {
+		patch.WebTools = SetValue(cloneWebTools(provider.WebTools))
+	}
+	if !reflect.ValueOf(provider.WebCapabilities).IsZero() {
+		patch.WebCapabilities = SetValue(provider.WebCapabilities)
+	}
 	return patch
 }
 
@@ -195,6 +205,7 @@ func CompleteProviderPatch(provider ProviderConfig) ProviderPatch {
 		CatalogProvider: SetValue(provider.CatalogProvider), ContextWindow: SetValue(provider.ContextWindow), TimeoutSeconds: SetValue(provider.TimeoutSeconds),
 		Headers: SetValue(cloneStringMap(provider.Headers)), RoutingTasks: SetValue(append([]string(nil), provider.Routing.Tasks...)),
 		RoutingPriority: SetValue(provider.Routing.Priority), InputCost: SetValue(provider.Routing.InputCostPerMillion), OutputCost: SetValue(provider.Routing.OutputCostPerMillion),
+		WebTools: SetValue(cloneWebTools(provider.WebTools)), WebCapabilities: SetValue(provider.WebCapabilities),
 	}
 }
 
@@ -241,6 +252,16 @@ func ApplyProviderPatch(provider ProviderConfig, patch ProviderPatch) ProviderCo
 	applyInt(&provider.Routing.Priority, patch.RoutingPriority)
 	applyFloat(&provider.Routing.InputCostPerMillion, patch.InputCost)
 	applyFloat(&provider.Routing.OutputCostPerMillion, patch.OutputCost)
+	if patch.WebTools.Remove {
+		provider.WebTools = WebToolsConfig{}
+	} else if patch.WebTools.Set {
+		provider.WebTools = cloneWebTools(patch.WebTools.Value)
+	}
+	if patch.WebCapabilities.Remove {
+		provider.WebCapabilities = WebCapabilityOverrides{}
+	} else if patch.WebCapabilities.Set {
+		provider.WebCapabilities = patch.WebCapabilities.Value
+	}
 	return provider
 }
 
@@ -317,6 +338,8 @@ func (s *Store) UpdateProvider(name string, patch ProviderPatch, activate bool) 
 			applyPatch(&provider.ContextWindow, patch.ContextWindow)
 			applyPatch(&provider.TimeoutSeconds, patch.TimeoutSeconds)
 			applyPatch(&provider.Headers, patch.Headers)
+			applyPatch(&provider.WebTools, patch.WebTools)
+			applyPatch(&provider.WebCapabilities, patch.WebCapabilities)
 			if patch.RoutingTasks.Set || patch.RoutingTasks.Remove || patch.RoutingPriority.Set || patch.RoutingPriority.Remove || patch.InputCost.Set || patch.InputCost.Remove || patch.OutputCost.Set || patch.OutputCost.Remove {
 				if provider.Routing == nil {
 					provider.Routing = &FileProviderRouting{}
@@ -556,6 +579,12 @@ func applyFileProvider(provider *ProviderConfig, file FileProviderConfig) {
 		assign(provider.Routing.InputCostPerMillion, file.Routing.InputCostPerMillion, func(value float64) { provider.Routing.InputCostPerMillion = value })
 		assign(provider.Routing.OutputCostPerMillion, file.Routing.OutputCostPerMillion, func(value float64) { provider.Routing.OutputCostPerMillion = value })
 	}
+	if file.WebTools != nil {
+		provider.WebTools = cloneWebTools(*file.WebTools)
+	}
+	if file.WebCapabilities != nil {
+		provider.WebCapabilities = *file.WebCapabilities
+	}
 }
 
 func applyFileMCPServer(server *MCPServerConfig, file FileMCPServerConfig) {
@@ -723,6 +752,14 @@ func fileProvider(provider ProviderConfig) FileProviderConfig {
 		if provider.Routing.OutputCostPerMillion != 0 {
 			file.Routing.OutputCostPerMillion = ptr(provider.Routing.OutputCostPerMillion)
 		}
+	}
+	if !reflect.ValueOf(provider.WebTools).IsZero() {
+		value := cloneWebTools(provider.WebTools)
+		file.WebTools = &value
+	}
+	if !reflect.ValueOf(provider.WebCapabilities).IsZero() {
+		value := provider.WebCapabilities
+		file.WebCapabilities = &value
 	}
 	return file
 }
