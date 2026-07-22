@@ -3,7 +3,7 @@
 ## Unreleased
 
 - 增加跨 Provider 的 hosted `web_search` / `web_fetch` 协议、目标能力解析、稳定工具规划、流式生命周期、引用、Web usage 和原始 Provider metadata；新增 Responses、Chat、Messages、Interactions、Conversations 与 Agent wire mapping。
-- 增加 delegated 与 MCP client fallback、提交级 `max_uses`、独立 Web 审批、URL/域名/公网地址校验、可信网络边界、TUI 活动与引用展示，以及 JSON/JSONL、指标和审计投影。
+- 增加 delegated 与 MCP client fallback、提交级 `max_uses`、可选 Web 审批、URL/域名/公网地址校验、可信网络边界、TUI 活动与引用展示，以及 JSON/JSONL、指标和审计投影；Web 默认直接执行，兼容 Responses 中转上的 GPT 搜索支持单批最多 10 条客户端并发扇出与稳定归并；TUI 展示批量查询词和打开 URL，并以最多 5 项的动画窗口折叠旧活动，隐藏计数行支持点击展开。
 - 修复恢复会话后的空历史视图：TUI 和 `--no-tui` 交互模式回显用户、助手与工具历史，TUI 默认定位到最新内容。
 - 修复 MCP 管理体验：启动加载期间在 Banner 下展示动画并在终态后清除；完整输入 `/mcp` 后可直接打开，详情页支持左右方向键切换，Tools 页仅展示工具列表，按 Enter 进入工具详情、Esc 返回；连接错误进入内容区并去重显示，原始配置与诊断 JSON 不再挤占详情页或输入区。
 - 优化 MCP 启动与连接稳定性：TUI 首轮请求复用启动时建立的 manager，多个 server 最多并行连接 4 个；Streamable HTTP 握手中的每个 POST 独立应用 60 秒期限并携带稳定 User-Agent，工具目录就绪即进入 connected，日志级别、资源、资源模板和提示词改为后台加载；临时连接错误最多自动重试 3 次，最终失败后可手动执行 `reconnect`，退出清理采用有界等待。

@@ -555,6 +555,7 @@ func cloneTurns(turns []protocol.Turn) []protocol.Turn {
 			}
 			if part.WebActivity != nil {
 				activity := *part.WebActivity
+				activity.Queries = append([]string(nil), part.WebActivity.Queries...)
 				activity.Sources = append([]protocol.WebSource(nil), part.WebActivity.Sources...)
 				activity.ProviderMetadata = cloneRawMessageMap(part.WebActivity.ProviderMetadata)
 				activity.RawProviderResponse = append(json.RawMessage(nil), part.WebActivity.RawProviderResponse...)

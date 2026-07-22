@@ -124,16 +124,51 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		definitions = plan.Definitions
 		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 		c.rebuildLedger(runtime)
+		expansion := expandToolCalls(calls, plan)
 		hooks := tool.BatchHooks{}
 		if emit != nil {
 			hooks.OnStart = func(call protocol.ToolCall) error {
+				if info, ok := expansion.web[call.ID]; ok {
+					activity := webActivityForCall(call, info)
+					return emit(protocol.ModelEvent{Kind: webStartedEvent(info.kind), WebActivity: &activity})
+				}
 				return emit(protocol.ModelEvent{Kind: protocol.EventToolStart, ToolCall: &call})
 			}
 			hooks.OnResult = func(result protocol.ToolResult) error {
+				if info, ok := expansion.web[result.CallID]; ok {
+					parts := webPartsForResult(info, result)
+					for index := range parts {
+						part := &parts[index]
+						switch {
+						case part.WebActivity != nil:
+							if part.WebActivity.CallID != info.callID {
+								started := *part.WebActivity
+								started.Status = protocol.WebStatusRunning
+								started.Error = ""
+								if err := emit(protocol.ModelEvent{Kind: webStartedEvent(started.Kind), WebActivity: &started}); err != nil {
+									return err
+								}
+							}
+							if err := emit(protocol.ModelEvent{Kind: webCompletedEvent(part.WebActivity.Kind), WebActivity: part.WebActivity}); err != nil {
+								return err
+							}
+						case part.Citation != nil:
+							if err := emit(protocol.ModelEvent{Kind: protocol.EventCitation, Citation: part.Citation}); err != nil {
+								return err
+							}
+						}
+					}
+					return nil
+				}
 				return emit(protocol.ModelEvent{Kind: protocol.EventToolResult, ToolResult: &result})
 			}
 		}
-		results, batchErr := executor.ExecuteBatch(ctx, requestID, calls, hooks)
+		limit := executor.ParallelLimit()
+		if len(expansion.web) > limit {
+			limit = min(len(expansion.web), webtool.MaxBatchQueries)
+		}
+		executedResults, batchErr := executor.ExecuteBatchWithLimit(ctx, requestID, expansion.calls, hooks, limit)
+		results, webParts := collapseToolResults(calls, expansion, executedResults)
 		for index := range results {
 			result := results[index]
 			if result.Metadata != nil && result.Metadata["interrupt_request"] == true {
@@ -143,6 +178,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			c.captureTodoListResult(result)
 			toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
 		}
+		toolTurn.Parts = append(toolTurn.Parts, webParts...)
 		c.turns = append(c.turns, toolTurn)
 		c.projectMapDirty = true
 		if interrupted {
@@ -181,7 +217,7 @@ func recordHostedWebActivities(executor *tool.Executor, runtime Runtime, request
 		if executor.Audit == nil {
 			continue
 		}
-		inputBytes := len([]byte(activity.Query)) + len([]byte(activity.URL))
+		inputBytes := webActivityInputBytes(activity)
 		executor.Audit.Record(tool.AuditRecord{
 			Timestamp: time.Now().UTC(), RequestID: requestID, SessionID: executor.SessionID,
 			ProviderName: runtime.Provider.Name, ProviderGeneration: runtime.Provider.Generation, Model: runtime.Provider.Config.Model,
@@ -195,6 +231,25 @@ func recordHostedWebActivities(executor *tool.Executor, runtime Runtime, request
 		})
 	}
 	return nil
+}
+
+func webActivityInputBytes(activity *protocol.WebActivity) int {
+	if activity == nil {
+		return 0
+	}
+	values := append([]string(nil), activity.Queries...)
+	query := strings.TrimSpace(activity.Query)
+	found := false
+	for _, value := range values {
+		if strings.TrimSpace(value) == query {
+			found = true
+			break
+		}
+	}
+	if query != "" && !found {
+		values = append(values, query)
+	}
+	return len([]byte(strings.Join(values, ""))) + len([]byte(activity.URL))
 }
 
 func (c *Conversation) refreshMCPRuntime(runtime Runtime, executor *tool.Executor, baseTools []tool.Tool) (Runtime, error) {
@@ -262,7 +317,7 @@ func authorizeHostedWeb(ctx context.Context, executor *tool.Executor, runtime Ru
 	}
 	permission := strings.ToLower(strings.TrimSpace(runtime.Provider.Config.WebTools.Permission))
 	if permission == "" {
-		permission = "ask"
+		permission = "allow"
 	}
 	if permission == "allow" {
 		*authorized = true
@@ -312,6 +367,259 @@ func registryToolsExcluding(registry *tool.Registry, excluded map[string]string)
 		}
 	}
 	return items
+}
+
+type expandedWebCall struct {
+	parentIndex int
+	childIndex  int
+	kind        protocol.ToolKind
+	value       string
+	callID      string
+}
+
+type toolCallExpansion struct {
+	calls          []protocol.ToolCall
+	parentChildren [][]int
+	web            map[string]expandedWebCall
+}
+
+func expandToolCalls(calls []protocol.ToolCall, plan webtool.ResolvedWebToolPlan) toolCallExpansion {
+	expansion := toolCallExpansion{
+		calls: make([]protocol.ToolCall, 0, len(calls)), parentChildren: make([][]int, len(calls)),
+		web: make(map[string]expandedWebCall),
+	}
+	local := make(map[string]webtool.ResolvedTool, len(plan.Local))
+	for _, resolved := range plan.Local {
+		local[resolved.Definition.Name] = resolved
+	}
+	for parentIndex, call := range calls {
+		resolved, isWeb := local[call.Name]
+		values, err := webtool.InputValues(resolved.Definition.Kind, call.Arguments)
+		if !isWeb || err != nil {
+			index := len(expansion.calls)
+			expansion.calls = append(expansion.calls, call)
+			expansion.parentChildren[parentIndex] = append(expansion.parentChildren[parentIndex], index)
+			if isWeb {
+				expansion.web[call.ID] = expandedWebCall{parentIndex: parentIndex, kind: resolved.Definition.Kind, callID: call.ID}
+			}
+			continue
+		}
+		field := "query"
+		if resolved.Definition.Kind == protocol.ToolWebFetch {
+			field = "url"
+		}
+		for childIndex, value := range values {
+			childID := call.ID
+			if len(values) > 1 {
+				childID = fmt.Sprintf("%s:%d", call.ID, childIndex+1)
+			}
+			arguments, _ := json.Marshal(map[string]any{field: value, "_eylu_batch_id": call.ID})
+			child := protocol.ToolCall{ID: childID, Name: call.Name, Arguments: arguments}
+			index := len(expansion.calls)
+			expansion.calls = append(expansion.calls, child)
+			expansion.parentChildren[parentIndex] = append(expansion.parentChildren[parentIndex], index)
+			expansion.web[childID] = expandedWebCall{
+				parentIndex: parentIndex, childIndex: childIndex, kind: resolved.Definition.Kind, value: value, callID: childID,
+			}
+		}
+	}
+	return expansion
+}
+
+func collapseToolResults(calls []protocol.ToolCall, expansion toolCallExpansion, executed []protocol.ToolResult) ([]protocol.ToolResult, []protocol.Part) {
+	results := make([]protocol.ToolResult, len(calls))
+	webParts := make([]protocol.Part, 0, len(expansion.web)*2)
+	for parentIndex, parent := range calls {
+		children := expansion.parentChildren[parentIndex]
+		if len(children) == 0 {
+			results[parentIndex] = protocol.ToolResult{CallID: parent.ID, Content: "tool call was not scheduled", IsError: true}
+			continue
+		}
+		for _, resultIndex := range children {
+			if resultIndex >= len(executed) {
+				continue
+			}
+			if info, ok := expansion.web[expansion.calls[resultIndex].ID]; ok {
+				webParts = append(webParts, webPartsForResult(info, executed[resultIndex])...)
+			}
+		}
+		if len(children) == 1 {
+			result := executed[children[0]]
+			result.CallID = parent.ID
+			results[parentIndex] = result
+			continue
+		}
+		results[parentIndex] = collapseWebBatch(parent, children, expansion, executed)
+	}
+	return results, webParts
+}
+
+func collapseWebBatch(parent protocol.ToolCall, children []int, expansion toolCallExpansion, executed []protocol.ToolResult) protocol.ToolResult {
+	type batchItem struct {
+		Query             string          `json:"query,omitempty"`
+		URL               string          `json:"url,omitempty"`
+		Content           string          `json:"content"`
+		StructuredContent json.RawMessage `json:"structured_content,omitempty"`
+		IsError           bool            `json:"is_error,omitempty"`
+		Truncated         bool            `json:"truncated,omitempty"`
+	}
+	items := make([]batchItem, 0, len(children))
+	activities := make([]protocol.WebActivity, 0, len(children))
+	citations := make([]protocol.URLCitation, 0)
+	metadata := map[string]any{"web_status": string(protocol.WebStatusCompleted), "web_query_count": len(children), "untrusted_web_content": true}
+	failed := 0
+	truncated := false
+	var content strings.Builder
+	for position, resultIndex := range children {
+		result := executed[resultIndex]
+		info := expansion.web[expansion.calls[resultIndex].ID]
+		item := batchItem{Content: result.Content, StructuredContent: result.StructuredContent, IsError: result.IsError, Truncated: result.Truncated}
+		if info.kind == protocol.ToolWebFetch {
+			item.URL = info.value
+		} else {
+			item.Query = info.value
+		}
+		items = append(items, item)
+		if result.IsError {
+			failed++
+		}
+		truncated = truncated || result.Truncated
+		if position > 0 {
+			content.WriteString("\n\n")
+		}
+		fmt.Fprintf(&content, "[%d] %s\n%s", position+1, info.value, result.Content)
+		for _, part := range webPartsForResult(info, result) {
+			if part.WebActivity != nil {
+				activities = append(activities, *part.WebActivity)
+			}
+			if part.Citation != nil {
+				citations = append(citations, *part.Citation)
+			}
+		}
+		mergeWebResultMetadata(metadata, result.Metadata)
+	}
+	metadata["web_failed_count"] = failed
+	metadata["activity_count"] = len(activities)
+	metadata["citation_count"] = len(citations)
+	if failed == len(children) {
+		metadata["web_status"] = string(protocol.WebStatusError)
+	}
+	structured, _ := json.Marshal(map[string]any{"results": items, "activities": activities, "citations": citations})
+	return protocol.ToolResult{
+		CallID: parent.ID, Content: content.String(), StructuredContent: structured,
+		IsError: failed == len(children), Truncated: truncated, Metadata: metadata,
+	}
+}
+
+func mergeWebResultMetadata(target, source map[string]any) {
+	for _, key := range []string{"web_backend", "web_kind", "web_target"} {
+		if target[key] == nil && source[key] != nil {
+			target[key] = source[key]
+		}
+	}
+	for _, key := range []string{"web_input_tokens", "web_output_tokens"} {
+		if value, ok := source[key].(int); ok {
+			current, _ := target[key].(int)
+			target[key] = current + value
+		}
+	}
+	if value, ok := source["web_cost_usd"].(float64); ok {
+		current, _ := target["web_cost_usd"].(float64)
+		target["web_cost_usd"] = current + value
+	}
+}
+
+func webActivityForCall(call protocol.ToolCall, info expandedWebCall) protocol.WebActivity {
+	activity := protocol.WebActivity{CallID: call.ID, Kind: info.kind, Status: protocol.WebStatusRunning}
+	if info.kind == protocol.ToolWebFetch {
+		activity.Action, activity.URL = "fetch", info.value
+	} else {
+		activity.Action, activity.Query = "search", info.value
+	}
+	return activity
+}
+
+func webPartsForResult(info expandedWebCall, result protocol.ToolResult) []protocol.Part {
+	var payload struct {
+		Activities []protocol.WebActivity `json:"activities"`
+		Citations  []protocol.URLCitation `json:"citations"`
+	}
+	if len(result.StructuredContent) > 0 {
+		_ = json.Unmarshal(result.StructuredContent, &payload)
+	}
+	if len(payload.Activities) == 0 {
+		activity := webActivityForCall(protocol.ToolCall{ID: info.callID}, info)
+		activity.Status = protocol.WebStatusCompleted
+		if result.IsError {
+			activity.Status = protocol.WebStatusError
+			activity.Error = result.Content
+		}
+		payload.Activities = []protocol.WebActivity{activity}
+	}
+	parts := make([]protocol.Part, 0, len(payload.Activities)+len(payload.Citations))
+	callIDs := make(map[string]string, len(payload.Activities))
+	for index, source := range payload.Activities {
+		activity := source
+		providerCallID := activity.CallID
+		activity.CallID = info.callID
+		if index > 0 {
+			activity.CallID = fmt.Sprintf("%s:%d", info.callID, index+1)
+		}
+		if providerCallID != "" {
+			callIDs[providerCallID] = activity.CallID
+		}
+		if activity.Kind == "" {
+			activity.Kind = info.kind
+		}
+		if index == 0 {
+			if activity.Kind == protocol.ToolWebFetch && activity.URL == "" {
+				activity.URL = info.value
+			}
+			if activity.Kind == protocol.ToolWebSearch && activity.Query == "" {
+				activity.Query = info.value
+			}
+		}
+		if activity.Action == "" {
+			if activity.Kind == protocol.ToolWebFetch {
+				activity.Action = "fetch"
+			} else {
+				activity.Action = "search"
+			}
+		}
+		activity.Queries = append([]string(nil), activity.Queries...)
+		activity.Sources = append([]protocol.WebSource(nil), activity.Sources...)
+		if result.IsError {
+			activity.Status = protocol.WebStatusError
+			activity.Error = result.Content
+		} else if activity.Status == "" || activity.Status == protocol.WebStatusRunning {
+			activity.Status = protocol.WebStatusCompleted
+		}
+		parts = append(parts, protocol.Part{Kind: protocol.PartWebActivity, WebActivity: &activity})
+	}
+	for _, source := range payload.Citations {
+		citation := source
+		if mapped := callIDs[citation.CallID]; mapped != "" {
+			citation.CallID = mapped
+		} else {
+			citation.CallID = info.callID
+		}
+		parts = append(parts, protocol.Part{Kind: protocol.PartCitation, Citation: &citation})
+	}
+	return parts
+}
+
+func webStartedEvent(kind protocol.ToolKind) protocol.EventKind {
+	if kind == protocol.ToolWebFetch {
+		return protocol.EventWebFetchStarted
+	}
+	return protocol.EventWebSearchStarted
+}
+
+func webCompletedEvent(kind protocol.ToolKind) protocol.EventKind {
+	if kind == protocol.ToolWebFetch {
+		return protocol.EventWebFetchCompleted
+	}
+	return protocol.EventWebSearchCompleted
 }
 
 func (c *Conversation) captureTodoListResult(result protocol.ToolResult) {

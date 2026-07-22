@@ -169,7 +169,7 @@ Run `eylu` after configuration to enter the TUI. `EYLU_API_KEY` overrides the ke
 
 ### Hosted Web Search and Web Fetch
 
-Eylu models `web_search` and `web_fetch` separately from function tools and resolves capabilities by `catalog_provider + adapter + model`. Recognized providers with supported Web capabilities publish the executable tools automatically. Compatible gateways can declare support through `web_capabilities`. Web permission defaults to `ask`, with one approval before hosted tools are exposed for each user submission. `--yes` uses the existing approval path.
+Eylu models `web_search` and `web_fetch` separately from function tools and resolves capabilities by `catalog_provider + adapter + model`. Recognized providers with supported Web capabilities publish the executable tools automatically. Compatible gateways can declare support through `web_capabilities`. Web permission defaults to `allow`, so search and fetch run directly; explicitly set `ask` or `deny` to require approval or disable access. GPT models behind compatible Responses relays hand same-round `queries` to Eylu for controlled fan-out, with up to 10 concurrent queries per batch and one result merged in original query order; `max_uses` continues to count model tool calls. The TUI expands batched queries into individual child items and shows the actual query, opened URL, and sources. Its collapsed view keeps the five newest items visible, renders hidden entries as `▸ … +N hidden`, and toggles the full history when that row is clicked.
 
 | Adapter | Native Web mapping |
 |---|---|
@@ -183,14 +183,14 @@ Eylu models `web_search` and `web_fetch` separately from function tools and reso
 Core CLI configuration:
 
 ```bash
-eylu providers edit work --catalog-provider openai --web-permission ask --web-search auto --web-fetch auto --web-max-uses 5 --web-context-size medium
+eylu providers edit work --catalog-provider openai --web-permission allow --web-search auto --web-fetch auto --web-max-uses 5 --web-context-size medium
 ```
 
 The full TOML form supports capability overrides, delegated fallback, and MCP client fallback:
 
 ```toml
 [providers.work.web_tools]
-permission = "ask"
+permission = "allow"
 
 [providers.work.web_tools.search]
 enabled = true

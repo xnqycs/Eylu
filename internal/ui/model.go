@@ -42,6 +42,7 @@ type timelineKind string
 const (
 	timelineMessage     timelineKind = "message"
 	timelineTool        timelineKind = "tool"
+	timelineWeb         timelineKind = "web"
 	timelineNotice      timelineKind = "notice"
 	maxInputRows                     = 8
 	maxInputContentRows              = 10_000
@@ -52,12 +53,21 @@ type timelineItem struct {
 	role              string
 	text              string
 	tool              *toolView
+	web               *webActivityView
 	err               bool
 	renderedSource    string
 	renderedText      string
 	renderedWidth     int
 	renderedWorkspace string
 	renderedNoColor   bool
+}
+
+type webActivityView struct {
+	operationID     string
+	activities      []protocol.WebActivity
+	expanded        bool
+	shiftGeneration uint64
+	shiftFrame      int
 }
 
 type toolView struct {
@@ -300,6 +310,11 @@ type transitionMsg struct {
 type colorAnimationTickMsg struct {
 	at         time.Time
 	generation uint64
+}
+
+type webShiftTickMsg struct {
+	operationID string
+	generation  uint64
 }
 
 type interruptRequestMsg struct{}
@@ -668,12 +683,25 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshViewport()
 		}
 		return m, m.colorAnimationTickCmd()
+	case webShiftTickMsg:
+		for index := len(m.timeline) - 1; index >= 0; index-- {
+			group := m.timeline[index].web
+			if m.timeline[index].kind == timelineWeb && group != nil && group.operationID == typed.operationID && group.shiftGeneration == typed.generation {
+				group.shiftFrame = 1
+				m.refreshViewport()
+				break
+			}
+		}
+		return m, nil
 	case operationSpinnerMsg:
 		if typed.operationID != m.operationID || !m.busy() || !m.animation {
 			return m, nil
 		}
 		updated, command := m.spinner.Update(typed.message)
 		m.spinner = updated
+		if m.hasRunningWebActivities() {
+			m.refreshViewport()
+		}
 		return m, wrapOperationCmd(m.operationID, command)
 	case transitionMsg:
 		if typed.operationID == m.operationID && m.state != StateFailed && m.state != StateCancelling {
@@ -834,11 +862,23 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 	case EventWebActivity:
 		m.finishReasoning()
 		if event.WebActivity != nil {
-			m.appendNotice(formatWebActivity(*event.WebActivity), event.WebActivity.Status == protocol.WebStatusError)
+			if event.WebActivity.Status == protocol.WebStatusPending || event.WebActivity.Status == protocol.WebStatusRunning {
+				m.state = StateExecutingTool
+			}
+			group, grew := m.applyWebActivity(*event.WebActivity)
+			if grew && webActivityItemCount(group.activities) > maxWebActivityItems && !group.expanded && m.animation {
+				group.shiftGeneration++
+				group.shiftFrame = 0
+				command = m.webShiftTickCmd(group)
+			} else if grew {
+				group.shiftFrame = 1
+			}
 		}
 	case EventCitation:
 		if event.Citation != nil {
-			m.appendNotice(formatCitation(*event.Citation), false)
+			if !m.applyWebCitation(*event.Citation) {
+				m.appendNotice(formatCitation(*event.Citation), false)
+			}
 		}
 	case EventNotice:
 		m.appendNotice(event.Notice, event.Error)
@@ -850,38 +890,148 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 	return m, command
 }
 
-func formatWebActivity(activity protocol.WebActivity) string {
-	label := "Web search"
-	if activity.Kind == protocol.ToolWebFetch {
-		label = "Web fetch"
-	}
-	status := string(activity.Status)
-	if status == "" {
-		status = string(protocol.WebStatusRunning)
-	}
-	detail := strings.TrimSpace(activity.Query)
-	if detail == "" {
-		detail = strings.TrimSpace(activity.URL)
-	}
-	message := fmt.Sprintf("%s · %s", label, status)
-	if detail != "" {
-		message += " · " + detail
-	}
-	if activity.Status == protocol.WebStatusCompleted {
-		message += fmt.Sprintf(" · %d sources", len(activity.Sources))
-	}
-	if activity.Error != "" {
-		message += " · " + activity.Error
-	}
-	return message
-}
-
 func formatCitation(citation protocol.URLCitation) string {
 	title := strings.TrimSpace(citation.Title)
 	if title == "" {
 		title = "Source"
 	}
 	return title + " · " + citation.URL
+}
+
+func (m *Model) applyWebActivity(activity protocol.WebActivity) (*webActivityView, bool) {
+	var group *webActivityView
+	for index := len(m.timeline) - 1; index >= 0; index-- {
+		item := &m.timeline[index]
+		if item.kind == timelineWeb && item.web != nil && item.web.operationID == m.operationID {
+			group = item.web
+			break
+		}
+	}
+	if group == nil {
+		group = &webActivityView{operationID: m.operationID, shiftFrame: 1}
+		m.timeline = append(m.timeline, timelineItem{kind: timelineWeb, web: group})
+	}
+	before := webActivityItemCount(group.activities)
+	group, _ = upsertWebActivity(group, activity)
+	return group, webActivityItemCount(group.activities) > before
+}
+
+func upsertWebActivity(group *webActivityView, activity protocol.WebActivity) (*webActivityView, bool) {
+	for index := range group.activities {
+		if activity.CallID != "" && group.activities[index].CallID == activity.CallID {
+			group.activities[index] = mergeUIWebActivity(group.activities[index], activity)
+			return group, false
+		}
+	}
+	group.activities = append(group.activities, cloneUIWebActivity(activity))
+	return group, true
+}
+
+func mergeUIWebActivity(current, update protocol.WebActivity) protocol.WebActivity {
+	if update.CallID != "" {
+		current.CallID = update.CallID
+	}
+	if update.Kind != "" {
+		current.Kind = update.Kind
+	}
+	if update.Query != "" {
+		current.Query = update.Query
+	}
+	if len(update.Queries) > 0 {
+		current.Queries = append([]string(nil), update.Queries...)
+	}
+	if update.URL != "" {
+		current.URL = update.URL
+	}
+	if update.Pattern != "" {
+		current.Pattern = update.Pattern
+	}
+	if update.Action != "" {
+		current.Action = update.Action
+	}
+	if update.Status != "" {
+		current.Status = update.Status
+	}
+	for _, source := range update.Sources {
+		current.Sources = appendUIWebSource(current.Sources, source)
+	}
+	if update.Error != "" {
+		current.Error = update.Error
+	}
+	current.DurationMS = max(current.DurationMS, update.DurationMS)
+	return current
+}
+
+func cloneUIWebActivity(activity protocol.WebActivity) protocol.WebActivity {
+	cloned := activity
+	cloned.Queries = append([]string(nil), activity.Queries...)
+	cloned.Sources = append([]protocol.WebSource(nil), activity.Sources...)
+	cloned.RawProviderResponse = append(json.RawMessage(nil), activity.RawProviderResponse...)
+	if activity.ProviderMetadata != nil {
+		cloned.ProviderMetadata = make(map[string]json.RawMessage, len(activity.ProviderMetadata))
+		for key, value := range activity.ProviderMetadata {
+			cloned.ProviderMetadata[key] = append(json.RawMessage(nil), value...)
+		}
+	}
+	return cloned
+}
+
+func (m *Model) hasRunningWebActivities() bool {
+	for index := len(m.timeline) - 1; index >= 0; index-- {
+		item := m.timeline[index]
+		if item.kind != timelineWeb || item.web == nil || item.web.operationID != m.operationID {
+			continue
+		}
+		for _, activity := range item.web.activities {
+			if activity.Status == "" || activity.Status == protocol.WebStatusPending || activity.Status == protocol.WebStatusRunning {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func appendUIWebSource(sources []protocol.WebSource, source protocol.WebSource) []protocol.WebSource {
+	if strings.TrimSpace(source.URL) == "" {
+		return sources
+	}
+	for index := range sources {
+		if sources[index].URL == source.URL {
+			if sources[index].Title == "" {
+				sources[index].Title = source.Title
+			}
+			return sources
+		}
+	}
+	return append(sources, source)
+}
+
+func (m *Model) applyWebCitation(citation protocol.URLCitation) bool {
+	for timelineIndex := len(m.timeline) - 1; timelineIndex >= 0; timelineIndex-- {
+		item := &m.timeline[timelineIndex]
+		if item.kind != timelineWeb || item.web == nil {
+			continue
+		}
+		for activityIndex := len(item.web.activities) - 1; activityIndex >= 0; activityIndex-- {
+			activity := &item.web.activities[activityIndex]
+			if citation.CallID != "" && activity.CallID != citation.CallID {
+				continue
+			}
+			activity.Sources = appendUIWebSource(activity.Sources, protocol.WebSource{URL: citation.URL, Title: citation.Title})
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) webShiftTickCmd(group *webActivityView) tea.Cmd {
+	if group == nil || !m.animation {
+		return nil
+	}
+	operationID, generation := group.operationID, group.shiftGeneration
+	return m.clock.Tick(webShiftInterval, func(time.Time) tea.Msg {
+		return webShiftTickMsg{operationID: operationID, generation: generation}
+	})
 }
 
 func (m *Model) resetReasoningRound() {
@@ -1821,11 +1971,21 @@ func (m *Model) hydrateHistory(history []HistoryItem) {
 			m.timeline = append(m.timeline, timelineItem{kind: timelineTool, tool: view})
 		case HistoryWebActivity:
 			if item.WebActivity != nil {
-				m.appendNotice(formatWebActivity(*item.WebActivity), item.WebActivity.Status == protocol.WebStatusError)
+				var group *webActivityView
+				if len(m.timeline) > 0 && m.timeline[len(m.timeline)-1].kind == timelineWeb {
+					group = m.timeline[len(m.timeline)-1].web
+				}
+				if group == nil {
+					group = &webActivityView{shiftFrame: 1}
+					m.timeline = append(m.timeline, timelineItem{kind: timelineWeb, web: group})
+				}
+				upsertWebActivity(group, *item.WebActivity)
 			}
 		case HistoryCitation:
 			if item.Citation != nil {
-				m.appendNotice(formatCitation(*item.Citation), false)
+				if !m.applyWebCitation(*item.Citation) {
+					m.appendNotice(formatCitation(*item.Citation), false)
+				}
 			}
 		}
 	}
@@ -1954,6 +2114,10 @@ func cloneUITodoList(list protocol.TodoList) protocol.TodoList {
 
 func (m *Model) applyToolCallDelta(update protocol.ToolCallDelta) {
 	view := m.findTool(update.ID, update.OutputIndex)
+	if isWebFunctionToolName(update.Name) || view != nil && isWebFunctionToolName(view.name) {
+		m.removeToolView(update.ID, update.OutputIndex)
+		return
+	}
 	if view == nil {
 		view = &toolView{callID: update.ID, outputIndex: update.OutputIndex}
 		m.timeline = append(m.timeline, timelineItem{kind: timelineTool, tool: view})
@@ -1977,6 +2141,10 @@ func (m *Model) applyToolCallDelta(update protocol.ToolCallDelta) {
 }
 
 func (m *Model) startTool(call protocol.ToolCall) {
+	if isWebFunctionToolName(call.Name) {
+		m.removeToolView(call.ID, -1)
+		return
+	}
 	view := m.findTool(call.ID, -1)
 	if view == nil {
 		view = &toolView{callID: call.ID}
@@ -1987,6 +2155,23 @@ func (m *Model) startTool(call protocol.ToolCall) {
 	view.preparing = false
 	view.running = true
 	updateFileToolPreview(view)
+}
+
+func (m *Model) removeToolView(callID string, outputIndex int) {
+	for index := len(m.timeline) - 1; index >= 0; index-- {
+		item := m.timeline[index]
+		if item.kind != timelineTool || item.tool == nil {
+			continue
+		}
+		if callID != "" && item.tool.callID == callID || callID == "" && outputIndex >= 0 && item.tool.outputIndex == outputIndex {
+			m.timeline = append(m.timeline[:index], m.timeline[index+1:]...)
+			return
+		}
+	}
+}
+
+func isWebFunctionToolName(name string) bool {
+	return name == string(protocol.ToolWebSearch) || name == string(protocol.ToolWebFetch)
 }
 
 func (view *toolView) replaceArguments(arguments string) {

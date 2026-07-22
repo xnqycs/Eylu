@@ -107,6 +107,30 @@ func TestConversationHistoryBuildsVisibleTimeline(t *testing.T) {
 	}
 }
 
+func TestConversationHistoryRestoresLocalWebBatchWithoutInternalToolCard(t *testing.T) {
+	call := protocol.ToolCall{ID: "web-batch", Name: "web_search", Arguments: json.RawMessage(`{"queries":["one","two"]}`)}
+	first := protocol.WebActivity{CallID: "web-batch:1", Kind: protocol.ToolWebSearch, Query: "one", Action: "search", Status: protocol.WebStatusCompleted}
+	second := protocol.WebActivity{CallID: "web-batch:2", Kind: protocol.ToolWebSearch, Query: "two", Action: "search", Status: protocol.WebStatusCompleted}
+	citation := protocol.URLCitation{CallID: second.CallID, URL: "https://two.example", Title: "Two"}
+	history := conversationHistory(agent.ConversationState{Turns: []protocol.Turn{
+		{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}},
+		{Role: protocol.RoleTool, Parts: []protocol.Part{
+			{Kind: protocol.PartToolResult, ToolResult: &protocol.ToolResult{CallID: call.ID, Content: "done", Metadata: map[string]any{"web_kind": "web_search"}}},
+			{Kind: protocol.PartWebActivity, WebActivity: &first},
+			{Kind: protocol.PartWebActivity, WebActivity: &second},
+			{Kind: protocol.PartCitation, Citation: &citation},
+		}},
+	}})
+	if len(history) != 3 || history[0].Kind != ui.HistoryWebActivity || history[1].Kind != ui.HistoryWebActivity || history[2].Kind != ui.HistoryCitation {
+		t.Fatalf("history=%#v", history)
+	}
+	for _, item := range history {
+		if item.Kind == ui.HistoryTool {
+			t.Fatalf("internal web tool card restored: %#v", item)
+		}
+	}
+}
+
 func TestFormatCompactionCompletionAndNoopBackendEvents(t *testing.T) {
 	formatted := formatCompactionCompletion(contextledger.CompressionEvent{DurationMS: 1234, BeforeTokens: 42_100, AfterTokens: 20_300, OmittedTurns: 18})
 	if formatted != "Context compacted in 1.234s; 42.1K → 20.3K tokens; 18 turns summarized." {

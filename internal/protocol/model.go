@@ -234,8 +234,10 @@ const (
 	EventResponseDone       EventKind = "response_done"
 	EventError              EventKind = "error"
 	EventWebSearchStarted   EventKind = "web_search.started"
+	EventWebSearchUpdated   EventKind = "web_search.updated"
 	EventWebSearchCompleted EventKind = "web_search.completed"
 	EventWebFetchStarted    EventKind = "web_fetch.started"
+	EventWebFetchUpdated    EventKind = "web_fetch.updated"
 	EventWebFetchCompleted  EventKind = "web_fetch.completed"
 	EventCitation           EventKind = "citation"
 )
@@ -350,7 +352,9 @@ type WebActivity struct {
 	CallID              string                     `json:"call_id"`
 	Kind                ToolKind                   `json:"kind"`
 	Query               string                     `json:"query,omitempty"`
+	Queries             []string                   `json:"queries,omitempty"`
 	URL                 string                     `json:"url,omitempty"`
+	Pattern             string                     `json:"pattern,omitempty"`
 	Action              string                     `json:"action,omitempty"`
 	Status              WebStatus                  `json:"status"`
 	Sources             []WebSource                `json:"sources,omitempty"`

@@ -69,6 +69,12 @@ func (m *Model) handleMouse(message tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.clearSelection()
 			return m, nil
 		}
+		if m.toggleWebDisclosureAtRow(m.viewport.YOffset()+localY, event.X-m.viewportLeftInset()) {
+			m.clearSelection()
+			m.followOutput = false
+			m.refreshViewport()
+			return m, nil
+		}
 		lines := selectionLines(m.viewport.GetContent(), m.viewport.Width())
 		point := clampSelectionPoint(lines, m.viewport.YOffset()+localY, event.X-m.viewportLeftInset())
 		m.selection = selectionState{active: true, dragging: true, anchor: point, focus: point, lines: lines}
@@ -105,6 +111,37 @@ func (m *Model) handleMouse(message tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *Model) toggleWebDisclosureAtRow(row, column int) bool {
+	lines := selectionLines(m.viewport.GetContent(), m.viewport.Width())
+	if row < 0 || row >= len(lines) || column < 0 || column > ansi.StringWidth(lines[row].text) {
+		return false
+	}
+	text := strings.TrimSpace(lines[row].text)
+	if !strings.HasPrefix(text, "▸ … +") && !strings.HasPrefix(text, "▾ … ") {
+		return false
+	}
+	ordinal := 0
+	for index := 0; index < row; index++ {
+		candidate := strings.TrimSpace(lines[index].text)
+		if strings.HasPrefix(candidate, "▸ … +") || strings.HasPrefix(candidate, "▾ … ") {
+			ordinal++
+		}
+	}
+	for index := range m.timeline {
+		group := m.timeline[index].web
+		if m.timeline[index].kind != timelineWeb || group == nil || webActivityItemCount(group.activities) <= maxWebActivityItems {
+			continue
+		}
+		if ordinal == 0 {
+			group.expanded = !group.expanded
+			group.shiftFrame = 1
+			return true
+		}
+		ordinal--
+	}
+	return false
 }
 
 func (m *Model) selectionPointAt(localY, column int, scroll bool) selectionPoint {

@@ -136,6 +136,14 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 func conversationHistory(state agent.ConversationState) []ui.HistoryItem {
 	history := make([]ui.HistoryItem, 0, len(state.Turns))
 	toolIndexes := make(map[string]int)
+	localWebCalls := make(map[string]bool)
+	for _, turn := range state.Turns {
+		for _, part := range turn.Parts {
+			if part.ToolResult != nil && part.ToolResult.Metadata != nil && part.ToolResult.Metadata["web_kind"] != nil {
+				localWebCalls[part.ToolResult.CallID] = true
+			}
+		}
+	}
 	for _, turn := range state.Turns {
 		switch turn.Role {
 		case protocol.RoleUser, protocol.RoleAgent:
@@ -157,6 +165,9 @@ func conversationHistory(state agent.ConversationState) []ui.HistoryItem {
 					text.WriteString(part.Text)
 				case part.Kind == protocol.PartToolCall && part.ToolCall != nil:
 					flushText()
+					if localWebCalls[part.ToolCall.ID] {
+						continue
+					}
 					call := cloneHistoryToolCall(part.ToolCall)
 					history = append(history, ui.HistoryItem{Kind: ui.HistoryTool, ToolCall: call})
 					if call.ID != "" {
@@ -173,10 +184,20 @@ func conversationHistory(state agent.ConversationState) []ui.HistoryItem {
 			flushText()
 		case protocol.RoleTool:
 			for _, part := range turn.Parts {
-				if part.Kind != protocol.PartToolResult || part.ToolResult == nil {
+				switch {
+				case part.Kind == protocol.PartWebActivity && part.WebActivity != nil:
+					history = append(history, ui.HistoryItem{Kind: ui.HistoryWebActivity, WebActivity: cloneHistoryWebActivity(part.WebActivity)})
+					continue
+				case part.Kind == protocol.PartCitation && part.Citation != nil:
+					history = append(history, ui.HistoryItem{Kind: ui.HistoryCitation, Citation: cloneHistoryCitation(part.Citation)})
+					continue
+				case part.Kind != protocol.PartToolResult || part.ToolResult == nil:
 					continue
 				}
 				result := cloneHistoryToolResult(part.ToolResult)
+				if localWebCalls[result.CallID] {
+					continue
+				}
 				if index, ok := toolIndexes[result.CallID]; ok {
 					history[index].ToolResult = result
 					continue
@@ -234,6 +255,7 @@ func cloneHistoryWebActivity(source *protocol.WebActivity) *protocol.WebActivity
 		return nil
 	}
 	cloned := *source
+	cloned.Queries = append([]string(nil), source.Queries...)
 	cloned.Sources = append([]protocol.WebSource(nil), source.Sources...)
 	cloned.RawProviderResponse = append(json.RawMessage(nil), source.RawProviderResponse...)
 	cloned.ProviderMetadata = cloneHistoryMetadata(source.ProviderMetadata)
@@ -365,7 +387,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventToolResult, ToolResult: event.ToolResult})
 		case protocol.EventUsage:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventUsage, Usage: event.Usage})
-		case protocol.EventWebSearchStarted, protocol.EventWebSearchCompleted, protocol.EventWebFetchStarted, protocol.EventWebFetchCompleted:
+		case protocol.EventWebSearchStarted, protocol.EventWebSearchUpdated, protocol.EventWebSearchCompleted, protocol.EventWebFetchStarted, protocol.EventWebFetchUpdated, protocol.EventWebFetchCompleted:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventWebActivity, WebActivity: event.WebActivity})
 		case protocol.EventCitation:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventCitation, Citation: event.Citation})

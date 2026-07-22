@@ -17,6 +17,7 @@ import (
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 	"Eylu/internal/tool"
+	"Eylu/internal/webtool"
 )
 
 type loopDriver struct {
@@ -418,6 +419,25 @@ func TestAgentLoopPublishesHostedWebToolsWithoutLocalExecution(t *testing.T) {
 	}
 }
 
+func TestAgentLoopDefaultsHostedWebPermissionToAllow(t *testing.T) {
+	model := &hostedWebLoopDriver{}
+	runtime := Runtime{Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), Model: "model"}}, Driver: model, PermissionMode: "manual"}
+	confirmations := 0
+	executor := &tool.Executor{
+		Registry: tool.NewRegistry(), Policy: policy.AllowAllChecker{},
+		Confirm: func(context.Context, policy.Request, policy.Outcome) (tool.Confirmation, error) {
+			confirmations++
+			return tool.Confirmation{Approved: true}, nil
+		},
+	}
+	if _, err := NewConversation().Run(context.Background(), "search", runtime, executor, LoopOptions{MaxTurns: 2}, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if confirmations != 0 {
+		t.Fatalf("hosted web requested %d confirmations with the default permission", confirmations)
+	}
+}
+
 func TestAgentLoopExecutesClientWebFallbackThroughExistingTool(t *testing.T) {
 	enabled := true
 	target := &webClientFixture{}
@@ -433,6 +453,103 @@ func TestAgentLoopExecutesClientWebFallbackThroughExistingTool(t *testing.T) {
 	}
 	if response.Turn.Parts[0].Text != "client done" || target.calls.Load() != 1 || len(model.requests) != 2 || model.requests[0].Model.Tools[1].Execution != protocol.ExecutionClient {
 		t.Fatalf("response=%#v calls=%d requests=%#v", response, target.calls.Load(), model.requests)
+	}
+}
+
+type relayBatchWebDriver struct {
+	requests atomic.Int32
+}
+
+func (*relayBatchWebDriver) Name() string { return "openai_responses" }
+func (*relayBatchWebDriver) Capabilities() driver.Capabilities {
+	return driver.Capabilities{ToolCalling: true, ParallelTools: true, HostedWebSearch: true, HostedAndFunctionTools: true}
+}
+func (d *relayBatchWebDriver) Generate(_ context.Context, _ driver.Request, _ driver.EmitFunc) (protocol.ModelResponse, error) {
+	if d.requests.Add(1) == 1 {
+		call := protocol.ToolCall{ID: "search-batch", Name: "web_search", Arguments: json.RawMessage(`{"queries":["one","two","three","four","five","six"]}`)}
+		return protocol.ModelResponse{Turn: protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}}, Stop: protocol.StopToolUse}, nil
+	}
+	return protocol.ModelResponse{Turn: protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "done"}}}, Stop: protocol.StopCompleted}, nil
+}
+
+func TestAgentLoopFansOutRelayBatchWebSearchConcurrentlyAndCollapsesResult(t *testing.T) {
+	model := &relayBatchWebDriver{}
+	var ready atomic.Int32
+	gate := make(chan struct{})
+	var once sync.Once
+	delegate := func(ctx context.Context, resolved webtool.ResolvedTool, input json.RawMessage) protocol.ToolResult {
+		var values struct {
+			Query string `json:"query"`
+		}
+		_ = json.Unmarshal(input, &values)
+		if resolved.Target != "default" {
+			return protocol.ToolResult{Content: "unexpected target " + resolved.Target, IsError: true}
+		}
+		if ready.Add(1) == 6 {
+			once.Do(func() { close(gate) })
+		}
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return protocol.ToolResult{Content: ctx.Err().Error(), IsError: true}
+		case <-time.After(time.Second):
+			return protocol.ToolResult{Content: "parallel fan-out timed out", IsError: true}
+		}
+		activity := protocol.WebActivity{CallID: "provider-" + values.Query, Kind: protocol.ToolWebSearch, Query: values.Query, Action: "search", Status: protocol.WebStatusCompleted, Sources: []protocol.WebSource{{URL: "https://" + values.Query + ".example"}}}
+		citation := protocol.URLCitation{CallID: activity.CallID, URL: activity.Sources[0].URL, Title: values.Query}
+		structured, _ := json.Marshal(map[string]any{"activities": []protocol.WebActivity{activity}, "citations": []protocol.URLCitation{citation}})
+		return protocol.ToolResult{Content: values.Query, StructuredContent: structured, Metadata: map[string]any{"web_backend": "delegated", "web_kind": "web_search"}}
+	}
+	runtime := Runtime{
+		Provider: provider.Snapshot{Name: "default", Config: config.ProviderConfig{Adapter: "openai_responses", BaseURL: "https://relay.example/v1", Model: "gpt-5.6-sol", WebTools: config.WebToolsConfig{Permission: config.WebPermissionAllow}}},
+		Driver:   model, PermissionMode: "full", WebDelegate: delegate,
+	}
+	executor := &tool.Executor{Registry: tool.NewRegistry(), Policy: policy.AllowAllChecker{}, MaxParallelTools: 2, Timeout: 2 * time.Second}
+	events := make([]protocol.ModelEvent, 0, 18)
+	conversation := NewConversation()
+	response, err := conversation.Run(context.Background(), "parallel search", runtime, executor, LoopOptions{MaxTurns: 3}, false, func(event protocol.ModelEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil || response.Turn.Parts[0].Text != "done" || ready.Load() != 6 {
+		t.Fatalf("response=%#v ready=%d err=%v", response, ready.Load(), err)
+	}
+	transcript := conversation.Transcript()
+	toolTurn := transcript[2]
+	results := make([]*protocol.ToolResult, 0)
+	activities := make([]*protocol.WebActivity, 0)
+	for index := range toolTurn.Parts {
+		part := &toolTurn.Parts[index]
+		if part.ToolResult != nil {
+			results = append(results, part.ToolResult)
+		}
+		if part.WebActivity != nil {
+			activities = append(activities, part.WebActivity)
+		}
+	}
+	if len(results) != 1 || results[0].CallID != "search-batch" || results[0].IsError || len(activities) != 6 {
+		t.Fatalf("tool turn = %#v", toolTurn)
+	}
+	for index, query := range []string{"one", "two", "three", "four", "five", "six"} {
+		if !strings.Contains(results[0].Content, query) || activities[index].Query != query || activities[index].CallID != fmt.Sprintf("search-batch:%d", index+1) {
+			t.Fatalf("query[%d]=%q result=%#v activity=%#v", index, query, results[0], activities[index])
+		}
+	}
+	started := make(map[string]bool)
+	completed := make(map[string]bool)
+	for _, event := range events {
+		if event.WebActivity == nil {
+			continue
+		}
+		switch event.Kind {
+		case protocol.EventWebSearchStarted:
+			started[event.WebActivity.Query] = true
+		case protocol.EventWebSearchCompleted:
+			completed[event.WebActivity.Query] = true
+		}
+	}
+	if len(started) != 6 || len(completed) != 6 {
+		t.Fatalf("started=%#v completed=%#v events=%#v", started, completed, events)
 	}
 }
 
