@@ -40,6 +40,9 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 	var data strings.Builder
 	text := strings.Builder{}
 	calls := make(map[int]*callAccumulator)
+	startedWeb := make(map[string]bool)
+	startedWebKinds := make(map[string]protocol.ToolKind)
+	startedWebOrder := make([]string, 0)
 	var final *protocol.ModelResponse
 	completed := false
 	emitToolDelta := func(index int, call *callAccumulator, delta string, done bool) error {
@@ -86,6 +89,23 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 				calls[event.OutputIndex] = call
 				if err := emitToolDelta(event.OutputIndex, call, "", false); err != nil {
 					return err
+				}
+			} else if strings.Contains(event.Item.Type, "web_search_call") || strings.Contains(event.Item.Type, "web_fetch_call") {
+				activity := webActivityFromItem(event.Item, nil)
+				activity.Status = protocol.WebStatusRunning
+				if !startedWeb[activity.CallID] {
+					startedWebOrder = append(startedWebOrder, activity.CallID)
+				}
+				startedWeb[activity.CallID] = true
+				startedWebKinds[activity.CallID] = activity.Kind
+				kind := protocol.EventWebSearchStarted
+				if activity.Kind == protocol.ToolWebFetch {
+					kind = protocol.EventWebFetchStarted
+				}
+				if emit != nil {
+					if err := emit(protocol.ModelEvent{Kind: kind, WebActivity: &activity}); err != nil {
+						return err
+					}
 				}
 			}
 		case "response.function_call_arguments.delta":
@@ -134,6 +154,11 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 					}
 				}
 			}
+			if emit != nil {
+				if err := emitResponseParts(converted, emit, startedWeb, false); err != nil {
+					return err
+				}
+			}
 			final = &converted
 			completed = true
 		case "response.failed", "error":
@@ -142,6 +167,9 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 				message = event.Error.Message
 			} else if event.Response.Error != nil && event.Response.Error.Message != "" {
 				message = event.Response.Error.Message
+			}
+			if err := emitWebFailures(emit, startedWebKinds, startedWebOrder, message); err != nil {
+				return err
 			}
 			return protocol.ClassifyProviderMessage(message)
 		}
@@ -168,12 +196,14 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		_ = emitWebFailures(emit, startedWebKinds, startedWebOrder, err.Error())
 		if ctx.Err() != nil {
 			return protocol.ModelResponse{}, mapTransportError(ctx, ctx.Err())
 		}
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrNetwork, Message: "read Responses stream", Retryable: true, Cause: err}
 	}
 	if !completed {
+		_ = emitWebFailures(emit, startedWebKinds, startedWebOrder, "Responses stream ended before completion")
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrNetwork, Message: "Responses stream ended before completion", Retryable: true}
 	}
 	if final == nil {
@@ -201,6 +231,24 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 		}
 	}
 	return *final, nil
+}
+
+func emitWebFailures(emit driver.EmitFunc, started map[string]protocol.ToolKind, order []string, message string) error {
+	if emit == nil {
+		return nil
+	}
+	for _, callID := range order {
+		toolKind := started[callID]
+		eventKind := protocol.EventWebSearchCompleted
+		if toolKind == protocol.ToolWebFetch {
+			eventKind = protocol.EventWebFetchCompleted
+		}
+		activity := protocol.WebActivity{CallID: callID, Kind: toolKind, Status: protocol.WebStatusError, Error: message}
+		if err := emit(protocol.ModelEvent{Kind: eventKind, WebActivity: &activity}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func responseText(response protocol.ModelResponse) string {

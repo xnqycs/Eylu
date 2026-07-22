@@ -40,6 +40,71 @@ func TestChatRequestHistoryAndResponse(t *testing.T) {
 	}
 }
 
+func TestChatHostedWebDialects(t *testing.T) {
+	tests := []struct {
+		provider string
+		kind     protocol.ToolKind
+		assert   func(*testing.T, map[string]any)
+	}{
+		{provider: "qwen", kind: protocol.ToolWebSearch, assert: func(t *testing.T, body map[string]any) {
+			if body["enable_search"] != true || body["search_options"].(map[string]any)["search_strategy"] != "turbo" {
+				t.Fatalf("qwen body = %#v", body)
+			}
+		}},
+		{provider: "groq", kind: protocol.ToolWebFetch, assert: func(t *testing.T, body map[string]any) {
+			compound := body["compound_custom"].(map[string]any)
+			tools := compound["tools"].(map[string]any)["enabled_tools"].([]any)
+			if tools[0] != "visit_website" {
+				t.Fatalf("groq body = %#v", body)
+			}
+		}},
+		{provider: "openrouter", kind: protocol.ToolWebSearch, assert: func(t *testing.T, body map[string]any) {
+			if body["tools"].([]any)[0].(map[string]any)["type"] != "openrouter:web_search" {
+				t.Fatalf("openrouter body = %#v", body)
+			}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.provider, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				tc.assert(t, body)
+				_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"result","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":6}]},"finish_reason":"stop"}],"citations":["https://example.com"]}`))
+			}))
+			defer server.Close()
+			options := map[string]json.RawMessage{}
+			if tc.provider == "qwen" {
+				options["search_strategy"] = json.RawMessage(`"turbo"`)
+			}
+			response, err := New(server.Client()).Generate(context.Background(), driver.Request{
+				BaseURL: server.URL, Target: driver.CapabilityTarget{Provider: tc.provider, Protocol: Name, Model: "model"},
+				Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "web"}}}}, Tools: []protocol.ToolDefinition{{Kind: tc.kind, Execution: protocol.ExecutionHosted, ProviderOptions: options}}},
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(response.Turn.Parts) < 2 || response.Turn.Parts[len(response.Turn.Parts)-1].Citation == nil {
+				t.Fatalf("response = %#v", response)
+			}
+		})
+	}
+}
+
+func TestChatTargetCapabilities(t *testing.T) {
+	model := New(nil)
+	groq := model.CapabilitiesFor(driver.CapabilityTarget{Provider: "groq"})
+	qwen := model.CapabilitiesFor(driver.CapabilityTarget{Provider: "qwen"})
+	if !groq.HostedWebSearch || !groq.HostedWebFetch || groq.HostedAndFunctionTools {
+		t.Fatalf("groq capabilities = %#v", groq)
+	}
+	if !qwen.HostedWebSearch || qwen.HostedWebFetch || !qwen.HostedAndFunctionTools {
+		t.Fatalf("qwen capabilities = %#v", qwen)
+	}
+}
+
 func TestChatAutoReasoningEffortIsOmitted(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
