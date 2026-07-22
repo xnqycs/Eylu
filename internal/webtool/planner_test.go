@@ -27,6 +27,40 @@ func TestResolveAutoHostedAndStableToolOrder(t *testing.T) {
 	}
 }
 
+func TestResolveAutoRelayGPTUsesSelfDelegatedBatchSearch(t *testing.T) {
+	provider := config.ProviderConfig{
+		Adapter: "openai_responses", BaseURL: "https://relay.example/v1", Model: "gpt-5.6-sol",
+		WebTools: config.WebToolsConfig{Permission: config.WebPermissionAllow},
+	}
+	plan, err := Resolve(PlanInput{
+		ProviderName: "default", Provider: provider,
+		Capabilities: driver.Capabilities{HostedWebSearch: true, HostedAndFunctionTools: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Hosted) != 0 || len(plan.Local) != 1 {
+		t.Fatalf("plan = %#v", plan)
+	}
+	search := plan.Local[0]
+	if search.Execution != protocol.ExecutionDelegated || search.Target != "default" {
+		t.Fatalf("search = %#v", search)
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		OneOf      []json.RawMessage          `json:"oneOf"`
+	}
+	if err := json.Unmarshal(search.Definition.InputSchema, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := schema.Properties["query"]; !ok {
+		t.Fatalf("query schema = %s", search.Definition.InputSchema)
+	}
+	if _, ok := schema.Properties["queries"]; !ok || len(schema.OneOf) != 2 {
+		t.Fatalf("batch schema = %s", search.Definition.InputSchema)
+	}
+}
+
 func TestResolveExplicitUnsupportedToolAndImplicitOmission(t *testing.T) {
 	provider := config.ProviderConfig{WebTools: config.WebToolsConfig{Permission: config.WebPermissionAllow}}
 	plan, err := Resolve(PlanInput{ProviderName: "work", Provider: provider})

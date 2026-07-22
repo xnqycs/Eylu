@@ -78,35 +78,48 @@ func TestResponsesStreamTextAndToolArguments(t *testing.T) {
 
 func TestResponsesStreamEmitsHostedWebLifecycle(t *testing.T) {
 	server := streamServer([]string{
-		`{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress","action":{"type":"search","query":"Eylu"}}}`,
-		`{"type":"response.completed","response":{"id":"resp_1","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Eylu"},"sources":[{"url":"https://example.com","title":"Example"}]},{"type":"message","content":[{"type":"output_text","text":"Eylu","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":4}]}]}]}}`,
+		`{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}`,
+		`{"type":"response.web_search_call.searching","output_index":0,"item_id":"ws_1","action":{"type":"search","queries":["Gemini latest model","Gemini API pricing"]}}`,
+		`{"type":"response.web_search_call.completed","output_index":0,"item_id":"ws_1"}`,
+		`{"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","queries":["Gemini latest model","Gemini API pricing","Gemini release notes"]}}}`,
+		`{"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.com/gemini","title":"Gemini","start_index":0,"end_index":6}}`,
+		`{"type":"response.completed","response":{"id":"resp_1","output":[{"type":"message","content":[{"type":"output_text","text":"Gemini"}]}]}}`,
 	})
 	defer server.Close()
 	request := streamRequest(server.URL)
 	request.Model.Tools = []protocol.ToolDefinition{{Kind: protocol.ToolWebSearch, Execution: protocol.ExecutionHosted}}
-	var events []protocol.EventKind
+	var events []protocol.ModelEvent
 	response, err := New(server.Client()).Generate(context.Background(), request, func(event protocol.ModelEvent) error {
-		events = append(events, event.Kind)
+		events = append(events, event)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Turn.Parts[0].WebActivity == nil || response.Turn.Parts[2].Citation == nil {
+	activity := response.Turn.Parts[0].WebActivity
+	if activity == nil || activity.Status != protocol.WebStatusCompleted || len(activity.Queries) != 3 || activity.Queries[2] != "Gemini release notes" || len(activity.Sources) != 1 || activity.Sources[0].URL != "https://example.com/gemini" || response.Turn.Parts[2].Citation == nil {
 		t.Fatalf("response = %#v", response)
 	}
 	starts, completions, citations := 0, 0, 0
-	for _, kind := range events {
-		switch kind {
+	var terminal *protocol.WebActivity
+	var early *protocol.WebActivity
+	for _, event := range events {
+		switch event.Kind {
 		case protocol.EventWebSearchStarted:
 			starts++
+		case protocol.EventWebSearchUpdated:
+			if len(event.WebActivity.Queries) > 0 && early == nil {
+				copy := *event.WebActivity
+				early = &copy
+			}
 		case protocol.EventWebSearchCompleted:
 			completions++
+			terminal = event.WebActivity
 		case protocol.EventCitation:
 			citations++
 		}
 	}
-	if starts != 1 || completions != 1 || citations != 1 {
+	if starts != 1 || completions != 1 || citations != 1 || early == nil || len(early.Queries) != 2 || terminal == nil || len(terminal.Queries) != 3 || len(terminal.Sources) != 1 {
 		t.Fatalf("events = %#v", events)
 	}
 }

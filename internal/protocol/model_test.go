@@ -179,7 +179,7 @@ func TestWebToolProtocolRoundTripAndFunctionCompatibility(t *testing.T) {
 
 func TestWebActivityAndCitationRoundTrip(t *testing.T) {
 	activity := WebActivity{
-		CallID: "web-1", Kind: ToolWebSearch, Query: "Eylu", Action: "search", Status: WebStatusCompleted,
+		CallID: "web-1", Kind: ToolWebSearch, Query: "Eylu", Queries: []string{"Eylu", "Eylu releases"}, Action: "search", Status: WebStatusCompleted,
 		Sources:    []WebSource{{URL: "https://example.com", Title: "Example", Snippet: "result"}},
 		DurationMS: 42, Usage: WebUsage{Searches: 1, InputTokens: 10, CostUSD: 0.01},
 		ProviderMetadata:    map[string]json.RawMessage{"request_id": json.RawMessage(`"req-1"`)},

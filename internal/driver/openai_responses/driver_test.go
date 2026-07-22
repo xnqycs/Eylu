@@ -12,6 +12,31 @@ import (
 	"Eylu/internal/protocol"
 )
 
+func TestCapabilitiesForInfersModelFamilyWithoutCatalogProvider(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     driver.CapabilityTarget
+		wantSearch bool
+		wantFetch  bool
+	}{
+		{name: "gpt relay", target: driver.CapabilityTarget{Protocol: Name, Model: "gpt-5.6-sol"}, wantSearch: true},
+		{name: "namespaced gpt relay", target: driver.CapabilityTarget{Protocol: Name, Model: "openai/gpt-5.6-sol"}, wantSearch: true},
+		{name: "grok relay", target: driver.CapabilityTarget{Protocol: Name, Model: "grok-4.5"}, wantSearch: true},
+		{name: "unknown relay", target: driver.CapabilityTarget{Protocol: Name, Model: "custom-model"}},
+		{name: "explicit catalog wins", target: driver.CapabilityTarget{Provider: "custom", Protocol: Name, Model: "gpt-5.6-sol"}},
+	}
+
+	modelDriver := New(nil)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			capabilities := modelDriver.CapabilitiesFor(test.target)
+			if capabilities.HostedWebSearch != test.wantSearch || capabilities.HostedWebFetch != test.wantFetch {
+				t.Fatalf("hosted capabilities = %#v", capabilities)
+			}
+		})
+	}
+}
+
 func TestGenerateTextRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/responses" || r.Method != http.MethodPost {
@@ -63,13 +88,13 @@ func TestGenerateHostedWebSearchRequestAndResponse(t *testing.T) {
 		web := tools[0].(map[string]any)
 		filters := web["filters"].(map[string]any)
 		location := web["user_location"].(map[string]any)
-		if web["type"] != "web_search" || web["search_context_size"] != "high" || web["max_uses"] != float64(5) || filters["allowed_domains"].([]any)[0] != "example.com" || location["country"] != "CN" {
+		if _, exists := web["max_uses"]; web["type"] != "web_search" || web["search_context_size"] != "high" || exists || filters["allowed_domains"].([]any)[0] != "example.com" || location["country"] != "CN" {
 			t.Fatalf("web tool = %#v", web)
 		}
 		_, _ = w.Write([]byte(`{"id":"resp_web","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Eylu"},"sources":[{"url":"https://example.com","title":"Example"}]},{"type":"message","content":[{"type":"output_text","text":"Eylu","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":4}]}]}],"usage":{"input_tokens":4,"output_tokens":1,"web_search_calls":1}}`))
 	}))
 	defer server.Close()
-	request := driver.Request{BaseURL: server.URL, Target: driver.CapabilityTarget{Provider: "openai", Protocol: Name, Model: "gpt-web"}, Model: protocol.ModelRequest{
+	request := driver.Request{BaseURL: server.URL, Target: driver.CapabilityTarget{Protocol: Name, Model: "gpt-web"}, Model: protocol.ModelRequest{
 		Model: "gpt-web", Turns: []protocol.Turn{{Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "search"}}}},
 		Tools: []protocol.ToolDefinition{{Kind: protocol.ToolWebSearch, Name: "web_search", Execution: protocol.ExecutionHosted, AllowedDomains: []string{"example.com"}, MaxUses: 5, ContextSize: protocol.WebContextHigh, UserLocation: &protocol.UserLocation{Country: "CN"}}},
 	}}

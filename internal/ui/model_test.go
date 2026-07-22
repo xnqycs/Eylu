@@ -488,14 +488,112 @@ func TestWebActivityAndCitationEventsRenderLifecycle(t *testing.T) {
 	completed := running
 	completed.Status = protocol.WebStatusCompleted
 	completed.Sources = []protocol.WebSource{{URL: "https://example.com", Title: "Example"}}
+	opened := protocol.WebActivity{CallID: "web-2", Kind: protocol.ToolWebSearch, URL: "https://example.com/page", Action: "open_page", Status: protocol.WebStatusCompleted}
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &running})
 	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &completed})
-	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventCitation, Citation: &protocol.URLCitation{URL: "https://example.com", Title: "Example"}})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &opened})
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventCitation, Citation: &protocol.URLCitation{CallID: "web-1", URL: "https://example.com", Title: "Example"}})
 	rendered := ansi.Strip(model.renderTimeline())
-	for _, expected := range []string{"Web search · running · Eylu", "Web search · completed · Eylu · 1 sources", "Example · https://example.com"} {
+	for _, expected := range []string{"Web search · completed · 1 source", "Search  Eylu", "Open  https://example.com/page"} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("missing %q:\n%s", expected, rendered)
 		}
+	}
+	if strings.Contains(rendered, "0 sources") || strings.Count(rendered, "Web search") != 1 {
+		t.Fatalf("web activity was not updated in place:\n%s", rendered)
+	}
+}
+
+func TestLocalWebFunctionToolIsRenderedOnlyAsWebActivity(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-web-function"
+	call := protocol.ToolCall{ID: "batch", Name: "web_search", Arguments: json.RawMessage(`{"queries":["one","two"]}`)}
+	activity := protocol.WebActivity{CallID: "batch:1", Kind: protocol.ToolWebSearch, Query: "one", Action: "search", Status: protocol.WebStatusRunning}
+	_, _ = model.handleBackendEvent(Event{OperationID: model.operationID, Kind: EventToolStart, ToolCall: &call})
+	_, _ = model.handleBackendEvent(Event{OperationID: model.operationID, Kind: EventWebActivity, WebActivity: &activity})
+	rendered := ansi.Strip(model.renderTimeline())
+	if strings.Contains(rendered, "> web_search") || !strings.Contains(rendered, "Web search · running") || !strings.Contains(rendered, "Search") || !strings.Contains(rendered, "one") {
+		t.Fatalf("rendered local web tool =\n%s", rendered)
+	}
+}
+
+func TestWebActivityGroupKeepsFiveNewestEntriesAndAnimatesOverflow(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	model := NewModel(&fakeBackend{}, Options{Clock: clock, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-web"
+	for index := 1; index <= 5; index++ {
+		activity := protocol.WebActivity{CallID: fmt.Sprintf("web-%d", index), Kind: protocol.ToolWebSearch, Query: fmt.Sprintf("query-%d", index), Action: "search", Status: protocol.WebStatusCompleted}
+		_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &activity})
+	}
+	sixth := protocol.WebActivity{CallID: "web-6", Kind: protocol.ToolWebSearch, Query: "query-6", Action: "search", Status: protocol.WebStatusRunning}
+	_, command := model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &sixth})
+	if command == nil {
+		t.Fatal("overflow did not schedule the upward transition")
+	}
+	before := ansi.Strip(model.renderTimeline())
+	if !strings.Contains(before, "query-1") || strings.Contains(before, "query-6") {
+		t.Fatalf("initial animation frame =\n%s", before)
+	}
+	_, _ = model.Update(command())
+	after := ansi.Strip(model.renderTimeline())
+	if strings.Contains(after, "query-1") || !strings.Contains(after, "query-6") || !strings.Contains(after, "▸ … +1 hidden") {
+		t.Fatalf("completed animation frame =\n%s", after)
+	}
+	seventh := protocol.WebActivity{CallID: "web-7", Kind: protocol.ToolWebSearch, Query: "query-7", Action: "search", Status: protocol.WebStatusRunning}
+	_, command = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &seventh})
+	_, _ = model.Update(command())
+	after = ansi.Strip(model.renderTimeline())
+	if strings.Contains(after, "query-2") || !strings.Contains(after, "query-7") || !strings.Contains(after, "▸ … +2 hidden") {
+		t.Fatalf("second animation frame =\n%s", after)
+	}
+}
+
+func TestWebActivityBatchQueriesCountAsItemsAndToggleExpansion(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-web"
+	activity := protocol.WebActivity{
+		CallID: "batch-1", Kind: protocol.ToolWebSearch, Action: "search", Status: protocol.WebStatusRunning,
+		Queries: []string{"query-1", "query-2", "query-3", "query-4", "query-5", "query-6"},
+	}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &activity})
+	collapsed := ansi.Strip(model.renderTimeline())
+	if strings.Contains(collapsed, "query-1") || !strings.Contains(collapsed, "query-6") || !strings.Contains(collapsed, "▸ … +1 hidden") {
+		t.Fatalf("collapsed batch =\n%s", collapsed)
+	}
+	group := model.timeline[len(model.timeline)-1].web
+	model.refreshViewport()
+	row := -1
+	for index, line := range selectionLines(model.viewport.GetContent(), model.viewport.Width()) {
+		if strings.HasPrefix(strings.TrimSpace(line.text), "▸ … +") {
+			row = index
+			break
+		}
+	}
+	visibleRow := row - model.viewport.YOffset()
+	if row < 0 || visibleRow < 0 || visibleRow >= model.viewport.Height() {
+		t.Fatalf("disclosure row=%d offset=%d height=%d", row, model.viewport.YOffset(), model.viewport.Height())
+	}
+	_, _ = model.handleMouse(tea.MouseClickMsg{X: model.viewportLeftInset() + 3, Y: model.layout().viewportTop + visibleRow, Button: tea.MouseLeft})
+	if !group.expanded {
+		t.Fatalf("disclosure click did not expand the group at row=%d", row)
+	}
+	expanded := ansi.Strip(model.renderTimeline())
+	if !strings.Contains(expanded, "query-1") || !strings.Contains(expanded, "query-6") || !strings.Contains(expanded, "▾ … 6 shown") {
+		t.Fatalf("expanded batch =\n%s", expanded)
+	}
+}
+
+func TestWebActivitySpinnerTickRefreshesViewport(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoColor: true, Width: 80, Height: 24})
+	model.operationID = "op-web"
+	model.state = StateStreaming
+	activity := protocol.WebActivity{CallID: "web-1", Kind: protocol.ToolWebSearch, Status: protocol.WebStatusRunning}
+	_, _ = model.handleBackendEvent(Event{OperationID: "op-web", Kind: EventWebActivity, WebActivity: &activity})
+	before := model.viewport.GetContent()
+	_, _ = model.Update(operationSpinnerMsg{operationID: "op-web", message: model.spinner.Tick()})
+	after := model.viewport.GetContent()
+	if before == after {
+		t.Fatal("running Web activity did not refresh with the spinner tick")
 	}
 }
 
@@ -2201,18 +2299,18 @@ func TestSnapshotHydratesHistoryAtBottomWithoutDuplicatingLiveTimeline(t *testin
 	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 50, Height: 16})
 	_, _ = model.Update(snapshotMsg{snapshot: backend.snapshot})
 	view := ansi.Strip(model.renderTimeline())
-	if len(model.timeline) != 6 || !strings.Contains(view, "old question") || !strings.Contains(view, "old answer") || !strings.Contains(view, "Web search · completed · Eylu · 1 sources") || !strings.Contains(view, "Example · https://example.com") || !strings.Contains(view, "> read_file  done") || !strings.Contains(view, "> bash  interrupted") {
+	if len(model.timeline) != 5 || !strings.Contains(view, "old question") || !strings.Contains(view, "old answer") || !strings.Contains(view, "Web search · completed · 1 source") || !strings.Contains(view, "Search  Eylu") || !strings.Contains(view, "> read_file  done") || !strings.Contains(view, "> bash  interrupted") {
 		t.Fatalf("timeline=%#v\n%s", model.timeline, view)
 	}
-	if model.timeline[4].tool.arguments != string(call.Arguments) || model.timeline[4].tool.content != "restored tool output" {
-		t.Fatalf("restored tool detail=%#v", model.timeline[4].tool)
+	if model.timeline[3].tool.arguments != string(call.Arguments) || model.timeline[3].tool.content != "restored tool output" {
+		t.Fatalf("restored tool detail=%#v", model.timeline[3].tool)
 	}
 	if !model.viewport.AtBottom() || !model.followOutput {
 		t.Fatalf("viewport bottom=%t follow=%t offset=%d", model.viewport.AtBottom(), model.followOutput, model.viewport.YOffset())
 	}
 	model.appendNotice("live notice", false)
 	_, _ = model.Update(snapshotMsg{snapshot: backend.snapshot})
-	if len(model.timeline) != 7 || model.timeline[6].text != "live notice" {
+	if len(model.timeline) != 6 || model.timeline[5].text != "live notice" {
 		t.Fatalf("same-session snapshot replaced live timeline: %#v", model.timeline)
 	}
 }

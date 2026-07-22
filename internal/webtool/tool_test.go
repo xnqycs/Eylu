@@ -2,10 +2,75 @@ package webtool
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"Eylu/internal/policy"
+	"Eylu/internal/protocol"
+	"Eylu/internal/tool"
 )
+
+func TestLocalWebToolDefaultsPermissionToAllow(t *testing.T) {
+	item := NewLocalTool(ResolvedTool{Definition: protocol.ToolDefinition{Kind: protocol.ToolWebSearch, Name: "web_search"}}, nil, nil, "", NewUsageBudget())
+	outcome, overridden := item.OverridePolicy(json.RawMessage(`{"query":"Eylu"}`))
+	if !overridden || outcome.Decision != policy.DecisionAllow || outcome.Confirmations != 0 {
+		t.Fatalf("outcome=%#v overridden=%t", outcome, overridden)
+	}
+}
+
+func TestDelegatedWebToolBatchExecutesConcurrently(t *testing.T) {
+	var ready atomic.Int32
+	var release sync.Once
+	gate := make(chan struct{})
+	delegate := func(_ context.Context, _ ResolvedTool, input json.RawMessage) protocol.ToolResult {
+		if ready.Add(1) == 2 {
+			release.Do(func() { close(gate) })
+		}
+		select {
+		case <-gate:
+			return protocol.ToolResult{Content: string(input)}
+		case <-time.After(time.Second):
+			return protocol.ToolResult{Content: "parallel execution timed out", IsError: true}
+		}
+	}
+	resolved := ResolvedTool{
+		Definition: protocol.ToolDefinition{Kind: protocol.ToolWebSearch, Name: "web_search", MaxUses: 2, InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`)},
+		Execution:  protocol.ExecutionDelegated,
+	}
+	item := NewLocalTool(resolved, nil, delegate, "allow", NewUsageBudget())
+	executor := &tool.Executor{Registry: tool.NewRegistry(item), Policy: policy.AllowAllChecker{}, MaxParallelTools: 2, Timeout: 2 * time.Second}
+	results := executor.ExecuteConcurrent(context.Background(), "request", []protocol.ToolCall{
+		{ID: "one", Name: "web_search", Arguments: json.RawMessage(`{"query":"one"}`)},
+		{ID: "two", Name: "web_search", Arguments: json.RawMessage(`{"query":"two"}`)},
+	})
+	if ready.Load() != 2 || len(results) != 2 || results[0].IsError || results[1].IsError {
+		t.Fatalf("ready=%d results=%#v", ready.Load(), results)
+	}
+}
+
+func TestInputValuesNormalizesBatchAndEnforcesLimit(t *testing.T) {
+	values, err := InputValues(protocol.ToolWebSearch, json.RawMessage(`{"queries":[" one ","two","one"]}`))
+	if err != nil || len(values) != 2 || values[0] != "one" || values[1] != "two" {
+		t.Fatalf("values=%#v err=%v", values, err)
+	}
+	tooMany := make([]string, MaxBatchQueries+1)
+	for index := range tooMany {
+		tooMany[index] = fmt.Sprintf("query-%d", index)
+	}
+	raw, _ := json.Marshal(map[string]any{"queries": tooMany})
+	if _, err := InputValues(protocol.ToolWebSearch, raw); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Fatalf("limit error=%v", err)
+	}
+	if _, err := InputValues(protocol.ToolWebSearch, json.RawMessage(`{"query":"one","queries":["two"]}`)); err == nil {
+		t.Fatal("query and queries were accepted together")
+	}
+}
 
 func TestValidateURLDomainAndAddressPolicy(t *testing.T) {
 	publicLookup := func(context.Context, string, string) ([]net.IP, error) {

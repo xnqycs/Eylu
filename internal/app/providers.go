@@ -211,7 +211,7 @@ func (r *runtime) providerUpsertCommand(verb string, editing bool) *cobra.Comman
 	cmd.Flags().IntVar(&opts.routingPriority, "routing-priority", 0, "automatic routing priority")
 	cmd.Flags().Float64Var(&opts.inputCost, "input-cost", 0, "input cost per million tokens")
 	cmd.Flags().Float64Var(&opts.outputCost, "output-cost", 0, "output cost per million tokens")
-	cmd.Flags().StringVar(&opts.webPermission, "web-permission", "ask", "web permission: ask, allow, or deny")
+	cmd.Flags().StringVar(&opts.webPermission, "web-permission", "allow", "web permission: ask, allow, or deny")
 	cmd.Flags().StringVar(&opts.webSearch, "web-search", "auto", "web search mode: off, auto, hosted, delegated, or client")
 	cmd.Flags().StringVar(&opts.webFetch, "web-fetch", "auto", "web fetch mode: off, auto, hosted, delegated, or client")
 	cmd.Flags().StringVar(&opts.searchFallback, "web-search-fallback", "", "web search fallback: delegated or client")

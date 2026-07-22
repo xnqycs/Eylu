@@ -28,8 +28,10 @@ const (
 	fixedChromeRows        = 5 + activityGapRows
 	minViewportRows        = 4
 	maxTaskPanelItems      = 5
+	maxWebActivityItems    = 5
 	bannerViewportRows     = 8
 	colorAnimationInterval = 50 * time.Millisecond
+	webShiftInterval       = 70 * time.Millisecond
 	colorSpatialFrequency  = 0.24
 	colorTemporalFrequency = 2.0
 )
@@ -397,12 +399,16 @@ func (m *Model) renderTimeline() string {
 				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.Agent.Render("EYLU"), m.renderTimelineMarkdown(item))
 			}
 		case timelineTool:
-			if item.tool != nil && item.tool.name == "todolist" {
+			if item.tool != nil && (item.tool.name == "todolist" || isWebFunctionToolName(item.tool.name)) {
 				continue
 			}
 			fmt.Fprintf(&output, "%s\n", m.renderTool(item.tool))
 			if next, ok := m.nextVisibleTimelineKind(index); ok && next != timelineTool {
 				output.WriteByte('\n')
+			}
+		case timelineWeb:
+			if item.web != nil {
+				fmt.Fprintf(&output, "%s\n\n", m.renderWebActivityGroup(item.web, contentWidth))
 			}
 		case timelineNotice:
 			style := m.styles.Status
@@ -436,7 +442,7 @@ func (m *Model) renderMCPStartupStatus() string {
 func (m *Model) nextVisibleTimelineKind(index int) (timelineKind, bool) {
 	for next := index + 1; next < len(m.timeline); next++ {
 		item := m.timeline[next]
-		if item.kind == timelineTool && (item.tool == nil || item.tool.name == "todolist") {
+		if item.kind == timelineTool && (item.tool == nil || item.tool.name == "todolist" || isWebFunctionToolName(item.tool.name)) {
 			continue
 		}
 		return item.kind, true
@@ -563,6 +569,151 @@ func (m *Model) renderTool(tool *toolView) string {
 		}
 	}
 	return m.styles.Tool.Render(strings.Join(lines, "\n"))
+}
+
+func (m *Model) renderWebActivityGroup(group *webActivityView, width int) string {
+	if group == nil || len(group.activities) == 0 {
+		return ""
+	}
+	status := protocol.WebStatusCompleted
+	hasSearch, hasFetch := false, false
+	sources := make(map[string]bool)
+	for _, activity := range group.activities {
+		hasSearch = hasSearch || activity.Kind != protocol.ToolWebFetch
+		hasFetch = hasFetch || activity.Kind == protocol.ToolWebFetch
+		if activity.Status == protocol.WebStatusRunning || activity.Status == protocol.WebStatusPending || activity.Status == "" {
+			status = protocol.WebStatusRunning
+		} else if activity.Status == protocol.WebStatusError && status != protocol.WebStatusRunning {
+			status = protocol.WebStatusError
+		}
+		for _, source := range activity.Sources {
+			if source.URL != "" {
+				sources[source.URL] = true
+			}
+		}
+	}
+	label := "Web search"
+	if hasFetch && !hasSearch {
+		label = "Web fetch"
+	}
+	header := fmt.Sprintf("%s · %s", label, status)
+	if len(sources) > 0 {
+		noun := "sources"
+		if len(sources) == 1 {
+			noun = "source"
+		}
+		header += fmt.Sprintf(" · %d %s", len(sources), noun)
+	}
+	items := flattenWebActivities(group.activities)
+	lines := []string{m.styles.Status.Render(truncateColumns(header, width))}
+	start, end := max(0, len(items)-maxWebActivityItems), len(items)
+	if group.expanded {
+		start = 0
+	} else if group.shiftFrame == 0 && len(items) > maxWebActivityItems {
+		start = max(0, len(items)-maxWebActivityItems-1)
+		end = len(items) - 1
+	}
+	if len(items) > maxWebActivityItems {
+		disclosure := fmt.Sprintf("  ▸ … +%d hidden", len(items)-maxWebActivityItems)
+		if group.expanded {
+			disclosure = fmt.Sprintf("  ▾ … %d shown", len(items))
+		}
+		lines = append(lines, m.styles.Muted.Render(truncateColumns(disclosure, width)))
+	}
+	for index := start; index < end; index++ {
+		prefix := "  ├ "
+		if index == end-1 {
+			prefix = "  └ "
+		}
+		lines = append(lines, m.renderWebActivityItem(items[index], prefix, width))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func flattenWebActivities(activities []protocol.WebActivity) []protocol.WebActivity {
+	items := make([]protocol.WebActivity, 0, webActivityItemCount(activities))
+	for _, activity := range activities {
+		queries := activity.Queries
+		if len(queries) == 0 && strings.TrimSpace(activity.Query) != "" {
+			queries = []string{activity.Query}
+		}
+		searchAction := activity.Kind != protocol.ToolWebFetch && (activity.Action == "" || activity.Action == "search")
+		if !searchAction || len(queries) == 0 {
+			items = append(items, activity)
+			continue
+		}
+		for _, query := range queries {
+			item := activity
+			item.Query = query
+			item.Queries = nil
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func webActivityItemCount(activities []protocol.WebActivity) int {
+	count := 0
+	for _, activity := range activities {
+		searchAction := activity.Kind != protocol.ToolWebFetch && (activity.Action == "" || activity.Action == "search")
+		if searchAction && len(activity.Queries) > 0 {
+			count += len(activity.Queries)
+		} else {
+			count++
+		}
+	}
+	return count
+}
+
+func (m *Model) renderWebActivityItem(activity protocol.WebActivity, prefix string, width int) string {
+	label := "Search"
+	detail := strings.TrimSpace(activity.Query)
+	switch activity.Action {
+	case "open_page":
+		label, detail = "Open", strings.TrimSpace(activity.URL)
+	case "find_in_page":
+		label = "Find"
+		pattern, pageURL := strings.TrimSpace(activity.Pattern), strings.TrimSpace(activity.URL)
+		switch {
+		case pattern != "" && pageURL != "":
+			detail = fmt.Sprintf("%q in %s", pattern, pageURL)
+		case pattern != "":
+			detail = pattern
+		default:
+			detail = pageURL
+		}
+	default:
+		if activity.Kind == protocol.ToolWebFetch {
+			label, detail = "Fetch", strings.TrimSpace(activity.URL)
+		}
+	}
+	marker := ""
+	if activity.Status == protocol.WebStatusRunning || activity.Status == protocol.WebStatusPending || activity.Status == "" {
+		marker = " " + m.spinner.View()
+	} else if activity.Status == protocol.WebStatusError {
+		marker = " !"
+	}
+	lead := prefix + label + marker
+	available := max(1, width-lipgloss.Width(lead)-2)
+	detail = truncateColumns(detail, available)
+	if strings.HasPrefix(detail, "http://") || strings.HasPrefix(detail, "https://") {
+		detail = m.renderWebURL(detail)
+	}
+	line := lead
+	if detail != "" {
+		line += "  " + detail
+	}
+	if activity.Status == protocol.WebStatusError && activity.Error != "" {
+		line += "  " + activity.Error
+	}
+	return m.styles.Muted.Render(prefix) + m.styles.Agent.Render(strings.TrimPrefix(line, prefix))
+}
+
+func (m *Model) renderWebURL(value string) string {
+	if m.noColor || value == "" {
+		return value
+	}
+	return ansi.SetHyperlink(value) + value + ansi.ResetHyperlink()
 }
 
 func (m *Model) renderToolFileDetail(tool *toolView) string {

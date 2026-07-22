@@ -19,11 +19,14 @@ import (
 type DelegateFunc func(context.Context, ResolvedTool, json.RawMessage) protocol.ToolResult
 
 type UsageBudget struct {
-	mu   sync.Mutex
-	uses map[protocol.ToolKind]int
+	mu      sync.Mutex
+	uses    map[protocol.ToolKind]int
+	batches map[string]struct{}
 }
 
-func NewUsageBudget() *UsageBudget { return &UsageBudget{uses: make(map[protocol.ToolKind]int)} }
+func NewUsageBudget() *UsageBudget {
+	return &UsageBudget{uses: make(map[protocol.ToolKind]int), batches: make(map[string]struct{})}
+}
 
 func (b *UsageBudget) Record(kind protocol.ToolKind, maximum int) bool {
 	if b == nil {
@@ -41,8 +44,25 @@ func (b *UsageBudget) Record(kind protocol.ToolKind, maximum int) bool {
 	return true
 }
 
-func (b *UsageBudget) acquire(kind protocol.ToolKind, maximum int) bool {
-	return b.Record(kind, maximum)
+func (b *UsageBudget) acquire(kind protocol.ToolKind, maximum int, batchID string) bool {
+	if b == nil || batchID == "" {
+		return b == nil || b.Record(kind, maximum)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	key := string(kind) + "\x00" + batchID
+	if _, ok := b.batches[key]; ok {
+		return true
+	}
+	if maximum <= 0 {
+		maximum = 5
+	}
+	if b.uses[kind] >= maximum {
+		return false
+	}
+	b.uses[kind]++
+	b.batches[key] = struct{}{}
+	return true
 }
 
 type LocalTool struct {
@@ -79,7 +99,7 @@ func (t *LocalTool) ParallelSafe() bool { return true }
 func (t *LocalTool) OverridePolicy(json.RawMessage) (policy.Outcome, bool) {
 	permission := strings.ToLower(strings.TrimSpace(t.permission))
 	if permission == "" {
-		permission = config.WebPermissionAsk
+		permission = config.WebPermissionAllow
 	}
 	outcome := policy.Outcome{Risk: policy.RiskNetwork, Classification: policy.CommandNotApplicable, Reason: "web access policy"}
 	switch permission {
@@ -95,22 +115,26 @@ func (t *LocalTool) OverridePolicy(json.RawMessage) (policy.Outcome, bool) {
 }
 
 func (t *LocalTool) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
-	if !t.budget.acquire(t.resolved.Definition.Kind, t.resolved.Definition.MaxUses) {
-		return protocol.ToolResult{Content: fmt.Sprintf("%s max_uses exceeded", t.resolved.Definition.Kind), IsError: true, Metadata: t.metadata()}
-	}
 	var input map[string]any
 	if err := json.Unmarshal(raw, &input); err != nil {
 		return protocol.ToolResult{Content: "invalid web tool input: " + err.Error(), IsError: true, Metadata: t.metadata()}
+	}
+	values, err := InputValues(t.resolved.Definition.Kind, raw)
+	if err != nil {
+		return protocol.ToolResult{Content: "invalid web tool input: " + err.Error(), IsError: true, Metadata: t.metadata()}
+	}
+	if len(values) != 1 {
+		return protocol.ToolResult{Content: "batched web search was not expanded before execution", IsError: true, Metadata: t.metadata()}
+	}
+	batchID, _ := input["_eylu_batch_id"].(string)
+	if !t.budget.acquire(t.resolved.Definition.Kind, t.resolved.Definition.MaxUses, batchID) {
+		return protocol.ToolResult{Content: fmt.Sprintf("%s max_uses exceeded", t.resolved.Definition.Kind), IsError: true, Metadata: t.metadata()}
 	}
 	field := "query"
 	if t.resolved.Definition.Kind == protocol.ToolWebFetch {
 		field = "url"
 	}
-	value, _ := input[field].(string)
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return protocol.ToolResult{Content: fmt.Sprintf("web tool input requires %q", field), IsError: true, Metadata: t.metadata()}
-	}
+	value := values[0]
 	if field == "url" {
 		if err := ValidateURL(ctx, value, t.resolved.Definition.AllowedDomains, t.resolved.Definition.BlockedDomains); err != nil {
 			return protocol.ToolResult{Content: "web fetch denied: " + err.Error(), IsError: true, Metadata: t.metadata()}
@@ -120,7 +144,8 @@ func (t *LocalTool) Execute(ctx context.Context, raw json.RawMessage) protocol.T
 		if t.delegate == nil {
 			return protocol.ToolResult{Content: "delegated web backend is unavailable", IsError: true, Metadata: t.metadata()}
 		}
-		result := t.delegate(ctx, t.resolved, raw)
+		delegateInput, _ := json.Marshal(map[string]string{field: value})
+		result := t.delegate(ctx, t.resolved, delegateInput)
 		result.Metadata = mergeMetadata(result.Metadata, t.metadata())
 		return result
 	}
@@ -138,6 +163,51 @@ func (t *LocalTool) Execute(ctx context.Context, raw json.RawMessage) protocol.T
 	result := t.target.Execute(ctx, encoded)
 	result.Metadata = mergeMetadata(result.Metadata, t.metadata())
 	return result
+}
+
+func InputValues(kind protocol.ToolKind, raw json.RawMessage) ([]string, error) {
+	var input struct {
+		Query   string   `json:"query"`
+		Queries []string `json:"queries"`
+		URL     string   `json:"url"`
+	}
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return nil, err
+	}
+	if kind == protocol.ToolWebFetch {
+		value := strings.TrimSpace(input.URL)
+		if value == "" {
+			return nil, fmt.Errorf("web tool input requires %q", "url")
+		}
+		return []string{value}, nil
+	}
+	query := strings.TrimSpace(input.Query)
+	if query != "" && len(input.Queries) > 0 {
+		return nil, fmt.Errorf("web search accepts query or queries, not both")
+	}
+	if query != "" {
+		return []string{query}, nil
+	}
+	values := make([]string, 0, len(input.Queries))
+	seen := make(map[string]struct{}, len(input.Queries))
+	for _, candidate := range input.Queries {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return nil, fmt.Errorf("web search queries cannot contain empty values")
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		values = append(values, candidate)
+	}
+	if len(values) == 0 {
+		return nil, fmt.Errorf("web tool input requires %q or %q", "query", "queries")
+	}
+	if len(values) > MaxBatchQueries {
+		return nil, fmt.Errorf("web search accepts at most %d queries per batch", MaxBatchQueries)
+	}
+	return values, nil
 }
 
 func (t *LocalTool) metadata() map[string]any {

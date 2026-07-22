@@ -163,6 +163,17 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 }
 
 func (e *Executor) ExecuteBatch(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks) ([]protocol.ToolResult, error) {
+	return e.executeBatch(ctx, requestID, calls, hooks, e.ParallelLimit())
+}
+
+func (e *Executor) ExecuteBatchWithLimit(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks, limit int) ([]protocol.ToolResult, error) {
+	if limit <= 0 {
+		limit = e.ParallelLimit()
+	}
+	return e.executeBatch(ctx, requestID, calls, hooks, limit)
+}
+
+func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks, limit int) ([]protocol.ToolResult, error) {
 	results := make([]protocol.ToolResult, len(calls))
 	if len(calls) == 0 {
 		return results, nil
@@ -223,7 +234,6 @@ func (e *Executor) ExecuteBatch(ctx context.Context, requestID string, calls []p
 		return results, batchErr
 	}
 
-	limit := e.ParallelLimit()
 	if limit > len(prepared) {
 		limit = len(prepared)
 	}

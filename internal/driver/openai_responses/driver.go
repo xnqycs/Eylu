@@ -40,16 +40,39 @@ func (d *Driver) Capabilities() driver.Capabilities {
 }
 
 func (d *Driver) CapabilitiesFor(target driver.CapabilityTarget) driver.Capabilities {
-	provider := strings.ToLower(strings.TrimSpace(target.Provider))
+	provider := responsesProvider(target)
 	capabilities := driver.Capabilities{
 		TextStreaming: true, ToolCalling: true, ParallelTools: true, Reasoning: true, ImageInput: true, RemoteSession: true,
 	}
-	if provider == "openai" || provider == "xai" || provider == "openrouter" {
+	switch provider {
+	case "openai", "xai":
+		capabilities.HostedWebSearch = true
+	case "openrouter":
 		capabilities.HostedWebSearch, capabilities.HostedWebFetch = true, true
+	}
+	if capabilities.HostedWebSearch || capabilities.HostedWebFetch {
 		capabilities.HostedToolStreaming, capabilities.HostedAndFunctionTools = true, true
 		capabilities.SearchDomainFilter, capabilities.SearchLocation, capabilities.SearchUsageDetails = true, true, true
 	}
 	return capabilities
+}
+
+func responsesProvider(target driver.CapabilityTarget) string {
+	if provider := strings.ToLower(strings.TrimSpace(target.Provider)); provider != "" {
+		return provider
+	}
+	model := strings.ToLower(strings.TrimSpace(target.Model))
+	if index := strings.LastIndexByte(model, '/'); index >= 0 {
+		model = model[index+1:]
+	}
+	switch {
+	case strings.HasPrefix(model, "gpt-"), strings.HasPrefix(model, "chatgpt-"):
+		return "openai"
+	case strings.HasPrefix(model, "grok-"):
+		return "xai"
+	default:
+		return ""
+	}
 }
 
 type requestBody struct {
@@ -132,20 +155,23 @@ type responseBody struct {
 	Usage  *responseUsage `json:"usage"`
 }
 
+type responseWebAction struct {
+	Type    string   `json:"type"`
+	Query   string   `json:"query"`
+	Queries []string `json:"queries"`
+	URL     string   `json:"url"`
+	Pattern string   `json:"pattern"`
+}
+
 type responseItem struct {
-	Type      string `json:"type"`
-	Role      string `json:"role"`
-	ID        string `json:"id"`
-	CallID    string `json:"call_id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-	Status    string `json:"status"`
-	Action    struct {
-		Type    string `json:"type"`
-		Query   string `json:"query"`
-		URL     string `json:"url"`
-		Pattern string `json:"pattern"`
-	} `json:"action"`
+	Type         string               `json:"type"`
+	Role         string               `json:"role"`
+	ID           string               `json:"id"`
+	CallID       string               `json:"call_id"`
+	Name         string               `json:"name"`
+	Arguments    string               `json:"arguments"`
+	Status       string               `json:"status"`
+	Action       responseWebAction    `json:"action"`
 	Sources      []protocol.WebSource `json:"sources"`
 	Content      []responseContent    `json:"content"`
 	Raw          json.RawMessage      `json:"-"`
@@ -306,7 +332,7 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "provider returned no text or tool calls"}
 	}
 	if emit != nil {
-		if err := emitResponseParts(result, emit, nil, true); err != nil {
+		if err := emitResponseParts(result, emit, nil, nil, true); err != nil {
 			return protocol.ModelResponse{}, err
 		}
 		if err := emit(protocol.ModelEvent{Kind: protocol.EventUsage, Usage: &result.Usage}); err != nil {
@@ -505,12 +531,16 @@ func mapToolDefinition(definition protocol.ToolDefinition, target driver.Capabil
 	if !kind.IsWeb() {
 		return tool{}, false, &protocol.Error{Code: protocol.ErrUnsupportedTool, Message: fmt.Sprintf("unknown tool kind %q", kind)}
 	}
-	provider := strings.ToLower(strings.TrimSpace(target.Provider))
+	provider := responsesProvider(target)
 	typeName := string(kind)
 	if provider == "openrouter" {
 		typeName = "openrouter:" + string(kind)
 	}
-	mapped := tool{Type: typeName, SearchContextSize: string(definition.ContextSize.Effective()), MaxUses: definition.MaxUses}
+	maxUses := definition.MaxUses
+	if provider == "openai" || provider == "xai" || provider == "openrouter" {
+		maxUses = 0
+	}
+	mapped := tool{Type: typeName, SearchContextSize: string(definition.ContextSize.Effective()), MaxUses: maxUses}
 	if len(definition.AllowedDomains) > 0 || len(definition.BlockedDomains) > 0 {
 		mapped.Filters = &webFilters{AllowedDomains: definition.AllowedDomains, BlockedDomains: definition.BlockedDomains}
 	}
@@ -566,7 +596,7 @@ func webActivityFromItem(item responseItem, usage *responseUsage) protocol.WebAc
 		status = protocol.WebStatusCompleted
 	}
 	activity := protocol.WebActivity{
-		CallID: item.ID, Kind: kind, Query: item.Action.Query, URL: item.Action.URL, Action: item.Action.Type,
+		CallID: item.ID, Kind: kind, Query: item.Action.Query, Queries: cleanWebQueries(item.Action.Queries), URL: item.Action.URL, Pattern: item.Action.Pattern, Action: item.Action.Type,
 		Status: status, Sources: append([]protocol.WebSource(nil), item.Sources...), RawProviderResponse: append(json.RawMessage(nil), item.Raw...), RawTruncated: item.RawTruncated,
 	}
 	if activity.Action == "" {
@@ -587,7 +617,21 @@ func webActivityFromItem(item responseItem, usage *responseUsage) protocol.WebAc
 	return activity
 }
 
-func emitResponseParts(response protocol.ModelResponse, emit driver.EmitFunc, started map[string]bool, includeText bool) error {
+func cleanWebQueries(values []string) []string {
+	cleaned := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		cleaned = append(cleaned, value)
+	}
+	return cleaned
+}
+
+func emitResponseParts(response protocol.ModelResponse, emit driver.EmitFunc, started, terminal map[string]bool, includeText bool) error {
 	for _, part := range response.Turn.Parts {
 		switch {
 		case part.Kind == protocol.PartText && includeText:
@@ -607,12 +651,14 @@ func emitResponseParts(response protocol.ModelResponse, emit driver.EmitFunc, st
 					return err
 				}
 			}
-			completedKind := protocol.EventWebSearchCompleted
-			if activity.Kind == protocol.ToolWebFetch {
-				completedKind = protocol.EventWebFetchCompleted
-			}
-			if err := emit(protocol.ModelEvent{Kind: completedKind, WebActivity: &activity}); err != nil {
-				return err
+			if terminal == nil || !terminal[activity.CallID] {
+				completedKind := protocol.EventWebSearchCompleted
+				if activity.Kind == protocol.ToolWebFetch {
+					completedKind = protocol.EventWebFetchCompleted
+				}
+				if err := emit(protocol.ModelEvent{Kind: completedKind, WebActivity: &activity}); err != nil {
+					return err
+				}
 			}
 		case part.Kind == protocol.PartCitation && part.Citation != nil:
 			citation := *part.Citation

@@ -24,6 +24,21 @@ import (
 	"Eylu/internal/provider"
 )
 
+func TestKnownDriverCapabilitiesInfersGPTWebToolsForRelay(t *testing.T) {
+	snapshot := provider.Snapshot{Name: "default", Config: config.ProviderConfig{Adapter: "openai_responses", Model: "gpt-5.6-sol"}}
+	capabilities, ok := knownDriverCapabilities(snapshot)
+	if !ok || !capabilities.HostedWebSearch || capabilities.HostedWebFetch || !capabilities.HostedAndFunctionTools {
+		t.Fatalf("capabilities = %#v, known = %t", capabilities, ok)
+	}
+
+	disabled := false
+	snapshot.Config.WebCapabilities.HostedWebSearch = &disabled
+	capabilities, ok = knownDriverCapabilities(snapshot)
+	if !ok || capabilities.HostedWebSearch || capabilities.HostedWebFetch {
+		t.Fatalf("overridden capabilities = %#v, known = %t", capabilities, ok)
+	}
+}
+
 func TestChatEndToEnd(t *testing.T) {
 	isolateUserState(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

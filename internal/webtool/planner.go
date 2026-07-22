@@ -3,6 +3,7 @@ package webtool
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -30,6 +31,8 @@ type ResolvedWebToolPlan struct {
 	Hosted      []ResolvedTool
 	Local       []ResolvedTool
 }
+
+const MaxBatchQueries = 10
 
 func Resolve(input PlanInput) (ResolvedWebToolPlan, error) {
 	input.Capabilities = ApplyCapabilityOverrides(input.Capabilities, input.Provider.WebCapabilities)
@@ -76,8 +79,11 @@ func resolveOne(input PlanInput, kind protocol.ToolKind, cfg config.WebToolConfi
 		return ResolvedTool{}, false, err
 	}
 	execution := protocol.ToolExecution(cfg.Execution).Effective()
+	selfDelegated := execution == protocol.ExecutionAuto && prefersClientWebFanout(input.Provider, kind)
 	if execution == protocol.ExecutionAuto {
-		if hostedSupported(kind, cfg, input.Capabilities, hasFunctions) {
+		if selfDelegated && hostedSupported(kind, cfg, input.Capabilities, false) {
+			execution = protocol.ExecutionDelegated
+		} else if hostedSupported(kind, cfg, input.Capabilities, hasFunctions) {
 			execution = protocol.ExecutionHosted
 		} else if cfg.Fallback != "" {
 			execution = protocol.ToolExecution(cfg.Fallback)
@@ -89,6 +95,9 @@ func resolveOne(input PlanInput, kind protocol.ToolKind, cfg config.WebToolConfi
 	}
 	resolved := ResolvedTool{Definition: definition, Execution: execution}
 	resolved.Definition.Execution = execution
+	if execution == protocol.ExecutionClient || execution == protocol.ExecutionDelegated {
+		resolved.Definition.InputSchema = canonicalInputSchema(kind)
+	}
 	switch execution {
 	case protocol.ExecutionHosted:
 		if !hostedSupported(kind, cfg, input.Capabilities, hasFunctions) {
@@ -108,8 +117,11 @@ func resolveOne(input PlanInput, kind protocol.ToolKind, cfg config.WebToolConfi
 		}
 	case protocol.ExecutionDelegated:
 		resolved.Target = strings.TrimSpace(cfg.DelegatedProvider)
-		if resolved.Target == "" || resolved.Target == input.ProviderName {
-			return ResolvedTool{}, false, unsupported(kind, input.ProviderName, "delegated provider must reference another configured provider")
+		if resolved.Target == "" && selfDelegated {
+			resolved.Target = input.ProviderName
+		}
+		if resolved.Target == "" {
+			return ResolvedTool{}, false, unsupported(kind, input.ProviderName, "delegated provider is required")
 		}
 	default:
 		return ResolvedTool{}, false, unsupported(kind, input.ProviderName, fmt.Sprintf("execution %q is invalid", execution))
@@ -128,7 +140,7 @@ func definitionFor(kind protocol.ToolKind, cfg config.WebToolConfig) (protocol.T
 		definition.MaxUses = 5
 	}
 	if kind == protocol.ToolWebSearch {
-		definition.Description = "Search the public web and return cited sources."
+		definition.Description = "Search the public web and return cited sources. Put two or more independent searches in queries so they execute concurrently in one tool round."
 	} else {
 		definition.Description = "Fetch an allowed public web page and return cited content."
 	}
@@ -153,6 +165,32 @@ func definitionFor(kind protocol.ToolKind, cfg config.WebToolConfig) (protocol.T
 		definition.InputSchema = json.RawMessage(fmt.Sprintf(`{"type":"object","properties":{"%s":{"type":"string"}},"required":["%s"],"additionalProperties":false}`, property, property))
 	}
 	return definition, nil
+}
+
+func canonicalInputSchema(kind protocol.ToolKind) json.RawMessage {
+	if kind == protocol.ToolWebSearch {
+		return json.RawMessage(fmt.Sprintf(`{"type":"object","properties":{"query":{"type":"string","minLength":1},"queries":{"type":"array","items":{"type":"string","minLength":1},"minItems":1,"maxItems":%d}},"oneOf":[{"required":["query"]},{"required":["queries"]}],"additionalProperties":false}`, MaxBatchQueries))
+	}
+	return json.RawMessage(`{"type":"object","properties":{"url":{"type":"string","minLength":1}},"required":["url"],"additionalProperties":false}`)
+}
+
+func prefersClientWebFanout(provider config.ProviderConfig, kind protocol.ToolKind) bool {
+	if kind != protocol.ToolWebSearch || !strings.EqualFold(strings.TrimSpace(provider.Adapter), "openai_responses") || strings.TrimSpace(provider.CatalogProvider) != "" {
+		return false
+	}
+	model := strings.ToLower(strings.TrimSpace(provider.Model))
+	if slash := strings.LastIndexByte(model, '/'); slash >= 0 {
+		model = model[slash+1:]
+	}
+	if !strings.HasPrefix(model, "gpt-") && !strings.HasPrefix(model, "chatgpt-") {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(provider.BaseURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host != "" && host != "api.openai.com"
 }
 
 func hostedSupported(kind protocol.ToolKind, cfg config.WebToolConfig, capabilities driver.Capabilities, hasFunctions bool) bool {
