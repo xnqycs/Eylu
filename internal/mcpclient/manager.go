@@ -1294,6 +1294,7 @@ func (runtime *serverRuntime) withSessionCall(ctx context.Context, call func(con
 		return nil, err
 	}
 	result, callErr := call(callCtx, session)
+	callErr = normalizeSessionMissingError(callErr)
 	cancel()
 	if callErr != nil && runtime.manager != nil {
 		if errors.Is(callErr, sdkmcp.ErrSessionMissing) {
@@ -1303,6 +1304,18 @@ func (runtime *serverRuntime) withSessionCall(ctx context.Context, call func(con
 		}
 	}
 	return result, callErr
+}
+
+func normalizeSessionMissingError(err error) error {
+	if err == nil || errors.Is(err, sdkmcp.ErrSessionMissing) {
+		return err
+	}
+	if !strings.Contains(err.Error(), sdkmcp.ErrSessionMissing.Error()) {
+		return err
+	}
+	// The SDK can flatten ErrSessionMissing behind its client-closing error
+	// when the stream reader and request writer observe the same 404 together.
+	return fmt.Errorf("%w: %w", sdkmcp.ErrSessionMissing, err)
 }
 
 func (m *Manager) failSession(runtime *serverRuntime, session *sdkmcp.ClientSession, failure error) {

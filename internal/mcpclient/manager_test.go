@@ -85,6 +85,29 @@ func TestProtocolErrorDataPreservesJSONRPCFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeSessionMissingErrorRestoresFlattenedSDKSentinel(t *testing.T) {
+	flattened := errors.Join(
+		context.Canceled,
+		errors.New(`client is closing: sending "resources/read": failed to connect: session not found`),
+	)
+	if errors.Is(flattened, sdkmcp.ErrSessionMissing) {
+		t.Fatal("flattened fixture unexpectedly preserves ErrSessionMissing")
+	}
+	normalized := normalizeSessionMissingError(flattened)
+	if !errors.Is(normalized, sdkmcp.ErrSessionMissing) || !errors.Is(normalized, context.Canceled) {
+		t.Fatalf("normalized error=%v", normalized)
+	}
+
+	direct := fmt.Errorf("read resource: %w", sdkmcp.ErrSessionMissing)
+	if normalizedDirect := normalizeSessionMissingError(direct); normalizedDirect != direct {
+		t.Fatalf("direct sentinel changed from %v to %v", direct, normalizedDirect)
+	}
+	unrelated := errors.New("resource not found")
+	if normalizedUnrelated := normalizeSessionMissingError(unrelated); normalizedUnrelated != unrelated {
+		t.Fatalf("unrelated error changed from %v to %v", unrelated, normalizedUnrelated)
+	}
+}
+
 func TestInspectRedactsServerArgumentsAndURLs(t *testing.T) {
 	secrets := []string{
 		"long-inline-secret", "long-separate-secret", "short-separate-secret", "short-inline-secret",
