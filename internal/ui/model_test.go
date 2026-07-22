@@ -1620,6 +1620,180 @@ func TestProviderFormValidationAndModelFiltering(t *testing.T) {
 	}
 }
 
+func TestModelsPaginationNavigationAndRendering(t *testing.T) {
+	newPaginatedModel := func(width, height, count int) *Model {
+		t.Helper()
+		model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: width, Height: height})
+		model.screen = screenModels
+		model.state = StateIdle
+		model.models = make([]string, count)
+		for index := range model.models {
+			model.models[index] = fmt.Sprintf("model-%02d", index)
+		}
+		return model
+	}
+
+	t.Run("renders only the selected responsive page", func(t *testing.T) {
+		model := newPaginatedModel(120, 16, 18)
+		firstPage := model.modelPage(len(model.models))
+		if firstPage.size != max(1, model.viewport.Height()-4) {
+			t.Fatalf("page size=%d viewport=%d", firstPage.size, model.viewport.Height())
+		}
+		model.modelCursor = firstPage.size + 2
+		page := model.modelPage(len(model.models))
+		rendered := ansi.Strip(model.renderModels())
+		for index := page.start; index < page.end; index++ {
+			if !strings.Contains(rendered, model.models[index]) {
+				t.Fatalf("page item %q missing:\n%s", model.models[index], rendered)
+			}
+		}
+		if page.start > 0 && strings.Contains(rendered, model.models[page.start-1]) {
+			t.Fatalf("previous page item leaked into rendered page:\n%s", rendered)
+		}
+		footer := fmt.Sprintf("Page %d/%d · ←/→ page · ↑/↓ select · Enter use · m manual · r refresh · Esc back", page.number, page.total)
+		if !strings.Contains(rendered, footer) {
+			t.Fatalf("page footer missing %q:\n%s", footer, rendered)
+		}
+		view := ansi.Strip(model.View().Content)
+		if lipgloss.Height(view) != model.height {
+			t.Fatalf("view height=%d want=%d\n%s", lipgloss.Height(view), model.height, view)
+		}
+	})
+
+	t.Run("left and right preserve the row when possible", func(t *testing.T) {
+		model := newPaginatedModel(80, 16, 17)
+		pageSize := model.modelPage(len(model.models)).size
+		model.modelCursor = 2
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+		if model.modelCursor != pageSize+2 {
+			t.Fatalf("right cursor=%d want=%d", model.modelCursor, pageSize+2)
+		}
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+		if model.modelCursor != 2*pageSize+2 {
+			t.Fatalf("second right cursor=%d want=%d", model.modelCursor, 2*pageSize+2)
+		}
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+		if model.modelCursor != len(model.models)-1 {
+			t.Fatalf("short final page cursor=%d want=%d", model.modelCursor, len(model.models)-1)
+		}
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+		if model.modelCursor != len(model.models)-1 {
+			t.Fatalf("right moved beyond final page: %d", model.modelCursor)
+		}
+		lastPage := model.modelPage(len(model.models))
+		lastPageOffset := model.modelCursor - lastPage.start
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+		if model.modelCursor != lastPage.start-pageSize+lastPageOffset {
+			t.Fatalf("left cursor=%d want=%d", model.modelCursor, lastPage.start-pageSize+lastPageOffset)
+		}
+	})
+
+	t.Run("vertical selection crosses pages and wraps the list", func(t *testing.T) {
+		model := newPaginatedModel(80, 16, 13)
+		pageSize := model.modelPage(len(model.models)).size
+		model.modelCursor = pageSize - 1
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+		if model.modelCursor != pageSize || model.modelPage(len(model.models)).number != 2 {
+			t.Fatalf("down cursor=%d page=%d", model.modelCursor, model.modelPage(len(model.models)).number)
+		}
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+		if model.modelCursor != pageSize-1 {
+			t.Fatalf("up cursor=%d want=%d", model.modelCursor, pageSize-1)
+		}
+		model.modelCursor = len(model.models) - 1
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+		if model.modelCursor != 0 {
+			t.Fatalf("down wrap cursor=%d", model.modelCursor)
+		}
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+		if model.modelCursor != len(model.models)-1 {
+			t.Fatalf("up wrap cursor=%d", model.modelCursor)
+		}
+	})
+
+	t.Run("filtering resets to the first result", func(t *testing.T) {
+		model := newPaginatedModel(80, 16, 13)
+		model.models[0] = "x-first"
+		model.models[8] = "x-later"
+		model.modelCursor = model.modelPage(len(model.models)).size + 1
+		_ = model.modelFilter.Focus()
+		_, _ = model.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: 'x', Text: "x"}))
+		if model.modelFilter.Value() != "x" || model.modelCursor != 0 {
+			t.Fatalf("filter=%q cursor=%d", model.modelFilter.Value(), model.modelCursor)
+		}
+	})
+
+	t.Run("resize keeps the selected model visible", func(t *testing.T) {
+		model := newPaginatedModel(80, 16, 18)
+		model.modelCursor = 7
+		model.resize(120, 22)
+		if model.modelCursor != 7 || !strings.Contains(ansi.Strip(model.renderModels()), "> model-07") {
+			t.Fatalf("expanded resize cursor=%d\n%s", model.modelCursor, ansi.Strip(model.renderModels()))
+		}
+		model.resize(40, 12)
+		rendered := ansi.Strip(model.renderModels())
+		if model.modelCursor != 7 || !strings.Contains(rendered, "> model-07") {
+			t.Fatalf("compact resize cursor=%d\n%s", model.modelCursor, rendered)
+		}
+		compactFooter := fmt.Sprintf("%d/%d · ←/→ page · ↑/↓ select · Enter", model.modelPage(len(model.models)).number, model.modelPage(len(model.models)).total)
+		if !strings.Contains(rendered, compactFooter) {
+			t.Fatalf("compact footer missing %q:\n%s", compactFooter, rendered)
+		}
+		for _, line := range strings.Split(rendered, "\n") {
+			if lipgloss.Width(line) > model.viewportContentWidth() {
+				t.Fatalf("line width=%d content width=%d line=%q", lipgloss.Width(line), model.viewportContentWidth(), line)
+			}
+		}
+	})
+
+	t.Run("single page and refreshed results start at the first model", func(t *testing.T) {
+		model := newPaginatedModel(80, 16, 3)
+		rendered := ansi.Strip(model.renderModels())
+		for _, modelID := range model.models {
+			if !strings.Contains(rendered, modelID) {
+				t.Fatalf("single page item %q missing:\n%s", modelID, rendered)
+			}
+		}
+		if !strings.Contains(rendered, "Page 1/1") {
+			t.Fatalf("single page counter missing:\n%s", rendered)
+		}
+		model.modelCursor = 2
+		_, _ = model.Update(modelsResultMsg{models: []string{"fresh-a", "fresh-b"}})
+		if model.modelCursor != 0 || len(model.models) != 2 {
+			t.Fatalf("refreshed cursor=%d models=%v", model.modelCursor, model.models)
+		}
+	})
+
+	t.Run("empty and manual states remain actionable", func(t *testing.T) {
+		empty := newPaginatedModel(80, 16, 0)
+		rendered := ansi.Strip(empty.renderModels())
+		if !strings.Contains(rendered, "No models found.") || !strings.Contains(rendered, "Page 1/1") {
+			t.Fatalf("empty state missing guidance:\n%s", rendered)
+		}
+
+		manual := newPaginatedModel(80, 16, 13)
+		manual.modelCursor = manual.modelPage(len(manual.models)).size + 1
+		manual.modelManual = true
+		manual.modelFilter.Placeholder = "Manual model ID"
+		manual.modelFilter.SetValue("abcd")
+		manual.modelFilter.SetCursor(2)
+		_ = manual.modelFilter.Focus()
+		beforeCursor := manual.modelCursor
+		_, _ = manual.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
+		if manual.modelFilter.Position() != 1 || manual.modelCursor != beforeCursor {
+			t.Fatalf("manual left input=%d model=%d", manual.modelFilter.Position(), manual.modelCursor)
+		}
+		_, _ = manual.handleModelsKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+		if manual.modelFilter.Position() != 2 || manual.modelCursor != beforeCursor {
+			t.Fatalf("manual right input=%d model=%d", manual.modelFilter.Position(), manual.modelCursor)
+		}
+		manualRendered := ansi.Strip(manual.renderModels())
+		if !strings.Contains(manualRendered, "Manual ID · Enter use · Esc back") {
+			t.Fatalf("manual footer missing:\n%s", manualRendered)
+		}
+	})
+}
+
 func TestContextWindowConfirmationAcceptsDetectedAndManualValues(t *testing.T) {
 	selection := ModelSelection{Provider: "work", Model: "next-model", DetectedContextWindow: 131072, LimitSource: "models_dev"}
 	t.Run("detected", func(t *testing.T) {

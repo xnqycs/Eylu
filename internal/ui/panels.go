@@ -8,6 +8,16 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
+const modelPageChromeRows = 4
+
+type modelPageState struct {
+	start  int
+	end    int
+	number int
+	total  int
+	size   int
+}
+
 func (m *Model) handleProvidersKey(key string) (tea.Model, tea.Cmd) {
 	providers := m.snapshot.Providers
 	switch key {
@@ -93,6 +103,15 @@ func (m *Model) handleModelsKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "down", "ctrl+n":
 		m.modelCursor = clampCursor(m.modelCursor+1, len(filtered))
 		return m, nil
+	case "left", "right":
+		if !m.modelManual {
+			delta := -1
+			if key == "right" {
+				delta = 1
+			}
+			m.moveModelPage(delta, len(filtered))
+			return m, nil
+		}
 	case "r":
 		m.state = StateFetchingModels
 		return m, m.fetchModelsCmd()
@@ -115,9 +134,15 @@ func (m *Model) handleModelsKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	previousFilter := m.modelFilter.Value()
 	updated, command := m.modelFilter.Update(message)
 	m.modelFilter = updated
-	m.modelCursor = clampCursor(m.modelCursor, len(m.filteredModels()))
+	filtered = m.filteredModels()
+	if !m.modelManual && m.modelFilter.Value() != previousFilter {
+		m.modelCursor = 0
+	} else {
+		m.modelCursor = clampCursor(m.modelCursor, len(filtered))
+	}
 	return m, command
 }
 
@@ -395,6 +420,39 @@ func (m *Model) filteredModels() []string {
 		}
 	}
 	return result
+}
+
+func (m *Model) modelPage(count int) modelPageState {
+	size := max(1, m.viewport.Height()-modelPageChromeRows)
+	total := max(1, (count+size-1)/size)
+	number := 1
+	if count > 0 {
+		cursor := min(max(0, m.modelCursor), count-1)
+		number = min(total, cursor/size+1)
+	}
+	start := (number - 1) * size
+	return modelPageState{
+		start:  start,
+		end:    min(count, start+size),
+		number: number,
+		total:  total,
+		size:   size,
+	}
+}
+
+func (m *Model) moveModelPage(delta, count int) {
+	if count <= 0 || delta == 0 {
+		return
+	}
+	page := m.modelPage(count)
+	targetNumber := min(max(1, page.number+delta), page.total)
+	if targetNumber == page.number {
+		return
+	}
+	offset := min(max(0, m.modelCursor-page.start), page.size-1)
+	targetStart := (targetNumber - 1) * page.size
+	targetEnd := min(count, targetStart+page.size)
+	m.modelCursor = min(targetStart+offset, targetEnd-1)
 }
 
 func clampCursor(value, count int) int {

@@ -838,7 +838,13 @@ func (m *Model) renderModels() string {
 		output.WriteString(m.styles.Loading.Render("Fetching models...") + "\n")
 		return output.String()
 	}
-	for index, model := range m.filteredModels() {
+	filtered := m.filteredModels()
+	page := m.modelPage(len(filtered))
+	if len(filtered) == 0 {
+		output.WriteString(m.styles.Muted.Render("No models found.") + "\n")
+	}
+	for index := page.start; index < page.end; index++ {
+		model := filtered[index]
 		cursor := "  "
 		if index == m.modelCursor {
 			cursor = "> "
@@ -849,7 +855,23 @@ func (m *Model) renderModels() string {
 		}
 		output.WriteString(line + "\n")
 	}
+	output.WriteString(m.renderModelsFooter(page))
 	return output.String()
+}
+
+func (m *Model) renderModelsFooter(page modelPageState) string {
+	full := fmt.Sprintf("Page %d/%d · ←/→ page · ↑/↓ select · Enter use · m manual · r refresh · Esc back", page.number, page.total)
+	compact := fmt.Sprintf("%d/%d · ←/→ page · ↑/↓ select · Enter", page.number, page.total)
+	if m.modelManual {
+		full = fmt.Sprintf("Page %d/%d · Manual ID · Enter use · Esc back", page.number, page.total)
+		compact = fmt.Sprintf("%d/%d · Manual ID · Enter · Esc", page.number, page.total)
+	}
+	footer := full
+	width := m.viewportContentWidth()
+	if lipgloss.Width(footer) > width {
+		footer = compact
+	}
+	return m.styles.Muted.Render(truncateColumns(footer, width))
 }
 
 func (m *Model) renderContextWindowConfirmation() string {
