@@ -93,6 +93,21 @@ type runtime struct {
 	searchTaskObservers map[string]func(protocol.AgentTaskActivity)
 }
 
+type synchronizedWriter struct {
+	mu     *sync.Mutex
+	writer io.Writer
+}
+
+func newSynchronizedWriter(writer io.Writer, mu *sync.Mutex) *synchronizedWriter {
+	return &synchronizedWriter{writer: writer, mu: mu}
+}
+
+func (w *synchronizedWriter) Write(content []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writer.Write(content)
+}
+
 type codeContextRuntimeOptions struct {
 	maxCacheBytes int64
 	maxReadLines  int
@@ -100,16 +115,19 @@ type codeContextRuntimeOptions struct {
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	r := &runtime{stdin: stdin, stdout: stdout, stderr: stderr, trustPrompted: make(map[string]bool), metrics: &metrics.Collector{}}
+	outputMu := &sync.Mutex{}
+	safeStdout := newSynchronizedWriter(stdout, outputMu)
+	safeStderr := newSynchronizedWriter(stderr, outputMu)
+	r := &runtime{stdin: stdin, stdout: safeStdout, stderr: safeStderr, trustPrompted: make(map[string]bool), metrics: &metrics.Collector{}}
 	root := r.rootCommand(ctx)
 	root.SetArgs(args)
 	root.SetIn(stdin)
-	root.SetOut(stdout)
-	root.SetErr(stderr)
+	root.SetOut(safeStdout)
+	root.SetErr(safeStderr)
 	defer func() {
 		r.closeSearchTasks()
 		if err := r.closeMCP(); err != nil {
-			fmt.Fprintf(stderr, "[mcp] close: %v\n", err)
+			fmt.Fprintf(safeStderr, "[mcp] close: %v\n", err)
 		}
 	}()
 	if err := root.ExecuteContext(ctx); err != nil {

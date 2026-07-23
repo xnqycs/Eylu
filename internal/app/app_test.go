@@ -28,6 +28,44 @@ import (
 	"Eylu/internal/webtool"
 )
 
+type overlapDetectWriter struct {
+	active     atomic.Int32
+	overlapped atomic.Bool
+}
+
+func (w *overlapDetectWriter) Write(content []byte) (int, error) {
+	if w.active.Add(1) > 1 {
+		w.overlapped.Store(true)
+	}
+	time.Sleep(100 * time.Microsecond)
+	w.active.Add(-1)
+	return len(content), nil
+}
+
+func TestSynchronizedWriterSerializesConcurrentWrites(t *testing.T) {
+	underlying := &overlapDetectWriter{}
+	outputMu := &sync.Mutex{}
+	writers := []*synchronizedWriter{
+		newSynchronizedWriter(underlying, outputMu),
+		newSynchronizedWriter(underlying, outputMu),
+	}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for index := range 32 {
+		workers.Add(1)
+		go func(writer *synchronizedWriter) {
+			defer workers.Done()
+			<-start
+			_, _ = writer.Write([]byte("event"))
+		}(writers[index%len(writers)])
+	}
+	close(start)
+	workers.Wait()
+	if underlying.overlapped.Load() {
+		t.Fatal("underlying writer received concurrent writes")
+	}
+}
+
 func TestKnownDriverCapabilitiesInfersGPTWebToolsForRelay(t *testing.T) {
 	snapshot := provider.Snapshot{Name: "default", Config: config.ProviderConfig{Adapter: "openai_responses", Model: "gpt-5.6-sol"}}
 	capabilities, ok := knownDriverCapabilities(snapshot)
