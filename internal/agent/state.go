@@ -133,6 +133,22 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 	return conversation, nil
 }
 
+func RestoreConversationForProfile(state ConversationState, profile Profile) (*Conversation, error) {
+	conversation, err := RestoreConversation(state)
+	if err != nil {
+		return nil, err
+	}
+	conversation.mu.Lock()
+	conversation.permissionMode = profile.PermissionMode
+	conversation.systemPrompt = profile.SystemPrompt()
+	conversation.lastRuntime.PermissionMode = profile.PermissionMode
+	conversation.profile = &profile
+	conversation.driverState = nil
+	conversation.rebuildLedger(conversation.lastRuntime)
+	conversation.mu.Unlock()
+	return conversation, nil
+}
+
 func cloneTodoList(list protocol.TodoList) protocol.TodoList {
 	return protocol.TodoList{Explanation: list.Explanation, Items: append([]protocol.TodoItem(nil), list.Items...)}
 }

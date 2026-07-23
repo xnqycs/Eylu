@@ -113,6 +113,26 @@ func TestReadFileRangesHashesAndCacheInvalidation(t *testing.T) {
 	}
 }
 
+func TestCreateOnlyWriteFileRejectsExistingPath(t *testing.T) {
+	workspace := t.TempDir()
+	path := filepath.Join(workspace, "existing.txt")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := NewWriteFile(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := writer.CreateOnly().Execute(context.Background(), json.RawMessage(`{"path":"existing.txt","content":"changed","reason":"test"}`))
+	if !result.IsError || !strings.Contains(result.Content, "use edit_file") {
+		t.Fatalf("create-only result = %#v", result)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("existing file = %q, %v", data, err)
+	}
+}
+
 func TestCodeContextRefreshIsSingleFlight(t *testing.T) {
 	workspace := t.TempDir()
 	var calls atomic.Int32

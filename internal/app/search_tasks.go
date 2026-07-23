@@ -14,6 +14,7 @@ import (
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
 	"Eylu/internal/tool"
+	"Eylu/internal/webtool"
 )
 
 type searchTaskEnvironment struct {
@@ -24,15 +25,16 @@ type searchTaskEnvironment struct {
 	environment  agent.ConversationState
 	codeContext  *tool.CodeContext
 	coordinator  *tool.ResourceCoordinator
+	executor     *tool.Executor
 }
 
 type boundSearchTaskService struct {
 	manager *tool.AgentTaskManager
-	runner  tool.AgentTaskRunner
+	factory tool.AgentTaskRunnerFactory
 }
 
 func (s boundSearchTaskService) Launch(ctx context.Context, request tool.AgentTaskRequest) (tool.AgentTask, error) {
-	return s.manager.LaunchWithRunner(ctx, request, s.runner)
+	return s.manager.LaunchWithFactory(ctx, request, s.factory)
 }
 
 func (s boundSearchTaskService) Output(ctx context.Context, sessionID, taskID string, block bool, timeout time.Duration) (tool.AgentTask, error) {
@@ -56,33 +58,43 @@ func (r *runtime) configureSearchAgent(manager *provider.Manager, conversation *
 	r.toolRuntimeMu.Unlock()
 	environment := searchTaskEnvironment{
 		manager: manager, runtime: modelRuntime, config: cfg, parentPrompt: prompt,
-		environment: conversation.ExportState(), codeContext: codeContext, coordinator: coordinator,
+		environment: conversation.ExportState(), codeContext: codeContext, coordinator: coordinator, executor: executor,
 	}
 	if observer != nil {
 		r.searchTaskObservers[conversation.SessionID()] = observer
 	}
 	managerService := r.searchTasks
 	r.searchTaskMu.Unlock()
-	service := boundSearchTaskService{manager: managerService, runner: func(ctx context.Context, request tool.AgentTaskRequest) (tool.SearchReport, error) {
-		return r.runSearchTask(ctx, request, environment)
-	}}
+
+	factory := func(taskID string, request tool.AgentTaskRequest) tool.AgentTaskRunner {
+		switch request.SubagentType {
+		case "search":
+			runner := &searchAgentRunner{runtime: r, environment: environment, taskID: taskID, usageExact: true}
+			return runner.run
+		case "general":
+			runner := &generalAgentRunner{environment: environment, manager: managerService, taskID: taskID, usageExact: true}
+			return runner.run
+		default:
+			return nil
+		}
+	}
+	service := boundSearchTaskService{manager: managerService, factory: factory}
 	if r.session != nil {
 		managerService.Restore(r.session.AgentTasks())
 		r.session.SetAgentTaskSource(func(sessionID string) []tool.AgentTask {
 			tasks := managerService.Snapshots(sessionID)
-			completed := tasks[:0]
+			terminal := tasks[:0]
 			for _, task := range tasks {
 				switch task.Status {
 				case tool.AgentTaskCompleted, tool.AgentTaskFailed, tool.AgentTaskCancelled:
-					completed = append(completed, task)
+					terminal = append(terminal, task)
 				}
 			}
-			return completed
+			return terminal
 		})
 	}
 
-	mode := modelRuntime.PermissionMode
-	profile := agent.ProfileForMode(mode)
+	profile := agent.ProfileForMode(modelRuntime.PermissionMode)
 	for _, item := range []tool.Tool{
 		tool.NewAgentTool(service, conversation.SessionID()), tool.NewTaskOutputTool(service, conversation.SessionID()), tool.NewTaskStopTool(service, conversation.SessionID()),
 	} {
@@ -97,17 +109,39 @@ func (r *runtime) configureSearchAgent(manager *provider.Manager, conversation *
 	return nil
 }
 
-func (r *runtime) runSearchTask(ctx context.Context, request tool.AgentTaskRequest, environment searchTaskEnvironment) (tool.SearchReport, error) {
-	if environment.codeContext == nil || environment.coordinator == nil {
-		return tool.SearchReport{}, errors.New("search task code context is unavailable")
+func (r *runtime) agentTaskManager(maxParallel int) *tool.AgentTaskManager {
+	r.searchTaskMu.Lock()
+	defer r.searchTaskMu.Unlock()
+	if r.searchTasks == nil {
+		r.searchTasks = tool.NewAgentTaskManager(maxParallel, nil, r.observeSearchTask)
+		if r.session != nil {
+			r.searchTasks.Restore(r.session.AgentTasks())
+		}
 	}
+	return r.searchTasks
+}
 
+type searchAgentRunner struct {
+	runtime     *runtime
+	environment searchTaskEnvironment
+	taskID      string
+	child       *agent.Conversation
+	started     bool
+	usage       protocol.Usage
+	usageExact  bool
+}
+
+func (r *searchAgentRunner) run(ctx context.Context, request tool.AgentTaskRequest, emit tool.AgentTaskEmitter) (tool.AgentTaskResult, error) {
+	environment := r.environment
+	if environment.codeContext == nil || environment.coordinator == nil {
+		return tool.AgentTaskResult{}, errors.New("search task code context is unavailable")
+	}
 	timeout := time.Duration(environment.config.SearchAgent.TimeoutSeconds) * time.Second
 	taskCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	modelRuntime, err := r.resolveSearchAgentRuntime(taskCtx, environment, request.Prompt)
+	modelRuntime, err := r.runtime.resolveSearchAgentRuntime(taskCtx, environment, request.Prompt)
 	if err != nil {
-		return tool.SearchReport{}, err
+		return tool.AgentTaskResult{}, err
 	}
 	profile := agent.SearchProfile(environment.config.SearchAgent.MaxTurns)
 	modelRuntime.PermissionMode = profile.PermissionMode
@@ -134,18 +168,161 @@ func (r *runtime) runSearchTask(ctx context.Context, request tool.AgentTaskReque
 		SessionID: request.SessionID, ProviderName: modelRuntime.Provider.Name,
 		ProviderGeneration: modelRuntime.Provider.Generation, Model: modelRuntime.Provider.Config.Model,
 	}
-	child := agent.NewConversationForProfile(profile, environment.environment.Environment)
-	prompt := "Delegated repository search:\n" + request.Prompt
-	if parent := strings.TrimSpace(environment.parentPrompt); parent != "" {
-		prompt += "\n\nCurrent parent request:\n" + parent
+	if r.child == nil {
+		r.child = agent.NewConversationForProfile(profile, environment.environment.Environment)
 	}
-	response, err := child.Run(taskCtx, prompt, modelRuntime, executor, agent.LoopOptions{
+	prompt := request.Prompt
+	if !r.started {
+		prompt = "Delegated repository search:\n" + prompt
+		if parent := strings.TrimSpace(environment.parentPrompt); parent != "" {
+			prompt += "\n\nCurrent parent request:\n" + parent
+		}
+		r.started = true
+	}
+	response, err := r.child.Run(taskCtx, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: profile.MaxTurns, MaxTotalTokens: environment.config.MaxTotalTokens,
-	}, false, nil)
+	}, true, modelEventEmitter(emit))
+	r.addUsage(response.Usage)
+	result := tool.AgentTaskResult{Output: modelResponseText(response), Usage: r.usage, Transcript: r.child.Transcript()}
 	if err != nil {
-		return tool.SearchReport{}, err
+		return result, err
 	}
-	return parseSearchReport(response)
+	report, err := parseSearchReport(response)
+	if err != nil {
+		return result, err
+	}
+	result.Output, result.Report = report.Summary, &report
+	return result, nil
+}
+
+func (r *searchAgentRunner) addUsage(usage protocol.Usage) {
+	r.usage.InputTokens += usage.InputTokens
+	r.usage.OutputTokens += usage.OutputTokens
+	r.usage.ReasoningTokens += usage.ReasoningTokens
+	r.usageExact = r.usageExact && usage.Exact
+	r.usage.Exact = r.usageExact
+}
+
+type generalAgentRunner struct {
+	environment searchTaskEnvironment
+	manager     *tool.AgentTaskManager
+	taskID      string
+	child       *agent.Conversation
+	executor    *tool.Executor
+	started     bool
+	usage       protocol.Usage
+	usageExact  bool
+}
+
+func (r *generalAgentRunner) run(ctx context.Context, request tool.AgentTaskRequest, emit tool.AgentTaskEmitter) (tool.AgentTaskResult, error) {
+	profile := agent.GeneralSubagentProfile(r.environment.runtime.PermissionMode, r.environment.config.MaxTurns)
+	if r.child == nil {
+		state := r.environment.environment
+		state.SessionID = r.taskID
+		state.DriverState = nil
+		var err error
+		r.child, err = agent.RestoreConversationForProfile(state, profile)
+		if err != nil {
+			return tool.AgentTaskResult{}, err
+		}
+		r.executor = generalAgentExecutor(r.environment.executor, profile, r.manager, r.taskID)
+	}
+	if r.executor == nil {
+		return tool.AgentTaskResult{}, errors.New("general task executor is unavailable")
+	}
+	modelRuntime := r.environment.runtime
+	modelRuntime.PermissionMode = profile.PermissionMode
+	modelRuntime.ContextEvent = nil
+	prompt := request.Prompt
+	if !r.started {
+		prompt = "Delegated task:\n" + prompt
+		if parent := strings.TrimSpace(r.environment.parentPrompt); parent != "" {
+			prompt += "\n\nCurrent parent request:\n" + parent
+		}
+		r.started = true
+	}
+	timeout := time.Duration(r.environment.config.MaxTurns) * modelRuntime.Timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
+	taskCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	response, err := r.child.Run(taskCtx, prompt, modelRuntime, r.executor, agent.LoopOptions{
+		MaxTurns: profile.MaxTurns, MaxTotalTokens: r.environment.config.MaxTotalTokens, RequestID: r.taskID,
+	}, true, modelEventEmitter(emit))
+	r.addUsage(response.Usage)
+	return tool.AgentTaskResult{Output: modelResponseText(response), Usage: r.usage, Transcript: r.child.Transcript()}, err
+}
+
+func (r *generalAgentRunner) addUsage(usage protocol.Usage) {
+	r.usage.InputTokens += usage.InputTokens
+	r.usage.OutputTokens += usage.OutputTokens
+	r.usage.ReasoningTokens += usage.ReasoningTokens
+	r.usageExact = r.usageExact && usage.Exact
+	r.usage.Exact = r.usageExact
+}
+
+type agentTaskAuditSink struct {
+	manager *tool.AgentTaskManager
+	taskID  string
+}
+
+func (s *agentTaskAuditSink) Record(record tool.AuditRecord) {
+	if s == nil || s.manager == nil {
+		return
+	}
+	s.manager.EmitAuditEvent(s.taskID, record)
+}
+
+func generalAgentExecutor(parent *tool.Executor, profile agent.Profile, manager *tool.AgentTaskManager, taskID string) *tool.Executor {
+	if parent == nil || parent.Registry == nil {
+		return nil
+	}
+	registered := make([]tool.Tool, 0)
+	for _, definition := range parent.Registry.Definitions() {
+		item, ok := parent.Registry.Get(definition.Name)
+		if !ok || !profile.AllowsTool(definition.Name, item.Risk()) {
+			continue
+		}
+		if _, dynamicWebTool := item.(*webtool.LocalTool); dynamicWebTool {
+			continue
+		}
+		if writeFile, ok := item.(*tool.WriteFile); ok {
+			item = writeFile.CreateOnly()
+		}
+		registered = append(registered, item)
+	}
+	clone := *parent
+	clone.Registry = tool.NewRegistry(registered...)
+	clone.ProviderName = parent.ProviderName
+	clone.Audit = &agentTaskAuditSink{manager: manager, taskID: taskID}
+	if parent.Confirm != nil {
+		confirm := parent.Confirm
+		clone.Confirm = func(ctx context.Context, request policy.Request, outcome policy.Outcome) (tool.Confirmation, error) {
+			return manager.Confirm(ctx, taskID, request, outcome, confirm)
+		}
+	}
+	return &clone
+}
+
+func modelEventEmitter(emit tool.AgentTaskEmitter) func(protocol.ModelEvent) error {
+	if emit == nil {
+		return nil
+	}
+	return func(event protocol.ModelEvent) error {
+		emit(event)
+		return nil
+	}
+}
+
+func modelResponseText(response protocol.ModelResponse) string {
+	var content strings.Builder
+	for _, part := range response.Turn.Parts {
+		if part.Kind == protocol.PartText {
+			content.WriteString(part.Text)
+		}
+	}
+	return strings.TrimSpace(content.String())
 }
 
 func (r *runtime) resolveSearchAgentRuntime(ctx context.Context, environment searchTaskEnvironment, prompt string) (agent.Runtime, error) {
@@ -168,13 +345,7 @@ func (r *runtime) resolveSearchAgentRuntime(ctx context.Context, environment sea
 }
 
 func parseSearchReport(response protocol.ModelResponse) (tool.SearchReport, error) {
-	var content strings.Builder
-	for _, part := range response.Turn.Parts {
-		if part.Kind == protocol.PartText {
-			content.WriteString(part.Text)
-		}
-	}
-	raw := strings.TrimSpace(content.String())
+	raw := modelResponseText(response)
 	if strings.HasPrefix(raw, "```") {
 		raw = strings.TrimPrefix(raw, "```json")
 		raw = strings.TrimPrefix(raw, "```")
@@ -202,22 +373,45 @@ func parseSearchReport(response protocol.ModelResponse) (tool.SearchReport, erro
 	return report, nil
 }
 
-func (r *runtime) promptWithCompletedSearchTasks(sessionID, prompt string) string {
+func (r *runtime) completedAgentNotifications(sessionID string) string {
 	r.searchTaskMu.RLock()
 	manager := r.searchTasks
 	r.searchTaskMu.RUnlock()
 	if manager == nil {
-		return prompt
+		return ""
 	}
-	tasks := manager.PendingReports(sessionID)
+	tasks := manager.PendingNotifications(sessionID)
 	if len(tasks) == 0 {
-		return prompt
+		return ""
 	}
-	payload, err := json.Marshal(tasks)
+	type notification struct {
+		TaskID       string               `json:"task_id"`
+		SubagentType string               `json:"subagent_type"`
+		Status       tool.AgentTaskStatus `json:"status"`
+		Version      uint64               `json:"version"`
+		Output       string               `json:"output,omitempty"`
+		Report       *tool.SearchReport   `json:"report,omitempty"`
+		Error        string               `json:"error,omitempty"`
+	}
+	items := make([]notification, 0, len(tasks))
+	for _, task := range tasks {
+		items = append(items, notification{
+			TaskID: task.ID, SubagentType: task.SubagentType, Status: task.Status, Version: task.NotificationRevision,
+			Output: task.Output, Report: task.Report, Error: task.Error,
+		})
+	}
+	payload, err := json.Marshal(items)
 	if err != nil {
-		return prompt
+		return ""
 	}
-	return prompt + "\n\n<completed_search_tasks>\n" + string(payload) + "\n</completed_search_tasks>"
+	return "<agent_notification>\n" + string(payload) + "\n</agent_notification>"
+}
+
+func (r *runtime) promptWithCompletedSearchTasks(sessionID, prompt string) string {
+	if notification := r.completedAgentNotifications(sessionID); notification != "" {
+		return prompt + "\n\n" + notification
+	}
+	return prompt
 }
 
 func (r *runtime) observeSearchTask(task tool.AgentTask) {

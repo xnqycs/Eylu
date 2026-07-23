@@ -361,11 +361,15 @@ max_parallel_tools = 4
 
 默认并发上限为 `4`。设为 `1` 可让工具串行执行；环境变量 `EYLU_MAX_PARALLEL_TOOLS` 可临时覆盖该值。明确声明为只读的 MCP 工具可参与并行调度，其他 MCP 工具采用独占执行。
 
-### 代码上下文与搜索子代理
+### 代码上下文与后台子代理
 
 `read_file` 支持 1-based 闭区间参数 `start_line`、`end_line`，并返回 `file_hash`、`slice_hash`、`artifact_id` 和续读游标 `next_start_line`。`search_code` 共享会话级增量三元组索引，支持 `offset` 分页和 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前会替换为稳定引用。
 
-模型可通过 `agent` 启动只读 `search` 子代理。前台任务直接返回结构化检索报告；后台任务返回 `task_id`，可用 `task_output` 查询、用 `task_stop` 取消，完成结果会在下一轮自动加入上下文。子代理只注册 `search_code`、`read_file`、`list_directory`，并与主代理共享代码缓存和资源协调器。
+模型可通过 `agent` 启动 `search` 或 `general` 子代理。所有任务强制在后台运行并立即返回 `task_id`；兼容输入中的 `run_in_background=false` 会被忽略。`task_output` 只返回即时快照，不会等待或消费完成通知；`task_stop` 会取消当前轮次并清空待处理消息。后台任务进入终态后，空闲的主会话会自动续轮；正在运行的主会话会在下一次模型调用前接收结果。结果以一次性 `<agent_notification>` 注入，多个同时完成的任务会合并交付。
+
+`search` 仅注册 `search_code`、`read_file`、`list_directory` 并返回结构化检索报告。`general` 继承父会话上下文、模型、reasoning effort、权限模式、MCP 和已激活 Skill，使用独立 Conversation 与串行消息队列，并禁用递归 `agent` 调用。多个代理共享工作区、资源协调器和 `max_parallel_agents` 上限；同一路径写入保持有序，子代理的 `write_file` 只创建新文件，现有文件通过 `read_file` 后使用精确 `edit_file`。
+
+TUI 输入 `/agents` 或 `/agents <筛选文本>` 可选择当前 Session 的代理。Enter 打开全屏会话，Enter 发送后续消息，活动任务按 `s` 停止，Esc 返回主会话。权限审批继承父模式并按 FIFO 展示代理来源。Eylu 退出时会取消并等待活动代理，保存终态转录；恢复后的历史代理可查看且为只读。
 
 ```toml
 max_parallel_agents = 2

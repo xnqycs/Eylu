@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,6 +42,13 @@ type fakeBackend struct {
 	mode          string
 	selection     ModelSelection
 	contextWindow int
+	agents        []AgentSummary
+	agentSnapshot AgentConversationSnapshot
+	agentEvents   chan AgentEvent
+	agentMessages []string
+	stoppedAgent  string
+	agentPending  bool
+	pendingChecks int
 }
 
 func (b *fakeBackend) Snapshot(context.Context) (Snapshot, error) { return b.snapshot, b.err }
@@ -88,6 +97,502 @@ func (b *fakeBackend) MCPServers(context.Context) ([]MCPServerItem, error) {
 func (b *fakeBackend) MCPAction(_ context.Context, server string, action MCPAction) error {
 	b.mcpActions = append(b.mcpActions, server+":"+string(action))
 	return b.err
+}
+func (b *fakeBackend) ListAgents(context.Context, string) ([]AgentSummary, error) {
+	return append([]AgentSummary(nil), b.agents...), b.err
+}
+func (b *fakeBackend) AgentConversation(context.Context, string) (AgentConversationSnapshot, error) {
+	return b.agentSnapshot, b.err
+}
+func (b *fakeBackend) SubscribeAgentEvents(ctx context.Context) (<-chan AgentEvent, error) {
+	if b.agentEvents != nil {
+		return b.agentEvents, b.err
+	}
+	events := make(chan AgentEvent)
+	go func() {
+		<-ctx.Done()
+		close(events)
+	}()
+	return events, b.err
+}
+func (b *fakeBackend) SendAgentMessage(_ context.Context, id, prompt string) error {
+	b.agentMessages = append(b.agentMessages, id+":"+prompt)
+	return b.err
+}
+func (b *fakeBackend) StopAgent(_ context.Context, id string) error {
+	b.stoppedAgent = id
+	return b.err
+}
+func (b *fakeBackend) HasPendingAgentNotifications(context.Context) (bool, error) {
+	b.pendingChecks++
+	return b.agentPending, b.err
+}
+
+type programBackend struct {
+	*fakeBackend
+
+	mu             sync.Mutex
+	subscribed     chan struct{}
+	subscribeOnce  sync.Once
+	submissions    []Submission
+	submissionCh   chan Submission
+	agentOpenedCh  chan string
+	agentMessageCh chan string
+	agentStoppedCh chan string
+	pendingNotices bool
+	pendingChecks  int
+}
+
+func newProgramBackend(snapshot Snapshot, agentSnapshot AgentConversationSnapshot) *programBackend {
+	agentEvents := make(chan AgentEvent, 16)
+	return &programBackend{
+		fakeBackend: &fakeBackend{
+			snapshot:      snapshot,
+			agentSnapshot: agentSnapshot,
+			agentEvents:   agentEvents,
+		},
+		subscribed:     make(chan struct{}),
+		submissionCh:   make(chan Submission, 8),
+		agentOpenedCh:  make(chan string, 4),
+		agentMessageCh: make(chan string, 4),
+		agentStoppedCh: make(chan string, 4),
+	}
+}
+
+func (b *programBackend) Submit(_ context.Context, operationID string, submission Submission, emit func(Event)) error {
+	b.mu.Lock()
+	b.submissions = append(b.submissions, submission)
+	index := len(b.submissions)
+	if index == 1 {
+		b.pendingNotices = true
+	} else if submission.AgentFollowUp {
+		b.pendingNotices = false
+	}
+	b.mu.Unlock()
+
+	b.submissionCh <- submission
+	emit(Event{OperationID: operationID, Kind: EventTextDelta, Delta: "ok"})
+	if index == 1 {
+		b.agentEvents <- AgentEvent{Agent: AgentSummary{
+			ID: "completed-general", SubagentType: "general", Status: "completed", Background: true,
+		}}
+		b.agentEvents <- AgentEvent{Agent: AgentSummary{
+			ID: "completed-search", SubagentType: "search", Status: "completed", Background: true,
+		}}
+	}
+	return nil
+}
+
+func (b *programBackend) SubscribeAgentEvents(context.Context) (<-chan AgentEvent, error) {
+	b.subscribeOnce.Do(func() { close(b.subscribed) })
+	return b.agentEvents, nil
+}
+
+func (b *programBackend) HasPendingAgentNotifications(context.Context) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pendingChecks++
+	return b.pendingNotices, nil
+}
+
+func (b *programBackend) AgentConversation(context.Context, string) (AgentConversationSnapshot, error) {
+	b.agentOpenedCh <- b.agentSnapshot.Agent.ID
+	return b.agentSnapshot, nil
+}
+
+func (b *programBackend) SendAgentMessage(_ context.Context, id, prompt string) error {
+	b.agentMessageCh <- id + ":" + prompt
+	return nil
+}
+
+func (b *programBackend) StopAgent(_ context.Context, id string) error {
+	b.agentStoppedCh <- id
+	return nil
+}
+
+func (b *programBackend) submissionSnapshot() ([]Submission, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]Submission(nil), b.submissions...), b.pendingChecks
+}
+
+func receiveTestValue[T any](t *testing.T, channel <-chan T, label string) T {
+	t.Helper()
+	select {
+	case value := <-channel:
+		return value
+	case <-time.After(3 * time.Second):
+		var zero T
+		t.Fatalf("timed out waiting for %s", label)
+		return zero
+	}
+}
+
+func sendProgramKey(program *tea.Program, code rune, text string) {
+	program.Send(tea.KeyPressMsg(tea.Key{Code: code, Text: text}))
+}
+
+func TestProgramBackgroundAgentsContinueOnceAndAgentPanelLifecycle(t *testing.T) {
+	now := time.Now().UTC()
+	runningAgent := AgentSummary{
+		ID: "running-agent", SubagentType: "general", Status: "running", Title: "inspect workspace", Background: true,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	snapshot := Snapshot{
+		SessionID: "program-agent-test",
+		Agents: []AgentSummary{
+			runningAgent,
+			{ID: "completed-general", SubagentType: "general", Status: "completed", Title: "general result", Background: true, CreatedAt: now, UpdatedAt: now},
+			{ID: "completed-search", SubagentType: "search", Status: "completed", Title: "search result", Background: true, CreatedAt: now, UpdatedAt: now},
+		},
+	}
+	backend := newProgramBackend(snapshot, AgentConversationSnapshot{
+		Agent:   runningAgent,
+		History: []HistoryItem{{Kind: HistoryMessage, Role: protocol.RoleUser, Text: "initial task"}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	program := tea.NewProgram(
+		NewModel(backend, Options{Context: ctx, NoAnimation: true, NoColor: true, Width: 60, Height: 20}),
+		tea.WithContext(ctx),
+		tea.WithInput(nil),
+		tea.WithOutput(io.Discard),
+		tea.WithoutRenderer(),
+		tea.WithoutSignalHandler(),
+	)
+	type runResult struct {
+		model tea.Model
+		err   error
+	}
+	runDone := make(chan runResult, 1)
+	go func() {
+		model, err := program.Run()
+		runDone <- runResult{model: model, err: err}
+	}()
+	defer func() {
+		program.Quit()
+		program.Wait()
+	}()
+
+	receiveTestValue(t, backend.subscribed, "agent event subscription")
+	program.Send(tea.PasteMsg{Content: "launch background agents"})
+	sendProgramKey(program, tea.KeyEnter, "")
+	first := receiveTestValue(t, backend.submissionCh, "initial submission")
+	if first.Text != "launch background agents" || first.AgentFollowUp {
+		t.Fatalf("initial submission = %#v", first)
+	}
+	second := receiveTestValue(t, backend.submissionCh, "automatic agent follow-up")
+	if !second.AgentFollowUp || second.Text != agentFollowUpPrompt {
+		t.Fatalf("automatic follow-up = %#v", second)
+	}
+	time.Sleep(100 * time.Millisecond)
+	submissions, pendingChecks := backend.submissionSnapshot()
+	if len(submissions) != 2 {
+		t.Fatalf("submissions after two terminal events = %#v", submissions)
+	}
+	if pendingChecks == 0 {
+		t.Fatal("pending notifications were never queried")
+	}
+
+	program.Send(tea.PasteMsg{Content: "/agents "})
+	time.Sleep(50 * time.Millisecond)
+	sendProgramKey(program, tea.KeyEnter, "")
+	if opened := receiveTestValue(t, backend.agentOpenedCh, "agent conversation open"); opened != runningAgent.ID {
+		t.Fatalf("opened agent = %q", opened)
+	}
+	time.Sleep(50 * time.Millisecond)
+	program.Send(tea.PasteMsg{Content: "continue inspection"})
+	sendProgramKey(program, tea.KeyEnter, "")
+	if message := receiveTestValue(t, backend.agentMessageCh, "agent follow-up message"); message != runningAgent.ID+":continue inspection" {
+		t.Fatalf("agent follow-up message = %q", message)
+	}
+	sendProgramKey(program, 's', "s")
+	if stopped := receiveTestValue(t, backend.agentStoppedCh, "agent stop"); stopped != runningAgent.ID {
+		t.Fatalf("stopped agent = %q", stopped)
+	}
+	sendProgramKey(program, tea.KeyEsc, "")
+	time.Sleep(50 * time.Millisecond)
+	program.Quit()
+	result := receiveTestValue(t, runDone, "program shutdown")
+	if result.err != nil {
+		t.Fatalf("program run: %v", result.err)
+	}
+	finalModel, ok := result.model.(*Model)
+	if !ok {
+		t.Fatalf("final model type = %T", result.model)
+	}
+	if finalModel.screen != screenChat || finalModel.input.Value() != "" {
+		t.Fatalf("restored screen=%s draft=%q", finalModel.screen, finalModel.input.Value())
+	}
+}
+
+func TestAgentsCompletionSortsFiltersAndShowsEmptyState(t *testing.T) {
+	now := time.Now().UTC()
+	snapshot := Snapshot{Agents: []AgentSummary{
+		{ID: "completed-agent", SubagentType: "search", Status: "completed", Title: "old target", UpdatedAt: now},
+		{ID: "running-agent", SubagentType: "general", Status: "running", Title: "active target", UpdatedAt: now.Add(-time.Hour)},
+	}}
+	items := slashCompletionItems("/agents target", snapshot)
+	if len(items) != 2 || items[0].agentID != "running-agent" || items[1].agentID != "completed-agent" {
+		t.Fatalf("agent completion items = %#v", items)
+	}
+	filtered := slashCompletionItems("/agents active", snapshot)
+	if len(filtered) != 1 || filtered[0].agentID != "running-agent" {
+		t.Fatalf("filtered items = %#v", filtered)
+	}
+	empty := slashCompletionItems("/agents", Snapshot{})
+	if len(empty) != 1 || !empty[0].disabled || empty[0].label != "No agents in this session" {
+		t.Fatalf("empty items = %#v", empty)
+	}
+}
+
+func TestAgentConversationOpenStreamSendStopAndRestoreMainState(t *testing.T) {
+	agentID := "12345678-agent"
+	backend := &fakeBackend{agentSnapshot: AgentConversationSnapshot{
+		Agent: AgentSummary{ID: agentID, SubagentType: "general", Status: "running", Title: "implement feature"},
+		Events: []AgentConversationEntry{
+			{Prompt: "delegated work"},
+			{ModelEvent: &protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "earlier output"}},
+		},
+	}}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 40, Height: 18})
+	model.snapshot.Agents = []AgentSummary{backend.agentSnapshot.Agent}
+	model.input.SetValue("main draft")
+	command := model.openAgent(agentID)
+	if model.screen != screenAgent || command == nil {
+		t.Fatalf("screen=%s command=%v", model.screen, command)
+	}
+	_, _ = model.Update(command())
+	if model.activeAgent == nil || !strings.Contains(ansi.Strip(model.renderAgentTimeline()), "delegated work") || !strings.Contains(ansi.Strip(model.renderAgentTimeline()), "earlier output") {
+		t.Fatalf("agent view = %q", ansi.Strip(model.renderAgentTimeline()))
+	}
+	model.handleAgentEvent(AgentEvent{Agent: backend.agentSnapshot.Agent, ModelEvent: &protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "working"}})
+	if !strings.Contains(ansi.Strip(model.renderAgentTimeline()), "working") {
+		t.Fatalf("streamed view = %q", ansi.Strip(model.renderAgentTimeline()))
+	}
+	call := protocol.ToolCall{ID: "call", Name: "read_file", Arguments: json.RawMessage(`{"path":"go.mod"}`)}
+	model.handleAgentEvent(AgentEvent{Agent: backend.agentSnapshot.Agent, ModelEvent: &protocol.ModelEvent{Kind: protocol.EventToolStart, ToolCall: &call}})
+	model.handleAgentEvent(AgentEvent{Agent: backend.agentSnapshot.Agent, ToolAudit: &ToolAudit{CallID: "call", DurationMS: 23}})
+	if len(model.agentTimeline) == 0 || model.agentTimeline[len(model.agentTimeline)-1].tool == nil || model.agentTimeline[len(model.agentTimeline)-1].tool.durationMS != 23 {
+		t.Fatalf("agent tool audit timeline = %#v", model.agentTimeline)
+	}
+	model.input.SetValue("follow up")
+	_, command = model.handleAgentKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	if command == nil {
+		t.Fatal("follow-up command is nil")
+	}
+	_, _ = model.Update(command())
+	if len(backend.agentMessages) != 1 || backend.agentMessages[0] != agentID+":follow up" {
+		t.Fatalf("agent messages = %#v", backend.agentMessages)
+	}
+	model.input.Reset()
+	_, command = model.handleAgentKey(tea.KeyPressMsg(tea.Key{Code: 's', Text: "s"}))
+	if command == nil {
+		t.Fatal("stop command is nil")
+	}
+	_, _ = model.Update(command())
+	if backend.stoppedAgent != agentID {
+		t.Fatalf("stopped agent = %q", backend.stoppedAgent)
+	}
+	for _, line := range strings.Split(ansi.Strip(model.View().Content), "\n") {
+		if lipgloss.Width(line) > 40 {
+			t.Fatalf("narrow agent row width=%d: %q", lipgloss.Width(line), line)
+		}
+	}
+	_, _ = model.handleAgentKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEsc}))
+	if model.screen != screenChat || model.input.Value() != "main draft" {
+		t.Fatalf("restored screen=%s draft=%q", model.screen, model.input.Value())
+	}
+}
+
+func TestAgentConversationSupportsSelectionCopyAndToolDetail(t *testing.T) {
+	copied := ""
+	model := NewModel(&fakeBackend{}, Options{
+		NoAnimation: true, NoColor: true, Width: 60, Height: 18,
+		ClipboardWrite: func(value string) error { copied = value; return nil },
+	})
+	model.screen = screenAgent
+	model.activeAgent = &AgentConversationSnapshot{Agent: AgentSummary{ID: "agent", Status: "running"}}
+	model.agentTimeline = []timelineItem{
+		{kind: timelineMessage, role: "user", text: "selectable agent history"},
+		{kind: timelineTool, tool: &toolView{name: "read_file", callID: "call", arguments: `{"path":"go.mod"}`, content: "module Eylu"}},
+	}
+	model.refreshViewport()
+	lines := selectionLines(model.viewport.GetContent(), model.viewport.Width())
+	row := -1
+	for index, line := range lines {
+		if strings.Contains(line.text, "selectable agent history") {
+			row = index
+			break
+		}
+	}
+	if row < 0 {
+		t.Fatalf("agent viewport = %q", ansi.Strip(model.viewport.GetContent()))
+	}
+	visibleRow := row - model.viewport.YOffset()
+	y := model.layout().viewportTop + visibleRow
+	_, _ = model.handleMouse(tea.MouseClickMsg{X: model.viewportLeftInset(), Y: y, Button: tea.MouseLeft})
+	_, _ = model.handleMouse(tea.MouseMotionMsg{X: model.viewportLeftInset() + 10, Y: y, Button: tea.MouseLeft})
+	_, command := model.handleMouse(tea.MouseReleaseMsg{X: model.viewportLeftInset() + 10, Y: y, Button: tea.MouseLeft})
+	if command == nil {
+		t.Fatal("agent selection did not produce a clipboard command")
+	}
+	_, _ = model.Update(command())
+	if copied == "" || model.copyToast == "" {
+		t.Fatalf("copied=%q toast=%q", copied, model.copyToast)
+	}
+
+	_, _ = model.handleAgentKey(tea.KeyPressMsg(tea.Key{Code: 't', Mod: tea.ModCtrl}))
+	if model.screen != screenToolDetail || !strings.Contains(ansi.Strip(model.renderToolDetail()), "module Eylu") {
+		t.Fatalf("screen=%s tool detail=%q", model.screen, ansi.Strip(model.renderToolDetail()))
+	}
+	_, _ = model.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEsc}))
+	if model.screen != screenAgent {
+		t.Fatalf("tool detail returned to %s", model.screen)
+	}
+}
+
+func TestAgentConversationSnapshotMergesBufferedLiveEventsWithoutDuplicates(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 60, Height: 18})
+	model.screen = screenAgent
+	model.activeAgent = &AgentConversationSnapshot{Agent: AgentSummary{ID: "agent", Status: "running"}}
+	model.agentSnapshotLoading = true
+	late := AgentEvent{
+		Agent:      AgentSummary{ID: "agent", Status: "running", ConversationRevision: 3},
+		ModelEvent: &protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: " late"},
+	}
+	model.handleAgentEvent(late)
+	if len(model.agentTimeline) != 0 || len(model.agentBufferedEvents) != 1 {
+		t.Fatalf("timeline=%#v buffered=%#v", model.agentTimeline, model.agentBufferedEvents)
+	}
+
+	_, _ = model.Update(agentSnapshotMsg{snapshot: AgentConversationSnapshot{
+		Agent: AgentSummary{ID: "agent", Status: "running", ConversationRevision: 2},
+		Events: []AgentConversationEntry{
+			{Prompt: "inspect"},
+			{ModelEvent: &protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "early"}},
+		},
+	}})
+	rendered := ansi.Strip(model.renderAgentTimeline())
+	if strings.Count(rendered, "early late") != 1 || !strings.Contains(rendered, "inspect") || model.activeAgent.Agent.ConversationRevision != 3 {
+		t.Fatalf("rendered=%q revision=%d", rendered, model.activeAgent.Agent.ConversationRevision)
+	}
+
+	model.agentSnapshotLoading = true
+	model.agentBufferedEvents = []AgentEvent{late}
+	_, _ = model.Update(agentSnapshotMsg{snapshot: AgentConversationSnapshot{
+		Agent: AgentSummary{ID: "agent", Status: "running", ConversationRevision: 3},
+		Events: []AgentConversationEntry{
+			{Prompt: "inspect"},
+			{ModelEvent: &protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "early late"}},
+		},
+	}})
+	rendered = ansi.Strip(model.renderAgentTimeline())
+	if strings.Count(rendered, "early late") != 1 {
+		t.Fatalf("duplicate buffered event rendered=%q", rendered)
+	}
+}
+
+func TestAgentConversationSnapshotKeepsFinalOutputWhenEventsContainOnlyPrompt(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 60, Height: 18})
+	model.screen = screenAgent
+	_, _ = model.Update(agentSnapshotMsg{snapshot: AgentConversationSnapshot{
+		Agent:  AgentSummary{ID: "agent", Status: "completed", ConversationRevision: 1},
+		Events: []AgentConversationEntry{{Prompt: "inspect"}},
+		Output: "final answer",
+	}})
+	rendered := ansi.Strip(model.renderAgentTimeline())
+	if !strings.Contains(rendered, "inspect") || !strings.Contains(rendered, "final answer") {
+		t.Fatalf("agent history = %q", rendered)
+	}
+}
+
+func TestCompletedBackgroundAgentAutomaticallyContinuesIdleParent(t *testing.T) {
+	backend := &fakeBackend{agentPending: true}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.state = StateCompleted
+	model.input.SetValue("/agents draft")
+	command := model.handleAgentEvent(AgentEvent{Agent: AgentSummary{
+		ID: "background-agent", SubagentType: "general", Status: "completed", Background: true,
+	}})
+	if command == nil {
+		t.Fatal("completed background agent did not schedule a notification check")
+	}
+	message := command()
+	check, ok := message.(agentFollowUpCheckMsg)
+	if !ok || !check.pending {
+		t.Fatalf("follow-up check = %#v", message)
+	}
+	_, command = model.Update(check)
+	if command == nil || model.state != StateConnecting {
+		t.Fatalf("follow-up state=%s command=%v", model.state, command)
+	}
+	if model.input.Value() != "/agents draft" {
+		t.Fatalf("main draft = %q", model.input.Value())
+	}
+	for _, item := range model.timeline {
+		if item.kind == timelineMessage && item.role == "user" && item.text == agentFollowUpPrompt {
+			t.Fatal("internal agent follow-up was rendered as a user message")
+		}
+	}
+	if backend.pendingChecks != 1 {
+		t.Fatalf("pending checks = %d", backend.pendingChecks)
+	}
+}
+
+func TestCompletedAgentFollowUpSkipsDeliveredAndLegacyForegroundNotifications(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true})
+	model.state = StateStreaming
+	if command := model.handleAgentEvent(AgentEvent{Agent: AgentSummary{
+		ID: "background-agent", SubagentType: "general", Status: "completed", Background: true,
+	}}); command != nil {
+		t.Fatal("busy parent started an agent follow-up immediately")
+	}
+	model.state = StateCompleted
+	command := model.maybeCheckAgentFollowUp()
+	if command == nil {
+		t.Fatal("busy completion did not retain the follow-up check")
+	}
+	message := command()
+	_, command = model.Update(message)
+	if command != nil || model.state != StateCompleted {
+		t.Fatalf("delivered notification restarted parent: state=%s command=%v", model.state, command)
+	}
+
+	if command := model.handleAgentEvent(AgentEvent{Agent: AgentSummary{
+		ID: "legacy-foreground-agent", SubagentType: "search", Status: "completed", Background: false,
+	}}); command != nil {
+		t.Fatal("legacy foreground agent scheduled a duplicate parent follow-up")
+	}
+}
+
+func TestAgentFollowUpRechecksWhenAnotherAgentCompletesDuringQuery(t *testing.T) {
+	backend := &fakeBackend{}
+	model := NewModel(backend, Options{NoAnimation: true, NoColor: true})
+	model.state = StateCompleted
+	firstCheck := model.handleAgentEvent(AgentEvent{Agent: AgentSummary{
+		ID: "agent-one", SubagentType: "general", Status: "completed", Background: true,
+	}})
+	if firstCheck == nil {
+		t.Fatal("first completion did not schedule a check")
+	}
+	staleResult := firstCheck()
+	backend.agentPending = true
+	if command := model.handleAgentEvent(AgentEvent{Agent: AgentSummary{
+		ID: "agent-two", SubagentType: "search", Status: "completed", Background: true,
+	}}); command != nil {
+		t.Fatal("second completion scheduled a concurrent check")
+	}
+	_, retry := model.Update(staleResult)
+	if retry == nil {
+		t.Fatal("stale pending result did not schedule a fresh check")
+	}
+	freshResult := retry()
+	_, continuation := model.Update(freshResult)
+	if continuation == nil || model.state != StateConnecting || backend.pendingChecks != 2 {
+		t.Fatalf("state=%s continuation=%v checks=%d", model.state, continuation, backend.pendingChecks)
+	}
 }
 
 func TestStartupLoadsMCPWithAnimatedStatusBelowBanner(t *testing.T) {
@@ -1550,6 +2055,32 @@ func TestCancelledBackendDoesNotBlockOnFullPreviewQueue(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("cancelled backend remained blocked on preview events")
+	}
+}
+
+func TestBackendCommandIgnoresEventsEmittedAfterReturn(t *testing.T) {
+	var lateEmit func(Event)
+	backend := &fakeBackend{submit: func(_ context.Context, _ string, _ Submission, emit func(Event)) error {
+		lateEmit = emit
+		return nil
+	}}
+	events := make(chan Event, 2)
+	_ = runBackendCmd(context.Background(), backend, "op-late", Submission{Text: "prompt"}, events)()
+	if lateEmit == nil {
+		t.Fatal("backend did not retain the emitter")
+	}
+	recovered := make(chan any, 1)
+	go func() {
+		defer func() { recovered <- recover() }()
+		lateEmit(Event{Kind: EventToolAudit, ToolAudit: &ToolAudit{CallID: "late"}})
+	}()
+	select {
+	case value := <-recovered:
+		if value != nil {
+			t.Fatalf("late event panicked: %v", value)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late event remained blocked")
 	}
 }
 

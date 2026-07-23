@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -52,6 +53,12 @@ func (r *runtime) runInteractiveFrontend(ctx context.Context, conversation *agen
 	detachMCP := r.attachMCPConversation(conversation)
 	defer detachMCP()
 	defer func() {
+		r.closeSearchTasks()
+		if r.session != nil {
+			if syncErr := r.session.Sync(conversation, manager, opts, returnErr); returnErr == nil {
+				returnErr = syncErr
+			}
+		}
 		returnErr = r.finishInteractive(conversation, returnErr)
 	}()
 	if useTUI {
@@ -207,7 +214,7 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 	command := fields[0]
 	switch command {
 	case "/help":
-		fmt.Fprintln(r.stdout, "/new  /compact  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /effort [level]  /gradient [on|off]  /mode manual|plan|auto|full  /quit")
+		fmt.Fprintln(r.stdout, "/new  /compact  /agents [filter]  /tasks  /context  /skills  /skill <name>  /providers  /provider add|edit|delete|use  /model [id]  /effort [level]  /gradient [on|off]  /mode manual|plan|auto|full  /quit")
 		return nil
 	case "/quit":
 		return errQuit
@@ -245,6 +252,30 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		return nil
 	case "/tasks":
 		renderTodoListText(r.stdout, conversation.TodoList())
+		return nil
+	case "/agents":
+		filter := strings.ToLower(strings.TrimSpace(strings.Join(fields[1:], " ")))
+		tasks := r.agentTaskManager(manager.Config().MaxParallelAgents).Snapshots(conversation.SessionID())
+		sort.SliceStable(tasks, func(i, j int) bool {
+			leftActive, rightActive := activeAgentStatus(string(tasks[i].Status)), activeAgentStatus(string(tasks[j].Status))
+			if leftActive != rightActive {
+				return leftActive
+			}
+			return tasks[i].UpdatedAt.After(tasks[j].UpdatedAt)
+		})
+		matched := 0
+		for _, task := range tasks {
+			title := agentTaskTitle(task.Prompt)
+			searchable := strings.ToLower(strings.Join([]string{task.ID, task.SubagentType, string(task.Status), title}, " "))
+			if filter != "" && !strings.Contains(searchable, filter) {
+				continue
+			}
+			fmt.Fprintf(r.stdout, "%s  %-7s  %-18s  %s\n", shortAgentTaskID(task.ID), task.SubagentType, task.Status, title)
+			matched++
+		}
+		if matched == 0 {
+			fmt.Fprintln(r.stdout, "No agents in this session.")
+		}
 		return nil
 	case "/providers":
 		r.printProviders(manager)

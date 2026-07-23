@@ -214,6 +214,30 @@ func TestPlanProfileForksContextFiltersToolsAndAdoptsFinalResult(t *testing.T) {
 	}
 }
 
+func TestGeneralSubagentProfileInheritsContextAndRejectsDelegation(t *testing.T) {
+	parent := NewConversationWithEnvironment(environment.Context{WorkingDirectory: "C:/workspace", Platform: "windows"})
+	state := parent.ExportState()
+	state.SessionID = "child-agent"
+	state.PermissionMode = "auto"
+	profile := GeneralSubagentProfile("auto", 7)
+	child, err := RestoreConversationForProfile(state, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := child.ExportState()
+	if restored.SessionID != "child-agent" || restored.PermissionMode != "auto" || restored.Environment.WorkingDirectory != "C:/workspace" || profile.MaxTurns != 7 {
+		t.Fatalf("restored child = %#v profile=%#v", restored, profile)
+	}
+	for _, name := range []string{"agent", "task_output", "task_stop", "ask", "activate_skill"} {
+		if profile.AllowsTool(name, policy.RiskSession) {
+			t.Fatalf("general subagent allowed %s", name)
+		}
+	}
+	if !profile.AllowsTool("read_file", policy.RiskRead) || !profile.AllowsTool("edit_file", policy.RiskWrite) {
+		t.Fatalf("general subagent profile = %#v", profile)
+	}
+}
+
 func testRuntime(modelDriver driver.ModelDriver, generation uint64) Runtime {
 	return Runtime{
 		Provider: provider.Snapshot{Name: "work", Generation: generation, Config: config.ProviderConfig{

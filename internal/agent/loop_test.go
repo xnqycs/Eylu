@@ -456,6 +456,31 @@ func TestAgentLoopExecutesClientWebFallbackThroughExistingTool(t *testing.T) {
 	}
 }
 
+func TestAgentLoopRebuildsStaleLocalWebFallback(t *testing.T) {
+	enabled := true
+	target := &webClientFixture{}
+	model := &hostedWebLoopDriver{local: true}
+	runtime := Runtime{Provider: provider.Snapshot{Name: "work", Config: config.ProviderConfig{Adapter: model.Name(), Model: "model", WebTools: config.WebToolsConfig{
+		Permission: config.WebPermissionAllow,
+		Search:     config.WebToolConfig{Enabled: &enabled, Fallback: "client", ClientTool: target.Definition().Name},
+	}}}, Driver: model, PermissionMode: "full"}
+	stale := webtool.NewLocalTool(webtool.ResolvedTool{
+		Definition: protocol.ToolDefinition{
+			Kind: protocol.ToolWebSearch, Name: "web_search", Execution: protocol.ExecutionClient,
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+		},
+		Execution: protocol.ExecutionClient, Target: target.Definition().Name,
+	}, target, nil, config.WebPermissionAllow, webtool.NewUsageBudget())
+	executor := &tool.Executor{Registry: tool.NewRegistry(target, stale), Policy: policy.AllowAllChecker{}}
+	response, err := NewConversation().Run(context.Background(), "search", runtime, executor, LoopOptions{MaxTurns: 3}, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Turn.Parts[0].Text != "client done" || target.calls.Load() != 1 {
+		t.Fatalf("response=%#v calls=%d", response, target.calls.Load())
+	}
+}
+
 type relayBatchWebDriver struct {
 	requests atomic.Int32
 }

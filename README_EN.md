@@ -390,6 +390,31 @@ max_parallel_tools = 4
 
 The default concurrency limit is `4`. Set it to `1` for serial execution, or override it temporarily with `EYLU_MAX_PARALLEL_TOOLS`. Explicitly configured read-only MCP tools can join concurrent batches; other MCP tools execute exclusively.
 
+### Code context and background subagents
+
+`read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.
+
+The `agent` tool launches `search` or `general` subagents. Every task is forced to run in the background and returns a `task_id` immediately; legacy `run_in_background=false` input is ignored. `task_output` returns an immediate snapshot without waiting or consuming the completion notification, while `task_stop` cancels the current turn and clears queued messages. When a background task reaches a terminal state, an idle parent conversation continues automatically; a running parent receives the result before its next model call. Results are injected exactly once as `<agent_notification>`, with concurrently completed tasks delivered together.
+
+`search` exposes only `search_code`, `read_file`, and `list_directory` and returns a structured report. `general` inherits the parent context, model, reasoning effort, permission mode, MCP catalog, and activated Skills. It owns a separate Conversation and serial message queue, and recursive `agent` calls are disabled. All subagents share the workspace, resource coordinator, and `max_parallel_agents` limit. Writes to the same path remain ordered; a general subagent's `write_file` creates new files only, while existing files require a fresh read and a precise `edit_file` call.
+
+Enter `/agents` or `/agents <filter>` in the TUI to select an agent from the current Session. Enter opens its full-screen conversation and sends follow-up messages, `s` stops an active task, and Esc restores the main conversation draft and scroll position. Approvals inherit the parent mode and appear in FIFO order with the agent source. On exit, Eylu cancels and waits for active agents and persists terminal transcripts; restored agent conversations are view-only.
+
+```toml
+max_parallel_agents = 2
+code_context_cache_bytes = 67108864
+max_read_lines = 2000
+code_index_workers = 4
+
+[search_agent]
+max_turns = 8
+timeout_seconds = 120
+# provider = "fast-model" # inherit the active provider when omitted
+# model = "model-id"      # inherit the active model when omitted
+```
+
+The matching environment variables are `EYLU_MAX_PARALLEL_AGENTS`, `EYLU_CODE_CONTEXT_CACHE_BYTES`, `EYLU_MAX_READ_LINES`, and `EYLU_CODE_INDEX_WORKERS`.
+
 ## Terminal Compatibility
 
 - An interactive TTY starts the full-screen Bubble Tea interface by default.

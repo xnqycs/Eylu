@@ -114,6 +114,7 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		GradientEnabled: cfg.GradientEnabled,
 		Context:         b.conversation.ContextReport(), TodoList: state.TodoList, PromptHistory: append([]string{}, state.PromptHistory...), History: conversationHistory(state),
 	}
+	snapshot.Agents, _ = b.ListAgents(context.Background(), "")
 	managerActive, _ := b.manager.Active()
 	for _, item := range b.manager.List() {
 		snapshot.Providers = append(snapshot.Providers, ui.ProviderItem{
@@ -131,6 +132,176 @@ func (b *tuiBackend) Snapshot(context.Context) (ui.Snapshot, error) {
 		}
 	}
 	return snapshot, nil
+}
+
+func (b *tuiBackend) ListAgents(ctx context.Context, filter string) ([]ui.AgentSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	manager := b.runtime.agentTaskManager(b.manager.Config().MaxParallelAgents)
+	tasks := manager.Snapshots(b.conversation.SessionID())
+	filter = strings.ToLower(strings.TrimSpace(filter))
+	result := make([]ui.AgentSummary, 0, len(tasks))
+	for _, task := range tasks {
+		summary := agentSummary(task)
+		searchable := strings.ToLower(strings.Join([]string{summary.ID, summary.SubagentType, summary.Status, summary.Title}, " "))
+		if filter == "" || strings.Contains(searchable, filter) {
+			result = append(result, summary)
+		}
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		leftActive, rightActive := activeAgentStatus(result[i].Status), activeAgentStatus(result[j].Status)
+		if leftActive != rightActive {
+			return leftActive
+		}
+		return result[i].UpdatedAt.After(result[j].UpdatedAt)
+	})
+	return result, nil
+}
+
+func (b *tuiBackend) AgentConversation(ctx context.Context, taskID string) (ui.AgentConversationSnapshot, error) {
+	manager := b.runtime.agentTaskManager(b.manager.Config().MaxParallelAgents)
+	task, err := manager.Output(ctx, b.conversation.SessionID(), taskID, false, 0)
+	if err != nil {
+		return ui.AgentConversationSnapshot{}, err
+	}
+	history := conversationHistory(agent.ConversationState{Turns: task.Transcript})
+	events := agentConversationEntries(task.Conversation)
+	if len(events) > 0 {
+		history = nil
+	} else if len(history) == 0 && strings.TrimSpace(task.Prompt) != "" {
+		history = []ui.HistoryItem{{Kind: ui.HistoryMessage, Role: protocol.RoleUser, Text: task.Prompt}}
+	}
+	return ui.AgentConversationSnapshot{
+		Agent: agentSummary(task), History: history, Events: events, Output: task.Output, Error: task.Error,
+	}, nil
+}
+
+func agentConversationEntries(entries []tool.AgentTaskConversationEntry) []ui.AgentConversationEntry {
+	result := make([]ui.AgentConversationEntry, 0, len(entries))
+	for _, entry := range entries {
+		converted := ui.AgentConversationEntry{Prompt: entry.Prompt, ModelEvent: entry.ModelEvent}
+		if entry.Audit != nil {
+			converted.ToolAudit = &ui.ToolAudit{
+				CallID: entry.Audit.CallID, DurationMS: entry.Audit.DurationMS, Decision: string(entry.Audit.Decision),
+				Risk: string(entry.Audit.Risk), ExitCode: entry.Audit.ExitCode,
+			}
+		}
+		result = append(result, converted)
+	}
+	return result
+}
+
+func (b *tuiBackend) SubscribeAgentEvents(ctx context.Context) (<-chan ui.AgentEvent, error) {
+	manager := b.runtime.agentTaskManager(b.manager.Config().MaxParallelAgents)
+	source := manager.Subscribe(ctx, b.conversation.SessionID())
+	events := make(chan ui.AgentEvent, 256)
+	go func() {
+		defer close(events)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-source:
+				if !ok {
+					return
+				}
+				converted := ui.AgentEvent{Agent: agentSummary(event.Task), ModelEvent: event.ModelEvent, Error: event.Task.Error}
+				if event.Audit != nil {
+					converted.ToolAudit = &ui.ToolAudit{
+						CallID: event.Audit.CallID, DurationMS: event.Audit.DurationMS, Decision: string(event.Audit.Decision),
+						Risk: string(event.Audit.Risk), ExitCode: event.Audit.ExitCode,
+					}
+				}
+				if event.Approval != nil {
+					modelReason, preview := approvalRequestDetails(event.Approval.Request.Tool, event.Approval.Request.Input)
+					preview = b.runtime.redact(preview)
+					if len(preview) > 512 {
+						preview = preview[:512] + "..."
+					}
+					response := make(chan ui.ApprovalDecision, 1)
+					converted.Approval = &ui.ApprovalRequest{
+						Tool: fmt.Sprintf("%s agent %s · %s", event.Task.SubagentType, shortAgentTaskID(event.Task.ID), event.Approval.Request.Tool),
+						Risk: string(event.Approval.Outcome.Risk), Summary: preview, Reason: modelReason,
+						PolicyReason: event.Approval.Outcome.Reason, Warning: event.Approval.Outcome.Warning,
+						Step: event.Approval.Request.ConfirmationStep, Total: event.Approval.Request.ConfirmationTotal, Response: response,
+					}
+					go func(approval *tool.AgentApproval) {
+						select {
+						case decision := <-response:
+							approval.Response <- tool.Confirmation{Approved: decision.Approved, RejectionReason: decision.Reason}
+						case <-ctx.Done():
+						}
+					}(event.Approval)
+				}
+				select {
+				case events <- converted:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return events, nil
+}
+
+func (b *tuiBackend) SendAgentMessage(ctx context.Context, taskID, prompt string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	manager := b.runtime.agentTaskManager(b.manager.Config().MaxParallelAgents)
+	_, err := manager.Continue(b.conversation.SessionID(), taskID, prompt)
+	return err
+}
+
+func (b *tuiBackend) StopAgent(ctx context.Context, taskID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	manager := b.runtime.agentTaskManager(b.manager.Config().MaxParallelAgents)
+	_, err := manager.Stop(b.conversation.SessionID(), taskID)
+	return err
+}
+
+func (b *tuiBackend) HasPendingAgentNotifications(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	manager := b.runtime.agentTaskManager(b.manager.Config().MaxParallelAgents)
+	return manager.HasPendingNotifications(b.conversation.SessionID()), nil
+}
+
+func agentSummary(task tool.AgentTask) ui.AgentSummary {
+	updated := task.UpdatedAt
+	if updated.IsZero() {
+		updated = task.CreatedAt
+	}
+	return ui.AgentSummary{
+		ID: task.ID, SubagentType: task.SubagentType, Status: string(task.Status), Title: agentTaskTitle(task.Prompt),
+		Background: task.Background,
+		CreatedAt:  task.CreatedAt, UpdatedAt: updated, StartedAt: task.StartedAt, CompletedAt: task.CompletedAt,
+		PendingMessages: task.PendingMessages, ReadOnly: task.ReadOnly, ConversationRevision: task.ConversationRevision,
+	}
+}
+
+func agentTaskTitle(prompt string) string {
+	prompt = strings.Join(strings.Fields(prompt), " ")
+	runes := []rune(prompt)
+	if len(runes) > 72 {
+		return string(runes[:71]) + "..."
+	}
+	return prompt
+}
+
+func shortAgentTaskID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+func activeAgentStatus(status string) bool {
+	return status == string(tool.AgentTaskQueued) || status == string(tool.AgentTaskRunning) || status == string(tool.AgentTaskWaitingApproval)
 }
 
 func conversationHistory(state agent.ConversationState) []ui.HistoryItem {
@@ -212,6 +383,10 @@ func conversationHistory(state agent.ConversationState) []ui.HistoryItem {
 
 func visibleUserMessage(prompt string) string {
 	switch {
+	case strings.HasPrefix(strings.TrimSpace(prompt), "<agent_notification>") && strings.HasSuffix(strings.TrimSpace(prompt), "</agent_notification>"):
+		return ""
+	case strings.HasPrefix(strings.TrimSpace(prompt), "<agent_follow_up>") && strings.HasSuffix(strings.TrimSpace(prompt), "</agent_follow_up>"):
+		return ""
 	case strings.HasPrefix(prompt, legacyPlanFeedbackPrefix):
 		prompt = strings.TrimPrefix(prompt, legacyPlanFeedbackPrefix)
 	case strings.Contains(prompt, legacyUserRequestStart) && strings.HasSuffix(prompt, legacyUserRequestEnd):
@@ -302,7 +477,6 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	if err != nil {
 		return err
 	}
-	prompt = b.runtime.promptWithCompletedSearchTasks(b.conversation.SessionID(), prompt)
 	contextReport := b.conversation.ContextReport()
 	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
 	estimatedInput := contextReport.InputTokens + estimator.Estimate(prompt)
@@ -417,7 +591,11 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
-	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, true, modelEvents)
+	sessionID := b.conversation.SessionID()
+	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{
+		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
+		BeforeModel: func() string { return b.runtime.completedAgentNotifications(sessionID) },
+	}, true, modelEvents)
 	flushText()
 	report := b.conversation.ContextReport()
 	observation.ObserveCodeSlices(report.CodeSlices)

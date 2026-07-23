@@ -21,6 +21,7 @@ type LoopOptions struct {
 	MaxTurns       int
 	MaxTotalTokens int
 	RequestID      string
+	BeforeModel    func() string
 }
 
 var ErrRequestInterrupted = errors.New("request interrupted by user")
@@ -67,6 +68,12 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 	for iteration := 0; iteration < maxTurns; iteration++ {
 		if err := ctx.Err(); err != nil {
 			return protocol.ModelResponse{}, err
+		}
+		if options.BeforeModel != nil {
+			if message := strings.TrimSpace(options.BeforeModel()); message != "" {
+				c.appendUser(message)
+				c.rebuildLedger(runtime)
+			}
 		}
 		runtime, err = c.refreshMCPRuntime(runtime, executor, baseTools)
 		if err != nil {
@@ -256,6 +263,22 @@ func (c *Conversation) refreshMCPRuntime(runtime Runtime, executor *tool.Executo
 	state := MCPRuntimeState{}
 	if runtime.MCPState != nil {
 		state = filterMCPRuntimeState(runtime.MCPState(), runtime.PermissionMode)
+		if c.profile != nil {
+			filtered := state.Tools[:0]
+			servers := make(map[string]string)
+			for _, item := range state.Tools {
+				definition := item.Definition()
+				if !c.profile.AllowsTool(definition.Name, item.Risk()) {
+					continue
+				}
+				filtered = append(filtered, item)
+				if server := state.ToolServers[definition.Name]; server != "" {
+					servers[definition.Name] = server
+				}
+			}
+			state.Tools = filtered
+			state.ToolServers = servers
+		}
 	}
 	registry := tool.NewRegistry()
 	for _, item := range append(append([]tool.Tool(nil), baseTools...), state.Tools...) {
@@ -363,6 +386,9 @@ func registryToolsExcluding(registry *tool.Registry, excluded map[string]string)
 			continue
 		}
 		if item, ok := registry.Get(definition.Name); ok {
+			if _, dynamicWebTool := item.(*webtool.LocalTool); dynamicWebTool {
+				continue
+			}
 			items = append(items, item)
 		}
 	}

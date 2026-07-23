@@ -43,7 +43,7 @@ type copyToastExpiredMsg struct{ sequence uint64 }
 func defaultClipboardWrite(value string) error { return clipboard.WriteAll(value) }
 
 func (m *Model) handleMouse(message tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if m.screen != screenChat || m.approval != nil {
+	if (m.screen != screenChat && m.screen != screenAgent) || m.approval != nil {
 		return m, nil
 	}
 	event := message.Mouse()
@@ -129,9 +129,13 @@ func (m *Model) toggleWebDisclosureAtRow(row, column int) bool {
 			ordinal++
 		}
 	}
-	for index := range m.timeline {
-		group := m.timeline[index].web
-		if m.timeline[index].kind != timelineWeb || group == nil || webActivityItemCount(group.activities) <= maxWebActivityItems {
+	timeline := m.timeline
+	if m.screen == screenAgent {
+		timeline = m.agentTimeline
+	}
+	for index := range timeline {
+		group := timeline[index].web
+		if timeline[index].kind != timelineWeb || group == nil || webActivityItemCount(group.activities) <= maxWebActivityItems {
 			continue
 		}
 		if ordinal == 0 {

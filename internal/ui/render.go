@@ -90,7 +90,7 @@ func (m *Model) View() tea.View {
 			parts = append(parts, completion)
 		}
 		input := strings.Repeat("\n", 2)
-		if m.screen == screenChat {
+		if m.screen == screenChat || m.screen == screenAgent {
 			input = m.renderInputBand()
 		}
 		parts = append(parts, renderBlankRows(m.width, activityGapRows), m.renderLoading())
@@ -109,7 +109,7 @@ func (m *Model) View() tea.View {
 	view.WindowTitle = "Eylu"
 	view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
 	view.KeyboardEnhancements.ReportAssociatedText = true
-	if m.screen == screenChat && m.approval == nil && m.ask == nil && m.planGate == nil {
+	if (m.screen == screenChat || m.screen == screenAgent) && m.approval == nil && m.ask == nil && m.planGate == nil {
 		view.Cursor = m.input.Cursor()
 		if view.Cursor != nil {
 			localRow := min(max(0, view.Cursor.Position.Y), max(0, m.input.Height()-1))
@@ -183,7 +183,7 @@ func (m *Model) setViewportHeight(height int) {
 }
 
 func (m *Model) refreshViewport() {
-	wasBottom := m.viewport.AtBottom() || (m.followOutput && m.screen == screenChat)
+	wasBottom := m.viewport.AtBottom() || (m.followOutput && (m.screen == screenChat || m.screen == screenAgent))
 	var content string
 	switch m.screen {
 	case screenProviders:
@@ -206,6 +206,8 @@ func (m *Model) refreshViewport() {
 		content = m.renderContext()
 	case screenTasks:
 		content = m.renderTasks()
+	case screenAgent:
+		content = m.renderAgentTimeline()
 	case screenToolDetail:
 		content = m.renderToolDetail()
 	default:
@@ -218,6 +220,16 @@ func (m *Model) refreshViewport() {
 }
 
 func (m *Model) renderHeader() string {
+	if m.screen == screenAgent && m.activeAgent != nil {
+		left := m.styles.Header.Render("Agent")
+		identity := strings.TrimSpace(m.activeAgent.Agent.SubagentType + "  " + shortAgentID(m.activeAgent.Agent.ID))
+		right := m.styles.Active.Render(m.activeAgent.Agent.Status)
+		available := max(0, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
+		identity = truncateColumns(identity, available)
+		middle := m.styles.Status.Render(identity)
+		gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(middle)-lipgloss.Width(right))
+		return truncateColumns(left+"  "+middle+strings.Repeat(" ", gap)+right, m.width)
+	}
 	provider := m.snapshot.Provider
 	if provider == "" {
 		provider = "unconfigured"
@@ -333,6 +345,18 @@ func (m *Model) renderThinkingActivity() string {
 }
 
 func (m *Model) renderStatus() string {
+	if m.screen == screenAgent && m.activeAgent != nil {
+		left := m.activeAgent.Agent.Status
+		if m.activeAgent.Agent.PendingMessages > 0 {
+			left += fmt.Sprintf(" · %d queued", m.activeAgent.Agent.PendingMessages)
+		}
+		right := "Esc main · Enter send"
+		if activeUIAgentStatus(m.activeAgent.Agent.Status) {
+			right += " · s stop"
+		}
+		gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
+		return padWidth(m.styles.Status.Render(left)+strings.Repeat(" ", gap)+m.styles.Muted.Render(right), m.width)
+	}
 	mode := m.snapshot.Mode
 	if mode == "" {
 		mode = "manual"
@@ -379,14 +403,32 @@ func (m *Model) renderStatus() string {
 }
 
 func (m *Model) renderTimeline() string {
+	return m.renderTimelineContent(true, "EYLU")
+}
+
+func (m *Model) renderAgentTimeline() string {
+	mainTimeline := m.timeline
+	m.timeline = m.agentTimeline
+	label := "AGENT"
+	if m.activeAgent != nil && m.activeAgent.Agent.SubagentType != "" {
+		label = strings.ToUpper(m.activeAgent.Agent.SubagentType)
+	}
+	content := m.renderTimelineContent(false, label)
+	m.timeline = mainTimeline
+	return content
+}
+
+func (m *Model) renderTimelineContent(includeBanner bool, agentLabel string) string {
 	var output strings.Builder
 	contentWidth := m.viewportContentWidth()
-	output.WriteString(m.renderBanner())
-	if status := m.renderMCPStartupStatus(); status != "" {
-		output.WriteByte('\n')
-		output.WriteString(status)
+	if includeBanner {
+		output.WriteString(m.renderBanner())
+		if status := m.renderMCPStartupStatus(); status != "" {
+			output.WriteByte('\n')
+			output.WriteString(status)
+		}
 	}
-	if len(m.timeline) > 0 {
+	if includeBanner && len(m.timeline) > 0 {
 		output.WriteString("\n\n")
 	}
 	for index := range m.timeline {
@@ -396,7 +438,7 @@ func (m *Model) renderTimeline() string {
 			if item.role == "user" {
 				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.User.Render("YOU"), wrapPlain(item.text, max(1, contentWidth-2)))
 			} else {
-				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.Agent.Render("EYLU"), m.renderTimelineMarkdown(item))
+				fmt.Fprintf(&output, "%s\n%s\n\n", m.styles.Agent.Render(agentLabel), m.renderTimelineMarkdown(item))
 			}
 		case timelineTool:
 			if item.tool != nil && (item.tool.name == "todolist" || isWebFunctionToolName(item.tool.name)) {
@@ -948,10 +990,14 @@ func (m *Model) workspaceRelativeDisplayPath(path string) string {
 }
 
 func (m *Model) renderToolDetail() string {
-	if m.toolCursor < 0 || m.toolCursor >= len(m.timeline) || m.timeline[m.toolCursor].tool == nil {
+	timeline := m.timeline
+	if m.toolDetailReturn == screenAgent {
+		timeline = m.agentTimeline
+	}
+	if m.toolCursor < 0 || m.toolCursor >= len(timeline) || timeline[m.toolCursor].tool == nil {
 		return ""
 	}
-	tool := m.timeline[m.toolCursor].tool
+	tool := timeline[m.toolCursor].tool
 	preview := tool.preview
 	if preview == "" {
 		preview = "(no file preview)"

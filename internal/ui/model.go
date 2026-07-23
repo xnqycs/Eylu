@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,11 +33,16 @@ const (
 	screenSkills         screenKind = "skills"
 	screenContext        screenKind = "context"
 	screenTasks          screenKind = "tasks"
+	screenAgent          screenKind = "agent"
 	screenToolDetail     screenKind = "tool_detail"
 	screenMCP            screenKind = "mcp"
 	screenMCPDetail      screenKind = "mcp_detail"
 	screenMCPToolDetail  screenKind = "mcp_tool_detail"
 )
+
+const agentFollowUpPrompt = `<agent_follow_up>
+A background agent reached a terminal state. Review the injected agent notification, continue the parent task from the current conversation, and report the result to the user.
+</agent_follow_up>`
 
 type timelineKind string
 
@@ -178,6 +185,7 @@ type Model struct {
 	skillCursor                int
 	modelCursor                int
 	toolCursor                 int
+	toolDetailReturn           screenKind
 	mcpCursor                  int
 	mcpCatalogCursor           int
 	mcpTab                     int
@@ -194,6 +202,8 @@ type Model struct {
 	approval                   *ApprovalRequest
 	approvalCursor             int
 	approvalEditing            bool
+	agentApproval              bool
+	agentApprovalReturnState   OperationState
 	ask                        *askState
 	planGate                   *planGateState
 	pendingImplementationMode  string
@@ -218,26 +228,38 @@ type Model struct {
 	colorAnimationElapsed      time.Duration
 	colorAnimationGeneration   uint64
 
-	operationID         string
-	operationMode       string
-	eventChannel        chan Event
-	cancel              context.CancelFunc
-	startedAt           time.Time
-	compactionStartedAt time.Time
-	retryAt             time.Time
-	cancelRequested     bool
-	activity            Activity
-	operationUsage      protocol.Usage
-	streamedBytes       int
-	reasoningStartedAt  time.Time
-	reasoningElapsed    time.Duration
-	reasoningActive     bool
-	reasoningSeen       bool
-	followOutput        bool
-	animation           bool
-	noColor             bool
-	operationSeq        uint64
-	markdown            markdownRenderCache
+	operationID             string
+	operationMode           string
+	eventChannel            chan Event
+	cancel                  context.CancelFunc
+	startedAt               time.Time
+	compactionStartedAt     time.Time
+	retryAt                 time.Time
+	cancelRequested         bool
+	activity                Activity
+	operationUsage          protocol.Usage
+	streamedBytes           int
+	reasoningStartedAt      time.Time
+	reasoningElapsed        time.Duration
+	reasoningActive         bool
+	reasoningSeen           bool
+	followOutput            bool
+	animation               bool
+	noColor                 bool
+	operationSeq            uint64
+	markdown                markdownRenderCache
+	agentEvents             <-chan AgentEvent
+	activeAgent             *AgentConversationSnapshot
+	agentTimeline           []timelineItem
+	agentSnapshotLoading    bool
+	agentBufferedEvents     []AgentEvent
+	mainDraft               string
+	mainViewportOffset      int
+	mainFollowOutput        bool
+	agentNotices            map[string]string
+	agentFollowUpPending    bool
+	agentFollowUpChecking   bool
+	agentFollowUpGeneration uint64
 }
 
 type snapshotMsg struct {
@@ -251,6 +273,34 @@ type backendEventMsg struct {
 
 type backendEventClosedMsg struct{ operationID string }
 type backendWorkerMsg struct{ operationID string }
+
+type agentSubscriptionMsg struct {
+	events <-chan AgentEvent
+	err    error
+}
+
+type agentEventMsg struct {
+	event  AgentEvent
+	events <-chan AgentEvent
+}
+
+type agentEventClosedMsg struct{}
+
+type agentFollowUpCheckMsg struct {
+	pending    bool
+	generation uint64
+	err        error
+}
+
+type agentSnapshotMsg struct {
+	snapshot AgentConversationSnapshot
+	err      error
+}
+
+type agentMutationMsg struct {
+	action string
+	err    error
+}
 
 type commandResultMsg struct {
 	text string
@@ -382,6 +432,7 @@ func NewModel(backend Backend, options Options) *Model {
 		version: strings.TrimSpace(options.Version), workspace: strings.TrimSpace(options.Workspace),
 		animation: !options.NoAnimation, noColor: options.NoColor, clipboardWrite: clipboardWrite,
 		colorAnimationStartedAt: clock.Now(),
+		agentNotices:            make(map[string]string),
 	}
 	if model.version == "" {
 		model.version = "dev"
@@ -424,7 +475,7 @@ func Run(backend Backend, options Options) error {
 }
 
 func (m *Model) Init() tea.Cmd {
-	commands := []tea.Cmd{m.input.Focus(), m.loadSnapshotCmd(), m.fetchMCPServersCmd()}
+	commands := []tea.Cmd{m.input.Focus(), m.loadSnapshotCmd(), m.fetchMCPServersCmd(), m.subscribeAgentEventsCmd()}
 	if command := m.mcpSpinnerTickCmd(); command != nil {
 		commands = append(commands, command)
 	}
@@ -573,10 +624,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(m.loadSnapshotCmd(), startCommand)
 			}
 		}
-		return m, m.loadSnapshotCmd()
+		return m, tea.Batch(m.loadSnapshotCmd(), m.maybeCheckAgentFollowUp())
 	case backendEventMsg:
 		return m.handleBackendEvent(typed.event)
 	case backendEventClosedMsg:
+		modeChangeQueued := m.queuedMode != "" && m.planGate == nil
 		if typed.operationID == m.operationID {
 			if m.state == StateCancelling {
 				m.state = StateCancelled
@@ -605,8 +657,71 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.queuedMode = ""
 			commands = append(commands, m.setModeCmd(next))
 		}
+		if !modeChangeQueued {
+			commands = append(commands, m.maybeCheckAgentFollowUp())
+		}
 		return m, tea.Batch(commands...)
 	case backendWorkerMsg:
+		return m, nil
+	case agentSubscriptionMsg:
+		if typed.err != nil {
+			m.appendNotice(typed.err.Error(), true)
+			m.refreshViewport()
+			return m, nil
+		}
+		m.agentEvents = typed.events
+		return m, waitAgentEventCmd(typed.events)
+	case agentEventMsg:
+		command := m.handleAgentEvent(typed.event)
+		return m, tea.Batch(command, waitAgentEventCmd(typed.events))
+	case agentEventClosedMsg:
+		m.agentEvents = nil
+		return m, nil
+	case agentFollowUpCheckMsg:
+		m.agentFollowUpChecking = false
+		if typed.generation != m.agentFollowUpGeneration {
+			return m, m.maybeCheckAgentFollowUp()
+		}
+		if typed.err != nil {
+			if !errors.Is(typed.err, context.Canceled) {
+				m.appendNotice(typed.err.Error(), true)
+				m.refreshViewport()
+			}
+			return m, nil
+		}
+		if !typed.pending {
+			m.agentFollowUpPending = false
+			return m, nil
+		}
+		if m.busy() {
+			m.agentFollowUpPending = true
+			return m, nil
+		}
+		m.agentFollowUpPending = false
+		return m.startRequest(Submission{Text: agentFollowUpPrompt, AgentFollowUp: true})
+	case agentSnapshotMsg:
+		buffered := append([]AgentEvent(nil), m.agentBufferedEvents...)
+		m.agentBufferedEvents = nil
+		m.agentSnapshotLoading = false
+		if typed.err != nil {
+			m.agentTimeline = append(m.agentTimeline, timelineItem{kind: timelineNotice, text: typed.err.Error(), err: true})
+		} else {
+			m.activeAgent = &typed.snapshot
+			m.hydrateAgentConversation(typed.snapshot)
+			if !timelineHasAgentMessage(m.agentTimeline) && strings.TrimSpace(typed.snapshot.Output) != "" {
+				m.agentTimeline = append(m.agentTimeline, timelineItem{kind: timelineMessage, role: "agent", text: typed.snapshot.Output})
+			}
+		}
+		m.replayBufferedAgentEvents(buffered)
+		m.refreshViewport()
+		return m, nil
+	case agentMutationMsg:
+		if typed.err != nil {
+			m.agentTimeline = append(m.agentTimeline, timelineItem{kind: timelineNotice, text: typed.err.Error(), err: true})
+		} else if typed.action == "stop" {
+			m.agentTimeline = append(m.agentTimeline, timelineItem{kind: timelineNotice, text: "Stop requested.", err: false})
+		}
+		m.refreshViewport()
 		return m, nil
 	case commandResultMsg:
 		if typed.err != nil {
@@ -730,7 +845,7 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.planGate.feedback = updated
 			return m, command
 		}
-		if m.screen == screenChat {
+		if m.screen == screenChat || m.screen == screenAgent {
 			m.clearSelection()
 			before := m.input.Value()
 			updated, command := m.input.Update(message)
@@ -738,14 +853,20 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if m.input.Value() != before {
 				m.resetHistoryNavigation()
 			}
-			completionCommand := m.refreshCompletion()
+			var completionCommand tea.Cmd
+			if m.screen == screenChat {
+				completionCommand = m.refreshCompletion()
+			}
 			return m, tea.Batch(command, completionCommand)
 		}
 	}
-	if m.screen == screenChat {
+	if m.screen == screenChat || m.screen == screenAgent {
 		updated, command := m.input.Update(message)
 		m.input = updated
-		completionCommand := m.refreshCompletion()
+		var completionCommand tea.Cmd
+		if m.screen == screenChat {
+			completionCommand = m.refreshCompletion()
+		}
 		return m, tea.Batch(command, completionCommand)
 	}
 	return m, nil
@@ -837,6 +958,7 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		}
 	case EventApproval:
 		m.approval = event.Approval
+		m.agentApproval = false
 		m.approvalCursor = 0
 		m.approvalEditing = false
 		m.approvalReason.Reset()
@@ -883,11 +1005,7 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 	case EventAgentTask:
 		if event.AgentTask != nil {
 			activity := event.AgentTask
-			message := fmt.Sprintf("Search task %s: %s", activity.TaskID, activity.Status)
-			if activity.Error != "" {
-				message += " (" + activity.Error + ")"
-			}
-			m.appendNotice(message, activity.Status == "failed")
+			m.appendAgentLifecycleNotice(AgentSummary{ID: activity.TaskID, SubagentType: activity.SubagentType, Status: activity.Status}, activity.Error)
 		}
 	case EventNotice:
 		m.appendNotice(event.Notice, event.Error)
@@ -897,6 +1015,188 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 		command = tea.Batch(command, waitEventCmd(m.operationID, m.eventChannel))
 	}
 	return m, command
+}
+
+func (m *Model) handleAgentEvent(event AgentEvent) tea.Cmd {
+	m.upsertAgentSummary(event.Agent)
+	if event.Approval != nil {
+		m.approval = event.Approval
+		m.agentApproval = true
+		m.agentApprovalReturnState = m.state
+		m.approvalCursor = 0
+		m.approvalEditing = false
+		m.approvalReason.Reset()
+		m.state = StateAwaitingApproval
+		m.refreshViewport()
+		return nil
+	}
+	if event.ModelEvent == nil && event.ToolAudit == nil {
+		m.appendAgentLifecycleNotice(event.Agent, event.Error)
+	}
+	terminalBackground := event.Approval == nil && event.ModelEvent == nil && event.ToolAudit == nil && event.Agent.Background && !activeUIAgentStatus(event.Agent.Status)
+	var followUpCommand tea.Cmd
+	if terminalBackground {
+		m.agentFollowUpPending = true
+		m.agentFollowUpGeneration++
+		followUpCommand = m.maybeCheckAgentFollowUp()
+	}
+	if m.activeAgent == nil || m.activeAgent.Agent.ID != event.Agent.ID {
+		if m.screen == screenChat {
+			m.refreshViewport()
+		}
+		return followUpCommand
+	}
+	if m.agentSnapshotLoading && (event.ModelEvent != nil || event.ToolAudit != nil) {
+		m.agentBufferedEvents = append(m.agentBufferedEvents, event)
+		return followUpCommand
+	}
+	if (event.ModelEvent != nil || event.ToolAudit != nil) && event.Agent.ConversationRevision > 0 && event.Agent.ConversationRevision <= m.activeAgent.Agent.ConversationRevision {
+		return followUpCommand
+	}
+	m.activeAgent.Agent = event.Agent
+	if event.ModelEvent != nil {
+		m.applyAgentModelEvent(*event.ModelEvent)
+	}
+	if event.ToolAudit != nil {
+		m.applyAgentToolAudit(*event.ToolAudit)
+	}
+	if !activeUIAgentStatus(event.Agent.Status) {
+		m.agentSnapshotLoading = true
+		m.refreshViewport()
+		return tea.Batch(m.loadAgentSnapshotCmd(event.Agent.ID), followUpCommand)
+	}
+	m.refreshViewport()
+	return followUpCommand
+}
+
+func (m *Model) hydrateAgentConversation(snapshot AgentConversationSnapshot) {
+	m.agentTimeline = m.timelineForHistory(snapshot.History)
+	for _, entry := range snapshot.Events {
+		if strings.TrimSpace(entry.Prompt) != "" {
+			m.agentTimeline = append(m.agentTimeline, timelineItem{kind: timelineMessage, role: "user", text: entry.Prompt})
+		}
+		if entry.ModelEvent != nil {
+			m.applyAgentModelEvent(*entry.ModelEvent)
+		}
+		if entry.ToolAudit != nil {
+			m.applyAgentToolAudit(*entry.ToolAudit)
+		}
+	}
+}
+
+func timelineHasAgentMessage(timeline []timelineItem) bool {
+	for _, item := range timeline {
+		if item.kind == timelineMessage && item.role == "agent" && strings.TrimSpace(item.text) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) replayBufferedAgentEvents(events []AgentEvent) {
+	if m.activeAgent == nil {
+		return
+	}
+	for _, event := range events {
+		if event.Agent.ID != m.activeAgent.Agent.ID {
+			continue
+		}
+		if event.Agent.ConversationRevision > 0 && event.Agent.ConversationRevision <= m.activeAgent.Agent.ConversationRevision {
+			continue
+		}
+		m.activeAgent.Agent = event.Agent
+		if event.ModelEvent != nil {
+			m.applyAgentModelEvent(*event.ModelEvent)
+		}
+		if event.ToolAudit != nil {
+			m.applyAgentToolAudit(*event.ToolAudit)
+		}
+	}
+}
+
+func (m *Model) applyAgentModelEvent(event protocol.ModelEvent) {
+	mainTimeline := m.timeline
+	mainOperationID := m.operationID
+	m.timeline = m.agentTimeline
+	m.operationID = m.activeAgent.Agent.ID
+	switch event.Kind {
+	case protocol.EventTextDelta:
+		m.appendAgentDelta(event.Delta)
+	case protocol.EventToolCallDelta:
+		if event.ToolCallDelta != nil {
+			m.applyToolCallDelta(*event.ToolCallDelta)
+		}
+	case protocol.EventToolStart:
+		if event.ToolCall != nil {
+			m.startTool(*event.ToolCall)
+		}
+	case protocol.EventToolResult:
+		if event.ToolResult != nil {
+			m.completeTool(event.ToolResult)
+		}
+	case protocol.EventWebSearchStarted, protocol.EventWebSearchUpdated, protocol.EventWebSearchCompleted,
+		protocol.EventWebFetchStarted, protocol.EventWebFetchUpdated, protocol.EventWebFetchCompleted:
+		if event.WebActivity != nil {
+			m.applyWebActivity(*event.WebActivity)
+		}
+	case protocol.EventCitation:
+		if event.Citation != nil {
+			m.applyWebCitation(*event.Citation)
+		}
+	}
+	m.agentTimeline = m.timeline
+	m.timeline = mainTimeline
+	m.operationID = mainOperationID
+}
+
+func (m *Model) applyAgentToolAudit(audit ToolAudit) {
+	mainTimeline := m.timeline
+	m.timeline = m.agentTimeline
+	m.applyToolAudit(audit)
+	m.agentTimeline = m.timeline
+	m.timeline = mainTimeline
+}
+
+func (m *Model) upsertAgentSummary(summary AgentSummary) {
+	found := false
+	for index := range m.snapshot.Agents {
+		if m.snapshot.Agents[index].ID == summary.ID {
+			m.snapshot.Agents[index] = summary
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.snapshot.Agents = append(m.snapshot.Agents, summary)
+	}
+	sortAgentSummaries(m.snapshot.Agents)
+}
+
+func sortAgentSummaries(agents []AgentSummary) {
+	sort.SliceStable(agents, func(i, j int) bool {
+		leftActive, rightActive := activeUIAgentStatus(agents[i].Status), activeUIAgentStatus(agents[j].Status)
+		if leftActive != rightActive {
+			return leftActive
+		}
+		return agents[i].UpdatedAt.After(agents[j].UpdatedAt)
+	})
+}
+
+func (m *Model) appendAgentLifecycleNotice(agent AgentSummary, failure string) {
+	if agent.ID == "" || (agent.Status != "queued" && agent.Status != "completed" && agent.Status != "failed" && agent.Status != "cancelled") {
+		return
+	}
+	key := agent.ID + ":" + agent.Status
+	if m.agentNotices[key] != "" {
+		return
+	}
+	m.agentNotices[key] = key
+	label := strings.TrimSpace(agent.SubagentType + " agent")
+	message := fmt.Sprintf("%s %s: %s", label, shortAgentID(agent.ID), agent.Status)
+	if strings.TrimSpace(failure) != "" {
+		message += " (" + failure + ")"
+	}
+	m.appendNotice(message, agent.Status == "failed")
 }
 
 func formatCitation(citation protocol.URLCitation) string {
@@ -1136,9 +1436,14 @@ func (m *Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		updated, command := m.viewport.Update(message)
 		m.viewport = updated
 		return m, command
+	case screenAgent:
+		return m.handleAgentKey(message)
 	case screenToolDetail:
 		if key == "esc" {
-			m.screen = screenChat
+			m.screen = m.toolDetailReturn
+			if m.screen != screenAgent {
+				m.screen = screenChat
+			}
 			m.refreshViewport()
 			return m, nil
 		}
@@ -1218,6 +1523,7 @@ func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+t":
 		if index := m.lastToolIndex(); index >= 0 {
 			m.toolCursor = index
+			m.toolDetailReturn = screenChat
 			m.screen = screenToolDetail
 			m.refreshViewport()
 		}
@@ -1231,6 +1537,108 @@ func (m *Model) handleChatKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	completionCommand := m.refreshCompletion()
 	return m, tea.Batch(command, completionCommand)
+}
+
+func (m *Model) handleAgentKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := message.String()
+	if key == "esc" {
+		m.screen = screenChat
+		m.input.Placeholder = "Message Eylu"
+		m.input.SetValue(m.mainDraft)
+		m.input.MoveToEnd()
+		m.activeAgent = nil
+		m.agentTimeline = nil
+		m.followOutput = m.mainFollowOutput
+		m.refreshViewport()
+		m.viewport.SetYOffset(m.mainViewportOffset)
+		m.updateViewportHeight()
+		return m, nil
+	}
+	if m.activeAgent == nil {
+		return m, nil
+	}
+	if key == "s" && strings.TrimSpace(m.input.Value()) == "" && activeUIAgentStatus(m.activeAgent.Agent.Status) {
+		return m, m.stopAgentCmd(m.activeAgent.Agent.ID)
+	}
+	if isModifiedEnter(message) {
+		m.input.InsertString("\n")
+		return m, nil
+	}
+	switch key {
+	case "enter":
+		prompt := strings.TrimSpace(m.input.Value())
+		if prompt == "" {
+			return m, nil
+		}
+		if m.activeAgent.Agent.ReadOnly {
+			m.agentTimeline = append(m.agentTimeline, timelineItem{kind: timelineNotice, text: "Restored agent conversations are read-only.", err: true})
+			m.refreshViewport()
+			return m, nil
+		}
+		taskID := m.activeAgent.Agent.ID
+		m.agentTimeline = append(m.agentTimeline, timelineItem{kind: timelineMessage, role: "user", text: prompt})
+		m.input.Reset()
+		m.followOutput = true
+		m.refreshViewport()
+		return m, m.sendAgentMessageCmd(taskID, prompt)
+	case "pgup":
+		m.followOutput = false
+		m.viewport.PageUp()
+		return m, nil
+	case "pgdown":
+		m.viewport.PageDown()
+		m.followOutput = m.viewport.AtBottom()
+		return m, nil
+	case "ctrl+t":
+		if index := lastToolIndexIn(m.agentTimeline); index >= 0 {
+			m.toolCursor = index
+			m.toolDetailReturn = screenAgent
+			m.screen = screenToolDetail
+			m.refreshViewport()
+		}
+		return m, nil
+	}
+	updated, command := m.input.Update(message)
+	m.input = updated
+	return m, command
+}
+
+func (m *Model) openAgent(taskID string) tea.Cmd {
+	if m.screen != screenAgent {
+		m.mainDraft = m.input.Value()
+		m.mainViewportOffset = m.viewport.YOffset()
+		m.mainFollowOutput = m.followOutput
+	}
+	m.screen = screenAgent
+	m.activeAgent = &AgentConversationSnapshot{Agent: AgentSummary{ID: taskID, Status: "queued"}}
+	for _, item := range m.snapshot.Agents {
+		if item.ID == taskID {
+			m.activeAgent.Agent = item
+			break
+		}
+	}
+	m.agentTimeline = nil
+	m.agentSnapshotLoading = true
+	m.agentBufferedEvents = nil
+	m.clearSelection()
+	m.input.Reset()
+	m.input.Placeholder = "Message agent"
+	m.followOutput = true
+	m.completion = completionState{}
+	m.updateViewportHeight()
+	m.refreshViewport()
+	return m.loadAgentSnapshotCmd(taskID)
+}
+
+func (m *Model) timelineForHistory(history []HistoryItem) []timelineItem {
+	mainTimeline := m.timeline
+	mainToolCursor := m.toolCursor
+	m.timeline = nil
+	m.hydrateHistory(history)
+	result := m.timeline
+	m.timeline = mainTimeline
+	m.toolCursor = mainToolCursor
+	return result
 }
 
 func isModifiedEnter(message tea.KeyPressMsg) bool {
@@ -1332,11 +1740,13 @@ func (m *Model) startRequest(submission Submission) (tea.Model, tea.Cmd) {
 	m.streamedBytes = 0
 	m.resetReasoningRound()
 	m.state = StateConnecting
-	m.draft = submission.Text
-	m.input.Reset()
+	if !submission.AgentFollowUp {
+		m.draft = submission.Text
+		m.input.Reset()
+		m.timeline = append(m.timeline, timelineItem{kind: timelineMessage, role: "user", text: submission.Text})
+	}
 	m.completion = completionState{}
 	m.updateViewportHeight()
-	m.timeline = append(m.timeline, timelineItem{kind: timelineMessage, role: "user", text: submission.Text})
 	m.followOutput = true
 	m.refreshViewport()
 	commands := []tea.Cmd{runBackendCmd(requestContext, m.backend, m.operationID, submission, m.eventChannel), waitEventCmd(m.operationID, m.eventChannel)}
@@ -1376,6 +1786,14 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 		m.screen = screenTasks
 		m.refreshViewport()
 		return m, m.loadSnapshotCmd()
+	case "/agents":
+		if len(fields) == 2 {
+			return m, m.openAgent(fields[1])
+		}
+		m.input.SetValue("/agents ")
+		m.input.MoveToEnd()
+		m.screen = screenChat
+		return m, m.refreshCompletion()
 	case "/skills":
 		m.screen = screenSkills
 		return m, m.loadSnapshotCmd()
@@ -1418,7 +1836,7 @@ func (m *Model) executeSlash(line string) (tea.Model, tea.Cmd) {
 			return m.requestMode(fields[1])
 		}
 	case "/help":
-		m.appendNotice("/new /compact /tasks /context /skills /skill /providers /provider /model /mcp /effort /gradient /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
+		m.appendNotice("/new /compact /agents /tasks /context /skills /skill /providers /provider /model /mcp /effort /gradient /mode /quit  ·  Shift+Tab cycles mode  ·  Plan: Auto/Full/Reject  ·  Approval: Tab adds rejection feedback", false)
 		m.refreshViewport()
 		return m, nil
 	}
@@ -1514,7 +1932,16 @@ func (m *Model) submitApproval(decision ApprovalDecision) tea.Cmd {
 	m.approvalEditing = false
 	m.approvalReason.Blur()
 	m.approvalReason.Reset()
+	if m.agentApproval {
+		m.agentApproval = false
+		m.state = m.agentApprovalReturnState
+		m.agentApprovalReturnState = ""
+		return nil
+	}
 	m.state = StateExecutingTool
+	if m.eventChannel == nil {
+		return nil
+	}
 	return waitEventCmd(m.operationID, m.eventChannel)
 }
 
@@ -1762,6 +2189,18 @@ func (m *Model) busy() bool {
 	}
 }
 
+func (m *Model) maybeCheckAgentFollowUp() tea.Cmd {
+	if !m.agentFollowUpPending || m.agentFollowUpChecking || m.busy() {
+		return nil
+	}
+	m.agentFollowUpChecking = true
+	generation := m.agentFollowUpGeneration
+	return func() tea.Msg {
+		pending, err := m.backend.HasPendingAgentNotifications(m.context)
+		return agentFollowUpCheckMsg{pending: pending, generation: generation, err: err}
+	}
+}
+
 func (m *Model) startCompact() (tea.Model, tea.Cmd) {
 	if m.busy() {
 		m.appendNotice("A request is already running.", true)
@@ -1797,22 +2236,9 @@ func (m *Model) startCompact() (tea.Model, tea.Cmd) {
 
 func runBackendCmd(ctx context.Context, backend Backend, operationID string, submission Submission, events chan Event) tea.Cmd {
 	return func() tea.Msg {
+		emitter := newOperationEventEmitter(ctx, events)
 		enqueue := func(event Event, lossy bool) {
-			if lossy {
-				select {
-				case events <- event:
-				default:
-				}
-				return
-			}
-			select {
-			case events <- event:
-			case <-ctx.Done():
-				select {
-				case events <- event:
-				default:
-				}
-			}
+			emitter.enqueue(event, lossy)
 		}
 		err := backend.Submit(ctx, operationID, submission, func(event Event) {
 			if event.OperationID == "" {
@@ -1833,25 +2259,19 @@ func runBackendCmd(ctx context.Context, backend Backend, operationID string, sub
 		} else {
 			enqueue(Event{OperationID: operationID, Kind: EventState, State: StateCompleted}, false)
 		}
-		close(events)
+		emitter.close()
 		return backendWorkerMsg{operationID: operationID}
 	}
 }
 
 func runCompactCmd(ctx context.Context, backend Backend, operationID string, events chan Event) tea.Cmd {
 	return func() tea.Msg {
+		emitter := newOperationEventEmitter(ctx, events)
 		enqueue := func(event Event) {
 			if event.OperationID == "" {
 				event.OperationID = operationID
 			}
-			select {
-			case events <- event:
-			case <-ctx.Done():
-				select {
-				case events <- event:
-				default:
-				}
-			}
+			emitter.enqueue(event, false)
 		}
 		err := backend.Compact(ctx, operationID, enqueue)
 		if err != nil {
@@ -1865,12 +2285,76 @@ func runCompactCmd(ctx context.Context, backend Backend, operationID string, eve
 		} else {
 			enqueue(Event{Kind: EventState, State: StateCompleted})
 		}
-		close(events)
+		emitter.close()
 		return backendWorkerMsg{operationID: operationID}
 	}
 }
 
+type operationEventEmitter struct {
+	ctx    context.Context
+	events chan Event
+	done   chan struct{}
+	mu     sync.Mutex
+	wg     sync.WaitGroup
+	closed bool
+}
+
+func newOperationEventEmitter(ctx context.Context, events chan Event) *operationEventEmitter {
+	return &operationEventEmitter{ctx: ctx, events: events, done: make(chan struct{})}
+}
+
+func (e *operationEventEmitter) enqueue(event Event, lossy bool) {
+	if e == nil || e.events == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.wg.Add(1)
+	e.mu.Unlock()
+	defer e.wg.Done()
+	if lossy {
+		select {
+		case e.events <- event:
+		case <-e.done:
+		default:
+		}
+		return
+	}
+	select {
+	case e.events <- event:
+	case <-e.done:
+	case <-e.ctx.Done():
+		select {
+		case e.events <- event:
+		case <-e.done:
+		default:
+		}
+	}
+}
+
+func (e *operationEventEmitter) close() {
+	if e == nil || e.events == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.closed = true
+	close(e.done)
+	e.mu.Unlock()
+	e.wg.Wait()
+	close(e.events)
+}
+
 func waitEventCmd(operationID string, events <-chan Event) tea.Cmd {
+	if events == nil {
+		return nil
+	}
 	return func() tea.Msg {
 		event, ok := <-events
 		if !ok {
@@ -1902,6 +2386,45 @@ func (m *Model) loadSnapshotCmd() tea.Cmd {
 	return func() tea.Msg {
 		snapshot, err := m.backend.Snapshot(m.context)
 		return snapshotMsg{snapshot: snapshot, err: err}
+	}
+}
+
+func (m *Model) subscribeAgentEventsCmd() tea.Cmd {
+	return func() tea.Msg {
+		events, err := m.backend.SubscribeAgentEvents(m.context)
+		return agentSubscriptionMsg{events: events, err: err}
+	}
+}
+
+func waitAgentEventCmd(events <-chan AgentEvent) tea.Cmd {
+	if events == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		event, ok := <-events
+		if !ok {
+			return agentEventClosedMsg{}
+		}
+		return agentEventMsg{event: event, events: events}
+	}
+}
+
+func (m *Model) loadAgentSnapshotCmd(taskID string) tea.Cmd {
+	return func() tea.Msg {
+		snapshot, err := m.backend.AgentConversation(m.context, taskID)
+		return agentSnapshotMsg{snapshot: snapshot, err: err}
+	}
+}
+
+func (m *Model) sendAgentMessageCmd(taskID, prompt string) tea.Cmd {
+	return func() tea.Msg {
+		return agentMutationMsg{action: "send", err: m.backend.SendAgentMessage(m.context, taskID, prompt)}
+	}
+}
+
+func (m *Model) stopAgentCmd(taskID string) tea.Cmd {
+	return func() tea.Msg {
+		return agentMutationMsg{action: "stop", err: m.backend.StopAgent(m.context, taskID)}
 	}
 }
 
@@ -2323,8 +2846,12 @@ func (m *Model) applyToolAudit(audit ToolAudit) {
 }
 
 func (m *Model) lastToolIndex() int {
-	for index := len(m.timeline) - 1; index >= 0; index-- {
-		if m.timeline[index].kind == timelineTool {
+	return lastToolIndexIn(m.timeline)
+}
+
+func lastToolIndexIn(timeline []timelineItem) int {
+	for index := len(timeline) - 1; index >= 0; index-- {
+		if timeline[index].kind == timelineTool {
 			return index
 		}
 	}

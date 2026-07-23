@@ -154,14 +154,21 @@ func TestAgentTaskReportsRoundTripThroughEvents(t *testing.T) {
 	createTestSession(t, store, "agent-tasks", root)
 	tasks := []tool.AgentTask{{
 		ID: "task-1", SessionID: "agent-tasks", SubagentType: "search", Status: tool.AgentTaskCompleted,
-		CreatedAt: time.Now().UTC(), CompletedAt: time.Now().UTC(), Consumed: false,
+		CreatedAt: time.Now().UTC(), CompletedAt: time.Now().UTC(), Consumed: false, Output: "found",
+		Usage: protocol.Usage{InputTokens: 12, OutputTokens: 4, Exact: true}, NotificationRevision: 1,
+		Transcript: []protocol.Turn{textTurn("agent-user", protocol.RoleUser, "find it"), textTurn("agent-result", protocol.RoleAgent, "found")},
+		Conversation: []tool.AgentTaskConversationEntry{
+			{Prompt: "find it"},
+			{ModelEvent: &protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "found"}},
+			{Audit: &tool.AuditRecord{CallID: "read", DurationMS: 9}},
+		},
 		Report: &tool.SearchReport{Summary: "found", Findings: []tool.SearchFinding{{Path: "main.go", StartLine: 1, EndLine: 2, Reason: "entrypoint", Confidence: 1}}},
 	}}
 	if _, err := store.Append("agent-tasks", []Event{{Type: EventAgentTasksUpdated, AgentTasks: tasks}}); err != nil {
 		t.Fatal(err)
 	}
 	restored, _, err := store.Load("agent-tasks")
-	if err != nil || len(restored.AgentTasks) != 1 || restored.AgentTasks[0].Report == nil || restored.AgentTasks[0].Report.Summary != "found" {
+	if err != nil || len(restored.AgentTasks) != 1 || restored.AgentTasks[0].Report == nil || restored.AgentTasks[0].Report.Summary != "found" || len(restored.AgentTasks[0].Transcript) != 2 || len(restored.AgentTasks[0].Conversation) != 3 || restored.AgentTasks[0].Conversation[2].Audit == nil || restored.AgentTasks[0].Conversation[2].Audit.DurationMS != 9 || restored.AgentTasks[0].Usage.InputTokens != 12 {
 		t.Fatalf("restored=%#v err=%v", restored.AgentTasks, err)
 	}
 }

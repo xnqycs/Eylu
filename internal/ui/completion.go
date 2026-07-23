@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -33,6 +34,7 @@ type completionItem struct {
 	execute     bool
 	expand      bool
 	rank        int
+	agentID     string
 }
 
 type completionState struct {
@@ -101,6 +103,7 @@ func previousRune(value string) (rune, int) {
 
 func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 	commands := []completionItem{
+		{label: "/agents", description: "Browse subagent conversations", insert: "/agents ", expand: true},
 		{label: "/compact", description: "Compact the current context", insert: "/compact"},
 		{label: "/context", description: "Inspect context usage", insert: "/context"},
 		{label: "/effort", description: "Choose the reasoning effort", insert: "/effort ", expand: true},
@@ -119,6 +122,39 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 	}
 	lower := strings.ToLower(value)
 	switch {
+	case lower == "/agents" || strings.HasPrefix(lower, "/agents "):
+		query := ""
+		if strings.HasPrefix(lower, "/agents ") {
+			query = strings.TrimSpace(strings.TrimPrefix(value, "/agents "))
+		}
+		agents := append([]AgentSummary(nil), snapshot.Agents...)
+		sort.SliceStable(agents, func(i, j int) bool {
+			leftActive, rightActive := activeUIAgentStatus(agents[i].Status), activeUIAgentStatus(agents[j].Status)
+			if leftActive != rightActive {
+				return leftActive
+			}
+			return agents[i].UpdatedAt.After(agents[j].UpdatedAt)
+		})
+		items := make([]completionItem, 0, len(agents))
+		for index, item := range agents {
+			label := strings.TrimSpace(item.SubagentType + "  " + shortAgentID(item.ID) + "  " + item.Title)
+			if query != "" && !strings.Contains(strings.ToLower(label+" "+item.Status), strings.ToLower(query)) {
+				continue
+			}
+			description := item.Status
+			if elapsed := agentElapsed(item, time.Now()); elapsed != "" {
+				description += " · " + elapsed
+			}
+			items = append(items, completionItem{
+				label: label, description: description, insert: "/agents " + item.ID,
+				execute: true, rank: index, agentID: item.ID,
+			})
+		}
+		items = filterCompletionItems(items, "")
+		if len(items) == 0 {
+			return []completionItem{{label: "No agents in this session", disabled: true}}
+		}
+		return items
 	case lower == "/gradient" || strings.HasPrefix(lower, "/gradient "):
 		query := ""
 		if strings.HasPrefix(lower, "/gradient ") {
@@ -177,6 +213,36 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 		}
 	}
 	return filterCompletionItems(items, query)
+}
+
+func activeUIAgentStatus(status string) bool {
+	return status == "queued" || status == "running" || status == "waiting_approval"
+}
+
+func shortAgentID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+func agentElapsed(agent AgentSummary, now time.Time) string {
+	start := agent.StartedAt
+	if start.IsZero() {
+		start = agent.CreatedAt
+	}
+	if start.IsZero() {
+		return ""
+	}
+	end := agent.CompletedAt
+	if end.IsZero() {
+		end = now
+	}
+	duration := max(time.Duration(0), end.Sub(start)).Round(time.Second)
+	if duration < time.Second {
+		duration = time.Second
+	}
+	return duration.String()
 }
 
 func referenceCompletionItems(query string, snapshot Snapshot, files []FileItem, loaded, loading bool, diagnostic string) ([]completionItem, bool) {
@@ -344,6 +410,9 @@ func (m *Model) handleCompletionKey(key string) (bool, tea.Cmd) {
 		m.completion = completionState{}
 		m.updateViewportHeight()
 		if key == "enter" && item.execute {
+			if item.agentID != "" {
+				return true, m.openAgent(item.agentID)
+			}
 			return true, m.commandCmd(value)
 		}
 		if item.expand {

@@ -237,7 +237,7 @@ func bindChatFlags(cmd *cobra.Command, opts *chatOptions) {
 	cmd.MarkFlagsMutuallyExclusive("session", "resume")
 }
 
-func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) error {
+func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) (returnErr error) {
 	manager, err := r.prepareManager(ctx, opts)
 	if err != nil {
 		return err
@@ -246,6 +246,14 @@ func (r *runtime) runChat(ctx context.Context, prompt string, opts chatOptions) 
 	if err != nil {
 		return err
 	}
+	defer func() {
+		r.closeSearchTasks()
+		if r.session != nil {
+			if syncErr := r.session.Sync(conversation, manager, opts, returnErr); returnErr == nil {
+				returnErr = syncErr
+			}
+		}
+	}()
 	return r.sendPrompt(ctx, conversation, manager, prompt, opts)
 }
 
@@ -276,7 +284,6 @@ func (r *runtime) prepareManager(ctx context.Context, opts chatOptions) (*provid
 func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
 	detachMCP := r.attachMCPConversation(conversation)
 	defer detachMCP()
-	prompt = r.promptWithCompletedSearchTasks(conversation.SessionID(), prompt)
 	conversation.RecordPrompt(prompt)
 	cfg := manager.Config()
 	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
@@ -439,7 +446,11 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		}
 		return nil
 	}
-	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, stream, emit)
+	sessionID := conversation.SessionID()
+	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{
+		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
+		BeforeModel: func() string { return r.completedAgentNotifications(sessionID) },
+	}, stream, emit)
 	observation.ObserveCodeSlices(conversation.ContextReport().CodeSlices)
 	metric := observation.Finish(response.Usage, err)
 	r.reportMetric(jsonlEncoder, metric)

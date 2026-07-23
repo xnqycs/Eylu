@@ -122,3 +122,23 @@ Every finding must be grounded in tool output. Use an empty findings array when 
 		},
 	}
 }
+
+func GeneralSubagentProfile(mode string, maxTurns int) Profile {
+	base := executionProfile(mode)
+	base.Name = "general"
+	base.Description = "General-purpose background repository subagent."
+	base.MaxTurns = maxTurns
+	base.Isolated = true
+	base.SystemPrompt = func() string {
+		return executionProfile(mode).SystemPrompt() + ` You are running as a child agent in a shared workspace. Complete the delegated task independently and keep the final response concise. Re-read a file immediately before editing it, use edit_file for existing files, and use write_file only for new files. You cannot delegate another agent or ask the user questions. The parent agent receives your final response and transcript.`
+	}
+	base.AllowTool = func(name string, _ policy.Risk) bool {
+		switch name {
+		case "agent", "task_output", "task_stop", "ask", "activate_skill":
+			return false
+		default:
+			return true
+		}
+	}
+	return base
+}

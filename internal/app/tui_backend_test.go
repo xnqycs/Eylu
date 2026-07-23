@@ -235,6 +235,100 @@ func TestTUIBackendStreamsEventsWithoutWritingTerminal(t *testing.T) {
 	}
 }
 
+func TestTUIBackendAutomaticAgentFollowUpInjectsPendingNotification(t *testing.T) {
+	t.Setenv("EYLU_API_KEY", "tui-secret")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(body, []byte("agent_follow_up")) || !bytes.Contains(body, []byte("agent_notification")) || !bytes.Contains(body, []byte("delegated result")) {
+			t.Fatalf("automatic follow-up input = %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"continued from agent\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_follow_up\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"continued from agent\"}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"))
+	}))
+	defer server.Close()
+
+	workspace := t.TempDir()
+	cfg := testAppConfig()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = config.ProviderConfig{Adapter: "openai_responses", BaseURL: server.URL + "/v1", Model: "test"}
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := skill.Discover(skill.DiscoveryOptions{Workspace: workspace, Home: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := agent.NewConversationWithEnvironment(environment.Context{WorkingDirectory: workspace, Platform: "windows", Today: "2026-07-23"})
+	appRuntime := &runtime{stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}, workspace: workspace, trustPrompted: make(map[string]bool)}
+	defer appRuntime.closeSearchTasks()
+	tasks := appRuntime.agentTaskManager(cfg.MaxParallelAgents)
+	tasks.Restore([]tool.AgentTask{{
+		ID: "completed-agent", SessionID: conversation.SessionID(), SubagentType: "general", Status: tool.AgentTaskCompleted,
+		Background: true, Prompt: "inspect project", Output: "delegated result", NotificationRevision: 1,
+	}})
+	backend := &tuiBackend{runtime: appRuntime, conversation: conversation, manager: manager, skills: registry, skillSession: skill.NewSession(registry, nil)}
+	pending, err := backend.HasPendingAgentNotifications(context.Background())
+	if err != nil || !pending {
+		t.Fatalf("pending=%t err=%v", pending, err)
+	}
+	var text strings.Builder
+	err = backend.Submit(context.Background(), "op-follow-up", ui.Submission{
+		Text: "<agent_follow_up>\nContinue the parent task.\n</agent_follow_up>", AgentFollowUp: true,
+	}, func(event ui.Event) {
+		if event.Kind == ui.EventTextDelta {
+			text.WriteString(event.Delta)
+		}
+	})
+	if err != nil || text.String() != "continued from agent" {
+		t.Fatalf("text=%q err=%v", text.String(), err)
+	}
+	pending, err = backend.HasPendingAgentNotifications(context.Background())
+	if err != nil || pending {
+		t.Fatalf("notification remained pending=%t err=%v", pending, err)
+	}
+	for _, item := range conversationHistory(conversation.ExportState()) {
+		if item.Role == protocol.RoleUser && (strings.Contains(item.Text, "agent_follow_up") || strings.Contains(item.Text, "agent_notification")) {
+			t.Fatalf("internal follow-up leaked into history: %#v", item)
+		}
+	}
+}
+
+func TestTUIBackendAgentConversationReplaysRecordedHistory(t *testing.T) {
+	cfg := testAppConfig()
+	manager, err := provider.NewManager(filepath.Join(t.TempDir(), "config.toml"), cfg, func(string, config.Config) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation := agent.NewConversationWithEnvironment(environment.Context{WorkingDirectory: t.TempDir(), Platform: "windows", Today: "2026-07-23"})
+	appRuntime := &runtime{workspace: t.TempDir()}
+	defer appRuntime.closeSearchTasks()
+	tasks := appRuntime.agentTaskManager(cfg.MaxParallelAgents)
+	tasks.Restore([]tool.AgentTask{{
+		ID: "history-agent", SessionID: conversation.SessionID(), SubagentType: "general", Status: tool.AgentTaskCompleted,
+		Prompt: "inspect history", ConversationRevision: 4,
+		Conversation: []tool.AgentTaskConversationEntry{
+			{Prompt: "inspect history"},
+			{ModelEvent: &protocol.ModelEvent{Kind: protocol.EventTextDelta, Delta: "prior answer"}},
+			{ModelEvent: &protocol.ModelEvent{Kind: protocol.EventToolStart, ToolCall: &protocol.ToolCall{ID: "call", Name: "read_file", Arguments: json.RawMessage(`{"path":"go.mod"}`)}}},
+			{Audit: &tool.AuditRecord{CallID: "call", DurationMS: 11}},
+		},
+	}})
+	backend := &tuiBackend{runtime: appRuntime, conversation: conversation, manager: manager}
+
+	snapshot, err := backend.AgentConversation(context.Background(), "history-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.History) != 0 || len(snapshot.Events) != 4 || snapshot.Events[0].Prompt != "inspect history" || snapshot.Events[1].ModelEvent == nil || snapshot.Events[1].ModelEvent.Delta != "prior answer" || snapshot.Events[3].ToolAudit == nil || snapshot.Events[3].ToolAudit.DurationMS != 11 || snapshot.Agent.ConversationRevision != 4 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+}
+
 func TestTUIBackendStreamsFileToolArgumentsBeforeExecution(t *testing.T) {
 	t.Setenv("EYLU_API_KEY", "tui-secret")
 	requests := 0

@@ -14,8 +14,9 @@ import (
 )
 
 type WriteFile struct {
-	paths   *pathResolver
-	context *CodeContext
+	paths      *pathResolver
+	context    *CodeContext
+	createOnly bool
 }
 
 func NewWriteFileWithContext(codeContext *CodeContext) *WriteFile {
@@ -30,10 +31,20 @@ func NewWriteFile(workspace string) (*WriteFile, error) {
 	return &WriteFile{paths: paths}, nil
 }
 
+func (w *WriteFile) CreateOnly() *WriteFile {
+	clone := *w
+	clone.createOnly = true
+	return &clone
+}
+
 func (w *WriteFile) Definition() protocol.ToolDefinition {
+	description := "Atomically create or replace a UTF-8 file inside the workspace. For a requested standalone file, call this directly once the target path and content are clear. Use for complete file content after inspecting relevant related code. Parent directories are created only when create_parent_dirs is true. Existing file permissions are preserved."
+	if w.createOnly {
+		description = "Atomically create a new UTF-8 file inside the workspace. Existing paths return a conflict; read the file and use edit_file for precise changes. Parent directories are created only when create_parent_dirs is true."
+	}
 	return protocol.ToolDefinition{
 		Name:        "write_file",
-		Description: "Atomically create or replace a UTF-8 file inside the workspace. For a requested standalone file, call this directly once the target path and content are clear. Use for complete file content after inspecting relevant related code. Parent directories are created only when create_parent_dirs is true. Existing file permissions are preserved.",
+		Description: description,
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"create_parent_dirs":{"type":"boolean","default":false},"reason":{"type":"string","minLength":1,"description":"User-facing reason"}},"required":["path","content","reason"],"additionalProperties":false}`),
 	}
 }
@@ -70,6 +81,9 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 	}
 	mode := os.FileMode(0o644)
 	if info, statErr := os.Stat(path); statErr == nil {
+		if w.createOnly {
+			return toolError("target already exists; read it and use edit_file")
+		}
 		if !info.Mode().IsRegular() {
 			return toolError("target is not a regular file")
 		}

@@ -154,9 +154,10 @@ type Reference struct {
 }
 
 type Submission struct {
-	Text        string      `json:"text"`
-	References  []Reference `json:"references,omitempty"`
-	HistoryText string      `json:"-"`
+	Text          string      `json:"text"`
+	References    []Reference `json:"references,omitempty"`
+	HistoryText   string      `json:"-"`
+	AgentFollowUp bool        `json:"-"`
 }
 
 type FileItem struct {
@@ -238,6 +239,43 @@ type HistoryItem struct {
 	Citation    *protocol.URLCitation `json:"citation,omitempty"`
 }
 
+type AgentSummary struct {
+	ID                   string    `json:"id"`
+	SubagentType         string    `json:"subagent_type"`
+	Status               string    `json:"status"`
+	Title                string    `json:"title"`
+	Background           bool      `json:"background,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	StartedAt            time.Time `json:"started_at,omitzero"`
+	CompletedAt          time.Time `json:"completed_at,omitzero"`
+	PendingMessages      int       `json:"pending_messages,omitempty"`
+	ReadOnly             bool      `json:"read_only,omitempty"`
+	ConversationRevision uint64    `json:"conversation_revision,omitempty"`
+}
+
+type AgentConversationEntry struct {
+	Prompt     string               `json:"prompt,omitempty"`
+	ModelEvent *protocol.ModelEvent `json:"model_event,omitempty"`
+	ToolAudit  *ToolAudit           `json:"tool_audit,omitempty"`
+}
+
+type AgentConversationSnapshot struct {
+	Agent   AgentSummary             `json:"agent"`
+	History []HistoryItem            `json:"history"`
+	Events  []AgentConversationEntry `json:"events,omitempty"`
+	Output  string                   `json:"output,omitempty"`
+	Error   string                   `json:"error,omitempty"`
+}
+
+type AgentEvent struct {
+	Agent      AgentSummary         `json:"agent"`
+	ModelEvent *protocol.ModelEvent `json:"model_event,omitempty"`
+	ToolAudit  *ToolAudit           `json:"tool_audit,omitempty"`
+	Approval   *ApprovalRequest     `json:"-"`
+	Error      string               `json:"error,omitempty"`
+}
+
 type Snapshot struct {
 	SessionID                 string               `json:"session_id"`
 	Workspace                 string               `json:"workspace"`
@@ -253,6 +291,7 @@ type Snapshot struct {
 	TodoList                  protocol.TodoList    `json:"todo_list,omitzero"`
 	PromptHistory             []string             `json:"prompt_history"`
 	History                   []HistoryItem        `json:"history"`
+	Agents                    []AgentSummary       `json:"agents,omitempty"`
 }
 
 type ProviderForm struct {
@@ -295,6 +334,12 @@ type Backend interface {
 	FetchModels(context.Context, string) ([]string, error)
 	MCPServers(context.Context) ([]MCPServerItem, error)
 	MCPAction(context.Context, string, MCPAction) error
+	ListAgents(context.Context, string) ([]AgentSummary, error)
+	AgentConversation(context.Context, string) (AgentConversationSnapshot, error)
+	SubscribeAgentEvents(context.Context) (<-chan AgentEvent, error)
+	HasPendingAgentNotifications(context.Context) (bool, error)
+	SendAgentMessage(context.Context, string, string) error
+	StopAgent(context.Context, string) error
 }
 
 type Clock interface {
