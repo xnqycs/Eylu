@@ -7,23 +7,25 @@ import (
 	contextledger "Eylu/internal/context"
 	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
+	"Eylu/internal/tool"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
 
 type EventType string
 
 const (
-	EventSessionCreated  EventType = "session_created"
-	EventTurnAppended    EventType = "turn_appended"
-	EventPromptRecorded  EventType = "prompt_recorded"
-	EventRuntimeUpdated  EventType = "runtime_updated"
-	EventDriverState     EventType = "driver_state_updated"
-	EventSkillActivated  EventType = "skill_activated"
-	EventContextUpdated  EventType = "context_updated"
-	EventErrorRecorded   EventType = "error_recorded"
-	EventSessionClosed   EventType = "session_closed"
-	EventSessionReopened EventType = "session_reopened"
+	EventSessionCreated    EventType = "session_created"
+	EventTurnAppended      EventType = "turn_appended"
+	EventPromptRecorded    EventType = "prompt_recorded"
+	EventRuntimeUpdated    EventType = "runtime_updated"
+	EventDriverState       EventType = "driver_state_updated"
+	EventSkillActivated    EventType = "skill_activated"
+	EventContextUpdated    EventType = "context_updated"
+	EventAgentTasksUpdated EventType = "agent_tasks_updated"
+	EventErrorRecorded     EventType = "error_recorded"
+	EventSessionClosed     EventType = "session_closed"
+	EventSessionReopened   EventType = "session_reopened"
 )
 
 type ProviderState struct {
@@ -73,6 +75,7 @@ type Snapshot struct {
 	Skills         []SkillState              `json:"skills,omitempty"`
 	Summary        string                    `json:"summary,omitempty"`
 	TodoList       protocol.TodoList         `json:"todo_list,omitzero"`
+	AgentTasks     []tool.AgentTask          `json:"agent_tasks,omitempty"`
 	OmittedTurnIDs []string                  `json:"omitted_turn_ids,omitempty"`
 	Ledger         contextledger.LedgerState `json:"ledger"`
 	LastError      string                    `json:"last_error,omitempty"`
@@ -95,6 +98,7 @@ type Event struct {
 	SkillCatalog   string                     `json:"skill_catalog,omitempty"`
 	Summary        string                     `json:"summary,omitempty"`
 	TodoList       *protocol.TodoList         `json:"todo_list,omitempty"`
+	AgentTasks     []tool.AgentTask           `json:"agent_tasks,omitempty"`
 	OmittedTurnIDs []string                   `json:"omitted_turn_ids,omitempty"`
 	Ledger         *contextledger.LedgerState `json:"ledger,omitempty"`
 	Error          string                     `json:"error,omitempty"`

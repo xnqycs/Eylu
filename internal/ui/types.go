@@ -52,6 +52,7 @@ const (
 	EventUsage          EventKind = "usage"
 	EventWebActivity    EventKind = "web_activity"
 	EventCitation       EventKind = "citation"
+	EventAgentTask      EventKind = "agent_task"
 	EventNotice         EventKind = "notice"
 )
 
@@ -64,24 +65,25 @@ type Activity struct {
 }
 
 type Event struct {
-	OperationID   string                  `json:"operation_id"`
-	Kind          EventKind               `json:"kind"`
-	State         OperationState          `json:"state,omitempty"`
-	Activity      *Activity               `json:"activity,omitempty"`
-	Delta         string                  `json:"delta,omitempty"`
-	ToolCallDelta *protocol.ToolCallDelta `json:"tool_call_delta,omitempty"`
-	ToolCall      *protocol.ToolCall      `json:"tool_call,omitempty"`
-	ToolResult    *protocol.ToolResult    `json:"tool_result,omitempty"`
-	ToolAudit     *ToolAudit              `json:"tool_audit,omitempty"`
-	Approval      *ApprovalRequest        `json:"-"`
-	Ask           *AskRequest             `json:"-"`
-	Context       *contextledger.Report   `json:"context,omitempty"`
-	Usage         *protocol.Usage         `json:"usage,omitempty"`
-	WebActivity   *protocol.WebActivity   `json:"web_activity,omitempty"`
-	Citation      *protocol.URLCitation   `json:"citation,omitempty"`
-	Notice        string                  `json:"notice,omitempty"`
-	Error         bool                    `json:"error,omitempty"`
-	RetryAfter    time.Duration           `json:"retry_after,omitempty"`
+	OperationID   string                      `json:"operation_id"`
+	Kind          EventKind                   `json:"kind"`
+	State         OperationState              `json:"state,omitempty"`
+	Activity      *Activity                   `json:"activity,omitempty"`
+	Delta         string                      `json:"delta,omitempty"`
+	ToolCallDelta *protocol.ToolCallDelta     `json:"tool_call_delta,omitempty"`
+	ToolCall      *protocol.ToolCall          `json:"tool_call,omitempty"`
+	ToolResult    *protocol.ToolResult        `json:"tool_result,omitempty"`
+	ToolAudit     *ToolAudit                  `json:"tool_audit,omitempty"`
+	Approval      *ApprovalRequest            `json:"-"`
+	Ask           *AskRequest                 `json:"-"`
+	Context       *contextledger.Report       `json:"context,omitempty"`
+	Usage         *protocol.Usage             `json:"usage,omitempty"`
+	WebActivity   *protocol.WebActivity       `json:"web_activity,omitempty"`
+	Citation      *protocol.URLCitation       `json:"citation,omitempty"`
+	AgentTask     *protocol.AgentTaskActivity `json:"agent_task,omitempty"`
+	Notice        string                      `json:"notice,omitempty"`
+	Error         bool                        `json:"error,omitempty"`
+	RetryAfter    time.Duration               `json:"retry_after,omitempty"`
 }
 
 type ToolAudit struct {

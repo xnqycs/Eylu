@@ -51,38 +51,52 @@ const (
 )
 
 type runtime struct {
-	stdin              io.Reader
-	stdout             io.Writer
-	stderr             io.Writer
-	configPath         string
-	workspace          string
-	output             string
-	secretMu           sync.RWMutex
-	apiKeys            []string
-	inputMu            sync.Mutex
-	inputReader        *bufio.Reader
-	inputRead          chan inputLineResult
-	inputInterrupts    <-chan os.Signal
-	trustPrompted      map[string]bool
-	session            *sessionRuntime
-	metrics            *metrics.Collector
-	mcp                *mcpclient.Manager
-	mcpKey             string
-	mcpMu              sync.Mutex
-	mcpHostMu          sync.RWMutex
-	mcpHost            mcpHostCallbacks
-	mcpStateMu         sync.RWMutex
-	mcpState           agent.MCPRuntimeState
-	mcpEvents          []mcpclient.Event
-	mcpConversations   map[*agent.Conversation]int
-	mcpWatchStop       func()
-	mcpWatchDone       chan struct{}
-	suppressMCPStderr  atomic.Bool
-	environmentCapture func(context.Context, string) environment.Context
-	limitMu            sync.Mutex
-	limitResolver      *provider.LimitResolver
-	metadataCachePath  string
-	limitWarnings      map[string]bool
+	stdin               io.Reader
+	stdout              io.Writer
+	stderr              io.Writer
+	configPath          string
+	workspace           string
+	output              string
+	secretMu            sync.RWMutex
+	apiKeys             []string
+	inputMu             sync.Mutex
+	inputReader         *bufio.Reader
+	inputRead           chan inputLineResult
+	inputInterrupts     <-chan os.Signal
+	trustPrompted       map[string]bool
+	session             *sessionRuntime
+	metrics             *metrics.Collector
+	mcp                 *mcpclient.Manager
+	mcpKey              string
+	mcpMu               sync.Mutex
+	mcpHostMu           sync.RWMutex
+	mcpHost             mcpHostCallbacks
+	mcpStateMu          sync.RWMutex
+	mcpState            agent.MCPRuntimeState
+	mcpEvents           []mcpclient.Event
+	mcpConversations    map[*agent.Conversation]int
+	mcpWatchStop        func()
+	mcpWatchDone        chan struct{}
+	suppressMCPStderr   atomic.Bool
+	environmentCapture  func(context.Context, string) environment.Context
+	limitMu             sync.Mutex
+	limitResolver       *provider.LimitResolver
+	metadataCachePath   string
+	limitWarnings       map[string]bool
+	toolRuntimeMu       sync.Mutex
+	toolWorkspace       string
+	toolContextOptions  codeContextRuntimeOptions
+	codeContext         *tool.CodeContext
+	resourceCoordinator *tool.ResourceCoordinator
+	searchTaskMu        sync.RWMutex
+	searchTasks         *tool.AgentTaskManager
+	searchTaskObservers map[string]func(protocol.AgentTaskActivity)
+}
+
+type codeContextRuntimeOptions struct {
+	maxCacheBytes int64
+	maxReadLines  int
+	indexWorkers  int
 }
 
 func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -93,6 +107,7 @@ func Execute(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	defer func() {
+		r.closeSearchTasks()
 		if err := r.closeMCP(); err != nil {
 			fmt.Fprintf(stderr, "[mcp] close: %v\n", err)
 		}
@@ -261,6 +276,7 @@ func (r *runtime) prepareManager(ctx context.Context, opts chatOptions) (*provid
 func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversation, manager *provider.Manager, prompt string, opts chatOptions) error {
 	detachMCP := r.attachMCPConversation(conversation)
 	defer detachMCP()
+	prompt = r.promptWithCompletedSearchTasks(conversation.SessionID(), prompt)
 	conversation.RecordPrompt(prompt)
 	cfg := manager.Config()
 	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
@@ -339,7 +355,8 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	defer cancel()
 	var emit driver.EmitFunc
 	if stream {
-		emit = func(event protocol.ModelEvent) error {
+		var emitMu sync.Mutex
+		rawEmit := func(event protocol.ModelEvent) error {
 			if r.output == "jsonl" {
 				return jsonlEncoder.Encode(map[string]any{"type": "model_event", "event": event})
 			}
@@ -359,8 +376,17 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 				if event.Citation != nil {
 					fmt.Fprintf(r.stderr, "[citation] %s %s\n", event.Citation.Title, event.Citation.URL)
 				}
+			case protocol.EventAgentTaskUpdated:
+				if event.AgentTask != nil {
+					fmt.Fprintf(r.stderr, "[agent] task_id=%s type=%s status=%s\n", event.AgentTask.TaskID, event.AgentTask.SubagentType, event.AgentTask.Status)
+				}
 			}
 			return nil
+		}
+		emit = func(event protocol.ModelEvent) error {
+			emitMu.Lock()
+			defer emitMu.Unlock()
+			return rawEmit(event)
 		}
 	}
 	audit := tool.AuditSink(&toolAuditWriter{writer: r.stderr})
@@ -369,6 +395,26 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	}
 	executor, err := r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, confirm, ask, audit)
 	if err != nil {
+		return err
+	}
+	taskEmit := emit
+	var taskObserverMu sync.Mutex
+	taskObserverActive := true
+	defer func() {
+		taskObserverMu.Lock()
+		taskObserverActive = false
+		taskObserverMu.Unlock()
+	}()
+	if err := r.configureSearchAgent(manager, conversation, modelRuntime, executor, cfg, prompt, func(activity protocol.AgentTaskActivity) {
+		taskObserverMu.Lock()
+		defer taskObserverMu.Unlock()
+		if !taskObserverActive {
+			return
+		}
+		if taskEmit != nil {
+			_ = taskEmit(protocol.ModelEvent{Kind: protocol.EventAgentTaskUpdated, AgentTask: &activity})
+		}
+	}); err != nil {
 		return err
 	}
 	task := routing.Classify(prompt)
@@ -394,6 +440,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return nil
 	}
 	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, stream, emit)
+	observation.ObserveCodeSlices(conversation.ContextReport().CodeSlices)
 	metric := observation.Finish(response.Usage, err)
 	r.reportMetric(jsonlEncoder, metric)
 	syncErr := error(nil)
@@ -453,35 +500,42 @@ func (r *runtime) reportMetric(jsonlEncoder *json.Encoder, metric metrics.Reques
 		return
 	}
 	if r.output == "text" {
-		fmt.Fprintf(r.stderr, "[metrics] timestamp=%s session_id=%s request_id=%s provider_name=%s provider_generation=%d model=%s first_token_ms=%d generation_ms=%d tokens_per_second=%.3f duration_ms=%d tool_success_rate=%.3f compression_count=%d input_tokens=%d output_tokens=%d estimated_cost=%.8f error_code=%s\n",
-			metric.Timestamp.Format(time.RFC3339Nano), metric.SessionID, metric.RequestID, metric.Provider, metric.ProviderGeneration, metric.Model, metric.FirstTokenMS, metric.GenerationMS, metric.TokensPerSecond, metric.DurationMS, metric.ToolSuccessRate, metric.CompressionCount, metric.Usage.InputTokens, metric.Usage.OutputTokens, metric.EstimatedCost, metric.ErrorCode)
+		fmt.Fprintf(r.stderr, "[metrics] timestamp=%s session_id=%s request_id=%s provider_name=%s provider_generation=%d model=%s first_token_ms=%d generation_ms=%d tokens_per_second=%.3f duration_ms=%d tool_success_rate=%.3f compression_count=%d input_tokens=%d output_tokens=%d code_slice_cache_hits=%d code_slice_deduplicated=%d code_slice_stale=%d estimated_cost=%.8f error_code=%s\n",
+			metric.Timestamp.Format(time.RFC3339Nano), metric.SessionID, metric.RequestID, metric.Provider, metric.ProviderGeneration, metric.Model, metric.FirstTokenMS, metric.GenerationMS, metric.TokensPerSecond, metric.DurationMS, metric.ToolSuccessRate, metric.CompressionCount, metric.Usage.InputTokens, metric.Usage.OutputTokens, metric.CodeSliceCacheHits, metric.CodeSliceDeduplicated, metric.CodeSliceStale, metric.EstimatedCost, metric.ErrorCode)
 	}
 }
 
 func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillRegistry *skill.Registry, skillSession *skill.Session, confirm tool.ConfirmFunc, ask tool.AskFunc, audit tool.AuditSink) (*tool.Executor, error) {
-	readFile, err := tool.NewReadFile(r.workspace, cfg.MaxReadBytes)
-	if err != nil {
-		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize read_file", Cause: err}
+	r.toolRuntimeMu.Lock()
+	workspaceChanged := r.toolWorkspace != r.workspace
+	contextOptions := codeContextRuntimeOptions{maxCacheBytes: cfg.CodeContextCacheBytes, maxReadLines: cfg.MaxReadLines, indexWorkers: cfg.CodeIndexWorkers}
+	if r.codeContext == nil || workspaceChanged || r.toolContextOptions != contextOptions {
+		codeContext, err := tool.NewCodeContext(r.workspace, tool.CodeContextOptions{
+			MaxCacheBytes: contextOptions.maxCacheBytes, MaxReadLines: contextOptions.maxReadLines, IndexWorkers: contextOptions.indexWorkers,
+		})
+		if err != nil {
+			r.toolRuntimeMu.Unlock()
+			return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize code context", Cause: err}
+		}
+		r.codeContext = codeContext
+		r.toolContextOptions = contextOptions
 	}
-	writeFile, err := tool.NewWriteFile(r.workspace)
-	if err != nil {
-		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize write_file", Cause: err}
+	if r.resourceCoordinator == nil || workspaceChanged {
+		r.resourceCoordinator = tool.NewResourceCoordinator()
 	}
-	bashTool, err := tool.NewBash(r.workspace, cfg.MaxOutputBytes, nil)
+	r.toolWorkspace = r.workspace
+	codeContext, coordinator := r.codeContext, r.resourceCoordinator
+	r.toolRuntimeMu.Unlock()
+	readFile := tool.NewReadFileWithContext(codeContext, cfg.MaxReadBytes)
+	writeFile := tool.NewWriteFileWithContext(codeContext)
+	bashTool, err := tool.NewBashWithContext(codeContext, cfg.MaxOutputBytes, nil)
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize bash", Cause: err}
 	}
 	bashTool.AllowEnvironment(cfg.ShellEnvironment)
-	editFile, err := tool.NewEditFile(r.workspace, int64(cfg.MaxReadBytes))
-	if err != nil {
-		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize edit_file", Cause: err}
-	}
-	index, err := tool.NewRepositoryIndex(r.workspace)
-	if err != nil {
-		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: "initialize repository index", Cause: err}
-	}
-	searchCode := tool.NewSearchCode(index, cfg.MaxSearchResults, int64(cfg.MaxReadBytes))
-	listDirectory := tool.NewListDirectory(index, cfg.MaxSearchResults*10)
+	editFile := tool.NewEditFileWithContext(codeContext, int64(cfg.MaxReadBytes))
+	searchCode := tool.NewSearchCodeWithContext(codeContext, cfg.MaxSearchResults, int64(cfg.MaxReadBytes))
+	listDirectory := tool.NewListDirectoryWithContext(codeContext, cfg.MaxSearchResults*10)
 	modeName := cfg.PermissionMode
 	if opts.mode != "" {
 		modeName = opts.mode
@@ -510,7 +564,8 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	return &tool.Executor{
 		Registry: tool.NewRegistry(registered...), Policy: checker,
 		Confirm: confirm, Audit: audit, Workspace: r.workspace,
-		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes, MaxParallelTools: cfg.MaxParallelTools,
+		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
+		MaxParallelTools: cfg.MaxParallelTools, Coordinator: coordinator,
 	}, nil
 }
 

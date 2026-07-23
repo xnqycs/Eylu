@@ -304,6 +304,40 @@ func TestContextLimitEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestSearchAgentAndCodeContextConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	cfg := Default()
+	cfg.ActiveProvider = "work"
+	cfg.Providers["work"] = ProviderConfig{Adapter: "openai_responses", BaseURL: "https://example.test/v1", Model: "primary"}
+	cfg.MaxParallelAgents = 3
+	cfg.CodeContextCacheBytes = 32 << 20
+	cfg.MaxReadLines = 750
+	cfg.CodeIndexWorkers = 6
+	cfg.SearchAgent = SearchAgentConfig{Provider: "work", Model: "fast", MaxTurns: 5, TimeoutSeconds: 45}
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Config
+	if got.MaxParallelAgents != 3 || got.CodeContextCacheBytes != 32<<20 || got.MaxReadLines != 750 || got.CodeIndexWorkers != 6 || got.SearchAgent.Provider != "work" || got.SearchAgent.Model != "fast" || got.SearchAgent.MaxTurns != 5 || got.SearchAgent.TimeoutSeconds != 45 {
+		t.Fatalf("config = %#v", got)
+	}
+
+	invalid := cfg.Clone()
+	invalid.SearchAgent.Provider = "missing"
+	if err := invalid.Validate(); err == nil || !strings.Contains(err.Error(), "search_agent provider") {
+		t.Fatalf("missing provider error = %v", err)
+	}
+	invalid = cfg.Clone()
+	invalid.MaxParallelAgents = 0
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("zero max_parallel_agents was accepted")
+	}
+}
+
 func TestContextCompactionPercentValidation(t *testing.T) {
 	for _, values := range [][2]int{{0, 60}, {100, 60}, {60, 60}, {50, 60}} {
 		cfg := Default()

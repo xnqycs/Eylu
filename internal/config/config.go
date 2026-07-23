@@ -166,6 +166,13 @@ type SkillRegistryConfig struct {
 	Disabled         bool              `toml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
+type SearchAgentConfig struct {
+	Provider       string `toml:"provider,omitempty" json:"provider,omitempty"`
+	Model          string `toml:"model,omitempty" json:"model,omitempty"`
+	MaxTurns       int    `toml:"max_turns,omitempty" json:"max_turns,omitempty"`
+	TimeoutSeconds int    `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+}
+
 func (p ProviderConfig) Timeout(fallback time.Duration) time.Duration {
 	if p.TimeoutSeconds <= 0 {
 		return fallback
@@ -280,6 +287,11 @@ type Config struct {
 	MaxReadBytes          int                            `toml:"max_read_bytes,omitempty" json:"max_read_bytes,omitempty"`
 	MaxSearchResults      int                            `toml:"max_search_results,omitempty" json:"max_search_results,omitempty"`
 	MaxParallelTools      int                            `toml:"max_parallel_tools,omitempty" json:"max_parallel_tools,omitempty"`
+	MaxParallelAgents     int                            `toml:"max_parallel_agents,omitempty" json:"max_parallel_agents,omitempty"`
+	CodeContextCacheBytes int64                          `toml:"code_context_cache_bytes,omitempty" json:"code_context_cache_bytes,omitempty"`
+	MaxReadLines          int                            `toml:"max_read_lines,omitempty" json:"max_read_lines,omitempty"`
+	CodeIndexWorkers      int                            `toml:"code_index_workers,omitempty" json:"code_index_workers,omitempty"`
+	SearchAgent           SearchAgentConfig              `toml:"search_agent,omitempty" json:"search_agent"`
 	ReadOnlyCommands      []string                       `toml:"read_only_commands,omitempty" json:"read_only_commands,omitempty"`
 	AutoAllowCommands     []string                       `toml:"auto_allow_commands,omitempty" json:"auto_allow_commands,omitempty"`
 	DangerousCommands     []string                       `toml:"dangerous_commands,omitempty" json:"dangerous_commands,omitempty"`
@@ -314,6 +326,11 @@ func Default() Config {
 		MaxReadBytes:          1 << 20,
 		MaxSearchResults:      200,
 		MaxParallelTools:      4,
+		MaxParallelAgents:     2,
+		CodeContextCacheBytes: 64 << 20,
+		MaxReadLines:          2000,
+		CodeIndexWorkers:      4,
+		SearchAgent:           SearchAgentConfig{MaxTurns: 8, TimeoutSeconds: 120},
 		ReadOnlyCommands:      []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files"},
 		AutoAllowCommands:     []string{"ls", "dir", "pwd", "find", "rg", "grep", "git status", "git diff", "git log", "git show", "git grep", "git branch", "git rev-parse", "git ls-files", "go test", "go vet", "go build", "go list", "go env", "go version", "gofmt", "go fmt"},
 		DangerousCommands:     []string{"rm -rf", "git reset --hard", "git clean -fd", "git push --force", "mkfs", "diskpart", "format ", "remove-item -recurse", "del /s", "rd /s"},
@@ -415,8 +432,16 @@ func (c Config) Validate() error {
 	if c.MaxTurns <= 0 || c.MaxTotalTokens <= 0 {
 		return errors.New("turn and token budgets must be greater than zero")
 	}
-	if c.ToolTimeoutSec <= 0 || c.MaxOutputBytes <= 0 || c.MaxReadBytes <= 0 || c.MaxSearchResults <= 0 || c.MaxParallelTools <= 0 {
+	if c.ToolTimeoutSec <= 0 || c.MaxOutputBytes <= 0 || c.MaxReadBytes <= 0 || c.MaxSearchResults <= 0 || c.MaxParallelTools <= 0 || c.MaxParallelAgents <= 0 || c.CodeContextCacheBytes <= 0 || c.MaxReadLines <= 0 || c.CodeIndexWorkers <= 0 {
 		return errors.New("resource limits must be greater than zero")
+	}
+	if c.SearchAgent.MaxTurns <= 0 || c.SearchAgent.TimeoutSeconds <= 0 {
+		return errors.New("search agent limits must be greater than zero")
+	}
+	if c.SearchAgent.Provider != "" {
+		if _, exists := c.Providers[c.SearchAgent.Provider]; !exists {
+			return fmt.Errorf("search_agent provider %q does not exist", c.SearchAgent.Provider)
+		}
 	}
 	if c.TokenBytesPerToken <= 0 || c.ReservedOutputTokens <= 0 || c.ContextRecentRounds <= 0 || c.MaxProjectMapBytes <= 0 || c.MaxToolContextBytes <= 0 || c.SkillCatalogPageBytes <= 0 || c.MaxSummaryBytes <= 0 {
 		return errors.New("context limits must be greater than zero")
@@ -882,6 +907,9 @@ func applyEnvironment(cfg *Config, environ []string) {
 		"EYLU_TOOL_TIMEOUT":                    &cfg.ToolTimeoutSec,
 		"EYLU_MAX_OUTPUT_BYTES":                &cfg.MaxOutputBytes,
 		"EYLU_MAX_PARALLEL_TOOLS":              &cfg.MaxParallelTools,
+		"EYLU_MAX_PARALLEL_AGENTS":             &cfg.MaxParallelAgents,
+		"EYLU_MAX_READ_LINES":                  &cfg.MaxReadLines,
+		"EYLU_CODE_INDEX_WORKERS":              &cfg.CodeIndexWorkers,
 		"EYLU_TOKEN_BYTES_PER_TOKEN":           &cfg.TokenBytesPerToken,
 		"EYLU_RESERVED_OUTPUT_TOKENS":          &cfg.ReservedOutputTokens,
 		"EYLU_CONTEXT_RECENT_ROUNDS":           &cfg.ContextRecentRounds,
@@ -902,6 +930,11 @@ func applyEnvironment(cfg *Config, environ []string) {
 	if value := env["EYLU_MAX_SESSION_BYTES"]; value != "" {
 		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
 			cfg.MaxSessionBytes = parsed
+		}
+	}
+	if value := env["EYLU_CODE_CONTEXT_CACHE_BYTES"]; value != "" {
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
+			cfg.CodeContextCacheBytes = parsed
 		}
 	}
 	if cfg.ActiveProvider != "" {

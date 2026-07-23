@@ -75,6 +75,13 @@ type ExecutorTimeoutPolicy interface {
 	UseExecutorTimeout() bool
 }
 
+// ExecutionFinalizer observes the policy outcome after a call finishes. It is
+// used for local state maintenance that must also run after cancellation or a
+// recovered tool panic.
+type ExecutionFinalizer interface {
+	AfterExecute(policy.Outcome)
+}
+
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool

@@ -17,9 +17,10 @@ import (
 const MaxIndexedFiles = 100_000
 
 type IndexedFile struct {
-	Relative string `json:"relative"`
-	Absolute string `json:"absolute"`
-	Size     int64  `json:"size"`
+	Relative        string `json:"relative"`
+	Absolute        string `json:"absolute"`
+	Size            int64  `json:"size"`
+	ModTimeUnixNano int64  `json:"mod_time_unix_nano"`
 }
 
 type IndexSnapshot struct {
@@ -156,7 +157,7 @@ func (i *RepositoryIndex) indexedFile(absolute string) (IndexedFile, error) {
 	if err != nil || !inside(i.workspace, absolute) {
 		return IndexedFile{}, errors.New("referenced file is outside workspace")
 	}
-	return IndexedFile{Relative: filepath.ToSlash(relative), Absolute: absolute, Size: info.Size()}, nil
+	return IndexedFile{Relative: filepath.ToSlash(relative), Absolute: absolute, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()}, nil
 }
 
 func sameReferenceBase(left, right string) bool {
@@ -200,7 +201,7 @@ func (i *RepositoryIndex) fromGit(ctx context.Context) (IndexSnapshot, error) {
 		if relErr != nil {
 			continue
 		}
-		files = append(files, IndexedFile{Relative: filepath.ToSlash(relative), Absolute: absolute, Size: info.Size()})
+		files = append(files, IndexedFile{Relative: filepath.ToSlash(relative), Absolute: absolute, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()})
 		if len(files) >= MaxIndexedFiles {
 			break
 		}
@@ -242,7 +243,7 @@ func (i *RepositoryIndex) fromFilesystem(ctx context.Context) IndexSnapshot {
 		if err != nil {
 			return nil
 		}
-		files = append(files, IndexedFile{Relative: filepath.ToSlash(relative), Absolute: path, Size: info.Size()})
+		files = append(files, IndexedFile{Relative: filepath.ToSlash(relative), Absolute: path, Size: info.Size(), ModTimeUnixNano: info.ModTime().UnixNano()})
 		if len(files) >= MaxIndexedFiles {
 			diagnostic = fmt.Sprintf("filesystem index truncated at %d files", MaxIndexedFiles)
 			return filepath.SkipAll

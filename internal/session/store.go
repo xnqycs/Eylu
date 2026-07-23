@@ -21,6 +21,7 @@ import (
 
 	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
+	"Eylu/internal/tool"
 )
 
 const (
@@ -788,7 +789,7 @@ func truncateEventTail(path string, validBytes int64) error {
 func validEventType(eventType EventType) bool {
 	switch eventType {
 	case EventSessionCreated, EventTurnAppended, EventRuntimeUpdated, EventDriverState,
-		EventPromptRecorded, EventSkillActivated, EventContextUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened:
+		EventPromptRecorded, EventSkillActivated, EventContextUpdated, EventAgentTasksUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened:
 		return true
 	default:
 		return false
@@ -850,6 +851,8 @@ func applyEvent(snapshot *Snapshot, event Event) {
 		if event.Ledger != nil {
 			snapshot.Ledger = *event.Ledger
 		}
+	case EventAgentTasksUpdated:
+		snapshot.AgentTasks = append([]tool.AgentTask(nil), event.AgentTasks...)
 	case EventErrorRecorded:
 		snapshot.LastError = event.Error
 	case EventSessionClosed:

@@ -16,7 +16,15 @@ import (
 
 type EditFile struct {
 	paths    *pathResolver
+	context  *CodeContext
 	maxBytes int64
+}
+
+func NewEditFileWithContext(codeContext *CodeContext, maxBytes int64) *EditFile {
+	if maxBytes <= 0 {
+		maxBytes = 2 << 20
+	}
+	return &EditFile{paths: codeContext.index.paths, context: codeContext, maxBytes: maxBytes}
 }
 
 func NewEditFile(workspace string, maxBytes int64) (*EditFile, error) {
@@ -111,6 +119,9 @@ func (e *EditFile) Execute(_ context.Context, raw json.RawMessage) protocol.Tool
 	}
 	if err := writeFileAtomically(filePath, []byte(updated), info.Mode().Perm()); err != nil {
 		return toolError("write edit: " + err.Error())
+	}
+	if e.context != nil {
+		e.context.Invalidate(filePath)
 	}
 	content := fmt.Sprintf("replacements: %d\nlines_added: %d\nlines_removed: %d\n%s", actual, added, removed, diff)
 	return protocol.ToolResult{Content: content, Metadata: map[string]any{

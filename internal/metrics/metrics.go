@@ -23,51 +23,57 @@ type Metadata struct {
 }
 
 type RequestMetric struct {
-	Timestamp            time.Time         `json:"timestamp"`
-	RequestID            string            `json:"request_id"`
-	SessionID            string            `json:"session_id"`
-	Provider             string            `json:"provider_name"`
-	ProviderGeneration   uint64            `json:"provider_generation"`
-	Model                string            `json:"model"`
-	Task                 string            `json:"task,omitempty"`
-	FirstTokenMS         int64             `json:"first_token_ms,omitempty"`
-	GenerationMS         int64             `json:"generation_ms,omitempty"`
-	TokensPerSecond      float64           `json:"tokens_per_second,omitempty"`
-	DurationMS           int64             `json:"duration_ms"`
-	ToolCalls            int               `json:"tool_calls"`
-	ToolSuccesses        int               `json:"tool_successes"`
-	ToolSuccessRate      float64           `json:"tool_success_rate"`
-	CompressionCount     int               `json:"compression_count"`
-	CompactionDurationMS int64             `json:"compaction_duration_ms,omitempty"`
-	CompactionFallbacks  int               `json:"compaction_fallbacks,omitempty"`
-	CompactionUsage      protocol.Usage    `json:"compaction_usage,omitzero"`
-	CompactionCost       float64           `json:"compaction_estimated_cost,omitempty"`
-	Usage                protocol.Usage    `json:"usage"`
-	EstimatedCost        float64           `json:"estimated_cost"`
-	ErrorCode            string            `json:"error_code,omitempty"`
-	WebActivities        int               `json:"web_activities,omitempty"`
-	WebCitations         int               `json:"web_citations,omitempty"`
-	WebUsage             protocol.WebUsage `json:"web_usage,omitzero"`
+	Timestamp             time.Time         `json:"timestamp"`
+	RequestID             string            `json:"request_id"`
+	SessionID             string            `json:"session_id"`
+	Provider              string            `json:"provider_name"`
+	ProviderGeneration    uint64            `json:"provider_generation"`
+	Model                 string            `json:"model"`
+	Task                  string            `json:"task,omitempty"`
+	FirstTokenMS          int64             `json:"first_token_ms,omitempty"`
+	GenerationMS          int64             `json:"generation_ms,omitempty"`
+	TokensPerSecond       float64           `json:"tokens_per_second,omitempty"`
+	DurationMS            int64             `json:"duration_ms"`
+	ToolCalls             int               `json:"tool_calls"`
+	ToolSuccesses         int               `json:"tool_successes"`
+	ToolSuccessRate       float64           `json:"tool_success_rate"`
+	CompressionCount      int               `json:"compression_count"`
+	CompactionDurationMS  int64             `json:"compaction_duration_ms,omitempty"`
+	CompactionFallbacks   int               `json:"compaction_fallbacks,omitempty"`
+	CompactionUsage       protocol.Usage    `json:"compaction_usage,omitzero"`
+	CompactionCost        float64           `json:"compaction_estimated_cost,omitempty"`
+	Usage                 protocol.Usage    `json:"usage"`
+	EstimatedCost         float64           `json:"estimated_cost"`
+	ErrorCode             string            `json:"error_code,omitempty"`
+	WebActivities         int               `json:"web_activities,omitempty"`
+	WebCitations          int               `json:"web_citations,omitempty"`
+	WebUsage              protocol.WebUsage `json:"web_usage,omitzero"`
+	CodeSliceCacheHits    int               `json:"code_slice_cache_hits,omitempty"`
+	CodeSliceDeduplicated int               `json:"code_slice_deduplicated,omitempty"`
+	CodeSliceStale        int               `json:"code_slice_stale,omitempty"`
 }
 
 type Summary struct {
-	Requests             int               `json:"requests"`
-	Failures             int               `json:"failures"`
-	AverageFirstTokenMS  float64           `json:"average_first_token_ms"`
-	AverageDurationMS    float64           `json:"average_duration_ms"`
-	ToolCalls            int               `json:"tool_calls"`
-	ToolSuccesses        int               `json:"tool_successes"`
-	ToolSuccessRate      float64           `json:"tool_success_rate"`
-	CompressionCount     int               `json:"compression_count"`
-	CompactionDurationMS int64             `json:"compaction_duration_ms,omitempty"`
-	CompactionFallbacks  int               `json:"compaction_fallbacks,omitempty"`
-	CompactionUsage      protocol.Usage    `json:"compaction_usage,omitzero"`
-	CompactionCost       float64           `json:"compaction_estimated_cost,omitempty"`
-	Usage                protocol.Usage    `json:"usage"`
-	EstimatedCost        float64           `json:"estimated_cost"`
-	WebActivities        int               `json:"web_activities,omitempty"`
-	WebCitations         int               `json:"web_citations,omitempty"`
-	WebUsage             protocol.WebUsage `json:"web_usage,omitzero"`
+	Requests              int               `json:"requests"`
+	Failures              int               `json:"failures"`
+	AverageFirstTokenMS   float64           `json:"average_first_token_ms"`
+	AverageDurationMS     float64           `json:"average_duration_ms"`
+	ToolCalls             int               `json:"tool_calls"`
+	ToolSuccesses         int               `json:"tool_successes"`
+	ToolSuccessRate       float64           `json:"tool_success_rate"`
+	CompressionCount      int               `json:"compression_count"`
+	CompactionDurationMS  int64             `json:"compaction_duration_ms,omitempty"`
+	CompactionFallbacks   int               `json:"compaction_fallbacks,omitempty"`
+	CompactionUsage       protocol.Usage    `json:"compaction_usage,omitzero"`
+	CompactionCost        float64           `json:"compaction_estimated_cost,omitempty"`
+	Usage                 protocol.Usage    `json:"usage"`
+	EstimatedCost         float64           `json:"estimated_cost"`
+	WebActivities         int               `json:"web_activities,omitempty"`
+	WebCitations          int               `json:"web_citations,omitempty"`
+	WebUsage              protocol.WebUsage `json:"web_usage,omitzero"`
+	CodeSliceCacheHits    int               `json:"code_slice_cache_hits,omitempty"`
+	CodeSliceDeduplicated int               `json:"code_slice_deduplicated,omitempty"`
+	CodeSliceStale        int               `json:"code_slice_stale,omitempty"`
 }
 
 type Collector struct {
@@ -94,8 +100,15 @@ type Observation struct {
 	webActivities       int
 	webCitations        int
 	webUsage            protocol.WebUsage
+	codeSlices          contextledger.SliceStats
 	finished            bool
 	now                 func() time.Time
+}
+
+func (o *Observation) ObserveCodeSlices(stats contextledger.SliceStats) {
+	o.mu.Lock()
+	o.codeSlices = stats
+	o.mu.Unlock()
 }
 
 func (c *Collector) Begin(metadata Metadata) *Observation {
@@ -209,6 +222,7 @@ func (o *Observation) Finish(fallbackUsage protocol.Usage, requestErr error) Req
 		DurationMS: now.Sub(o.started).Milliseconds(), ToolCalls: o.toolCalls, ToolSuccesses: o.toolSuccesses,
 		CompressionCount: o.compressions, CompactionDurationMS: o.compactionDuration.Milliseconds(), CompactionFallbacks: o.compactionFallbacks, CompactionUsage: o.compactionUsage, Usage: o.usage,
 		WebActivities: o.webActivities, WebCitations: o.webCitations, WebUsage: o.webUsage,
+		CodeSliceCacheHits: o.codeSlices.CacheHits, CodeSliceDeduplicated: o.codeSlices.Deduplicated, CodeSliceStale: o.codeSlices.Stale,
 	}
 	if !o.firstToken.IsZero() {
 		metric.FirstTokenMS = o.firstToken.Sub(o.started).Milliseconds()
@@ -281,6 +295,9 @@ func (c *Collector) Snapshot() Summary {
 		summary.WebUsage.InputTokens += metric.WebUsage.InputTokens
 		summary.WebUsage.OutputTokens += metric.WebUsage.OutputTokens
 		summary.WebUsage.CostUSD += metric.WebUsage.CostUSD
+		summary.CodeSliceCacheHits += metric.CodeSliceCacheHits
+		summary.CodeSliceDeduplicated += metric.CodeSliceDeduplicated
+		summary.CodeSliceStale += metric.CodeSliceStale
 	}
 	if firstTokenCount > 0 {
 		summary.AverageFirstTokenMS = float64(firstTokenTotal) / float64(firstTokenCount)

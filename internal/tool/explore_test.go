@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSearchCodeLiteralRegexGlobAndLimits(t *testing.T) {
@@ -47,6 +48,43 @@ func TestSearchCodeLiteralRegexGlobAndLimits(t *testing.T) {
 	result = search.Execute(context.Background(), json.RawMessage(`{"query":"Alpha"}`))
 	if !strings.Contains(result.Content, `"skipped_binary": 1`) || !strings.Contains(result.Content, `"skipped_large": 1`) {
 		t.Fatalf("skip counters = %s", result.Content)
+	}
+}
+
+func TestSearchCodePaginationContextAndIncrementalRefresh(t *testing.T) {
+	workspace := t.TempDir()
+	writeTestFile(t, workspace, "one.go", "needle one\nneedle two\n")
+	writeTestFile(t, workspace, "two.go", "needle three\n")
+	index, _ := newRepositoryIndex(workspace, func(context.Context, string, ...string) ([]byte, error) { return nil, os.ErrNotExist })
+	codeContext := newCodeContext(index, CodeContextOptions{RefreshInterval: time.Hour})
+	search := NewSearchCodeWithContext(codeContext, 2, 1024)
+	first := search.Execute(context.Background(), json.RawMessage(`{"query":"needle","context_lines":1}`))
+	if first.IsError || !first.Truncated {
+		t.Fatalf("first page = %#v", first)
+	}
+	var firstPage struct {
+		Matches    []SearchMatch `json:"matches"`
+		NextOffset int           `json:"next_offset"`
+		Generation uint64        `json:"index_generation"`
+	}
+	if err := json.Unmarshal([]byte(first.Content), &firstPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage.Matches) != 2 || firstPage.NextOffset != 2 || firstPage.Matches[0].Context == "" || firstPage.Matches[0].FileHash == "" {
+		t.Fatalf("first payload = %#v", firstPage)
+	}
+	second := search.Execute(context.Background(), json.RawMessage(`{"query":"needle","offset":2}`))
+	if second.IsError || second.Truncated || !strings.Contains(second.Content, "two.go") {
+		t.Fatalf("second page = %#v", second)
+	}
+
+	write := NewWriteFileWithContext(codeContext)
+	if result := write.Execute(context.Background(), json.RawMessage(`{"path":"two.go","content":"replacement"}`)); result.IsError {
+		t.Fatal(result.Content)
+	}
+	after := search.Execute(context.Background(), json.RawMessage(`{"query":"needle"}`))
+	if after.IsError || strings.Contains(after.Content, "two.go") || after.Metadata["index_generation"].(uint64) <= firstPage.Generation {
+		t.Fatalf("refreshed search = %#v", after)
 	}
 }
 

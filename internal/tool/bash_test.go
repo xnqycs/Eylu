@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"Eylu/internal/policy"
 )
 
 type helperShell struct{}
@@ -110,5 +112,27 @@ func TestBashCancellationKillsProcessTree(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("child process survived cancellation: %v", err)
+	}
+}
+
+func TestBashInvalidatesCodeIndexAfterPotentialMutation(t *testing.T) {
+	codeContext, err := NewCodeContext(t.TempDir(), CodeContextOptions{RefreshInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bashTool, err := NewBashWithContext(codeContext, 1024, helperShell{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, initialGeneration := codeContext.Refresh(context.Background())
+	bashTool.AfterExecute(policy.Outcome{Classification: policy.CommandReadOnly})
+	_, readOnlyGeneration := codeContext.Refresh(context.Background())
+	if readOnlyGeneration != initialGeneration {
+		t.Fatalf("read-only generation = %d, want %d", readOnlyGeneration, initialGeneration)
+	}
+	bashTool.AfterExecute(policy.Outcome{Classification: policy.CommandAutoAllowed})
+	_, mutatedGeneration := codeContext.Refresh(context.Background())
+	if mutatedGeneration <= readOnlyGeneration {
+		t.Fatalf("mutated generation = %d, want greater than %d", mutatedGeneration, readOnlyGeneration)
 	}
 }

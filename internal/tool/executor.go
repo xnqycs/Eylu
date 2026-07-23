@@ -86,6 +86,7 @@ type Executor struct {
 	ProviderGeneration uint64
 	Model              string
 	MaxParallelTools   int
+	Coordinator        *ResourceCoordinator
 }
 
 type BatchHooks struct {
@@ -437,15 +438,28 @@ func (e *Executor) cancelledPrepared(requestID, batchID string, batchIndex int, 
 }
 
 func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) (result protocol.ToolResult) {
-	prepared.executionStarted = time.Now()
-	executionStarted := prepared.executionStarted
+	var executionStarted time.Time
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result = protocol.ToolResult{CallID: prepared.call.ID, Content: fmt.Sprintf("tool execution panicked: %v", recovered), IsError: true}
 		}
 		result.CallID = prepared.call.ID
-		result = e.finishPrepared(prepared, result, time.Since(executionStarted))
+		duration := time.Duration(0)
+		if !executionStarted.IsZero() {
+			duration = time.Since(executionStarted)
+		}
+		result = e.finishPrepared(prepared, result, duration)
 	}()
+	release, err := e.Coordinator.Acquire(ctx, prepared.spec)
+	if err != nil {
+		return protocol.ToolResult{CallID: prepared.call.ID, Content: "tool execution cancelled", IsError: true}
+	}
+	defer release()
+	if finalizer, ok := prepared.item.(ExecutionFinalizer); ok {
+		defer finalizer.AfterExecute(prepared.outcome)
+	}
+	prepared.executionStarted = time.Now()
+	executionStarted = prepared.executionStarted
 	toolCtx := ctx
 	cancel := func() {}
 	useTimeout := true

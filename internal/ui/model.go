@@ -880,6 +880,15 @@ func (m *Model) handleBackendEvent(event Event) (tea.Model, tea.Cmd) {
 				m.appendNotice(formatCitation(*event.Citation), false)
 			}
 		}
+	case EventAgentTask:
+		if event.AgentTask != nil {
+			activity := event.AgentTask
+			message := fmt.Sprintf("Search task %s: %s", activity.TaskID, activity.Status)
+			if activity.Error != "" {
+				message += " (" + activity.Error + ")"
+			}
+			m.appendNotice(message, activity.Status == "failed")
+		}
 	case EventNotice:
 		m.appendNotice(event.Notice, event.Error)
 	}

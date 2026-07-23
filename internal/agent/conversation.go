@@ -133,6 +133,7 @@ type Conversation struct {
 	projectMapDirty            bool
 	mcpFingerprint             string
 	lastCompressionFingerprint string
+	profile                    *Profile
 }
 
 func NewConversation() *Conversation {
@@ -144,6 +145,18 @@ func NewConversationWithEnvironment(environmentContext environment.Context) *Con
 	conversation.environment = environmentContext
 	conversation.systemPrompt = promptForRuntime("manual")
 	conversation.rebuildLedger(Runtime{})
+	return conversation
+}
+
+func NewConversationForProfile(profile Profile, environmentContext environment.Context) *Conversation {
+	conversation := NewConversationWithEnvironment(environmentContext)
+	conversation.mu.Lock()
+	conversation.permissionMode = profile.PermissionMode
+	conversation.systemPrompt = profile.SystemPrompt()
+	conversation.lastRuntime.PermissionMode = profile.PermissionMode
+	conversation.profile = &profile
+	conversation.rebuildLedger(conversation.lastRuntime)
+	conversation.mu.Unlock()
 	return conversation
 }
 
@@ -240,6 +253,7 @@ func (c *Conversation) Fork(profile Profile) (*Conversation, error) {
 	fork.mu.Lock()
 	fork.systemPrompt = profile.SystemPrompt()
 	fork.driverState = nil
+	fork.profile = &profile
 	fork.mu.Unlock()
 	return fork, nil
 }
@@ -299,7 +313,11 @@ func (c *Conversation) applyRuntime(runtime Runtime) error {
 		c.permissionMode = mode
 		c.skillCatalog = runtime.SkillCatalog
 		c.mcpFingerprint = runtime.MCPFingerprint
-		c.systemPrompt = promptForRuntime(mode)
+		if c.profile != nil {
+			c.systemPrompt = c.profile.SystemPrompt()
+		} else {
+			c.systemPrompt = promptForRuntime(mode)
+		}
 	}
 	return nil
 }

@@ -27,6 +27,7 @@ const (
 	CategoryUserMessage       Category = "user_message"
 	CategoryAgentMessage      Category = "agent_message"
 	CategoryBuiltinToolResult Category = "builtin_tool_result"
+	CategoryCodeSlice         Category = "code_slice"
 	CategoryProjectContext    Category = "project_context"
 	CategorySummary           Category = "summary"
 	CategoryDriverState       Category = "driver_state"
@@ -47,6 +48,7 @@ var categoryOrder = []Category{
 	CategoryUserMessage,
 	CategoryAgentMessage,
 	CategoryBuiltinToolResult,
+	CategoryCodeSlice,
 	CategoryProjectContext,
 	CategorySummary,
 	CategoryDriverState,
@@ -67,6 +69,7 @@ var categoryLabels = map[Category]string{
 	CategoryUserMessage:       "User messages",
 	CategoryAgentMessage:      "Agent messages",
 	CategoryBuiltinToolResult: "Tool results",
+	CategoryCodeSlice:         "Code slices",
 	CategoryProjectContext:    "Project context",
 	CategorySummary:           "Summary",
 	CategoryDriverState:       "Driver state",
@@ -146,6 +149,7 @@ type Report struct {
 	MeasurementKind         string            `json:"measurement_kind"`
 	CompressionCount        int               `json:"compression_count"`
 	LastCompression         *CompressionEvent `json:"last_compression,omitempty"`
+	CodeSlices              SliceStats        `json:"code_slices,omitzero"`
 }
 
 type LimitDetails struct {
@@ -285,6 +289,7 @@ func (l *Ledger) ReportWithLimits(providerName, model string, limits LimitDetail
 	defer l.mu.RUnlock()
 	usage := make(map[Category]*CategoryUsage, len(categoryOrder))
 	sources := make(map[Category]map[string]*SourceUsage, len(categoryOrder))
+	sliceStats := SliceStats{}
 	for _, category := range categoryOrder {
 		usage[category] = &CategoryUsage{Category: category, Label: categoryLabels[category], Exact: true}
 	}
@@ -310,12 +315,24 @@ func (l *Ledger) ReportWithLimits(providerName, model string, limits LimitDetail
 		source.Bytes += block.Bytes
 		source.Tokens += block.Tokens
 		source.Exact = source.Exact && block.Exact
+		if block.Category == CategoryCodeSlice {
+			if hit, _ := block.Metadata["cache_hit"].(bool); hit {
+				sliceStats.CacheHits++
+			}
+			if canonical, _ := block.Metadata["canonical_artifact_id"].(string); canonical != "" {
+				sliceStats.Deduplicated++
+			}
+			if stale, _ := block.Metadata["stale"].(bool); stale {
+				sliceStats.Stale++
+			}
+		}
 	}
 	report := Report{
 		Provider: providerName, Model: model, ConfiguredContextWindow: limits.Configured, DetectedContextWindow: limits.Detected,
 		ContextWindow: limits.Effective, LimitSource: limits.Source, LimitCached: limits.Cached, LimitAssumed: limits.Assumed,
 		LimitObservedAt: limits.ObservedAt, LimitDegradations: limits.Degradations,
 		LastUsage: l.lastUsage, MeasurementKind: "estimated", CompressionCount: l.compressionCount,
+		CodeSlices: sliceStats,
 	}
 	if l.lastCompression != nil {
 		copy := *l.lastCompression

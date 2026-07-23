@@ -11,6 +11,7 @@ import (
 
 	"Eylu/internal/environment"
 	"Eylu/internal/protocol"
+	"Eylu/internal/tool"
 )
 
 func TestStoreReplaysEventsAndHydratesAttachments(t *testing.T) {
@@ -126,7 +127,7 @@ func TestStoreReplaysPromptHistoryEvents(t *testing.T) {
 	}
 }
 
-func TestSnapshotTodoListIsOptionalForSchemaVersionOne(t *testing.T) {
+func TestSnapshotTodoListIsOptionalForLegacySchemaVersionOne(t *testing.T) {
 	encoded, err := json.Marshal(Snapshot{Version: SchemaVersion, SessionID: "legacy-v1", TodoList: protocol.TodoList{Items: []protocol.TodoItem{}}})
 	if err != nil {
 		t.Fatal(err)
@@ -138,8 +139,30 @@ func TestSnapshotTodoListIsOptionalForSchemaVersionOne(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"version":1,"session_id":"legacy-v1"}`), &restored); err != nil {
 		t.Fatal(err)
 	}
-	if restored.Version != SchemaVersion || len(restored.TodoList.Items) != 0 {
+	if restored.Version != 1 || len(restored.TodoList.Items) != 0 || len(restored.AgentTasks) != 0 {
 		t.Fatalf("restored=%#v", restored)
+	}
+	migrated, changed, err := migrateJSONDocument([]byte(`{"version":1,"session_id":"legacy-v1"}`))
+	if err != nil || !changed || !bytes.Contains(migrated, []byte(`"version": 2`)) {
+		t.Fatalf("migration changed=%t err=%v data=%s", changed, err, migrated)
+	}
+}
+
+func TestAgentTaskReportsRoundTripThroughEvents(t *testing.T) {
+	root := t.TempDir()
+	store := openTestStore(t, root)
+	createTestSession(t, store, "agent-tasks", root)
+	tasks := []tool.AgentTask{{
+		ID: "task-1", SessionID: "agent-tasks", SubagentType: "search", Status: tool.AgentTaskCompleted,
+		CreatedAt: time.Now().UTC(), CompletedAt: time.Now().UTC(), Consumed: false,
+		Report: &tool.SearchReport{Summary: "found", Findings: []tool.SearchFinding{{Path: "main.go", StartLine: 1, EndLine: 2, Reason: "entrypoint", Confidence: 1}}},
+	}}
+	if _, err := store.Append("agent-tasks", []Event{{Type: EventAgentTasksUpdated, AgentTasks: tasks}}); err != nil {
+		t.Fatal(err)
+	}
+	restored, _, err := store.Load("agent-tasks")
+	if err != nil || len(restored.AgentTasks) != 1 || restored.AgentTasks[0].Report == nil || restored.AgentTasks[0].Report.Summary != "found" {
+		t.Fatalf("restored=%#v err=%v", restored.AgentTasks, err)
 	}
 }
 

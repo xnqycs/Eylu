@@ -264,6 +264,84 @@ func TestExecuteBatchExclusiveCallIsBarrier(t *testing.T) {
 	}
 }
 
+func TestResourceCoordinatorSchedulesAcrossExecutors(t *testing.T) {
+	item := &scheduledBatchTool{started: make(chan string, 3), release: map[string]chan struct{}{
+		"writer": make(chan struct{}), "blocked": make(chan struct{}), "independent": make(chan struct{}),
+	}}
+	coordinator := NewResourceCoordinator()
+	newExecutor := func() *Executor {
+		return &Executor{
+			Registry: NewRegistry(item), Policy: policy.AllowAllChecker{}, Timeout: time.Second,
+			MaxParallelTools: 2, Coordinator: coordinator,
+		}
+	}
+	first, second := newExecutor(), newExecutor()
+	done := make(chan protocol.ToolResult, 3)
+	run := func(executor *Executor, id, path string) {
+		go func() {
+			done <- executor.Execute(context.Background(), "request", protocol.ToolCall{
+				ID: id, Name: "scheduled",
+				Arguments: json.RawMessage(`{"id":"` + id + `","path":"` + path + `","access":"write"}`),
+			})
+		}()
+	}
+
+	run(first, "writer", "same.go")
+	expectBatchStart(t, item.started, "writer")
+	run(second, "blocked", "same.go")
+	run(second, "independent", "other.go")
+	expectBatchStart(t, item.started, "independent")
+	assertNoBatchStart(t, item.started)
+
+	close(item.release["independent"])
+	close(item.release["writer"])
+	expectBatchStart(t, item.started, "blocked")
+	close(item.release["blocked"])
+	for range 3 {
+		select {
+		case result := <-done:
+			if result.IsError {
+				t.Fatalf("result = %#v", result)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cross-executor work did not finish")
+		}
+	}
+}
+
+func TestResourceCoordinatorCancelsWaitingCall(t *testing.T) {
+	item := &scheduledBatchTool{started: make(chan string, 2), release: map[string]chan struct{}{
+		"writer": make(chan struct{}), "waiting": make(chan struct{}),
+	}}
+	coordinator := NewResourceCoordinator()
+	executor := &Executor{Registry: NewRegistry(item), Policy: policy.AllowAllChecker{}, Coordinator: coordinator, Timeout: time.Second}
+	done := make(chan protocol.ToolResult, 2)
+	go func() {
+		done <- executor.Execute(context.Background(), "request", protocol.ToolCall{
+			ID: "writer", Name: "scheduled", Arguments: json.RawMessage(`{"id":"writer","path":"same.go","access":"write"}`),
+		})
+	}()
+	expectBatchStart(t, item.started, "writer")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		done <- executor.Execute(ctx, "request", protocol.ToolCall{
+			ID: "waiting", Name: "scheduled", Arguments: json.RawMessage(`{"id":"waiting","path":"same.go","access":"read"}`),
+		})
+	}()
+	cancel()
+	result := <-done
+	if result.CallID != "waiting" || !result.IsError || !strings.Contains(result.Content, "cancel") {
+		t.Fatalf("waiting result = %#v", result)
+	}
+	assertNoBatchStart(t, item.started)
+	close(item.release["writer"])
+	result = <-done
+	if result.CallID != "writer" || result.IsError {
+		t.Fatalf("writer result = %#v", result)
+	}
+}
+
 type confirmedBatchTool struct{ calls atomic.Int32 }
 
 func (t *confirmedBatchTool) Definition() protocol.ToolDefinition {
@@ -336,7 +414,7 @@ func TestBuiltinConcurrencyClassifiers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec := bash.ClassifyConcurrency(nil, policy.Outcome{Classification: policy.CommandReadOnly}); spec.Mode != ConcurrencyShared {
+	if spec := bash.ClassifyConcurrency(nil, policy.Outcome{Classification: policy.CommandReadOnly}); spec.Mode != ConcurrencyClaimed || len(spec.Claims) != 1 || spec.Claims[0].Kind != ResourceTree || spec.Claims[0].Access != ResourceRead {
 		t.Fatalf("read-only bash = %#v", spec)
 	}
 	if spec := bash.ClassifyConcurrency(nil, policy.Outcome{Classification: policy.CommandAutoAllowed}); spec.Mode != ConcurrencyExclusive {

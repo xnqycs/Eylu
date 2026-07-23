@@ -361,6 +361,27 @@ max_parallel_tools = 4
 
 默认并发上限为 `4`。设为 `1` 可让工具串行执行；环境变量 `EYLU_MAX_PARALLEL_TOOLS` 可临时覆盖该值。明确声明为只读的 MCP 工具可参与并行调度，其他 MCP 工具采用独占执行。
 
+### 代码上下文与搜索子代理
+
+`read_file` 支持 1-based 闭区间参数 `start_line`、`end_line`，并返回 `file_hash`、`slice_hash`、`artifact_id` 和续读游标 `next_start_line`。`search_code` 共享会话级增量三元组索引，支持 `offset` 分页和 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前会替换为稳定引用。
+
+模型可通过 `agent` 启动只读 `search` 子代理。前台任务直接返回结构化检索报告；后台任务返回 `task_id`，可用 `task_output` 查询、用 `task_stop` 取消，完成结果会在下一轮自动加入上下文。子代理只注册 `search_code`、`read_file`、`list_directory`，并与主代理共享代码缓存和资源协调器。
+
+```toml
+max_parallel_agents = 2
+code_context_cache_bytes = 67108864
+max_read_lines = 2000
+code_index_workers = 4
+
+[search_agent]
+max_turns = 8
+timeout_seconds = 120
+# provider = "fast-model" # 省略时继承当前 Provider
+# model = "model-id"      # 省略时继承当前模型
+```
+
+对应环境变量为 `EYLU_MAX_PARALLEL_AGENTS`、`EYLU_CODE_CONTEXT_CACHE_BYTES`、`EYLU_MAX_READ_LINES` 和 `EYLU_CODE_INDEX_WORKERS`。
+
 ## 终端兼容性
 
 - 交互式 TTY 默认启动 Bubble Tea 全屏界面。

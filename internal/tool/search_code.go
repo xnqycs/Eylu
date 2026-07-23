@@ -1,11 +1,10 @@
 package tool
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"io"
-	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -18,15 +17,21 @@ import (
 
 type SearchCode struct {
 	index        *RepositoryIndex
+	context      *CodeContext
 	maxResults   int
 	maxFileBytes int64
 }
 
 type SearchMatch struct {
-	Path   string `json:"path"`
-	Line   int    `json:"line"`
-	Column int    `json:"column"`
-	Text   string `json:"text"`
+	Path      string `json:"path"`
+	Line      int    `json:"line"`
+	Column    int    `json:"column"`
+	Text      string `json:"text"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+	Context   string `json:"context,omitempty"`
+	FileHash  string `json:"file_hash"`
+	SliceHash string `json:"slice_hash"`
 }
 
 func NewSearchCode(index *RepositoryIndex, maxResults int, maxFileBytes int64) *SearchCode {
@@ -39,11 +44,17 @@ func NewSearchCode(index *RepositoryIndex, maxResults int, maxFileBytes int64) *
 	return &SearchCode{index: index, maxResults: maxResults, maxFileBytes: maxFileBytes}
 }
 
+func NewSearchCodeWithContext(codeContext *CodeContext, maxResults int, maxFileBytes int64) *SearchCode {
+	search := NewSearchCode(codeContext.RepositoryIndex(), maxResults, maxFileBytes)
+	search.context = codeContext
+	return search
+}
+
 func (s *SearchCode) Definition() protocol.ToolDefinition {
 	return protocol.ToolDefinition{
 		Name:        "search_code",
-		Description: "Search text in the shared repository index. Supports literal or RE2 regular-expression matching, optional file glob, stable path/line ordering, result limits, binary skipping, and per-file size limits. Use it to locate symbols before reading or editing files.",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"regex":{"type":"boolean","default":false},"glob":{"type":"string"},"max_results":{"type":"integer","minimum":1}},"required":["query"],"additionalProperties":false}`),
+		Description: "Search the session's incremental lexical code index. Supports literal or RE2 matching, file globs, stable pagination, and optional surrounding lines. Results include file and slice hashes for precise follow-up reads.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"regex":{"type":"boolean","default":false},"glob":{"type":"string"},"max_results":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0,"default":0},"context_lines":{"type":"integer","minimum":0,"maximum":20,"default":0}},"required":["query"],"additionalProperties":false}`),
 	}
 }
 
@@ -61,16 +72,24 @@ func (s *SearchCode) ClassifyConcurrency(_ json.RawMessage, _ policy.Outcome) Co
 
 func (s *SearchCode) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var input struct {
-		Query      string `json:"query"`
-		Regex      bool   `json:"regex"`
-		Glob       string `json:"glob"`
-		MaxResults int    `json:"max_results"`
+		Query        string `json:"query"`
+		Regex        bool   `json:"regex"`
+		Glob         string `json:"glob"`
+		MaxResults   int    `json:"max_results"`
+		Offset       int    `json:"offset"`
+		ContextLines int    `json:"context_lines"`
 	}
 	if err := decodeStrict(raw, &input); err != nil {
 		return toolError("invalid search_code input: " + err.Error())
 	}
 	if input.Query == "" {
 		return toolError("query is required")
+	}
+	if input.Offset < 0 {
+		return toolError("offset cannot be negative")
+	}
+	if input.ContextLines < 0 || input.ContextLines > 20 {
+		return toolError("context_lines must be between 0 and 20")
 	}
 	limit := input.MaxResults
 	if limit <= 0 || limit > s.maxResults {
@@ -84,10 +103,23 @@ func (s *SearchCode) Execute(ctx context.Context, raw json.RawMessage) protocol.
 			return toolError("invalid regular expression: " + err.Error())
 		}
 	}
-	snapshot := s.index.Refresh(ctx)
-	matches := make([]SearchMatch, 0)
-	skippedBinary, skippedLarge := 0, 0
-	for _, file := range snapshot.Files {
+	codeContext := s.context
+	if codeContext == nil {
+		codeContext = newCodeContext(s.index, CodeContextOptions{})
+	}
+	regexPrefix := ""
+	if expression != nil {
+		regexPrefix, _ = expression.LiteralPrefix()
+	}
+	snapshot, generation, candidates, err := codeContext.CandidateFiles(ctx, input.Query, regexPrefix, s.maxFileBytes)
+	if err != nil {
+		return toolError("search index: " + err.Error())
+	}
+	matches := make([]SearchMatch, 0, limit+1)
+	skippedBinary, skippedLarge := codeContext.LexicalStats(generation, s.maxFileBytes)
+	cacheHits := 0
+	seen := 0
+	for _, file := range candidates {
 		if input.Glob != "" && !matchFileGlob(input.Glob, file.Relative) {
 			continue
 		}
@@ -95,21 +127,14 @@ func (s *SearchCode) Execute(ctx context.Context, raw json.RawMessage) protocol.
 			skippedLarge++
 			continue
 		}
-		openFile, err := os.Open(file.Absolute)
+		data, fileHash, binary, cacheHit, err := codeContext.FileText(ctx, file)
 		if err != nil {
 			continue
 		}
-		data, err := io.ReadAll(io.LimitReader(openFile, s.maxFileBytes+1))
-		_ = openFile.Close()
-		if err != nil {
-			continue
+		if cacheHit {
+			cacheHits++
 		}
-		if int64(len(data)) > s.maxFileBytes {
-			skippedLarge++
-			continue
-		}
-		if bytes.IndexByte(data, 0) >= 0 || !utf8.Valid(data) {
-			skippedBinary++
+		if binary {
 			continue
 		}
 		lines := strings.Split(string(data), "\n")
@@ -124,13 +149,31 @@ func (s *SearchCode) Execute(ctx context.Context, raw json.RawMessage) protocol.
 				column = utf8.RuneCountInString(line[:byteIndex]) + 1
 			}
 			if column > 0 {
-				matches = append(matches, SearchMatch{Path: file.Relative, Line: lineIndex + 1, Column: column, Text: strings.TrimSuffix(line, "\r")})
-				if len(matches) >= limit {
+				if seen < input.Offset {
+					seen++
+					continue
+				}
+				startLine := lineIndex + 1 - input.ContextLines
+				if startLine < 1 {
+					startLine = 1
+				}
+				endLine := lineIndex + 1 + input.ContextLines
+				if endLine > len(lines) {
+					endLine = len(lines)
+				}
+				contextText := strings.Join(lines[startLine-1:endLine], "\n")
+				digest := sha256.Sum256([]byte(contextText))
+				matches = append(matches, SearchMatch{
+					Path: file.Relative, Line: lineIndex + 1, Column: column, Text: strings.TrimSuffix(line, "\r"),
+					StartLine: startLine, EndLine: endLine, Context: contextText, FileHash: fileHash,
+					SliceHash: hex.EncodeToString(digest[:]),
+				})
+				if len(matches) > limit {
 					break
 				}
 			}
 		}
-		if len(matches) >= limit {
+		if len(matches) > limit {
 			break
 		}
 	}
@@ -143,11 +186,23 @@ func (s *SearchCode) Execute(ctx context.Context, raw json.RawMessage) protocol.
 		}
 		return matches[a].Column < matches[b].Column
 	})
+	truncated := len(matches) > limit
+	if truncated {
+		matches = matches[:limit]
+	}
+	nextOffset := 0
+	if truncated {
+		nextOffset = input.Offset + len(matches)
+	}
 	payload, _ := json.MarshalIndent(map[string]any{
-		"matches": matches, "truncated": len(matches) >= limit, "source": snapshot.Source,
+		"matches": matches, "truncated": truncated, "next_offset": nextOffset,
+		"index_generation": generation, "source": snapshot.Source, "cache_hits": cacheHits,
 		"skipped_binary": skippedBinary, "skipped_large": skippedLarge, "diagnostic": snapshot.Diagnostic,
 	}, "", "  ")
-	return protocol.ToolResult{Content: string(payload), Truncated: len(matches) >= limit, Metadata: map[string]any{"matches": len(matches), "source": snapshot.Source}}
+	return protocol.ToolResult{Content: string(payload), Truncated: truncated, Metadata: map[string]any{
+		"matches": len(matches), "source": snapshot.Source, "next_offset": nextOffset,
+		"index_generation": generation, "cache_hits": cacheHits,
+	}}
 }
 
 func matchFileGlob(pattern, name string) bool {

@@ -40,6 +40,7 @@ type Bash struct {
 	shell          ShellAdapter
 	maxOutputBytes int
 	environment    []string
+	context        *CodeContext
 }
 
 func (b *Bash) AllowEnvironment(names []string) {
@@ -60,6 +61,15 @@ func NewBash(workspace string, maxOutputBytes int, shell ShellAdapter) (*Bash, e
 	return &Bash{paths: paths, workspace: paths.real, shell: shell, maxOutputBytes: maxOutputBytes}, nil
 }
 
+func NewBashWithContext(codeContext *CodeContext, maxOutputBytes int, shell ShellAdapter) (*Bash, error) {
+	bash, err := NewBash(codeContext.index.workspace, maxOutputBytes, shell)
+	if err != nil {
+		return nil, err
+	}
+	bash.context = codeContext
+	return bash, nil
+}
+
 func (b *Bash) Definition() protocol.ToolDefinition {
 	return protocol.ToolDefinition{
 		Name:        "bash",
@@ -72,9 +82,15 @@ func (b *Bash) Risk() policy.Risk { return policy.RiskExec }
 
 func (b *Bash) ClassifyConcurrency(_ json.RawMessage, outcome policy.Outcome) ConcurrencySpec {
 	if outcome.Classification == policy.CommandReadOnly {
-		return ConcurrencySpec{Mode: ConcurrencyShared}
+		return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceTree, Path: b.workspace, Access: ResourceRead}}}
 	}
 	return ConcurrencySpec{Mode: ConcurrencyExclusive}
+}
+
+func (b *Bash) AfterExecute(outcome policy.Outcome) {
+	if b.context != nil && outcome.Classification != policy.CommandReadOnly {
+		b.context.InvalidateAll()
+	}
 }
 
 func (b *Bash) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {

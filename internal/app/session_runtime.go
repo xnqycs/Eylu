@@ -30,6 +30,7 @@ type sessionRuntime struct {
 	persistedPrompts int
 	persistedSkills  map[string]string
 	revalidated      bool
+	agentTasks       func(string) []tool.AgentTask
 	workspace        string
 	redact           func(string) string
 }
@@ -181,6 +182,11 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	events = append(events, session.Event{
 		Type: session.EventRuntimeUpdated, Workspace: state.Workspace, PermissionMode: state.PermissionMode, Provider: &providerState,
 	})
+	agentTasks := append([]tool.AgentTask(nil), s.snapshot.AgentTasks...)
+	if s.agentTasks != nil {
+		agentTasks = s.agentTasks(state.SessionID)
+	}
+	events = append(events, session.Event{Type: session.EventAgentTasksUpdated, AgentTasks: agentTasks})
 	if !bytes.Equal(state.DriverState, s.snapshot.DriverState) {
 		events = append(events, session.Event{Type: session.EventDriverState, DriverState: append(json.RawMessage(nil), state.DriverState...)})
 	}
@@ -213,6 +219,7 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 		s.snapshot.Sequence = prepared[len(prepared)-1].Sequence
 	}
 	next := snapshotFromAgentState(state, s.snapshot)
+	next.AgentTasks = agentTasks
 	next.Sequence = s.snapshot.Sequence
 	next.LastError = lastError
 	if err := s.store.Save(next); err != nil {
@@ -230,6 +237,24 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 		return sessionProtocolError("clean session store", err)
 	}
 	return nil
+}
+
+func (s *sessionRuntime) SetAgentTaskSource(source func(string) []tool.AgentTask) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.agentTasks = source
+	s.mu.Unlock()
+}
+
+func (s *sessionRuntime) AgentTasks() []tool.AgentTask {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]tool.AgentTask(nil), s.snapshot.AgentTasks...)
 }
 
 func (s *sessionRuntime) Close(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions) error {
@@ -339,6 +364,7 @@ func snapshotFromAgentState(state agent.ConversationState, previous session.Snap
 		Provider: sessionProviderState(state.Provider),
 		Turns:    state.Turns, PromptHistory: append([]string{}, state.PromptHistory...), DriverState: append(json.RawMessage(nil), state.DriverState...), SkillCatalog: state.SkillCatalog,
 		Summary: state.Summary, TodoList: cloneProtocolTodoList(state.TodoList), OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: state.Ledger,
+		AgentTasks: append([]tool.AgentTask(nil), previous.AgentTasks...),
 	}
 	if snapshot.CreatedAt.IsZero() {
 		snapshot.CreatedAt = time.Now().UTC()

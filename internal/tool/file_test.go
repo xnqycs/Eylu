@@ -7,7 +7,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"Eylu/internal/protocol"
 )
@@ -70,6 +73,135 @@ func TestReadAndWriteFileBoundaries(t *testing.T) {
 	data, _ = os.ReadFile(filepath.Join(workspace, "source.txt"))
 	if string(data) != "replacement" {
 		t.Fatalf("replaced file = %q", data)
+	}
+}
+
+func TestReadFileRangesHashesAndCacheInvalidation(t *testing.T) {
+	workspace := t.TempDir()
+	path := filepath.Join(workspace, "source.txt")
+	if err := os.WriteFile(path, []byte("alpha\r\nbeta\r\ngamma\r\ndelta"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	codeContext, err := NewCodeContext(workspace, CodeContextOptions{MaxReadLines: 2, RefreshInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewReadFileWithContext(codeContext, 1024)
+	first := reader.Execute(context.Background(), json.RawMessage(`{"path":"source.txt","start_line":2,"end_line":4}`))
+	if first.IsError || first.Content != "beta\r\ngamma\r\n" || !first.Truncated {
+		t.Fatalf("first range = %#v", first)
+	}
+	if first.Metadata["start_line"] != 2 || first.Metadata["end_line"] != 3 || first.Metadata["total_lines"] != 4 || first.Metadata["next_start_line"] != 4 {
+		t.Fatalf("first metadata = %#v", first.Metadata)
+	}
+	if first.Metadata["file_hash"] == "" || first.Metadata["slice_hash"] == "" || first.Metadata["artifact_id"] == "" || first.Metadata["cache_hit"] != false {
+		t.Fatalf("first hashes = %#v", first.Metadata)
+	}
+	second := reader.Execute(context.Background(), json.RawMessage(`{"path":"source.txt","start_line":2,"end_line":3}`))
+	if second.IsError || second.Metadata["cache_hit"] != true || second.Metadata["slice_hash"] != first.Metadata["slice_hash"] {
+		t.Fatalf("cached range = %#v", second)
+	}
+
+	writer := NewWriteFileWithContext(codeContext)
+	written := writer.Execute(context.Background(), json.RawMessage(`{"path":"source.txt","content":"changed\ncontent"}`))
+	if written.IsError {
+		t.Fatalf("write = %#v", written)
+	}
+	after := reader.Execute(context.Background(), json.RawMessage(`{"path":"source.txt"}`))
+	if after.IsError || after.Metadata["cache_hit"] != false || after.Metadata["file_hash"] == first.Metadata["file_hash"] {
+		t.Fatalf("invalidated range = %#v", after)
+	}
+}
+
+func TestCodeContextRefreshIsSingleFlight(t *testing.T) {
+	workspace := t.TempDir()
+	var calls atomic.Int32
+	index, err := newRepositoryIndex(workspace, func(context.Context, string, ...string) ([]byte, error) {
+		calls.Add(1)
+		time.Sleep(10 * time.Millisecond)
+		return nil, os.ErrNotExist
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeContext := newCodeContext(index, CodeContextOptions{RefreshInterval: time.Hour})
+	var wait sync.WaitGroup
+	for range 16 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			codeContext.Refresh(context.Background())
+		}()
+	}
+	wait.Wait()
+	if calls.Load() != 1 {
+		t.Fatalf("git probes = %d, want 1", calls.Load())
+	}
+}
+
+func TestCodeContextFileLoadIsSingleFlight(t *testing.T) {
+	workspace := t.TempDir()
+	path := filepath.Join(workspace, "source.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	codeContext, err := NewCodeContext(workspace, CodeContextOptions{RefreshInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalRead := codeContext.readFile
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	codeContext.readFile = func(name string) ([]byte, error) {
+		calls.Add(1)
+		startOnce.Do(func() { close(started) })
+		<-release
+		return originalRead(name)
+	}
+
+	const readers = 16
+	ready := make(chan struct{}, readers)
+	begin := make(chan struct{})
+	errors := make(chan error, readers)
+	for range readers {
+		go func() {
+			ready <- struct{}{}
+			<-begin
+			_, err := codeContext.ReadSlice(context.Background(), "source.txt", 1, 1, 1024)
+			errors <- err
+		}()
+	}
+	for range readers {
+		<-ready
+	}
+	close(begin)
+	<-started
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	for range readers {
+		if err := <-errors; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("file reads = %d, want 1", calls.Load())
+	}
+}
+
+func TestReadFileByteTruncationReportsCompletedLineBoundary(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "lines.txt"), []byte("one\ntwo\nthree"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewReadFile(workspace, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := reader.Execute(context.Background(), json.RawMessage(`{"path":"lines.txt"}`))
+	if result.IsError || !result.Truncated || result.Content != "one\n" || result.Metadata["end_line"] != 1 || result.Metadata["next_start_line"] != 2 {
+		t.Fatalf("result = %#v", result)
 	}
 }
 

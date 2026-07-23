@@ -15,6 +15,7 @@ import (
 
 type ListDirectory struct {
 	index      *RepositoryIndex
+	context    *CodeContext
 	maxEntries int
 }
 
@@ -23,6 +24,13 @@ func NewListDirectory(index *RepositoryIndex, maxEntries int) *ListDirectory {
 		maxEntries = 2000
 	}
 	return &ListDirectory{index: index, maxEntries: maxEntries}
+}
+
+func NewListDirectoryWithContext(codeContext *CodeContext, maxEntries int) *ListDirectory {
+	if maxEntries <= 0 {
+		maxEntries = 2000
+	}
+	return &ListDirectory{index: codeContext.RepositoryIndex(), context: codeContext, maxEntries: maxEntries}
 }
 
 func (l *ListDirectory) Definition() protocol.ToolDefinition {
@@ -94,7 +102,12 @@ func (l *ListDirectory) Execute(ctx context.Context, raw json.RawMessage) protoc
 	if limit <= 0 || limit > l.maxEntries {
 		limit = l.maxEntries
 	}
-	snapshot := l.index.Refresh(ctx)
+	var snapshot IndexSnapshot
+	if l.context != nil {
+		snapshot, _ = l.context.Refresh(ctx)
+	} else {
+		snapshot = l.index.Refresh(ctx)
+	}
 	entries := make(map[string]bool)
 	for _, file := range snapshot.Files {
 		relative := file.Relative

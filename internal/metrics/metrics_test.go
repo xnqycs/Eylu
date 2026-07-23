@@ -29,12 +29,13 @@ func TestObservationAndSummary(t *testing.T) {
 	now = now.Add(2 * time.Second)
 	observation.ObserveModelEvent(protocol.ModelEvent{Kind: protocol.EventResponseDone})
 	observation.ObserveContextEvent(contextledger.Event{Kind: contextledger.EventCompression, Compression: &contextledger.CompressionEvent{DurationMS: 250, Strategy: "deterministic_fallback", Usage: protocol.Usage{InputTokens: 20, OutputTokens: 5, Exact: true}}})
+	observation.ObserveCodeSlices(contextledger.SliceStats{CacheHits: 3, Deduplicated: 2, Stale: 1})
 	metric := observation.Finish(protocol.Usage{}, nil)
-	if metric.RequestID != "request" || metric.FirstTokenMS != 3000 || metric.GenerationMS != 2000 || metric.TokensPerSecond != 25 || metric.ToolSuccessRate != 1 || metric.CompressionCount != 1 || metric.CompactionDurationMS != 250 || metric.CompactionFallbacks != 1 || metric.CompactionUsage.OutputTokens != 5 || metric.EstimatedCost != 0.0004 || math.Abs(metric.CompactionCost-0.00006) > 1e-12 || metric.WebActivities != 1 || metric.WebCitations != 1 || metric.WebUsage.Searches != 1 || metric.WebUsage.CostUSD != 0.01 {
+	if metric.RequestID != "request" || metric.FirstTokenMS != 3000 || metric.GenerationMS != 2000 || metric.TokensPerSecond != 25 || metric.ToolSuccessRate != 1 || metric.CompressionCount != 1 || metric.CompactionDurationMS != 250 || metric.CompactionFallbacks != 1 || metric.CompactionUsage.OutputTokens != 5 || metric.EstimatedCost != 0.0004 || math.Abs(metric.CompactionCost-0.00006) > 1e-12 || metric.WebActivities != 1 || metric.WebCitations != 1 || metric.WebUsage.Searches != 1 || metric.WebUsage.CostUSD != 0.01 || metric.CodeSliceCacheHits != 3 || metric.CodeSliceDeduplicated != 2 || metric.CodeSliceStale != 1 {
 		t.Fatalf("metric = %#v", metric)
 	}
 	summary := collector.Snapshot()
-	if summary.Requests != 1 || summary.ToolCalls != 1 || summary.ToolSuccessRate != 1 || summary.Usage.InputTokens != 100 || summary.EstimatedCost != metric.EstimatedCost || summary.WebActivities != 1 || summary.WebCitations != 1 || summary.WebUsage.Searches != 1 {
+	if summary.Requests != 1 || summary.ToolCalls != 1 || summary.ToolSuccessRate != 1 || summary.Usage.InputTokens != 100 || summary.EstimatedCost != metric.EstimatedCost || summary.WebActivities != 1 || summary.WebCitations != 1 || summary.WebUsage.Searches != 1 || summary.CodeSliceCacheHits != 3 || summary.CodeSliceDeduplicated != 2 || summary.CodeSliceStale != 1 {
 		t.Fatalf("summary = %#v", summary)
 	}
 }

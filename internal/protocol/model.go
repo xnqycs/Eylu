@@ -240,19 +240,30 @@ const (
 	EventWebFetchUpdated    EventKind = "web_fetch.updated"
 	EventWebFetchCompleted  EventKind = "web_fetch.completed"
 	EventCitation           EventKind = "citation"
+	EventAgentTaskUpdated   EventKind = "agent_task.updated"
 )
 
+type AgentTaskActivity struct {
+	TaskID       string          `json:"task_id"`
+	SubagentType string          `json:"subagent_type"`
+	Status       string          `json:"status"`
+	Background   bool            `json:"background"`
+	Error        string          `json:"error,omitempty"`
+	Report       json.RawMessage `json:"report,omitempty"`
+}
+
 type ModelEvent struct {
-	Kind          EventKind      `json:"kind"`
-	Delta         string         `json:"delta,omitempty"`
-	ToolCallDelta *ToolCallDelta `json:"tool_call_delta,omitempty"`
-	ToolCall      *ToolCall      `json:"tool_call,omitempty"`
-	ToolResult    *ToolResult    `json:"tool_result,omitempty"`
-	Usage         *Usage         `json:"usage,omitempty"`
-	Response      *ModelResponse `json:"response,omitempty"`
-	Error         *Error         `json:"error,omitempty"`
-	WebActivity   *WebActivity   `json:"web_activity,omitempty"`
-	Citation      *URLCitation   `json:"citation,omitempty"`
+	Kind          EventKind          `json:"kind"`
+	Delta         string             `json:"delta,omitempty"`
+	ToolCallDelta *ToolCallDelta     `json:"tool_call_delta,omitempty"`
+	ToolCall      *ToolCall          `json:"tool_call,omitempty"`
+	ToolResult    *ToolResult        `json:"tool_result,omitempty"`
+	Usage         *Usage             `json:"usage,omitempty"`
+	Response      *ModelResponse     `json:"response,omitempty"`
+	Error         *Error             `json:"error,omitempty"`
+	WebActivity   *WebActivity       `json:"web_activity,omitempty"`
+	Citation      *URLCitation       `json:"citation,omitempty"`
+	AgentTask     *AgentTaskActivity `json:"agent_task,omitempty"`
 }
 
 type ToolKind string

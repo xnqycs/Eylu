@@ -33,6 +33,11 @@ type FileConfig struct {
 	MaxReadBytes           *int                           `toml:"max_read_bytes,omitempty"`
 	MaxSearchResults       *int                           `toml:"max_search_results,omitempty"`
 	MaxParallelTools       *int                           `toml:"max_parallel_tools,omitempty"`
+	MaxParallelAgents      *int                           `toml:"max_parallel_agents,omitempty"`
+	CodeContextCacheBytes  *int64                         `toml:"code_context_cache_bytes,omitempty"`
+	MaxReadLines           *int                           `toml:"max_read_lines,omitempty"`
+	CodeIndexWorkers       *int                           `toml:"code_index_workers,omitempty"`
+	SearchAgent            *FileSearchAgentConfig         `toml:"search_agent,omitempty"`
 	ReadOnlyCommands       *[]string                      `toml:"read_only_commands,omitempty"`
 	AutoAllowCommands      *[]string                      `toml:"auto_allow_commands,omitempty"`
 	DangerousCommands      *[]string                      `toml:"dangerous_commands,omitempty"`
@@ -124,6 +129,13 @@ type FileModelMetadataConfig struct {
 	MaxResponseBytes      *int    `toml:"max_response_bytes,omitempty"`
 	MaxCacheEntries       *int    `toml:"max_cache_entries,omitempty"`
 	ProbeTiers            *[]int  `toml:"probe_tiers,omitempty"`
+}
+
+type FileSearchAgentConfig struct {
+	Provider       *string `toml:"provider,omitempty"`
+	Model          *string `toml:"model,omitempty"`
+	MaxTurns       *int    `toml:"max_turns,omitempty"`
+	TimeoutSeconds *int    `toml:"timeout_seconds,omitempty"`
 }
 
 type ValuePatch[T any] struct {
@@ -540,6 +552,16 @@ func applyFileConfig(cfg *Config, file FileConfig) {
 	assign(cfg.MaxReadBytes, file.MaxReadBytes, func(value int) { cfg.MaxReadBytes = value })
 	assign(cfg.MaxSearchResults, file.MaxSearchResults, func(value int) { cfg.MaxSearchResults = value })
 	assign(cfg.MaxParallelTools, file.MaxParallelTools, func(value int) { cfg.MaxParallelTools = value })
+	assign(cfg.MaxParallelAgents, file.MaxParallelAgents, func(value int) { cfg.MaxParallelAgents = value })
+	assign(cfg.CodeContextCacheBytes, file.CodeContextCacheBytes, func(value int64) { cfg.CodeContextCacheBytes = value })
+	assign(cfg.MaxReadLines, file.MaxReadLines, func(value int) { cfg.MaxReadLines = value })
+	assign(cfg.CodeIndexWorkers, file.CodeIndexWorkers, func(value int) { cfg.CodeIndexWorkers = value })
+	if file.SearchAgent != nil {
+		assign(cfg.SearchAgent.Provider, file.SearchAgent.Provider, func(value string) { cfg.SearchAgent.Provider = value })
+		assign(cfg.SearchAgent.Model, file.SearchAgent.Model, func(value string) { cfg.SearchAgent.Model = value })
+		assign(cfg.SearchAgent.MaxTurns, file.SearchAgent.MaxTurns, func(value int) { cfg.SearchAgent.MaxTurns = value })
+		assign(cfg.SearchAgent.TimeoutSeconds, file.SearchAgent.TimeoutSeconds, func(value int) { cfg.SearchAgent.TimeoutSeconds = value })
+	}
 	assignSlice(file.ReadOnlyCommands, func(value []string) { cfg.ReadOnlyCommands = value })
 	assignSlice(file.AutoAllowCommands, func(value []string) { cfg.AutoAllowCommands = value })
 	assignSlice(file.DangerousCommands, func(value []string) { cfg.DangerousCommands = value })
@@ -696,6 +718,18 @@ func fileConfigFromResolved(cfg Config) FileConfig {
 	setDifferent(&file.MaxReadBytes, cfg.MaxReadBytes, defaults.MaxReadBytes)
 	setDifferent(&file.MaxSearchResults, cfg.MaxSearchResults, defaults.MaxSearchResults)
 	setDifferent(&file.MaxParallelTools, cfg.MaxParallelTools, defaults.MaxParallelTools)
+	setDifferent(&file.MaxParallelAgents, cfg.MaxParallelAgents, defaults.MaxParallelAgents)
+	setDifferent(&file.CodeContextCacheBytes, cfg.CodeContextCacheBytes, defaults.CodeContextCacheBytes)
+	setDifferent(&file.MaxReadLines, cfg.MaxReadLines, defaults.MaxReadLines)
+	setDifferent(&file.CodeIndexWorkers, cfg.CodeIndexWorkers, defaults.CodeIndexWorkers)
+	searchAgent := FileSearchAgentConfig{}
+	setDifferent(&searchAgent.Provider, cfg.SearchAgent.Provider, defaults.SearchAgent.Provider)
+	setDifferent(&searchAgent.Model, cfg.SearchAgent.Model, defaults.SearchAgent.Model)
+	setDifferent(&searchAgent.MaxTurns, cfg.SearchAgent.MaxTurns, defaults.SearchAgent.MaxTurns)
+	setDifferent(&searchAgent.TimeoutSeconds, cfg.SearchAgent.TimeoutSeconds, defaults.SearchAgent.TimeoutSeconds)
+	if !reflect.ValueOf(searchAgent).IsZero() {
+		file.SearchAgent = &searchAgent
+	}
 	setSliceDifferent(&file.ReadOnlyCommands, cfg.ReadOnlyCommands, defaults.ReadOnlyCommands)
 	setSliceDifferent(&file.AutoAllowCommands, cfg.AutoAllowCommands, defaults.AutoAllowCommands)
 	setSliceDifferent(&file.DangerousCommands, cfg.DangerousCommands, defaults.DangerousCommands)

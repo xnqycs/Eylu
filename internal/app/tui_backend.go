@@ -302,6 +302,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	if err != nil {
 		return err
 	}
+	prompt = b.runtime.promptWithCompletedSearchTasks(b.conversation.SessionID(), prompt)
 	contextReport := b.conversation.ContextReport()
 	estimator := contextledger.ApproxEstimator{BytesPerToken: cfg.TokenBytesPerToken}
 	estimatedInput := contextReport.InputTokens + estimator.Estimate(prompt)
@@ -354,6 +355,23 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	}
 	executor.SessionID, executor.ProviderName = b.conversation.SessionID(), modelRuntime.Provider.Name
 	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
+	var taskObserverMu sync.Mutex
+	taskObserverActive := true
+	defer func() {
+		taskObserverMu.Lock()
+		taskObserverActive = false
+		taskObserverMu.Unlock()
+	}()
+	if err := b.runtime.configureSearchAgent(b.manager, b.conversation, modelRuntime, executor, cfg, prompt, func(activity protocol.AgentTaskActivity) {
+		taskObserverMu.Lock()
+		defer taskObserverMu.Unlock()
+		if !taskObserverActive {
+			return
+		}
+		emit(ui.Event{OperationID: operationID, Kind: ui.EventAgentTask, AgentTask: &activity})
+	}); err != nil {
+		return err
+	}
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventActivity, Activity: &ui.Activity{
 		Reasoning: modelRuntime.Driver.Capabilities().Reasoning, ReasoningKnown: true,
 		TokenBytesPerToken: max(1, cfg.TokenBytesPerToken), InputTokens: estimatedInput,
@@ -391,6 +409,8 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventWebActivity, WebActivity: event.WebActivity})
 		case protocol.EventCitation:
 			emit(ui.Event{OperationID: operationID, Kind: ui.EventCitation, Citation: event.Citation})
+		case protocol.EventAgentTaskUpdated:
+			emit(ui.Event{OperationID: operationID, Kind: ui.EventAgentTask, AgentTask: event.AgentTask})
 		}
 		return nil
 	}
@@ -399,10 +419,11 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	defer cancel()
 	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID()}, true, modelEvents)
 	flushText()
+	report := b.conversation.ContextReport()
+	observation.ObserveCodeSlices(report.CodeSlices)
 	metric := observation.Finish(response.Usage, err)
 	interrupted := errors.Is(err, agent.ErrRequestInterrupted)
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: formatRequestCompletion(metric, interrupted)})
-	report := b.conversation.ContextReport()
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &report})
 	if interrupted {
 		return ui.ErrRequestInterrupted

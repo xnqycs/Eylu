@@ -87,7 +87,38 @@ Emit independent read-only tool calls together in the same response. Keep calls 
 The final response must be a decision-complete plan with a title, summary, implementation changes, important interface or compatibility changes, test scenarios, and explicit assumptions. Mention concrete files only when they disambiguate ownership. Local permission policy is authoritative.`
 		},
 		AllowTool: func(name string, risk policy.Risk) bool {
-			return risk == policy.RiskRead || name == "bash" || name == "ask"
+			return risk == policy.RiskRead || name == "bash" || name == "ask" || name == "agent" || name == "task_output" || name == "task_stop"
+		},
+	}
+}
+
+func SearchProfile(maxTurns int) Profile {
+	if maxTurns <= 0 {
+		maxTurns = 8
+	}
+	return Profile{
+		Name: "search", Description: "Read-only repository search specialist.", PermissionMode: "plan",
+		Model: ModelInherit, MaxTurns: maxTurns, Isolated: true,
+		SystemPrompt: func() string {
+			return `You are Eylu's repository search subagent. Locate the smallest set of source locations that answers the delegated question.
+
+Use search_code to narrow candidates, read_file with exact line ranges to verify them, and list_directory only when repository shape matters. Emit independent reads together. Keep dependent searches and reads in separate rounds. You cannot edit files, run commands, or delegate another agent.
+
+Return only one JSON object with this schema:
+{"summary":"concise answer","findings":[{"path":"workspace/relative/path","start_line":1,"end_line":1,"symbol":"optional symbol","reason":"why this location matters","confidence":0.0,"file_hash":"hash from read/search"}],"follow_up":["optional unresolved question"]}
+
+Every finding must be grounded in tool output. Use an empty findings array when no verified location exists.`
+		},
+		AllowTool: func(name string, risk policy.Risk) bool {
+			if risk != policy.RiskRead {
+				return false
+			}
+			switch name {
+			case "read_file", "search_code", "list_directory":
+				return true
+			default:
+				return false
+			}
 		},
 	}
 }

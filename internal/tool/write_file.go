@@ -14,7 +14,12 @@ import (
 )
 
 type WriteFile struct {
-	paths *pathResolver
+	paths   *pathResolver
+	context *CodeContext
+}
+
+func NewWriteFileWithContext(codeContext *CodeContext) *WriteFile {
+	return &WriteFile{paths: codeContext.index.paths, context: codeContext}
 }
 
 func NewWriteFile(workspace string) (*WriteFile, error) {
@@ -75,6 +80,9 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 	content := []byte(input.Content)
 	if err := writeFileAtomically(path, content, mode); err != nil {
 		return toolError(err.Error())
+	}
+	if w.context != nil {
+		w.context.Invalidate(path)
 	}
 	lines := 0
 	if len(content) > 0 {

@@ -22,6 +22,7 @@ import (
 	"Eylu/internal/config"
 	"Eylu/internal/protocol"
 	"Eylu/internal/provider"
+	"Eylu/internal/tool"
 )
 
 func TestKnownDriverCapabilitiesInfersGPTWebToolsForRelay(t *testing.T) {
@@ -36,6 +37,71 @@ func TestKnownDriverCapabilitiesInfersGPTWebToolsForRelay(t *testing.T) {
 	capabilities, ok = knownDriverCapabilities(snapshot)
 	if !ok || capabilities.HostedWebSearch || capabilities.HostedWebFetch {
 		t.Fatalf("overridden capabilities = %#v, known = %t", capabilities, ok)
+	}
+}
+
+func TestToolExecutorReloadsCodeContextOptionsAndKeepsWorkspaceCoordinator(t *testing.T) {
+	runtime := &runtime{workspace: t.TempDir()}
+	cfg := config.Default()
+	if _, err := runtime.toolExecutorWith(cfg, chatOptions{}, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	firstContext, firstCoordinator := runtime.codeContext, runtime.resourceCoordinator
+	if _, err := runtime.toolExecutorWith(cfg, chatOptions{}, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.codeContext != firstContext || runtime.resourceCoordinator != firstCoordinator {
+		t.Fatal("unchanged tool runtime was rebuilt")
+	}
+	cfg.MaxReadLines++
+	if _, err := runtime.toolExecutorWith(cfg, chatOptions{}, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.codeContext == firstContext || runtime.resourceCoordinator != firstCoordinator {
+		t.Fatal("context option reload did not preserve the workspace coordinator")
+	}
+	runtime.workspace = t.TempDir()
+	if _, err := runtime.toolExecutorWith(cfg, chatOptions{}, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.resourceCoordinator == firstCoordinator {
+		t.Fatal("workspace change reused the previous coordinator")
+	}
+}
+
+func TestCompletedBackgroundSearchTaskIsInjectedOnce(t *testing.T) {
+	appRuntime := &runtime{}
+	appRuntime.searchTasks = tool.NewAgentTaskManager(1, func(context.Context, tool.AgentTaskRequest) (tool.SearchReport, error) {
+		return tool.SearchReport{Summary: "located target", Findings: []tool.SearchFinding{{
+			Path: "main.go", StartLine: 10, EndLine: 12, Reason: "target implementation", Confidence: 1,
+		}}}, nil
+	}, nil)
+	defer appRuntime.closeSearchTasks()
+	if _, err := appRuntime.searchTasks.Launch(context.Background(), tool.AgentTaskRequest{
+		SessionID: "session", SubagentType: "search", Prompt: "find target", RunInBackground: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		tasks := appRuntime.searchTasks.Snapshots("session")
+		if len(tasks) == 1 && tasks[0].Status == tool.AgentTaskCompleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background task did not complete: %#v", tasks)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	first := appRuntime.promptWithCompletedSearchTasks("session", "continue")
+	if !strings.Contains(first, "<completed_search_tasks>") || !strings.Contains(first, "located target") {
+		t.Fatalf("injected prompt = %q", first)
+	}
+	if second := appRuntime.promptWithCompletedSearchTasks("session", "continue"); second != "continue" {
+		t.Fatalf("completed task was injected twice: %q", second)
+	}
+	if other := appRuntime.promptWithCompletedSearchTasks("other", "continue"); other != "continue" {
+		t.Fatalf("cross-session task was injected: %q", other)
 	}
 }
 
@@ -467,7 +533,7 @@ func TestChatToolLoopReadsAndBuilds(t *testing.T) {
 		switch number {
 		case 1:
 			tools := body["tools"].([]any)
-			if len(tools) != 7 || !containsFunctionTool(tools, "todolist") {
+			if len(tools) != 10 || !containsFunctionTool(tools, "todolist") || !containsFunctionTool(tools, "agent") || !containsFunctionTool(tools, "task_output") || !containsFunctionTool(tools, "task_stop") {
 				t.Fatalf("tools = %#v", body["tools"])
 			}
 			writeResponsesCompleted(w, `{"id":"resp_1","output":[{"type":"function_call","id":"fc_1","call_id":"call-read","name":"read_file","arguments":"{\"path\":\"main.go\"}"}]}`)
@@ -497,6 +563,61 @@ func TestChatToolLoopReadsAndBuilds(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "call_id=call-read") || !strings.Contains(stderr.String(), "decision=confirm") || !strings.Contains(stderr.String(), "call_id=call-build") {
 		t.Fatalf("tool diagnostics missing: %s", stderr.String())
+	}
+}
+
+func TestChatForegroundSearchAgentUsesReadOnlyChildTools(t *testing.T) {
+	isolateUserState(t)
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		number := requests.Add(1)
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		input := body["input"].([]any)
+		tools, _ := body["tools"].([]any)
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch number {
+		case 1:
+			if !containsFunctionTool(tools, "agent") {
+				t.Fatalf("parent tools = %#v", tools)
+			}
+			writeResponsesCompleted(w, `{"id":"parent_1","output":[{"type":"function_call","id":"fc_parent","call_id":"call-agent","name":"agent","arguments":"{\"subagent_type\":\"search\",\"prompt\":\"find the entrypoint\"}"}]}`)
+		case 2:
+			if len(tools) != 3 || !containsFunctionTool(tools, "read_file") || !containsFunctionTool(tools, "search_code") || !containsFunctionTool(tools, "list_directory") || containsFunctionTool(tools, "agent") || containsFunctionTool(tools, "bash") {
+				t.Fatalf("child tools = %#v", tools)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"child_1","output":[{"type":"function_call","id":"fc_search","call_id":"call-search","name":"search_code","arguments":"{\"query\":\"func main\"}"}]}`))
+		case 3:
+			if !containsFunctionOutput(input, "call-search", "main.go") {
+				t.Fatalf("child search result missing: %#v", input)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"child_2","output":[{"type":"message","content":[{"type":"output_text","text":"{\"summary\":\"found entrypoint\",\"findings\":[{\"path\":\"main.go\",\"start_line\":3,\"end_line\":3,\"symbol\":\"main\",\"reason\":\"program entrypoint\",\"confidence\":1.0}],\"follow_up\":[]}"}]}]}`))
+		case 4:
+			if !containsFunctionOutput(input, "call-agent", "found entrypoint") {
+				t.Fatalf("parent agent result missing: %#v", input)
+			}
+			writeResponsesCompleted(w, `{"id":"parent_2","output":[{"type":"message","content":[{"type":"output_text","text":"entrypoint located"}]}]}`)
+		default:
+			t.Fatalf("unexpected request %d", number)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("EYLU_API_KEY", "agent-secret")
+	var stdout, stderr bytes.Buffer
+	code := Execute(context.Background(), []string{
+		"--config", filepath.Join(workspace, "config.toml"), "--workspace", workspace,
+		"chat", "locate entrypoint", "--base-url", server.URL, "--model", "test-model", "--yes",
+	}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 || stdout.String() != "entrypoint located\n" || requests.Load() != 4 {
+		t.Fatalf("exit=%d requests=%d stdout=%q stderr=%q", code, requests.Load(), stdout.String(), stderr.String())
 	}
 }
 
