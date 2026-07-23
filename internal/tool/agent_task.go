@@ -176,7 +176,7 @@ func (m *AgentTaskManager) LaunchWithRunner(ctx context.Context, request AgentTa
 	return m.LaunchWithFactory(ctx, request, func(string, AgentTaskRequest) AgentTaskRunner { return runner })
 }
 
-func (m *AgentTaskManager) LaunchWithFactory(ctx context.Context, request AgentTaskRequest, factory AgentTaskRunnerFactory) (AgentTask, error) {
+func (m *AgentTaskManager) LaunchWithFactory(_ context.Context, request AgentTaskRequest, factory AgentTaskRunnerFactory) (AgentTask, error) {
 	if m == nil || factory == nil {
 		return AgentTask{}, errors.New("agent task service is unavailable")
 	}
@@ -189,10 +189,6 @@ func (m *AgentTaskManager) LaunchWithFactory(ctx context.Context, request AgentT
 	if request.Prompt == "" {
 		return AgentTask{}, errors.New("agent prompt is required")
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
 	now := time.Now().UTC()
 	taskID := uuid.NewString()
 	runner := factory(taskID, request)
