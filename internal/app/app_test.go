@@ -45,7 +45,7 @@ func (w *overlapDetectWriter) Write(content []byte) (int, error) {
 func TestSynchronizedWriterSerializesConcurrentWrites(t *testing.T) {
 	underlying := &overlapDetectWriter{}
 	outputMu := &sync.Mutex{}
-	writers := []*synchronizedWriter{
+	writers := []io.Writer{
 		newSynchronizedWriter(underlying, outputMu),
 		newSynchronizedWriter(underlying, outputMu),
 	}
@@ -53,7 +53,7 @@ func TestSynchronizedWriterSerializesConcurrentWrites(t *testing.T) {
 	var workers sync.WaitGroup
 	for index := range 32 {
 		workers.Add(1)
-		go func(writer *synchronizedWriter) {
+		go func(writer io.Writer) {
 			defer workers.Done()
 			<-start
 			_, _ = writer.Write([]byte("event"))
@@ -63,6 +63,53 @@ func TestSynchronizedWriterSerializesConcurrentWrites(t *testing.T) {
 	workers.Wait()
 	if underlying.overlapped.Load() {
 		t.Fatal("underlying writer received concurrent writes")
+	}
+}
+
+func TestSynchronizedWriterPreservesTerminalFileCapabilities(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "terminal-writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	writer := io.Writer(newSynchronizedWriter(file, &sync.Mutex{}))
+	terminal, ok := writer.(interface {
+		io.ReadWriteCloser
+		Fd() uintptr
+	})
+	if !ok {
+		t.Fatalf("synchronized file writer type %T does not preserve terminal capabilities", writer)
+	}
+	if got := terminal.Fd(); got != file.Fd() {
+		t.Fatalf("terminal fd = %d, want %d", got, file.Fd())
+	}
+}
+
+func TestTerminalFileUnwrapsSynchronizedWriter(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "terminal-file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	testCases := []struct {
+		name  string
+		input any
+		want  *os.File
+	}{
+		{name: "direct file", input: file, want: file},
+		{name: "wrapped file", input: newSynchronizedWriter(file, &sync.Mutex{}), want: file},
+		{name: "nested wrapped file", input: newSynchronizedWriter(newSynchronizedWriter(file, &sync.Mutex{}), &sync.Mutex{}), want: file},
+		{name: "memory writer", input: &bytes.Buffer{}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, ok := terminalFile(testCase.input)
+			if ok != (testCase.want != nil) || got != testCase.want {
+				t.Fatalf("terminalFile() = %v, %t; want %v", got, ok, testCase.want)
+			}
+		})
 	}
 }
 

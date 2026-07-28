@@ -98,7 +98,15 @@ type synchronizedWriter struct {
 	writer io.Writer
 }
 
-func newSynchronizedWriter(writer io.Writer, mu *sync.Mutex) *synchronizedWriter {
+type synchronizedFileWriter struct {
+	*os.File
+	mu *sync.Mutex
+}
+
+func newSynchronizedWriter(writer io.Writer, mu *sync.Mutex) io.Writer {
+	if file, ok := writer.(*os.File); ok && file != nil {
+		return &synchronizedFileWriter{File: file, mu: mu}
+	}
 	return &synchronizedWriter{writer: writer, mu: mu}
 }
 
@@ -106,6 +114,12 @@ func (w *synchronizedWriter) Write(content []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.writer.Write(content)
+}
+
+func (w *synchronizedFileWriter) Write(content []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.File.Write(content)
 }
 
 type codeContextRuntimeOptions struct {

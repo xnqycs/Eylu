@@ -504,8 +504,29 @@ func readTerminalSecret(ctx context.Context, file *os.File, interrupts <-chan os
 	}
 }
 
+func terminalFile(input any) (*os.File, bool) {
+	for {
+		switch value := input.(type) {
+		case *os.File:
+			return value, value != nil
+		case *synchronizedFileWriter:
+			if value == nil || value.File == nil {
+				return nil, false
+			}
+			return value.File, true
+		case *synchronizedWriter:
+			if value == nil {
+				return nil, false
+			}
+			input = value.writer
+		default:
+			return nil, false
+		}
+	}
+}
+
 func isTerminal(input any) bool {
-	file, ok := input.(*os.File)
+	file, ok := terminalFile(input)
 	return ok && term.IsTerminal(int(file.Fd()))
 }
 
