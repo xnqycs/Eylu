@@ -231,6 +231,14 @@ func (o BatchOutcome) Err() error {
 	}
 }
 
+// LineRange is one retained 1-based inclusive line range of a code slice. A
+// trimmed fragment reports exactly which file lines survived, so a reference is
+// only used when the retained body really covers the lines it points at.
+type LineRange struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
 type ToolResult struct {
 	CallID            string          `json:"call_id"`
 	Content           string          `json:"content"`

@@ -55,9 +55,27 @@ type canonicalSlice struct {
 	artifactID string
 	startLine  int
 	endLine    int
+	// retained lists the line ranges whose bodies are really present in the
+	// request. An empty list means the whole declared range is present.
+	retained   []protocol.LineRange
 	turnIndex  int
 	partIndex  int
 	blockIndex int
+}
+
+// covers reports whether a slice's real body contains one line range. Only a
+// single retained range can cover a range completely: a range that spans an
+// omitted middle is not covered, however many pieces survived.
+func covers(declaredStart, declaredEnd int, retained []protocol.LineRange, start, end int) bool {
+	if len(retained) == 0 {
+		return declaredStart <= start && declaredEnd >= end
+	}
+	for _, item := range retained {
+		if item.Start <= start && item.End >= end {
+			return true
+		}
+	}
+	return false
 }
 
 func NewPromptBuilder(estimator TokenEstimator) *PromptBuilder {
@@ -131,12 +149,13 @@ func (b *PromptBuilder) AddTurn(turn protocol.Turn) {
 						startLine: codeSlice.startLine, endLine: codeSlice.endLine,
 						turnIndex: turnIndex, partIndex: index, blockIndex: len(b.result.Blocks) - 1,
 					})
-				case codeSlice.complete:
-					// Only a complete fragment may act as a canonical slice for
-					// later fragments to reference.
+				case codeSlice.complete || len(codeSlice.retained) > 0:
+					// A fragment is canonical for the lines it really holds: the
+					// whole declared range when it is complete, or only its
+					// retained ranges when it was trimmed.
 					b.slices = append(b.slices, canonicalSlice{
 						path: codeSlice.path, fileHash: codeSlice.fileHash, artifactID: codeSlice.artifactID,
-						startLine: codeSlice.startLine, endLine: codeSlice.endLine,
+						startLine: codeSlice.startLine, endLine: codeSlice.endLine, retained: codeSlice.retained,
 						turnIndex: turnIndex, partIndex: index, blockIndex: len(b.result.Blocks) - 1,
 					})
 				}
@@ -152,17 +171,23 @@ type codeSliceMetadata struct {
 	startLine  int
 	endLine    int
 	cacheHit   bool
-	// complete reports whether the body actually covers the whole declared line
-	// range. Only a complete fragment may act as a canonical code slice.
+	// complete reports whether the body covers the whole declared line range.
 	complete bool
+	// retained lists the line ranges whose bodies really survived a trim, so a
+	// trimmed fragment can still be canonical for the lines it kept.
+	retained []protocol.LineRange
 }
 
 func (s codeSliceMetadata) metadata() map[string]any {
-	return map[string]any{
+	metadata := map[string]any{
 		"path": s.path, "file_hash": s.fileHash, "artifact_id": s.artifactID,
 		"start_line": s.startLine, "end_line": s.endLine, "cache_hit": s.cacheHit,
 		"slice_complete": s.complete,
 	}
+	if len(s.retained) > 0 {
+		metadata["retained_ranges"] = s.retained
+	}
+	return metadata
 }
 
 func parseCodeSlice(metadata map[string]any) (codeSliceMetadata, bool) {
@@ -190,7 +215,37 @@ func parseCodeSlice(metadata map[string]any) (codeSliceMetadata, bool) {
 	if value, ok := metadata["context_truncated"].(bool); ok && value {
 		complete = false
 	}
-	return codeSliceMetadata{path: path, fileHash: fileHash, artifactID: artifactID, startLine: startLine, endLine: endLine, cacheHit: cacheHit, complete: complete}, true
+	return codeSliceMetadata{
+		path: path, fileHash: fileHash, artifactID: artifactID, startLine: startLine, endLine: endLine,
+		cacheHit: cacheHit, complete: complete, retained: parseRetainedRanges(metadata["retained_ranges"]),
+	}, true
+}
+
+// parseRetainedRanges reads the retained line ranges of a trimmed fragment. The
+// value survives a JSON round trip through the session store, so both the typed
+// and the decoded forms are accepted.
+func parseRetainedRanges(value any) []protocol.LineRange {
+	switch typed := value.(type) {
+	case []protocol.LineRange:
+		return append([]protocol.LineRange(nil), typed...)
+	case []any:
+		ranges := make([]protocol.LineRange, 0, len(typed))
+		for _, item := range typed {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			start, startOK := promptInt(entry["start"])
+			end, endOK := promptInt(entry["end"])
+			if !startOK || !endOK || start <= 0 || end < start {
+				continue
+			}
+			ranges = append(ranges, protocol.LineRange{Start: start, End: end})
+		}
+		return ranges
+	default:
+		return nil
+	}
 }
 
 func promptInt(value any) (int, bool) {
@@ -216,7 +271,11 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 		if existing.path == current.path && existing.fileHash != current.fileHash {
 			stale = true
 		}
-		if existing.path == current.path && existing.fileHash == current.fileHash && existing.startLine <= current.startLine && existing.endLine >= current.endLine {
+		// A canonical fragment is only usable for a range whose body it really
+		// holds: a trimmed fragment covers the lines it kept, and a range that
+		// spans its omitted middle is not covered at all.
+		if existing.path == current.path && existing.fileHash == current.fileHash &&
+			covers(existing.startLine, existing.endLine, existing.retained, current.startLine, current.endLine) {
 			copy := existing
 			containing = &copy
 		}
@@ -228,15 +287,20 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 		b.result.SliceStats.Deduplicated++
 		return sliceReference(containing.artifactID, current.path, current.startLine, current.endLine, current.fileHash), containing.artifactID, stale
 	}
-	// An incomplete fragment does not actually contain the range it declares, so
-	// it may not replace a complete canonical fragment, may not redirect the
-	// references that point at one, and may not become canonical itself.
-	if !current.complete {
+	// A fragment becomes canonical for the lines it actually holds. A complete
+	// fragment holds its whole declared range; a trimmed one holds only its
+	// retained ranges, which the containment check above enforces.
+	if !current.complete && len(current.retained) == 0 {
 		return content, "", stale
 	}
 	kept := b.slices[:0]
 	for _, existing := range b.slices {
-		if existing.path == current.path && existing.fileHash == current.fileHash && current.startLine <= existing.startLine && current.endLine >= existing.endLine {
+		// A fragment only supersedes a smaller one when it really holds that
+		// fragment's whole range, so a trimmed fragment cannot replace a canonical
+		// whose body it does not contain.
+		if existing.path == current.path && existing.fileHash == current.fileHash &&
+			current.startLine <= existing.startLine && current.endLine >= existing.endLine &&
+			covers(current.startLine, current.endLine, current.retained, existing.startLine, existing.endLine) {
 			for index := range b.references {
 				reference := &b.references[index]
 				if reference.canonicalID != existing.artifactID {

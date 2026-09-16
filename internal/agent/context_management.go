@@ -526,18 +526,21 @@ func contextualizeTurn(turn protocol.Turn, maxToolBytes int) (protocol.Turn, boo
 		if part.ToolResult != nil {
 			toolResult := *part.ToolResult
 			toolResult.Metadata = cloneMetadata(part.ToolResult.Metadata)
-			snippet := contextSnippet(part.ToolResult.Content, maxToolBytes)
-			if snippet != part.ToolResult.Content {
-				// The body no longer covers the line range its metadata
-				// declares, so the copy is explicitly marked incomplete. The
-				// dedup layer may only treat a complete body with a reliable
-				// range as a canonical code slice.
-				toolResult.Content = snippet
+			trimmed, retained, complete := trimToolResultContent(part.ToolResult.Content, maxToolBytes, declaredStartLine(toolResult.Metadata))
+			if !complete {
+				// The body no longer covers the line range its metadata declares,
+				// so the copy is explicitly marked incomplete and reports the lines
+				// that survived. The dedup layer may then use it as a canonical
+				// slice only for the ranges it actually retained.
+				toolResult.Content = trimmed
 				toolResult.Truncated = true
 				if toolResult.Metadata == nil {
-					toolResult.Metadata = make(map[string]any, 2)
+					toolResult.Metadata = make(map[string]any, 3)
 				}
 				toolResult.Metadata["context_truncated"] = true
+				if len(retained) > 0 {
+					toolResult.Metadata["retained_ranges"] = retained
+				}
 				if _, declared := toolResult.Metadata["lines_complete"]; declared {
 					toolResult.Metadata["lines_complete"] = false
 				}
@@ -549,25 +552,114 @@ func contextualizeTurn(turn protocol.Turn, maxToolBytes int) (protocol.Turn, boo
 	return result, len(result.Parts) > 0
 }
 
-func contextSnippet(content string, limit int) string {
+// declaredStartLine reports the first file line a tool result claims to describe,
+// or 0 when it describes no line range.
+func declaredStartLine(metadata map[string]any) int {
+	value, ok := metadata["start_line"]
+	if !ok {
+		return 0
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
+	}
+}
+
+// trimToolResultContent keeps whole lines that fit in the budget, preferring the
+// beginning and the end of the body, and reports the file line ranges that
+// survived.
+//
+// Keeping whole lines, rather than cutting inside one, is what makes the retained
+// ranges trustworthy: a range either survived completely or is reported as
+// missing, so a reference may only be built on lines that are really present.
+func trimToolResultContent(content string, limit int, startLine int) (string, []protocol.LineRange, bool) {
 	if limit <= 0 || len(content) <= limit {
-		return content
+		return content, nil, true
 	}
 	marker := fmt.Sprintf("\n[tool result summarized: original_bytes=%d]\n", len(content))
 	available := limit - len(marker)
 	if available <= 0 {
-		return marker[:min(len(marker), limit)]
+		// Not even the marker fits: the body is reported as fully omitted rather
+		// than as a partial range.
+		return marker[:min(len(marker), limit)], nil, false
 	}
-	head := available * 2 / 3
-	tail := available - head
-	for head > 0 && !utf8.RuneStart(content[head]) {
-		head--
+	lines := strings.Split(content, "\n")
+	// The beginning gets two thirds of the budget and the end one third, so the
+	// declaration and the most recent lines stay available.
+	headBudget := available * 2 / 3
+	tailBudget := available - headBudget
+	headLines := 0
+	used := 0
+	for headLines < len(lines) {
+		size := len(lines[headLines])
+		if headLines > 0 {
+			size++
+		}
+		if used+size > headBudget {
+			break
+		}
+		used += size
+		headLines++
 	}
-	start := len(content) - tail
-	for start < len(content) && !utf8.RuneStart(content[start]) {
-		start++
+	tailLines := 0
+	used = 0
+	for tailLines < len(lines)-headLines {
+		index := len(lines) - 1 - tailLines
+		size := len(lines[index])
+		if index < len(lines)-1 {
+			size++
+		}
+		if used+size > tailBudget {
+			break
+		}
+		used += size
+		tailLines++
 	}
-	return content[:head] + marker + content[start:]
+	if headLines == 0 && tailLines == 0 {
+		// No whole line fits, which is what a very long single line looks like.
+		// The body is cut inside the line instead, and because a partially kept
+		// line cannot back a reliable range, no retained range is reported.
+		head := available * 2 / 3
+		tail := available - head
+		for head > 0 && !utf8.RuneStart(content[head]) {
+			head--
+		}
+		start := len(content) - tail
+		for start < len(content) && !utf8.RuneStart(content[start]) {
+			start++
+		}
+		if start < head {
+			start = head
+		}
+		return content[:head] + marker + content[start:], nil, false
+	}
+	var builder strings.Builder
+	builder.WriteString(strings.Join(lines[:headLines], "\n"))
+	if headLines+tailLines < len(lines) {
+		builder.WriteString(marker)
+	} else {
+		builder.WriteString("\n")
+	}
+	if tailLines > 0 {
+		builder.WriteString(strings.Join(lines[len(lines)-tailLines:], "\n"))
+	}
+	retained := make([]protocol.LineRange, 0, 2)
+	if startLine > 0 {
+		if headLines > 0 {
+			retained = append(retained, protocol.LineRange{Start: startLine, End: startLine + headLines - 1})
+		}
+		if tailLines > 0 {
+			first := startLine + len(lines) - tailLines
+			retained = append(retained, protocol.LineRange{Start: first, End: first + tailLines - 1})
+		}
+	}
+	return builder.String(), retained, false
 }
 
 func cloneMetadata(source map[string]any) map[string]any {

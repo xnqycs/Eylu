@@ -431,11 +431,15 @@ The default concurrency limit is `4`. Set it to `1` for serial execution, or ove
 
 Code slice deduplication — replacing a repeated read with a stable reference — only applies to a fragment whose **body is complete and whose line range is reliable**:
 
-- Trimming for the context window keeps the head and tail and inserts a summary marker. The trimmed copy is explicitly marked incomplete (`context_truncated`, `Truncated`) and is therefore no longer treated as a canonical fragment.
-- An incomplete large fragment does not overwrite a smaller complete fragment, does not make later reads degrade into references, and does not redirect existing references; otherwise the model would receive a reference to a body that does not contain the range.
-- A read the tool itself declared incomplete (`lines_complete = false`, for example when it reached `max_read_lines`) is not canonical either.
+- Trimming for the context window keeps the head and tail and inserts a summary marker. The trimmed copy is explicitly marked incomplete (`context_truncated`, `Truncated`) and is therefore no longer treated as a canonical fragment for its whole declared range.
+- The trim keeps **whole lines** and records the line ranges that survived (`retained_ranges`): a fragment is canonical only for the lines it really holds. A target range that spans the omitted middle is never deduplicated, and its body is provided instead.
+- An incomplete large fragment does not overwrite a smaller complete fragment, does not make later reads degrade into references, and does not redirect existing references.
+- A read the tool itself declared incomplete (`lines_complete = false`, for example when it reached `max_read_lines`) is not canonical for its whole declared range either.
+- When no whole line fits — a very long single line — the body is cut inside the line and reports no retained range, because a partially kept line can never back a reference.
 - A changed file hash never references an older generation of the content.
 - The original transcript is never modified, and omitted text never becomes a basis for deduplication. Token savings may suffer; content correctness may not.
+
+The benefit is quantified: twenty repeated reads of the same 40-line region drop from 6000 to 718 code-slice tokens (about 88% saved), asserted by `TestDeduplicationQuantifiesItsTokenSavings`, with `BenchmarkCodeSliceDeduplication` providing a timing baseline.
 
 ### Session event log and snapshot
 

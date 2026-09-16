@@ -402,11 +402,15 @@ max_parallel_tools = 4
 
 代码切片去重（重复读取被替换为稳定引用）只对**正文完整且行范围可靠**的片段生效：
 
-- 上下文窗口裁剪会保留首尾并插入摘要标记。被裁剪的副本会显式标记为不完整（`context_truncated`、`Truncated`），因此不会再被当作 canonical 片段。
-- 不完整的大片段不会覆盖更小的完整片段，不会让后续读取退化为引用，也不会重定向已有引用；否则模型会拿到指向并不包含该范围正文的引用。
-- 工具自身声明不完整（`lines_complete = false`，例如达到 `max_read_lines`）的读取同样不作为 canonical。
+- 上下文窗口裁剪会保留首尾并插入摘要标记。被裁剪的副本会显式标记为不完整（`context_truncated`、`Truncated`），因此不会再被当作覆盖整段范围的 canonical 片段。
+- 裁剪按**整行**进行，并记录实际保留的行区间（`retained_ranges`）：片段只对真正保留下来的行区间作为 canonical。跨越被省略中间部分的目标范围不会被去重，正文照常提供。
+- 不完整的大片段不会覆盖更小的完整片段，不会让后续读取退化为引用，也不会重定向已有引用。
+- 工具自身声明不完整（`lines_complete = false`，例如达到 `max_read_lines`）的读取同样不作为覆盖整段范围的 canonical。
+- 无法按整行保留时（超长单行），改按字节裁剪且不报告保留区间，因为被截断的行不能作为引用的依据。
 - 文件 hash 变化时不会引用旧版本内容。
 - 原始 transcript 不会被修改，被省略的正文不会成为去重依据。token 节省可以让步，内容正确性不能让步。
+
+去重收益有量化数据：20 次重复读取同一 40 行区间时，代码切片 token 从 6000 降至 718（约 88% 节省），由 `TestDeduplicationQuantifiesItsTokenSavings` 断言，`BenchmarkCodeSliceDeduplication` 提供耗时基准。
 
 ### 会话事件日志与快照
 
