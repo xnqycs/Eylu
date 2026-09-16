@@ -486,10 +486,17 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	}
 	sessionID := conversation.SessionID()
 	var runReport agent.RunReport
+	// Every committed turn is written while the request is still running, so a
+	// crash in the middle cannot lose a turn whose side effect already happened.
+	var onTurnCommitted func(protocol.Turn) error
+	if r.session != nil {
+		onTurnCommitted = r.session.RecordTurn
+	}
 	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
-		BeforeModel: func() string { return r.completedAgentNotifications(sessionID) },
-		Report:      &runReport,
+		BeforeModel:     func() string { return r.completedAgentNotifications(sessionID) },
+		Report:          &runReport,
+		OnTurnCommitted: onTurnCommitted,
 	}, stream, emit)
 	observation.ObserveCodeSlices(conversation.ContextReport().CodeSlices)
 	metric := observation.Finish(response.Usage, err)

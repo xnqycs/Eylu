@@ -27,9 +27,50 @@ type LoopOptions struct {
 	// Report, when non-nil, receives the durable summary of this run: why it
 	// stopped, what executed, what stayed unknown and what it cost.
 	Report *RunReport
+	// OnTurnCommitted, when non-nil, is called with every turn immediately after
+	// it is committed to the transcript, in transcript order: the model turn as
+	// soon as the response is validated, and the tool turn as soon as its results
+	// are recorded.
+	//
+	// It is how a host makes the conversation durable turn by turn instead of
+	// once at the end of the request, so a crash in the middle loses at most the
+	// turn that was still in flight. A failure is a persistence fault: the results
+	// already in memory are kept and no new side effect starts, because a request
+	// that cannot record what it did must not do more.
+	OnTurnCommitted func(protocol.Turn) error
 }
 
 var ErrRequestInterrupted = errors.New("request interrupted by user")
+
+// TurnPersistError reports that a committed turn could not be made durable.
+//
+// The turn is already part of the in-memory transcript and its results are kept:
+// the failure says the record is behind, not that the work was undone. Because a
+// request that cannot record what it did must not do more, it also ends the
+// request instead of letting the next batch start.
+type TurnPersistError struct {
+	TurnID string
+	Cause  error
+}
+
+func (e *TurnPersistError) Error() string {
+	return fmt.Sprintf("the committed turn %s could not be persisted: %v", e.TurnID, e.Cause)
+}
+
+func (e *TurnPersistError) Unwrap() error { return e.Cause }
+
+// commitTurn hands one committed turn to the host. A host without a persistence
+// hook is a host that persists the whole conversation later, which is what every
+// caller did before the hook existed.
+func commitTurn(hook func(protocol.Turn) error, turn protocol.Turn) error {
+	if hook == nil {
+		return nil
+	}
+	if err := hook(turn); err != nil {
+		return &TurnPersistError{TurnID: turn.ID, Cause: err}
+	}
+	return nil
+}
 
 // StopNote describes a stop reason that must not be presented as a normal
 // completion. It returns an empty string for a genuine completion.
@@ -196,6 +237,14 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		calls := toolCalls(response.Turn)
 		finalizer.calls = calls
 		closePending := finalizer.closePending
+		// The turn is committed, so the host gets the chance to make it durable
+		// before any of its calls can run. A failure here is a persistence fault:
+		// the calls are closed without being executed and the request ends,
+		// because a request that cannot record what it did must not do more.
+		if err := commitTurn(options.OnTurnCommitted, response.Turn); err != nil {
+			closePending("tool call was not executed: the committed turn could not be persisted")
+			return finish(protocol.ModelResponse{}, last, err, stopPersistenceFailed)
+		}
 		if err := recordHostedWebActivities(executor, runtime, requestID, response.Turn, plan, webBudget); err != nil {
 			closePending("tool call was not executed: hosted web activity was rejected")
 			return finish(protocol.ModelResponse{}, last, err, stopAborted)
@@ -268,6 +317,11 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 		c.rebuildLedger(runtime)
 		c.mu.Unlock()
+		// The tool turn is committed too, so the results of this batch are made
+		// durable before the next round can start.
+		if err := commitTurn(options.OnTurnCommitted, toolTurn); err != nil {
+			return finish(protocol.ModelResponse{}, last, err, stopPersistenceFailed)
+		}
 		// The request-level control state is owned by the executor. It is never
 		// derived from tool content or from metadata rebuilt by Web aggregation,
 		// so an external tool cannot interrupt or abort the host request.

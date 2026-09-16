@@ -94,6 +94,9 @@ const (
 	stopCancelled      = "cancelled"
 	stopAborted        = "aborted"
 	stopInterrupted    = "interrupt_request"
+	// stopPersistenceFailed is the reason a request whose committed turn could not
+	// be made durable gets. The work already done is kept; nothing new starts.
+	stopPersistenceFailed = "persistence_failed"
 	// stopPolicyTightened is the reason a host that narrowed a safety setting
 	// gets: the request stopped because it would otherwise have run under the
 	// settings that were just replaced.

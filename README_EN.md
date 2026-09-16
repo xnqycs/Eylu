@@ -450,6 +450,10 @@ The event log (`events.jsonl`) and the snapshot (`snapshot.json`) track their pr
 - State events (runtime, context, agentTasks, driverState, error) are appended only when their payload changes, so a repeated sync produces no duplicate events.
 - When the snapshot is missing or behind, the event log alone restores the session, and recovered turns are not duplicated.
 - Stable event IDs, uncertain append results (Write/Sync/Close failures) and schema migration belong to a later stage (PR-10).
+- **Per-turn persistence.** A model turn and a tool turn are written as soon as they are committed, instead of waiting for the sync at the end of the request. Killing a run in the middle therefore loses at most the turn that was still in flight, and never leaves a file that was written by a turn the conversation does not mention.
+- **The write order is synchronous serialization, not a queue.** Within one process every append happens in call order and `Store.Append`'s mutex fixes the log order; the loop continues only after the append returned, so the "intent precedes the side effect" guarantee is never weakened by a deferred write.
+- A turn event's identity is the turn ID, which is a host-owned UUID, so the incremental write of a turn and a later sync replay of that turn are literally the same event ID: the log recognizes the second one as a retry rather than writing a second copy.
+- A failing commit hook is a persistence fault: the in-memory results are kept, no new side effect starts, the run report records `stop_reason: persistence_failed`, and the next successful sync fills the log in.
 
 ### Resource conflict keys
 

@@ -600,9 +600,16 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	b.beginSafetyBaseline()
 	defer b.endSafetyBaseline()
 	sessionID := b.conversation.SessionID()
+	// Every committed turn is written while the request is still running, so a
+	// crash in the middle cannot lose a turn whose side effect already happened.
+	var onTurnCommitted func(protocol.Turn) error
+	if b.runtime.session != nil {
+		onTurnCommitted = b.runtime.session.RecordTurn
+	}
 	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
-		BeforeModel: func() string { return b.runtime.completedAgentNotifications(sessionID) },
+		BeforeModel:     func() string { return b.runtime.completedAgentNotifications(sessionID) },
+		OnTurnCommitted: onTurnCommitted,
 	}, true, modelEvents)
 	flushText()
 	report := b.conversation.ContextReport()

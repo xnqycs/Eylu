@@ -286,6 +286,14 @@ func (s *sessionRuntime) eventIDFor(identity string) string {
 	if identity == "" {
 		return ""
 	}
+	// A turn identity is the turn's own host-owned UUID, so it is already unique
+	// across runs and processes. Using it as the event ID makes the incremental
+	// write of a turn and a later replay of the same turn literally the same
+	// event, which is what lets the log recognize the second one as a retry
+	// instead of writing the turn twice.
+	if strings.HasPrefix(identity, "turn:") {
+		return identity
+	}
 	if eventID, ok := s.log.pending[identity]; ok {
 		return eventID
 	}
@@ -426,6 +434,40 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	if _, err := s.store.Cleanup(cfg.MaxSessions, cfg.MaxSessionBytes, state.SessionID); err != nil {
 		return sessionProtocolError("clean session store", err)
 	}
+	return nil
+}
+
+// RecordTurn persists one committed transcript turn as soon as the request
+// commits it.
+//
+// Sync writes the whole conversation at the end of a request, so a crash in the
+// middle used to leave the log holding only the lifecycle evidence of a side
+// effect while the turn that produced it was never written: the file existed and
+// the conversation did not mention it. This writes the turn while the request is
+// still running.
+//
+// It is synchronous on purpose, and it is not a queue: the append completes, in
+// transcript order, before the loop continues. The identity and therefore the
+// event ID are derived from the turn ID, which is the same identity Sync uses, so
+// an incremental write and a later replay of the same turn are the same event and
+// the log keeps exactly one copy.
+func (s *sessionRuntime) RecordTurn(turn protocol.Turn) error {
+	if s == nil || turn.ID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	event := session.Event{Type: session.EventTurnAppended, ID: s.eventIDFor("turn:" + turn.ID), Turn: &turn}
+	prepared, err := s.append(s.snapshot.SessionID, []session.Event{event})
+	if err != nil {
+		return sessionProtocolError("append committed turn", err)
+	}
+	// The append is durable, so the log progress advances here: the later Sync
+	// must not write this turn a second time.
+	s.acceptAppended(prepared)
+	// The snapshot is behind the log until the next Sync; that is the same state
+	// a failed snapshot save already leaves, and recovery replays the log.
+	s.snapshotPending = true
 	return nil
 }
 
