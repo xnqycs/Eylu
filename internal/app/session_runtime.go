@@ -167,6 +167,12 @@ func (r *runtime) openConversation(ctx context.Context, manager *provider.Manage
 			for _, diagnostic := range diagnostics {
 				fmt.Fprintf(r.stderr, "[session] %s: %s\n", diagnostic.Path, diagnostic.Message)
 			}
+			// An execution that started without a recorded outcome is reported
+			// here: its effect may have happened, so it is never replayed and the
+			// recorded hints are offered for verification.
+			for _, intent := range controller.PendingIntents() {
+				fmt.Fprintf(r.stderr, "[session] %s\n", describePendingIntent(intent))
+			}
 			return conversation, nil
 		}
 		if resuming && errors.Is(loadErr, os.ErrNotExist) {
@@ -491,6 +497,21 @@ func (s *sessionRuntime) PendingIntents() []session.ToolIntent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]session.ToolIntent(nil), s.snapshot.PendingIntents...)
+}
+
+// describePendingIntent renders one started-without-outcome execution as the
+// host reports it. The wording states the uncertainty instead of claiming the
+// operation either happened or did not happen.
+func describePendingIntent(intent session.ToolIntent) string {
+	target := strings.TrimSpace(intent.TargetPath)
+	if target == "" {
+		target = "an unknown target"
+	}
+	message := fmt.Sprintf("tool %s on %s started but its outcome was not recorded (outcome unknown; it was not replayed)", intent.Tool, target)
+	if intent.PreviousHash != "" {
+		message += fmt.Sprintf("; its content before the call had hash %s", intent.PreviousHash)
+	}
+	return message
 }
 
 func (s *sessionRuntime) AgentTasks() []tool.AgentTask {

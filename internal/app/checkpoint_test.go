@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -170,6 +171,53 @@ func TestCompletedRunHasNoPendingIntentEvenWithoutASnapshot(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(fixture.workspace, "target.txt"))
 	if err != nil || string(data) != "written" {
 		t.Fatalf("file = %q err = %v", data, err)
+	}
+}
+
+// A restart reports an execution that started without an outcome as unknown
+// rather than as success, failure or "not executed".
+func TestResumeReportsAnUnrecordedExecutionAsUnknown(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := session.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Create(session.Snapshot{
+		SessionID: "unknown-outcome", Workspace: workspace, PermissionMode: "manual",
+		Provider: session.ProviderState{Name: "stub", Adapter: "stub", Model: "stub-model"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The intent is in the log, and the run died before its completion.
+	intent := session.ToolIntent{
+		CallID: "exec-1", Tool: "write_file", TargetPath: filepath.Join(workspace, "target.txt"),
+		PreviousHash: "hash-before", StartedAt: time.Now().UTC(),
+	}
+	if _, err := store.Append(snapshot.SessionID, []session.Event{{Type: session.EventToolExecutionIntent, Intent: &intent}}); err != nil {
+		t.Fatal(err)
+	}
+	// A restart replays the log, so the restored snapshot carries the intent.
+	loaded, _, err := store.Load(snapshot.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := newSessionRuntime(store, loaded, workspace, nil)
+	pending := controller.PendingIntents()
+	if len(pending) != 1 {
+		t.Fatalf("pending intents = %#v", pending)
+	}
+	message := describePendingIntent(pending[0])
+	for _, expected := range []string{"write_file", "outcome unknown", "not replayed", "hash-before"} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("message = %q, missing %q", message, expected)
+		}
+	}
+	// The report never claims the operation happened, nor that it did not.
+	for _, forbidden := range []string{"was not executed", "completed successfully"} {
+		if strings.Contains(message, forbidden) {
+			t.Fatalf("message = %q claims %q", message, forbidden)
+		}
 	}
 }
 
