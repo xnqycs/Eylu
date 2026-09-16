@@ -405,6 +405,15 @@ max_parallel_tools = 4
 
 The default concurrency limit is `4`. Set it to `1` for serial execution, or override it temporarily with `EYLU_MAX_PARALLEL_TOOLS`. Explicitly configured read-only MCP tools can join concurrent batches; other MCP tools execute exclusively.
 
+### Cancellation, failure, and batch termination
+
+- The scheduler re-checks cancellation before starting each call, after `OnStart` returns, and again after a resource claim is granted, so a call never starts once cancellation has been observed. A queued waiter is removed from the resource coordinator when it is cancelled.
+- Results already obtained are preserved when a request ends. A write that committed successfully is never rewritten as "did not execute" because of a later cancellation, while the request itself still reports the cancellation.
+- A tool failure and a request-infrastructure failure behave differently. An ordinary tool error is left to the model to adjust to; an approval-channel failure or a scheduler that cannot make progress aborts the whole preflight batch, so calls already approved in that batch do not run either, and the request reports a failure instead of a user interruption.
+- When several errors coincide, the first substantive failure stays the leading error and the cancellation cause is preserved beside it, so `errors.Is` holds for both.
+- A tool timeout is a cooperative cancellation: the executor relies on the tool honouring context cancellation and never starts an unreclaimable goroutine to fake a hard timeout. Untrusted or non-cooperative plugins would need process isolation, which is a separate enhancement.
+- Every call produces at most one start event and one terminal event, and at most one audit record.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

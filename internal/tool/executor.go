@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -21,6 +22,37 @@ type Confirmation struct {
 }
 
 type ConfirmFunc func(context.Context, policy.Request, policy.Outcome) (Confirmation, error)
+
+// ApprovalError reports that the approval channel itself failed, as opposed to a
+// user rejecting a request with or without a reason. An approval-channel failure
+// is an infrastructure fault: it aborts the whole preflight batch, so calls that
+// were already approved in the same batch do not run either, and the request
+// reports a failure instead of a user interruption.
+type ApprovalError struct {
+	Tool string
+	Err  error
+}
+
+func (e *ApprovalError) Error() string {
+	return fmt.Sprintf("approval channel failed for %s: %v", e.Tool, e.Err)
+}
+
+func (e *ApprovalError) Unwrap() error { return e.Err }
+
+// joinBatchError keeps the first substantive failure and the request
+// cancellation cause together. errors.Is then holds for either one, while the
+// message still leads with the original failure. A batch-local cancel derived
+// from a hook failure is never reported a second time.
+func joinBatchError(primary, cancel error) error {
+	switch {
+	case primary == nil:
+		return cancel
+	case cancel == nil || errors.Is(primary, cancel):
+		return primary
+	default:
+		return errors.Join(primary, cancel)
+	}
+}
 
 type AuditRecord struct {
 	Timestamp           time.Time           `json:"timestamp"`
@@ -77,11 +109,16 @@ type AuditSink interface {
 }
 
 type Executor struct {
-	Registry           *Registry
-	Policy             policy.Checker
-	Confirm            ConfirmFunc
-	Audit              AuditSink
-	Workspace          string
+	Registry  *Registry
+	Policy    policy.Checker
+	Confirm   ConfirmFunc
+	Audit     AuditSink
+	Workspace string
+	// Timeout bounds one tool execution. It is a cooperative deadline, not a
+	// hard preemption mechanism: the executor relies on the tool honouring
+	// context cancellation and never starts an unreclaimable goroutine to fake a
+	// hard timeout. Untrusted or non-cooperative plugins would need process
+	// isolation, which is a separate enhancement.
 	Timeout            time.Duration
 	MaxOutputBytes     int
 	SessionID          string
@@ -104,10 +141,12 @@ type preparedCall struct {
 	outcome          policy.Outcome
 	spec             ConcurrencySpec
 	terminal         *protocol.ToolResult
+	approvalErr      error
 	queuedAt         time.Time
 	executionStarted time.Time
 	record           AuditRecord
 	auditOnce        sync.Once
+	startNotified    bool
 	running          bool
 	done             bool
 }
@@ -189,17 +228,32 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 	prepared := make([]*preparedCall, len(calls))
 	interrupt := false
 	var batchErr error
+	// finalize reports a cancellation that the batch observed even when every
+	// call already produced a result. The results themselves are kept: once a
+	// call committed a side effect, its outcome is never replaced.
+	finalize := func() ([]protocol.ToolResult, error) {
+		if batchCtx.Err() != nil {
+			batchErr = joinBatchError(batchErr, ctx.Err())
+		}
+		return results, batchErr
+	}
 	for index, call := range calls {
+		// Observe a request cancellation before preparing the next call, so a
+		// cancelled request never reaches the approval or execution stage.
+		batchErr = joinBatchError(batchErr, ctx.Err())
 		if interrupt || batchErr != nil {
 			prepared[index] = e.cancelledPrepared(requestID, batchID, index, call, queuedAt, "tool execution cancelled by batch preflight")
 			continue
 		}
 		prepared[index] = e.prepareCall(batchCtx, requestID, batchID, index, call, queuedAt)
+		// An approval-channel failure is infrastructure, not a user decision, so
+		// it aborts the preflight batch instead of letting the remaining calls
+		// run.
+		if prepared[index].approvalErr != nil {
+			batchErr = joinBatchError(batchErr, prepared[index].approvalErr)
+		}
 		if prepared[index].terminal != nil && prepared[index].terminal.Metadata != nil && prepared[index].terminal.Metadata["interrupt_request"] == true {
 			interrupt = true
-		}
-		if err := ctx.Err(); err != nil {
-			batchErr = err
 		}
 	}
 	if interrupt || batchErr != nil {
@@ -227,15 +281,13 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 		item.done = true
 		completed++
 		if hookErr != nil {
-			if batchErr == nil {
-				batchErr = hookErr
-				cancel()
-			}
+			batchErr = joinBatchError(batchErr, hookErr)
+			cancel()
 			hooks = BatchHooks{}
 		}
 	}
 	if completed == len(prepared) {
-		return results, batchErr
+		return finalize()
 	}
 
 	if limit > len(prepared) {
@@ -247,6 +299,12 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 	for completed < len(prepared) {
 		if batchErr == nil && batchCtx.Err() == nil {
 			for len(active) < limit {
+				// A cancellation observed at any point before this call starts
+				// must prevent the call from starting.
+				if batchCtx.Err() != nil {
+					batchErr = joinBatchError(batchErr, ctx.Err())
+					break
+				}
 				index := nextRunnable(prepared, active)
 				if index < 0 {
 					break
@@ -254,11 +312,18 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 				item := prepared[index]
 				if hooks.OnStart != nil {
 					if err := hooks.OnStart(item.call); err != nil {
-						batchErr = err
+						batchErr = joinBatchError(batchErr, err)
 						cancel()
 						hooks = BatchHooks{}
 						break
 					}
+					item.startNotified = true
+				}
+				// OnStart may itself observe or trigger a cancellation, so the
+				// check is repeated before the call is actually started.
+				if batchCtx.Err() != nil {
+					batchErr = joinBatchError(batchErr, ctx.Err())
+					break
 				}
 				item.running = true
 				active[index] = item
@@ -271,6 +336,10 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			}
 		}
 		if batchCtx.Err() != nil {
+			// Report the request cancellation. A batch-local cancel derived from
+			// a hook failure is deliberately not reported again, so the original
+			// failure stays the leading error.
+			batchErr = joinBatchError(batchErr, ctx.Err())
 			for index, item := range prepared {
 				if item.done || item.running {
 					continue
@@ -281,9 +350,7 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 				item.done = true
 				completed++
 				if hookErr != nil {
-					if batchErr == nil {
-						batchErr = hookErr
-					}
+					batchErr = joinBatchError(batchErr, hookErr)
 					hooks = BatchHooks{}
 				}
 			}
@@ -310,24 +377,20 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			completed++
 			if hooks.OnResult != nil {
 				if err := hooks.OnResult(finished.result); err != nil {
-					if batchErr == nil {
-						batchErr = err
-						cancel()
-					}
+					batchErr = joinBatchError(batchErr, err)
+					cancel()
 					hooks = BatchHooks{}
 				}
 			}
 		case <-contextDone:
+			batchErr = joinBatchError(batchErr, ctx.Err())
 			if batchErr == nil {
-				batchErr = ctx.Err()
-				if batchErr == nil {
-					batchErr = batchCtx.Err()
-				}
+				batchErr = batchCtx.Err()
 			}
 			contextDone = nil
 		}
 	}
-	return results, batchErr
+	return finalize()
 }
 
 func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time) (prepared *preparedCall) {
@@ -405,6 +468,7 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 			policyRequest.ConfirmationTotal = confirmations
 			confirmation, err := e.Confirm(ctx, policyRequest, outcome)
 			if err != nil {
+				prepared.approvalErr = &ApprovalError{Tool: call.Name, Err: err}
 				result := protocol.ToolResult{CallID: call.ID, Content: "confirmation failed: " + err.Error(), IsError: true}
 				prepared.terminal = &result
 				return prepared
@@ -440,6 +504,17 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 	return prepared
 }
 
+// cancelledExecution reports a call that was cancelled before the tool started.
+// The batch already reports the request-level cancellation, so the result only
+// has to be recognizable and must never claim success.
+func cancelledExecution(prepared *preparedCall, err error) protocol.ToolResult {
+	message := "tool execution cancelled"
+	if err != nil {
+		message += ": " + err.Error()
+	}
+	return protocol.ToolResult{CallID: prepared.call.ID, Content: message, IsError: true}
+}
+
 func (e *Executor) cancelledPrepared(requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time, message string) *preparedCall {
 	prepared := &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}}
 	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
@@ -465,11 +540,19 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 		}
 		result = e.finishPrepared(prepared, result, duration)
 	}()
+	if ctx.Err() != nil {
+		return cancelledExecution(prepared, ctx.Err())
+	}
 	release, err := e.Coordinator.Acquire(ctx, prepared.spec)
 	if err != nil {
-		return protocol.ToolResult{CallID: prepared.call.ID, Content: "tool execution cancelled", IsError: true}
+		return cancelledExecution(prepared, err)
 	}
 	defer release()
+	// Re-check after the resource was granted: a cancellation observed while
+	// waiting for the claim must not start a new side effect.
+	if err := ctx.Err(); err != nil {
+		return cancelledExecution(prepared, err)
+	}
 	if finalizer, ok := prepared.item.(ExecutionFinalizer); ok {
 		defer finalizer.AfterExecute(prepared.outcome)
 	}
@@ -490,12 +573,17 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 	}
 	defer cancel()
 	result = prepared.item.Execute(toolCtx, prepared.input)
-	if useTimeout && toolCtx.Err() == context.DeadlineExceeded {
-		result.IsError = true
-		result.Content = "tool execution timed out"
-	} else if toolCtx.Err() == context.Canceled {
-		result.IsError = true
-		result.Content = "tool execution cancelled"
+	// A result that reports success is never rewritten as cancelled or timed
+	// out: the tool may have committed a side effect before the cancellation was
+	// observed, and a committed effect must never be reported as if it had not
+	// run. The request-level cancellation is still reported by the batch.
+	if result.IsError {
+		switch {
+		case useTimeout && toolCtx.Err() == context.DeadlineExceeded:
+			result.Content = "tool execution timed out"
+		case toolCtx.Err() == context.Canceled:
+			result.Content = "tool execution cancelled"
+		}
 	}
 	maxOutput := e.MaxOutputBytes
 	if maxOutput <= 0 {
@@ -548,11 +636,15 @@ func (e *Executor) finishPrepared(prepared *preparedCall, result protocol.ToolRe
 	return result
 }
 
+// deliverTerminal emits the start event for a call that never reached the
+// scheduler and then reports its terminal result. A call that already emitted
+// its start event is not announced twice.
 func (e *Executor) deliverTerminal(prepared *preparedCall, result protocol.ToolResult, hooks BatchHooks) (protocol.ToolResult, error) {
-	if hooks.OnStart != nil {
+	if hooks.OnStart != nil && !prepared.startNotified {
 		if err := hooks.OnStart(prepared.call); err != nil {
 			return e.finishPrepared(prepared, result, 0), err
 		}
+		prepared.startNotified = true
 	}
 	result = e.finishPrepared(prepared, result, 0)
 	if hooks.OnResult != nil {

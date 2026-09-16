@@ -96,3 +96,15 @@ func (r *ReadFile) Execute(ctx context.Context, raw json.RawMessage) protocol.To
 func toolError(message string) protocol.ToolResult {
 	return protocol.ToolResult{Content: message, IsError: true}
 }
+
+// cancelledToolResult reports a tool call that stopped because its context was
+// cancelled. It is deliberately an error result so a cancelled operation is
+// never mistaken for a completed one, and the message starts with "cancelled"
+// so it is recognizable in the transcript.
+func cancelledToolResult(err error) protocol.ToolResult {
+	message := "cancelled"
+	if err != nil {
+		message += ": " + err.Error()
+	}
+	return protocol.ToolResult{Content: message, IsError: true}
+}

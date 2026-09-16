@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -41,7 +42,10 @@ func (r *pathResolver) existing(path string) (string, error) {
 	return real, nil
 }
 
-func (r *pathResolver) forWrite(path string, createParents bool) (string, error) {
+// forWrite resolves a path for writing and optionally creates its parents. The
+// cancellation check runs before the directory creation, which is the first side
+// effect of a write.
+func (r *pathResolver) forWrite(ctx context.Context, path string, createParents bool) (string, error) {
 	candidate, err := r.lexical(path)
 	if err != nil {
 		return "", err
@@ -64,6 +68,9 @@ func (r *pathResolver) forWrite(path string, createParents bool) (string, error)
 		realParent, err := filepath.EvalSymlinks(ancestor)
 		if err != nil || !inside(r.real, realParent) {
 			return "", errors.New("parent resolves outside workspace")
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
 		if err := os.MkdirAll(parent, 0o755); err != nil {
 			return "", err

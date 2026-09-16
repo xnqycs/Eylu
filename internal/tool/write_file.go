@@ -65,7 +65,11 @@ func (w *WriteFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) C
 	return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceFile, Path: path, Access: ResourceWrite}}}
 }
 
-func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.ToolResult {
+func (w *WriteFile) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
+	// Parse and read nothing before the cancellation is observed.
+	if err := ctx.Err(); err != nil {
+		return cancelledToolResult(err)
+	}
 	var input struct {
 		Path             string `json:"path"`
 		Content          string `json:"content"`
@@ -75,8 +79,11 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 	if err := decodeStrict(raw, &input); err != nil {
 		return toolError("invalid write_file input: " + err.Error())
 	}
-	path, err := w.paths.forWrite(input.Path, input.CreateParentDirs)
+	path, err := w.paths.forWrite(ctx, input.Path, input.CreateParentDirs)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return cancelledToolResult(ctxErr)
+		}
 		return toolError("resolve file: " + err.Error())
 	}
 	mode := os.FileMode(0o644)
@@ -92,7 +99,12 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 		return toolError(statErr.Error())
 	}
 	content := []byte(input.Content)
-	if err := writeFileAtomically(path, content, mode); err != nil {
+	if err := writeFileAtomically(ctx, path, content, mode); err != nil {
+		// Once the atomic replace succeeded the write has happened, so a
+		// cancellation observed afterwards must not be reported as a failure.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return cancelledToolResult(ctxErr)
+		}
 		return toolError(err.Error())
 	}
 	if w.context != nil {
@@ -105,13 +117,28 @@ func (w *WriteFile) Execute(_ context.Context, raw json.RawMessage) protocol.Too
 	return protocol.ToolResult{Content: fmt.Sprintf("wrote %d bytes to %s", len(content), input.Path), Metadata: map[string]any{"path": path, "bytes": len(content), "lines": lines}}
 }
 
-func writeFileAtomically(path string, content []byte, mode os.FileMode) error {
+// writeFileAtomically writes content through a temporary file and an atomic
+// replace, checking cancellation before each side-effecting boundary.
+//
+// Cancellation is cooperative: it is checked before the temporary file is
+// created and again before the atomic replace. Once the replace succeeds the
+// write has happened and the caller must report success rather than pretend the
+// operation did not run. A cancelled attempt removes its temporary artifact.
+func writeFileAtomically(ctx context.Context, path string, content []byte, mode os.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".eylu-write-*.tmp")
 	if err != nil {
 		return err
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
 	if err := temporary.Chmod(mode); err != nil {
 		temporary.Close()
 		return err
@@ -127,8 +154,12 @@ func writeFileAtomically(path string, content []byte, mode os.FileMode) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := replaceAtomically(temporaryPath, path); err != nil {
 		return err
 	}
+	committed = true
 	return nil
 }

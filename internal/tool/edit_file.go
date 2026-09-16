@@ -62,7 +62,11 @@ func (e *EditFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) Co
 	return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceFile, Path: path, Access: ResourceWrite}}}
 }
 
-func (e *EditFile) Execute(_ context.Context, raw json.RawMessage) protocol.ToolResult {
+func (e *EditFile) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
+	// Parse and read nothing before the cancellation is observed.
+	if err := ctx.Err(); err != nil {
+		return cancelledToolResult(err)
+	}
 	var input struct {
 		Path                 string `json:"path"`
 		OldString            string `json:"old_string"`
@@ -97,6 +101,9 @@ func (e *EditFile) Execute(_ context.Context, raw json.RawMessage) protocol.Tool
 	if info.Size() > e.maxBytes {
 		return toolError(fmt.Sprintf("file exceeds edit limit of %d bytes", e.maxBytes))
 	}
+	if err := ctx.Err(); err != nil {
+		return cancelledToolResult(err)
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return toolError(err.Error())
@@ -117,7 +124,12 @@ func (e *EditFile) Execute(_ context.Context, raw json.RawMessage) protocol.Tool
 	if err != nil {
 		return toolError("generate diff: " + err.Error())
 	}
-	if err := writeFileAtomically(filePath, []byte(updated), info.Mode().Perm()); err != nil {
+	if err := writeFileAtomically(ctx, filePath, []byte(updated), info.Mode().Perm()); err != nil {
+		// Once the atomic replace succeeded the edit has happened, so a
+		// cancellation observed afterwards must not be reported as a failure.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return cancelledToolResult(ctxErr)
+		}
 		return toolError("write edit: " + err.Error())
 	}
 	if e.context != nil {

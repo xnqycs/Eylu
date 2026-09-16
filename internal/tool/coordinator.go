@@ -29,6 +29,9 @@ func NewResourceCoordinator() *ResourceCoordinator {
 
 // Acquire waits for the resource claims and returns an idempotent release
 // function. Earlier conflicting waiters retain priority.
+//
+// Cancellation is checked on entry, before every grant, and while queued, so a
+// cancelled call never receives a claim and never leaves a waiter behind.
 func (c *ResourceCoordinator) Acquire(ctx context.Context, spec ConcurrencySpec) (func(), error) {
 	if c == nil {
 		return func() {}, nil
@@ -36,15 +39,30 @@ func (c *ResourceCoordinator) Acquire(ctx context.Context, spec ConcurrencySpec)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	spec = normalizeConcurrencySpec(spec)
 
 	c.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	c.nextID++
 	waiter := &resourceWaiter{id: c.nextID, spec: spec}
 	c.waiters = append(c.waiters, waiter)
 	for {
 		index := c.waiterIndexLocked(waiter.id)
 		if index >= 0 && c.canAcquireLocked(index) {
+			// Re-check before the grant: a cancellation observed while queued
+			// must not start a new side effect.
+			if err := ctx.Err(); err != nil {
+				c.waiters = append(c.waiters[:index], c.waiters[index+1:]...)
+				c.signalLocked()
+				c.mu.Unlock()
+				return nil, err
+			}
 			c.waiters = append(c.waiters[:index], c.waiters[index+1:]...)
 			c.active[waiter.id] = waiter.spec
 			c.signalLocked()
