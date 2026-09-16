@@ -668,6 +668,21 @@ The matching environment variables are `EYLU_MAX_PARALLEL_AGENTS`, `EYLU_CODE_CO
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): third-party components and applicable terms
 - [docs/go-terminal-agent-development-plan.md](docs/go-terminal-agent-development-plan.md): architecture and phased development history (Chinese)
 
+### What a large log costs to load and recover
+
+The first `Append` builds the event index used for idempotency, and it pays for that by reading the whole log once. Measured on this host (Windows) with the benchmarks in `internal/session/perf_test.go`:
+
+| Events | First `Append` (index build) | Later `Append` (index reused) | `Load` | `Load` allocation |
+|---|---|---|---|---|
+| 10^4 | 90.6 ms | 1.0 ms | 55.0 ms | 36.9 MB / 220k allocs |
+| 10^5 | 895 ms | - | 511 ms | 393 MB / 2.2M allocs |
+
+- **The curve is linear**: ten times the events costs about ten times the time and memory (first append x9.9, load x9.3, allocations x10.0), with no quadratic behaviour. That is why PR-27's third item - incremental or windowed indexing - is **not needed**: it exists for a non-linear cost, and there is none here. Adding it would introduce a second piece of state that would have to be argued correct.
+- The index is built once: within one process the next append drops from 90.6 ms to 1.0 ms, about 87x.
+- There are two thresholds, both deliberately loose, because they exist to catch a change in complexity rather than a slow machine: a five-second budget for the first append and for the load, and a tighter bound on the load's **allocation count** of 60 per event (measured: 22.0 per event). Allocation counts are deterministic, which makes that guard firmer than the timing one.
+- Loading 10^5 events allocates about 393 MB transiently, which is the cost of decoding JSON line by line and is reclaimable; it is recorded because it is the one figure worth noticing at that scale.
+- A large log changes the cost, never the conclusion: the test requires the load and the recovery to agree on the session, the sequence and the number of prompts, and the existing idempotency and recovery tests pass unmodified.
+
 ### Soak and stress tests
 
 - `internal/tool/soak_test.go` searches for concurrency defects over many rounds: parallel batches on conflicting resources, repeated cancellation, and **a host-callback fault injected into every round** (the audit sink panics on every call, the checkpoint fails every third intent). Six rounds by default; `EYLU_SOAK_ROUNDS=<n>` lengthens it locally.

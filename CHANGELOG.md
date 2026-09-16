@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 大日志加载与恢复有量化基准与阈值：首次 Append（建索引）10^4 事件 90.6ms、10^5 事件 895ms，Load 55.0ms / 511ms，曲线线性（×10 事件约 ×10 代价），因此"增量/窗口索引"当前不需要；断言含 5 秒时间预算与每事件 60 次的分配上限（实测 22.0 次/事件，分配次数是确定性的），并断言大日志只改变代价、不改变结论。
+
 - soak 与压力测试：新增 `internal/tool/soak_test.go`（冲突资源并行批次、反复取消、每轮注入审计/checkpoint 故障；默认 6 轮，`EYLU_SOAK_ROUNDS` 可延长），断言终态闭合、协调器不残留 waiter、无 goroutine 增长、每调用恰好一次意图与 completion；泄漏检测器自身有反证测试；"同路径不得重叠"这条搜索的已知局限写在 README 与测试注释里。
 
 - POSIX 运行时验证：新增 `//go:build !windows` / `unix` 的显式测试（`internal/session/replace_other_test.go` 的原子替换与目录 fsync、`internal/tool/process_tree_unix_test.go` 的进程组取消），它们在 CI 的 Linux/macOS leg 上真实运行；README 写明"本机能做的最强验证只是交叉链接，能编译不等于已验证"。

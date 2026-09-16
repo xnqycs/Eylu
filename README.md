@@ -668,6 +668,20 @@ scripts/verify_selftest.sh
 pwsh -NoProfile -File scripts/verify_selftest.ps1
 ```
 
+### 大日志的加载与恢复成本
+
+首次 `Append` 需要为幂等判定建立事件索引，代价是**读一遍整个日志**。实测（本机 Windows，`internal/session/perf_test.go` 的基准，`go test ./internal/session/ -run '^$' -bench Large -benchmem`）：
+
+| 事件数 | 首次 Append（建索引） | 后续 Append（复用索引） | Load | Load 内存分配 |
+|---|---|---|---|---|
+| 10^4 | 90.6 ms | 1.0 ms | 55.0 ms | 36.9 MB / 220k allocs |
+| 10^5 | 895 ms | — | 511 ms | 393 MB / 2.2M allocs |
+
+- **曲线是线性的**：事件数 ×10，时间与内存都约 ×10（首次 Append ×9.9、Load ×9.3、allocs ×10.0），没有出现二次行为。因此计划 §7.3 第 3 条（增量索引/只索引最近窗口）**当前不需要**：那是为非线性代价准备的，而这里没有非线性代价，引入它只会增加一份必须论证正确性的状态。
+- 索引只建一次：同一进程内后续 Append 从 90.6 ms 降到 1.0 ms（约 87×）。
+- 阈值断言有两条，都刻意宽松，目的是抓"复杂度变了"而不是抓"机器慢"：首次 Append 与 Load 各 5 秒预算；Load 的**分配次数**上限为每事件 60 次（实测 22.0 次/事件——分配次数是确定性的，所以这条比时间断言更硬）。
+- 10^5 事件的 Load 会瞬时分配约 393 MB，这是 JSON 逐行解析的开销，可被 GC 回收；记录在此是因为它是唯一一个量级上值得注意的数字。
+- 大日志只改变代价，不改变结论：断言要求大日志的 Load 与 LoadRecovering 给出同样的 session、sequence 与 prompt 数量，并且既有幂等/恢复测试（PR-10/PR-12）在改动后一行未改即通过。
 ### soak 与压力测试
 
 - `internal/tool/soak_test.go` 以"多轮"方式搜索并发缺陷：冲突资源上的并行批次、反复取消、以及**每轮都注入宿主回调故障**（审计 sink 每调用必 panic、checkpoint 每第 3 次意图失败）。默认 6 轮，`EYLU_SOAK_ROUNDS=<n>` 可在本地拉长。
