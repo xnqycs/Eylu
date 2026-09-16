@@ -331,10 +331,16 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrNetwork, Message: "Responses stream ended before completion", Retryable: true}
 	}
 	if final == nil {
-		built := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted}
+		// A gateway that ends the stream with [DONE] and no terminal envelope
+		// leaves the response to be synthesized from the deltas. Its stopping
+		// condition still comes from the one policy: this dialect expresses tool
+		// use as content, so the canonical reason is derived from the calls the
+		// stream actually produced.
+		built := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}}
 		if text.Len() > 0 {
 			built.Turn.Parts = append(built.Turn.Parts, protocol.Part{Kind: protocol.PartText, Text: text.String()})
 		}
+		hasCalls := false
 		for index := 0; index < len(calls); index++ {
 			call := calls[index]
 			if call == nil {
@@ -342,7 +348,19 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			}
 			toolCall := protocol.ToolCall{ID: call.ID, Name: call.Name, Arguments: json.RawMessage(call.Arguments.String())}
 			built.Turn.Parts = append(built.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &toolCall})
-			built.Stop = protocol.StopToolUse
+			hasCalls = true
+		}
+		reason := driver.StopReasonCompleted
+		if hasCalls {
+			reason = driver.StopReasonToolUse
+		}
+		kind, interop, err := driver.StopKindFor(reason, hasCalls, acceptToolCallsWithStop)
+		if err != nil {
+			return protocol.ModelResponse{}, err
+		}
+		built.Stop = kind
+		if interop != "" {
+			built.Interop = append(built.Interop, interop)
 		}
 		final = &built
 	}
