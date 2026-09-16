@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 
 	"Eylu/internal/protocol"
 )
@@ -52,8 +53,12 @@ type RunReport struct {
 	EventsDropped int `json:"events_dropped,omitempty"`
 	// Warnings lists diagnostics that did not stop the request but that a caller
 	// must be able to see: a host callback that failed, a consumer that fell
-	// behind.
+	// behind, a tool call that was still open when the request ended.
 	Warnings []string `json:"warnings,omitempty"`
+	// PendingAtEnd counts the tool calls that were still open when the request
+	// ended. The healthy value is 0: a request that ends with an open call is a
+	// defect, and publishing the count is what keeps it from passing unnoticed.
+	PendingAtEnd int `json:"pending_at_end,omitempty"`
 
 	// RecoveredCalls lists tool call IDs that had no recorded result and were
 	// closed with outcome_unknown when a request was built.
@@ -208,8 +213,20 @@ func (f *runFinalizer) publish(stop string, err error) {
 	if f.usage != nil {
 		*f.usage = usage
 	}
+	// The pending set belongs to this request, so it is read and then emptied on
+	// every exit path, including the one where there is no report to fill.
+	open := f.conversation.OpenPendingCalls()
+	f.conversation.forgetPendingCalls()
 	if f.report == nil {
 		return
+	}
+	if len(open) > 0 {
+		ids := make([]string, 0, len(open))
+		for _, entry := range open {
+			ids = append(ids, entry.CallID)
+		}
+		f.report.PendingAtEnd = len(open)
+		f.report.Warnings = append(f.report.Warnings, fmt.Sprintf("the request ended with %d tool call(s) still open: %s", len(open), strings.Join(ids, ", ")))
 	}
 	if stop == "" {
 		stop = "unknown"

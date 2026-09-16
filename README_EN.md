@@ -426,6 +426,8 @@ The default concurrency limit is `4`. Set it to `1` for serial execution, or ove
 - A truncated (`length`) response keeps its partial content, its tool calls are not executed, and they are closed with `not_executed`.
 - The stored transcript is left as it is. When a model request is built, a historical call with no recorded result is closed with `outcome_unknown` and is never replayed automatically; the diagnostic is available through `RecoveryNotes`.
 - `Send` and `Adopt` do not run tools, so the calls they record are closed too.
+- **The pending set is queryable.** While a request runs, the `Conversation` keeps an explicit set of its committed calls (`PendingCalls()` / `OpenPendingCalls()`): each entry carries the call ID, tool, parent call ID, the turn and round it belongs to, whether the executor accepted it (`prepared`), and its terminal state (empty while it is open). A call enters the set when its turn is committed, is marked `prepared` when the executor accepts it, and carries a state when its result is recorded. **Closing uses this set** instead of re-deriving the answer by scanning the transcript; the scan survives only on the recovery path, where there is no request to have tracked anything.
+- A request always ends with the set empty, and the run report publishes `pending_at_end` plus a `warnings` entry when it does not: an open call at the end is a **defect signal**, not something left for the next crash to reveal. `prepared=false` is strong evidence that the call has not produced a side effect yet.
 
 ### Code slice references and context trimming
 

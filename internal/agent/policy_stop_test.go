@@ -71,7 +71,7 @@ type gatedTool struct {
 }
 
 func newGatedTool(name string, risk policy.Risk) *gatedTool {
-	return &gatedTool{name: name, risk: risk, started: make(chan struct{})}
+	return &gatedTool{name: name, risk: risk, started: make(chan struct{}), release: make(chan struct{})}
 }
 
 func (g *gatedTool) Definition() protocol.ToolDefinition {

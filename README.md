@@ -397,6 +397,8 @@ max_parallel_tools = 4
 - 长度截断（`length`）响应保留部分内容，其中的工具调用不会执行，并补上 `not_executed` 终态。
 - 已保存的 transcript 保持原样。构建模型请求时，历史上没有结果记录的调用会以 `outcome_unknown` 补全，并且不会自动重放；诊断可通过 `RecoveryNotes` 读取。
 - `Send` 与 `Adopt` 不执行工具，它们记录的调用同样会被闭合。
+- **pending 集合是可查询的**：请求运行期间，`Conversation` 维护一份显式的调用集合（`PendingCalls()` / `OpenPendingCalls()`），每条记录包含调用 ID、工具名、父调用 ID、所属 turn 与轮次、是否已被执行器接受（`prepared`）、以及终态（未终结时为空）。调用在 turn 提交时进入集合、在执行器接受时标记 `prepared`、在结果写入时带上终态；**终态闭合改为消费这份集合**，不再重新扫描 transcript（扫描逻辑只保留在恢复路径上，那里没有请求可追踪）。
+- 请求结束时集合必定为空，运行摘要的 `pending_at_end` 与 `warnings` 会把"仍有未闭合调用"作为**缺陷信号**报出来，而不是留给下一次崩溃去发现。`prepared=false` 是强证据：它证明该调用还没有产生副作用。
 
 ### 代码片段引用与上下文裁剪
 

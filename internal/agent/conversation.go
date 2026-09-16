@@ -150,6 +150,10 @@ type Conversation struct {
 	// when a request starts, and read on the way out so the run report says why
 	// the request stopped instead of only that it was cancelled.
 	stopReason string
+	// pendingCalls is the explicit set of the current request's committed tool
+	// calls and their lifecycle. It is the authority for closing calls, so the
+	// closure of the history does not depend on re-reading the transcript.
+	pendingCalls []PendingCall
 }
 
 // RecoveryNotes reports the tool call IDs that had no recorded result and were
@@ -648,31 +652,23 @@ func (c *Conversation) commitResponse(response protocol.ModelResponse, runtime R
 	c.ledger.SetLastUsage(response.Usage)
 }
 
-// resolvedCallIDs collects the call IDs that already carry a terminal result.
-func (c *Conversation) resolvedCallIDs() map[string]struct{} {
-	resolved := make(map[string]struct{})
-	for _, turn := range c.turns {
-		for _, part := range turn.Parts {
-			if part.ToolResult != nil && part.ToolResult.CallID != "" {
-				resolved[part.ToolResult.CallID] = struct{}{}
-			}
-		}
-	}
-	return resolved
-}
-
 // closeToolCalls gives every call that has no terminal result yet one synthetic
 // terminal state. It is the single exit path for committed calls, so a request
 // never ends with a tool call the next model request cannot pair, and a call
 // that already has a result is never rewritten.
+//
+// Openness is read from the pending set, not from the transcript: the set was
+// built when each turn was committed and updated as results arrived, so the two
+// cannot disagree. The transcript scan still exists, but only on the recovery
+// path, where there is no request to have tracked anything.
 func (c *Conversation) closeToolCalls(runtime Runtime, calls []protocol.ToolCall, state protocol.CallState, message string) {
-	resolved := c.resolvedCallIDs()
 	pending := make([]protocol.ToolCall, 0, len(calls))
 	for _, call := range calls {
 		if call.ID == "" {
 			continue
 		}
-		if _, ok := resolved[call.ID]; ok {
+		entry := c.pendingEntryLocked(call.ID)
+		if entry != nil && entry.State != "" {
 			continue
 		}
 		pending = append(pending, call)
@@ -684,6 +680,9 @@ func (c *Conversation) closeToolCalls(runtime Runtime, calls []protocol.ToolCall
 	for _, call := range pending {
 		result := protocol.ToolResult{CallID: call.ID, Content: message, IsError: true, State: state}
 		turn.Parts = append(turn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
+		if entry := c.pendingEntryLocked(call.ID); entry != nil && entry.State == "" {
+			entry.State = state
+		}
 	}
 	c.turns = append(c.turns, turn)
 	// The remote driver state belongs to a response whose calls never all

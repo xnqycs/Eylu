@@ -38,6 +38,12 @@ type LoopOptions struct {
 	// already in memory are kept and no new side effect starts, because a request
 	// that cannot record what it did must not do more.
 	OnTurnCommitted func(protocol.Turn) error
+	// OnToolPrepared, when non-nil, is called for every call the executor accepts
+	// for execution, from the same place the conversation marks the call prepared.
+	// It is the point after which the call may have had an effect and before which
+	// it provably has not, so a host that records it can tell "never started" from
+	// "outcome unknown" without guessing.
+	OnToolPrepared func(protocol.ToolCall) error
 }
 
 var ErrRequestInterrupted = errors.New("request interrupted by user")
@@ -53,6 +59,45 @@ type TurnPersistError struct {
 	Cause  error
 }
 
+// toolHooksWithPrepared wraps the batch hooks so the pending set and the host both
+// learn that a call was accepted for execution.
+//
+// The wrapper is additive: the event projection still decides what the host is
+// told, and a hook failure is reported exactly as before. Marking the call prepared
+// happens first, so a call the executor accepted is recorded as such even when the
+// host event cannot be delivered - the failure stops the batch, and a call that was
+// accepted but never reported must not look like one that never started.
+func toolHooksWithPrepared(hooks tool.BatchHooks, conversation *Conversation, onPrepared func(protocol.ToolCall) error) tool.BatchHooks {
+	if conversation == nil {
+		return hooks
+	}
+	inner := hooks.OnStart
+	hooks.OnStart = func(call protocol.ToolCall) error {
+		conversation.markCallPrepared(call.ID)
+		if onPrepared != nil {
+			if err := onPrepared(call); err != nil {
+				return err
+			}
+		}
+		if inner == nil {
+			return nil
+		}
+		return inner(call)
+	}
+	return hooks
+}
+
+// recordBatchResultsLocked puts the terminal state of every executed call into the
+// pending set, so a call that ran is closed by the set rather than by a later scan
+// of the transcript. The caller holds the state lock: it is called from inside the
+// commit of the tool turn, so the two records are written together.
+func (c *Conversation) recordBatchResultsLocked(results []protocol.ToolResult) {
+	for _, result := range results {
+		if entry := c.pendingEntryLocked(result.CallID); entry != nil && entry.State == "" {
+			entry.State = result.State
+		}
+	}
+}
 func (e *TurnPersistError) Error() string {
 	return fmt.Sprintf("the committed turn %s could not be persisted: %v", e.TurnID, e.Cause)
 }
@@ -233,6 +278,9 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 		c.mu.Lock()
 		c.commitResponse(response, effectiveRuntime)
+		// The calls of this turn enter the pending set at the moment the turn is
+		// committed, so the set describes the transcript rather than a later view.
+		c.trackCommittedCalls(requestID, iteration+1, response.Turn)
 		c.mu.Unlock()
 		// An interoperability relaxation the provider needed is durable evidence,
 		// so it is recorded on the report instead of only existing in the driver
@@ -299,7 +347,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		definitions = plan.Definitions
 		c.applyToolDefinitions(runtime, definitions)
 		expansion := expandToolCalls(calls, plan, newExecutionAllocator(callIDs(calls)))
-		hooks := projectToolEvents(emit, expansion)
+		hooks := toolHooksWithPrepared(projectToolEvents(emit, expansion), c, options.OnToolPrepared)
 		limit := executor.ParallelLimit()
 		if len(expansion.web) > limit {
 			limit = min(len(expansion.web), webtool.MaxBatchQueries)
@@ -318,6 +366,9 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 		toolTurn.Parts = append(toolTurn.Parts, webParts...)
 		c.turns = append(c.turns, toolTurn)
+		// The set learns the terminal state of every executed call from the same
+		// results the transcript is built from, so the two cannot disagree.
+		c.recordBatchResultsLocked(results)
 		c.projectMapDirty = true
 		if batchOutcome.Control != protocol.ControlContinue {
 			// A remote driver state built from a response whose calls did not all
