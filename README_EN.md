@@ -668,6 +668,23 @@ The matching environment variables are `EYLU_MAX_PARALLEL_AGENTS`, `EYLU_CODE_CO
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): third-party components and applicable terms
 - [docs/go-terminal-agent-development-plan.md](docs/go-terminal-agent-development-plan.md): architecture and phased development history (Chinese)
 
+### The measured benefit of deduplicating a repeated read
+
+`internal/tool/read_dedup_benefit_test.go` measures the token benefit of a repeated read per file shape, using **real reads** and a 1 byte/token estimator:
+
+| Shape | Body | First read | Repeated read | Benefit | Deduplicated |
+|---|---|---|---|---|---|
+| empty file | 0 B | ~0 | ~0 | 0 | no (nothing to replace) |
+| single line | 14 B | ~14 | ~173 | **-159** | yes |
+| no trailing newline | 29 B | ~29 | ~173 | **-144** | yes |
+| CRLF and LF mixed | 21 B | ~21 | ~173 | **-152** | yes |
+| Unicode multibyte | 67 B | ~67 | ~173 | **-106** | yes |
+| one very long line | 40,001 B | ~40,001 | ~173 | **+39,828** | yes |
+
+- **Deduplicating a small body is a net loss.** The reference that replaces it is roughly a fixed size (~173 tokens here), larger than the body it removed. "Deduplication always saves tokens" is therefore false: whether it saves depends on the body's size, and the crossover is a few hundred bytes. That is not a defect, it is the measured shape of the design, and writing it down is what a benefit baseline is for.
+- **The plan's A11 premise did not reproduce.** A11 states that a body which cannot be kept whole by lines is trimmed by bytes with no reported line ranges and therefore earns nothing. Measured with a real read whose byte limit does not trim, the very long line deduplicates **and earns the largest benefit** (~39,828 tokens). Reproducing the shape A11 describes needs a body that was genuinely trimmed for the window (`context_truncated`, no line ranges) - the shape the hand-built fixture in `prompt_builder_slice_test.go` models - and there is currently **no evidence** that the read path emits it. Items 1 and 2 of §8.3 (in-line byte intervals, the conservative degradation marker) are therefore **not implemented**: writing them now would be writing code for an unconfirmed problem.
+- Body correctness is unaffected either way: a shape that deduplicates must still announce that it is a reference (the test asserts it), and every PR-05/PR-14 regression case is kept.
+
 ### What a large log costs to load and recover
 
 The first `Append` builds the event index used for idempotency, and it pays for that by reading the whole log once. Measured on this host (Windows) with the benchmarks in `internal/session/perf_test.go`:
