@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,17 +24,59 @@ import (
 	"Eylu/internal/tool"
 )
 
+// appendProgress records what the event log has durably accepted.
+//
+// It is deliberately independent of the snapshot checkpoint: once Append
+// confirms, that progress advances and a later snapshot failure never rolls it
+// back. Otherwise the next Sync would append the same turn, prompt, skill or
+// state event a second time and break replay.
+type appendProgress struct {
+	turns    int
+	prompts  int
+	skills   map[string]string
+	sequence uint64
+	// driverState is the raw value of the last appended driver-state event. An
+	// empty state is a real value (the remote state was cleared), so it is
+	// compared rather than treated as absent.
+	driverState json.RawMessage
+	// fingerprints identify the last appended payload of each state event type.
+	fingerprints map[session.EventType]string
+}
+
 type sessionRuntime struct {
-	mu               sync.Mutex
-	store            *session.Store
-	snapshot         session.Snapshot
-	persistedTurns   int
-	persistedPrompts int
-	persistedSkills  map[string]string
-	revalidated      bool
-	agentTasks       func(string) []tool.AgentTask
-	workspace        string
-	redact           func(string) string
+	mu sync.Mutex
+	// store persists the event log and the snapshot.
+	store *session.Store
+	// snapshot is the last snapshot known to be on disk. It may lag behind the
+	// log while a save is pending.
+	snapshot session.Snapshot
+	// log is the durable append progress, which is never rolled back by a
+	// failed snapshot save.
+	log appendProgress
+	// snapshotPending reports that the log is ahead of the snapshot on disk.
+	snapshotPending bool
+	// appendEvents and saveSnapshot are fault-injection seams for tests. They
+	// default to the store methods.
+	appendEvents func(string, []session.Event) ([]session.Event, error)
+	saveSnapshot func(session.Snapshot) error
+	revalidated  bool
+	agentTasks   func(string) []tool.AgentTask
+	workspace    string
+	redact       func(string) string
+}
+
+// eventFingerprint returns a stable digest of one event payload. The volatile
+// fields a store assigns (version, sequence, session ID, timestamp) are excluded
+// so the same logical state always yields the same fingerprint and a retry after
+// a failed snapshot save is recognized instead of being appended again.
+func eventFingerprint(event session.Event) string {
+	event.Version, event.Sequence, event.SessionID, event.At = 0, 0, "", time.Time{}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 func (r *runtime) openConversation(ctx context.Context, manager *provider.Manager, opts *chatOptions) (*agent.Conversation, error) {
@@ -140,7 +184,71 @@ func newSessionRuntime(store *session.Store, snapshot session.Snapshot, workspac
 	for _, item := range snapshot.Skills {
 		digests[item.Name] = item.Digest
 	}
-	return &sessionRuntime{store: store, snapshot: snapshot, persistedTurns: len(snapshot.Turns), persistedPrompts: len(snapshot.PromptHistory), persistedSkills: digests, workspace: workspace, redact: redact}
+	return &sessionRuntime{
+		store: store, snapshot: snapshot, workspace: workspace, redact: redact,
+		// A restored snapshot describes what the log already contains, so both
+		// progress trackers start from it.
+		log: appendProgress{
+			turns: len(snapshot.Turns), prompts: len(snapshot.PromptHistory), skills: digests,
+			sequence: snapshot.Sequence, driverState: append(json.RawMessage(nil), snapshot.DriverState...),
+			fingerprints: make(map[session.EventType]string),
+		},
+	}
+}
+
+func (s *sessionRuntime) append(id string, events []session.Event) ([]session.Event, error) {
+	if s.appendEvents != nil {
+		return s.appendEvents(id, events)
+	}
+	return s.store.Append(id, events)
+}
+
+func (s *sessionRuntime) save(snapshot session.Snapshot) error {
+	if s.saveSnapshot != nil {
+		return s.saveSnapshot(snapshot)
+	}
+	return s.store.Save(snapshot)
+}
+
+// acceptAppended advances the durable append progress from the events the store
+// confirmed. It is only called after a successful append, so the progress always
+// describes what the log actually holds.
+func (s *sessionRuntime) acceptAppended(prepared []session.Event) {
+	for _, event := range prepared {
+		switch event.Type {
+		case session.EventTurnAppended:
+			s.log.turns++
+		case session.EventPromptRecorded:
+			s.log.prompts++
+		case session.EventSkillActivated:
+			if event.Skill != nil {
+				if s.log.skills == nil {
+					s.log.skills = make(map[string]string)
+				}
+				s.log.skills[event.Skill.Name] = event.Skill.Digest
+			}
+		case session.EventDriverState:
+			s.log.driverState = append(json.RawMessage(nil), event.DriverState...)
+		case session.EventRuntimeUpdated, session.EventContextUpdated, session.EventAgentTasksUpdated, session.EventErrorRecorded:
+			if s.log.fingerprints == nil {
+				s.log.fingerprints = make(map[session.EventType]string)
+			}
+			s.log.fingerprints[event.Type] = eventFingerprint(event)
+		}
+		if event.Sequence > s.log.sequence {
+			s.log.sequence = event.Sequence
+		}
+	}
+}
+
+// stateChanged reports whether a state event has to be appended, comparing it
+// with the payload the log already accepted.
+func (s *sessionRuntime) stateChanged(event session.Event) bool {
+	fingerprint := eventFingerprint(event)
+	if fingerprint == "" {
+		return true
+	}
+	return s.log.fingerprints[event.Type] != fingerprint
 }
 
 func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provider.Manager, opts chatOptions, runErr error) error {
@@ -153,11 +261,11 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	if state.SessionID != s.snapshot.SessionID {
 		return fmt.Errorf("conversation session %q does not match persistence session %q", state.SessionID, s.snapshot.SessionID)
 	}
-	if len(state.Turns) < s.persistedTurns {
-		return fmt.Errorf("session transcript shrank from %d to %d turns", s.persistedTurns, len(state.Turns))
+	if len(state.Turns) < s.log.turns {
+		return fmt.Errorf("session transcript shrank from %d to %d turns", s.log.turns, len(state.Turns))
 	}
-	if len(state.PromptHistory) < s.persistedPrompts {
-		return fmt.Errorf("session prompt history shrank from %d to %d entries", s.persistedPrompts, len(state.PromptHistory))
+	if len(state.PromptHistory) < s.log.prompts {
+		return fmt.Errorf("session prompt history shrank from %d to %d entries", s.log.prompts, len(state.PromptHistory))
 	}
 	providerState := sessionProviderState(state.Provider)
 	selectedProvider, selectedErr := selectedSessionProvider(manager, opts)
@@ -171,35 +279,31 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	state.Workspace = s.workspace
 	state.PermissionMode = selectedMode(manager, opts)
 
-	events := make([]session.Event, 0, len(state.Turns)-s.persistedTurns+4)
-	for index := s.persistedTurns; index < len(state.Turns); index++ {
+	// Only events the log does not already hold are appended. The progress
+	// counters describe confirmed appends, not saved snapshots, so a retry after
+	// a failed save does not duplicate an earlier append.
+	events := make([]session.Event, 0, len(state.Turns)-s.log.turns+4)
+	for index := s.log.turns; index < len(state.Turns); index++ {
 		turn := state.Turns[index]
 		events = append(events, session.Event{Type: session.EventTurnAppended, Turn: &turn})
 	}
-	for index := s.persistedPrompts; index < len(state.PromptHistory); index++ {
+	for index := s.log.prompts; index < len(state.PromptHistory); index++ {
 		events = append(events, session.Event{Type: session.EventPromptRecorded, Prompt: state.PromptHistory[index]})
 	}
-	events = append(events, session.Event{
-		Type: session.EventRuntimeUpdated, Workspace: state.Workspace, PermissionMode: state.PermissionMode, Provider: &providerState,
-	})
 	agentTasks := append([]tool.AgentTask(nil), s.snapshot.AgentTasks...)
 	if s.agentTasks != nil {
 		agentTasks = s.agentTasks(state.SessionID)
 	}
-	events = append(events, session.Event{Type: session.EventAgentTasksUpdated, AgentTasks: agentTasks})
-	if !bytes.Equal(state.DriverState, s.snapshot.DriverState) {
-		events = append(events, session.Event{Type: session.EventDriverState, DriverState: append(json.RawMessage(nil), state.DriverState...)})
+	stateEvents := []session.Event{
+		{Type: session.EventRuntimeUpdated, Workspace: state.Workspace, PermissionMode: state.PermissionMode, Provider: &providerState},
+		{Type: session.EventAgentTasksUpdated, AgentTasks: agentTasks},
 	}
-	for _, item := range state.ProtectedSkills {
-		if s.persistedSkills[item.Name] == item.Digest {
-			continue
-		}
-		skillState := skillStateFromProtected(item)
-		events = append(events, session.Event{Type: session.EventSkillActivated, Skill: &skillState})
+	if !bytes.Equal(state.DriverState, s.log.driverState) {
+		stateEvents = append(stateEvents, session.Event{Type: session.EventDriverState, DriverState: append(json.RawMessage(nil), state.DriverState...)})
 	}
 	ledger := state.Ledger
 	todoList := state.TodoList
-	events = append(events, session.Event{
+	stateEvents = append(stateEvents, session.Event{
 		Type: session.EventContextUpdated, SkillCatalog: state.SkillCatalog, Summary: state.Summary,
 		TodoList: &todoList, OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: &ledger,
 	})
@@ -209,29 +313,37 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 		if s.redact != nil {
 			lastError = s.redact(lastError)
 		}
-		events = append(events, session.Event{Type: session.EventErrorRecorded, Error: lastError})
+		stateEvents = append(stateEvents, session.Event{Type: session.EventErrorRecorded, Error: lastError})
 	}
-	prepared, err := s.store.Append(state.SessionID, events)
+	for _, event := range stateEvents {
+		if s.stateChanged(event) {
+			events = append(events, event)
+		}
+	}
+	for _, item := range state.ProtectedSkills {
+		if s.log.skills[item.Name] == item.Digest {
+			continue
+		}
+		skillState := skillStateFromProtected(item)
+		events = append(events, session.Event{Type: session.EventSkillActivated, Skill: &skillState})
+	}
+	prepared, err := s.append(state.SessionID, events)
 	if err != nil {
 		return sessionProtocolError("append session events", err)
 	}
-	if len(prepared) > 0 {
-		s.snapshot.Sequence = prepared[len(prepared)-1].Sequence
-	}
+	// The append is durable now, so the log progress advances here. A later
+	// snapshot failure marks the checkpoint as behind instead of undoing it.
+	s.acceptAppended(prepared)
 	next := snapshotFromAgentState(state, s.snapshot)
 	next.AgentTasks = agentTasks
-	next.Sequence = s.snapshot.Sequence
+	next.Sequence = s.log.sequence
 	next.LastError = lastError
-	if err := s.store.Save(next); err != nil {
+	if err := s.save(next); err != nil {
+		s.snapshotPending = true
 		return sessionProtocolError("save session snapshot", err)
 	}
 	s.snapshot = next
-	s.persistedTurns = len(state.Turns)
-	s.persistedPrompts = len(state.PromptHistory)
-	s.persistedSkills = make(map[string]string, len(state.ProtectedSkills))
-	for _, item := range state.ProtectedSkills {
-		s.persistedSkills[item.Name] = item.Digest
-	}
+	s.snapshotPending = false
 	cfg := manager.Config()
 	if _, err := s.store.Cleanup(cfg.MaxSessions, cfg.MaxSessionBytes, state.SessionID); err != nil {
 		return sessionProtocolError("clean session store", err)
@@ -263,16 +375,19 @@ func (s *sessionRuntime) Close(conversation *agent.Conversation, manager *provid
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	events, err := s.store.Append(s.snapshot.SessionID, []session.Event{{Type: session.EventSessionClosed}})
+	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventSessionClosed}})
 	if err != nil {
 		return sessionProtocolError("close session", err)
 	}
+	s.acceptAppended(events)
 	closedAt := events[len(events)-1].At
-	s.snapshot.Sequence = events[len(events)-1].Sequence
+	s.snapshot.Sequence = s.log.sequence
 	s.snapshot.ClosedAt = &closedAt
-	if err := s.store.Save(s.snapshot); err != nil {
+	if err := s.save(s.snapshot); err != nil {
+		s.snapshotPending = true
 		return sessionProtocolError("save closed session", err)
 	}
+	s.snapshotPending = false
 	return nil
 }
 

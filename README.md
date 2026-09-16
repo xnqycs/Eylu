@@ -408,6 +408,16 @@ max_parallel_tools = 4
 - 文件 hash 变化时不会引用旧版本内容。
 - 原始 transcript 不会被修改，被省略的正文不会成为去重依据。token 节省可以让步，内容正确性不能让步。
 
+### 会话事件日志与快照
+
+事件日志（`events.jsonl`）与快照（`snapshot.json`）的进度相互独立，两者都记录会话状态：
+
+- 追加成功即视为持久：日志进度立刻推进。随后快照保存失败只标记“快照落后”，不会回退日志进度。
+- 下一次同步不会重复发送已确认的追加事件，会重试快照保存，并只追加真正新增的事件。turn、prompt、skill、runtime、context、driverState 与错误记录使用同一套进度管理。
+- 状态类事件（runtime、context、agentTasks、driverState、error）只在负载变化时追加，重复同步不会产生重复事件。
+- snapshot 丢失或落后时，仅凭事件日志即可恢复会话；恢复后的 turn 不会重复。
+- 追加结果不确定（Write/Sync/Close 报错）时的稳定事件 ID、重复检测与 schema 迁移属于后续阶段（PR-10）。
+
 ### 代码上下文与后台子代理
 
 `read_file` 支持 1-based 闭区间参数 `start_line`、`end_line`，并返回 `file_hash`、`slice_hash`、`artifact_id` 和续读游标 `next_start_line`。`search_code` 共享会话级增量三元组索引，支持 `offset` 分页和 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前会替换为稳定引用。

@@ -437,6 +437,16 @@ Code slice deduplication â€” replacing a repeated read with a stable reference â
 - A changed file hash never references an older generation of the content.
 - The original transcript is never modified, and omitted text never becomes a basis for deduplication. Token savings may suffer; content correctness may not.
 
+### Session event log and snapshot
+
+The event log (`events.jsonl`) and the snapshot (`snapshot.json`) track their progress independently, and both describe the session state:
+
+- A confirmed append is durable: log progress advances immediately. A later snapshot save failure only marks the snapshot as behind; it never rolls the log progress back.
+- The next sync does not re-send an event the log already accepted. It retries the snapshot save and appends only genuinely new events. Turns, prompts, skills, runtime, context, driver state and error records share one progress mechanism.
+- State events (runtime, context, agentTasks, driverState, error) are appended only when their payload changes, so a repeated sync produces no duplicate events.
+- When the snapshot is missing or behind, the event log alone restores the session, and recovered turns are not duplicated.
+- Stable event IDs, uncertain append results (Write/Sync/Close failures) and schema migration belong to a later stage (PR-10).
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.
