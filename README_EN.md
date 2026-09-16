@@ -511,6 +511,17 @@ A Conversation has exactly one writer:
 - Rotating to a new session waits for the running request (cancelling it first if it overruns the grace period), so it can never interleave with a request that is still committing state.
 - The lock order is always run ownership then state lock, and the session persistence lock never forms a reverse dependency with the state lock.
 
+### Execution checkpoints and crash recovery
+
+A side-effecting tool persists its execution intent before it starts, which shrinks the window in which an effect has happened but nothing records it:
+
+- An intent that cannot be written means the call never starts and reports `not_executed`: only an operation the host can log is allowed to happen.
+- The terminal outcome is persisted as soon as the operation is over. When that record cannot be written, the in-memory result is kept, the batch stops starting new side effects, and the failure is reported explicitly as "the operation may have completed but its record did not" (the result metadata carries `checkpoint_incomplete`).
+- Read-only calls need no intent, and streaming text deltas are never written per token.
+- The file tools provide verifiable hints: `previous_hash` (the content hash before the change) and `file_hash` (the hash after it), plus the target path in the audit record. Those hints only help a human decide whether the change happened; they are never used to replay it.
+- Recovery rules: an intent without a completion means the call is `outcome_unknown` and is never re-run; a recorded completion is used directly; shell commands and network requests are non-idempotent and need explicit confirmation by default.
+- The session schema is now 3, adding the lifecycle events and the stable event ID. A version 2 session is still readable, an older version is refused explicitly on load, and `Migrate` upgrades one while keeping a `.v<old-version>.bak` backup.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

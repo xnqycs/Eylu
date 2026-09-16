@@ -10,7 +10,14 @@ import (
 	"Eylu/internal/tool"
 )
 
-const SchemaVersion = 2
+// SchemaVersion 3 adds the stable event ID and the tool lifecycle events. A
+// version 2 document is still readable because the new fields are additive, while
+// anything outside the supported range is refused explicitly.
+const SchemaVersion = 3
+
+// MinReadableSchemaVersion is the oldest document this build reads. An older
+// document is refused rather than guessed at.
+const MinReadableSchemaVersion = 2
 
 type EventType string
 
@@ -26,7 +33,39 @@ const (
 	EventErrorRecorded     EventType = "error_recorded"
 	EventSessionClosed     EventType = "session_closed"
 	EventSessionReopened   EventType = "session_reopened"
+	// EventToolExecutionIntent records that a side-effecting execution is about
+	// to start. It is written before the tool runs, so its presence is evidence
+	// that the operation may have happened.
+	EventToolExecutionIntent EventType = "tool_execution_intent"
+	// EventToolCompleted records the terminal outcome of one execution.
+	EventToolCompleted EventType = "tool_completed"
 )
+
+// ToolIntent is the durable record of one execution that is about to start.
+//
+// TargetPath and PreviousHash are verifiable recovery hints for file tools: they
+// help decide whether the operation happened. They are never used to replay it.
+type ToolIntent struct {
+	RequestID    string    `json:"request_id,omitempty"`
+	CallID       string    `json:"call_id"`
+	ParentCallID string    `json:"parent_call_id,omitempty"`
+	Tool         string    `json:"tool"`
+	Risk         string    `json:"risk,omitempty"`
+	TargetPath   string    `json:"target_path,omitempty"`
+	PreviousHash string    `json:"previous_hash,omitempty"`
+	StartedAt    time.Time `json:"started_at,omitzero"`
+}
+
+// ToolCompletion is the durable record of one finished execution.
+type ToolCompletion struct {
+	CallID      string    `json:"call_id"`
+	Tool        string    `json:"tool"`
+	State       string    `json:"state,omitempty"`
+	IsError     bool      `json:"is_error,omitempty"`
+	TargetPath  string    `json:"target_path,omitempty"`
+	ResultHash  string    `json:"result_hash,omitempty"`
+	CompletedAt time.Time `json:"completed_at,omitzero"`
+}
 
 type ProviderState struct {
 	Name                   string    `json:"name"`
@@ -79,6 +118,9 @@ type Snapshot struct {
 	OmittedTurnIDs []string                  `json:"omitted_turn_ids,omitempty"`
 	Ledger         contextledger.LedgerState `json:"ledger"`
 	LastError      string                    `json:"last_error,omitempty"`
+	// PendingIntents lists executions that started but never recorded a terminal
+	// outcome. Recovery reports them as outcome_unknown and never replays them.
+	PendingIntents []ToolIntent `json:"pending_intents,omitempty"`
 }
 
 type Event struct {
@@ -107,6 +149,8 @@ type Event struct {
 	OmittedTurnIDs []string                   `json:"omitted_turn_ids,omitempty"`
 	Ledger         *contextledger.LedgerState `json:"ledger,omitempty"`
 	Error          string                     `json:"error,omitempty"`
+	Intent         *ToolIntent                `json:"intent,omitempty"`
+	Completion     *ToolCompletion            `json:"completion,omitempty"`
 }
 
 type Diagnostic struct {

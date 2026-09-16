@@ -24,6 +24,14 @@ type PolicyOverride interface {
 	OverridePolicy(json.RawMessage) (policy.Outcome, bool)
 }
 
+// IntentReporter lets a tool describe the recovery hints of one call before it
+// runs: the path it intends to change and the content hash it observed first.
+// They only help decide whether an interrupted operation happened, and are never
+// used to replay it.
+type IntentReporter interface {
+	ReportIntent(json.RawMessage) (targetPath, previousHash string)
+}
+
 // ParallelSafe is an explicit opt-in for tools whose executions do not mutate
 // shared state and may run beside other calls from the same model response.
 type ParallelSafe interface {

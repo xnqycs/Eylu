@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -142,8 +143,8 @@ func TestSnapshotTodoListIsOptionalForLegacySchemaVersionOne(t *testing.T) {
 	if restored.Version != 1 || len(restored.TodoList.Items) != 0 || len(restored.AgentTasks) != 0 {
 		t.Fatalf("restored=%#v", restored)
 	}
-	migrated, changed, err := migrateJSONDocument([]byte(`{"version":1,"session_id":"legacy-v1"}`))
-	if err != nil || !changed || !bytes.Contains(migrated, []byte(`"version": 2`)) {
+	migrated, _, changed, err := migrateJSONDocument([]byte(`{"version":1,"session_id":"legacy-v1"}`))
+	if err != nil || !changed || !bytes.Contains(migrated, []byte(fmt.Sprintf(`"version": %d`, SchemaVersion))) {
 		t.Fatalf("migration changed=%t err=%v data=%s", changed, err, migrated)
 	}
 }

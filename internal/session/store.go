@@ -326,7 +326,7 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 		var header struct {
 			Version int `json:"version"`
 		}
-		if json.Unmarshal(data, &header) == nil && header.Version != SchemaVersion {
+		if json.Unmarshal(data, &header) == nil && !readableSchemaVersion(header.Version) {
 			return Snapshot{}, diagnostics, schemaError(header.Version, id)
 		}
 		if err := json.Unmarshal(data, &snapshot); err != nil {
@@ -536,12 +536,14 @@ func (s *Store) Migrate(id string) error {
 	}
 	snapshotPath := filepath.Join(directory, "snapshot.json")
 	if data, readErr := os.ReadFile(snapshotPath); readErr == nil {
-		migrated, changed, migrateErr := migrateJSONDocument(data)
+		migrated, previous, changed, migrateErr := migrateJSONDocument(data)
 		if migrateErr != nil {
 			return migrateErr
 		}
 		if changed {
-			if err := writeAtomic(snapshotPath+".v0.bak", data, 0o600); err != nil {
+			// The backup keeps the only copy of the older document, so a failed
+			// migration can never destroy the data it was migrating.
+			if err := writeAtomic(fmt.Sprintf("%s.v%d.bak", snapshotPath, previous), data, 0o600); err != nil {
 				return err
 			}
 			if err := writeAtomic(snapshotPath, migrated, 0o600); err != nil {
@@ -556,11 +558,12 @@ func (s *Store) Migrate(id string) error {
 		lines := bytes.Split(data, []byte{'\n'})
 		var output bytes.Buffer
 		changed := false
+		previousVersion := SchemaVersion
 		for _, line := range lines {
 			if len(bytes.TrimSpace(line)) == 0 {
 				continue
 			}
-			migrated, lineChanged, migrateErr := migrateJSONDocument(line)
+			migrated, previous, lineChanged, migrateErr := migrateJSONDocument(line)
 			if migrateErr != nil {
 				return migrateErr
 			}
@@ -569,11 +572,14 @@ func (s *Store) Migrate(id string) error {
 				return err
 			}
 			changed = changed || lineChanged
+			if lineChanged {
+				previousVersion = previous
+			}
 			output.Write(compact.Bytes())
 			output.WriteByte('\n')
 		}
 		if changed {
-			if err := writeAtomic(eventsPath+".v0.bak", data, 0o600); err != nil {
+			if err := writeAtomic(fmt.Sprintf("%s.v%d.bak", eventsPath, previousVersion), data, 0o600); err != nil {
 				return err
 			}
 			if err := writeAtomic(eventsPath, output.Bytes(), 0o600); err != nil {
@@ -584,27 +590,28 @@ func (s *Store) Migrate(id string) error {
 		return readErr
 	}
 	delete(s.sequences, id)
+	delete(s.eventIDs, id)
 	return nil
 }
 
-func migrateJSONDocument(data []byte) ([]byte, bool, error) {
+func migrateJSONDocument(data []byte) ([]byte, int, bool, error) {
 	var document map[string]any
 	if err := json.Unmarshal(data, &document); err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	version := 0
 	if raw, ok := document["version"].(float64); ok {
 		version = int(raw)
 	}
-	if version > SchemaVersion || version < 0 {
-		return nil, false, fmt.Errorf("unsupported session schema version %d", version)
+	if !migratableSchemaVersion(version) {
+		return nil, version, false, fmt.Errorf("unsupported session schema version %d", version)
 	}
 	if version == SchemaVersion {
-		return data, false, nil
+		return data, version, false, nil
 	}
 	document["version"] = SchemaVersion
 	migrated, err := json.MarshalIndent(document, "", "  ")
-	return migrated, true, err
+	return migrated, version, true, err
 }
 
 func (s *Store) sessionDirectory(id string, create bool) (string, error) {
@@ -797,6 +804,22 @@ func writeAtomic(path string, data []byte, mode os.FileMode) (returnErr error) {
 	return syncDirectory(directory)
 }
 
+// readableSchemaVersion reports whether this build can read a document written by
+// another schema version. An older document is readable when it is still in the
+// supported range; anything else is refused explicitly instead of being guessed
+// at.
+func readableSchemaVersion(version int) bool {
+	return version >= MinReadableSchemaVersion && version <= SchemaVersion
+}
+
+// migratableSchemaVersion reports whether Migrate can upgrade a document. It
+// accepts more than the reader does, because upgrading an older session is the
+// supported way to bring it forward: the migration writes a backup of the original
+// document before it rewrites anything.
+func migratableSchemaVersion(version int) bool {
+	return version >= 0 && version <= SchemaVersion
+}
+
 func schemaError(version int, id string) error {
 	return fmt.Errorf("session %q uses unsupported schema version %d (current %d); run `eylu sessions migrate %s`", id, version, SchemaVersion, id)
 }
@@ -842,7 +865,7 @@ func readEventsDetailed(path, expectedSessionID string) ([]Event, []Diagnostic, 
 				diagnostics = append(diagnostics, Diagnostic{Path: path, Message: fmt.Sprintf("ignored damaged event tail at line %d: %v", lineNumber, err)})
 				break
 			}
-			if header.Version != SchemaVersion {
+			if !readableSchemaVersion(header.Version) {
 				id := expectedSessionID
 				if id == "" {
 					id = header.SessionID
@@ -925,11 +948,39 @@ func truncateEventTail(path string, validBytes int64) error {
 func validEventType(eventType EventType) bool {
 	switch eventType {
 	case EventSessionCreated, EventTurnAppended, EventRuntimeUpdated, EventDriverState,
-		EventPromptRecorded, EventSkillActivated, EventContextUpdated, EventAgentTasksUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened:
+		EventPromptRecorded, EventSkillActivated, EventContextUpdated, EventAgentTasksUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened,
+		EventToolExecutionIntent, EventToolCompleted:
 		return true
 	default:
 		return false
 	}
+}
+
+// recordToolIntent adds one started execution to the pending set.
+func recordToolIntent(snapshot *Snapshot, intent ToolIntent) {
+	for index, existing := range snapshot.PendingIntents {
+		if existing.CallID == intent.CallID {
+			snapshot.PendingIntents[index] = intent
+			return
+		}
+	}
+	snapshot.PendingIntents = append(snapshot.PendingIntents, intent)
+}
+
+// clearToolIntent removes the pending entry of one execution that reached a
+// terminal outcome.
+func clearToolIntent(snapshot *Snapshot, callID string) {
+	if callID == "" || len(snapshot.PendingIntents) == 0 {
+		return
+	}
+	kept := snapshot.PendingIntents[:0]
+	for _, intent := range snapshot.PendingIntents {
+		if intent.CallID == callID {
+			continue
+		}
+		kept = append(kept, intent)
+	}
+	snapshot.PendingIntents = kept
 }
 
 func applyEvent(snapshot *Snapshot, event Event) {
@@ -996,6 +1047,14 @@ func applyEvent(snapshot *Snapshot, event Event) {
 		snapshot.ClosedAt = &closedAt
 	case EventSessionReopened:
 		snapshot.ClosedAt = nil
+	case EventToolExecutionIntent:
+		if event.Intent != nil {
+			recordToolIntent(snapshot, *event.Intent)
+		}
+	case EventToolCompleted:
+		if event.Completion != nil {
+			clearToolIntent(snapshot, event.Completion.CallID)
+		}
 	}
 }
 

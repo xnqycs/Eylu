@@ -2,6 +2,8 @@ package tool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -47,6 +49,22 @@ func (e *EditFile) Definition() protocol.ToolDefinition {
 }
 
 func (e *EditFile) Risk() policy.Risk { return policy.RiskWrite }
+
+// ReportIntent describes the recovery hints of one call without running it: the
+// resolved path and the hash of the content it found there.
+func (e *EditFile) ReportIntent(raw json.RawMessage) (string, string) {
+	var input struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(raw, &input) != nil {
+		return "", ""
+	}
+	path, err := e.paths.existing(input.Path)
+	if err != nil {
+		return input.Path, ""
+	}
+	return path, fileContentHash(path)
+}
 
 func (e *EditFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) ConcurrencySpec {
 	var input struct {
@@ -136,8 +154,13 @@ func (e *EditFile) Execute(ctx context.Context, raw json.RawMessage) protocol.To
 		e.context.Invalidate(filePath)
 	}
 	content := fmt.Sprintf("replacements: %d\nlines_added: %d\nlines_removed: %d\n%s", actual, added, removed, diff)
+	previous := sha256.Sum256([]byte(original))
+	updatedHash := sha256.Sum256([]byte(updated))
 	return protocol.ToolResult{Content: content, Metadata: map[string]any{
 		"path": filePath, "replacements": actual, "lines_added": added, "lines_removed": removed, "diff": diff,
+		// Verifiable recovery hints: what the file was before the edit and what it
+		// became after it.
+		"file_hash": hex.EncodeToString(updatedHash[:]), "previous_hash": hex.EncodeToString(previous[:]),
 	}}
 }
 

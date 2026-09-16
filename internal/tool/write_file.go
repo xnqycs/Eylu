@@ -2,6 +2,8 @@ package tool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,35 @@ func (w *WriteFile) Definition() protocol.ToolDefinition {
 
 func (w *WriteFile) Risk() policy.Risk { return policy.RiskWrite }
 
+// ReportIntent describes the recovery hints of one call without running it: the
+// resolved path and the hash of the content it found there.
+func (w *WriteFile) ReportIntent(raw json.RawMessage) (string, string) {
+	var input struct {
+		Path             string `json:"path"`
+		CreateParentDirs bool   `json:"create_parent_dirs"`
+	}
+	if json.Unmarshal(raw, &input) != nil {
+		return "", ""
+	}
+	path, err := w.paths.forWrite(context.Background(), input.Path, input.CreateParentDirs)
+	if err != nil {
+		return input.Path, ""
+	}
+	return path, fileContentHash(path)
+}
+
+// fileContentHash returns the hash of a file's current content, or an empty
+// string when it does not exist or cannot be read. It is evidence for recovery,
+// never a precondition for writing.
+func fileContentHash(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func (w *WriteFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) ConcurrencySpec {
 	var input struct {
 		Path string `json:"path"`
@@ -99,6 +130,7 @@ func (w *WriteFile) Execute(ctx context.Context, raw json.RawMessage) protocol.T
 		return toolError(statErr.Error())
 	}
 	content := []byte(input.Content)
+	previousHash := fileContentHash(path)
 	if err := writeFileAtomically(ctx, path, content, mode); err != nil {
 		// Once the atomic replace succeeded the write has happened, so a
 		// cancellation observed afterwards must not be reported as a failure.
@@ -114,7 +146,13 @@ func (w *WriteFile) Execute(ctx context.Context, raw json.RawMessage) protocol.T
 	if len(content) > 0 {
 		lines = strings.Count(input.Content, "\n") + 1
 	}
-	return protocol.ToolResult{Content: fmt.Sprintf("wrote %d bytes to %s", len(content), input.Path), Metadata: map[string]any{"path": path, "bytes": len(content), "lines": lines}}
+	written := sha256.Sum256(content)
+	return protocol.ToolResult{Content: fmt.Sprintf("wrote %d bytes to %s", len(content), input.Path), Metadata: map[string]any{
+		"path": path, "bytes": len(content), "lines": lines,
+		// Verifiable recovery hints: they describe what the file was and what it
+		// became, so an interrupted run can be checked instead of guessed at.
+		"file_hash": hex.EncodeToString(written[:]), "previous_hash": previousHash,
+	}}
 }
 
 // writeFileAtomically writes content through a temporary file and an atomic

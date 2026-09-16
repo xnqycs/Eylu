@@ -470,6 +470,12 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	})
 	executor.SessionID, executor.ProviderName = conversation.SessionID(), modelRuntime.Provider.Name
 	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
+	// A side-effecting call persists its intent before it runs, so the window in
+	// which an operation has happened without a record is as small as the store
+	// allows.
+	if r.session != nil {
+		executor.Checkpoint = r.session
+	}
 	baseEmit := emit
 	emit = func(event protocol.ModelEvent) error {
 		observation.ObserveModelEvent(event)

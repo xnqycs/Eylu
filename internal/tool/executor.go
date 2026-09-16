@@ -39,6 +39,60 @@ func (e *ApprovalError) Error() string {
 
 func (e *ApprovalError) Unwrap() error { return e.Err }
 
+// CheckpointSink records the lifecycle of side-effecting tool executions.
+//
+// The intent of a side-effecting call is persisted before the call starts, which
+// is what shrinks the window in which an operation has happened but nothing
+// records it. An intent that cannot be written prevents the call from running at
+// all; a completion that cannot be written keeps the in-memory result, stops the
+// batch from starting new side effects, and is reported distinctly.
+type CheckpointSink interface {
+	RecordIntent(Intent) error
+	RecordCompletion(Completion) error
+}
+
+// Intent describes one execution that is about to start.
+type Intent struct {
+	RequestID    string
+	CallID       string
+	ParentCallID string
+	Tool         string
+	Risk         policy.Risk
+	// TargetPath and PreviousHash are verifiable recovery hints: they help decide
+	// whether the operation happened, and are never used to replay it.
+	TargetPath   string
+	PreviousHash string
+}
+
+// Completion describes the terminal outcome of one execution.
+type Completion struct {
+	RequestID  string
+	CallID     string
+	Tool       string
+	State      protocol.CallState
+	IsError    bool
+	TargetPath string
+	ResultHash string
+}
+
+// CheckpointError reports that the lifecycle of a call could not be recorded.
+// Recorded distinguishes a failed intent, which prevents the call from running,
+// from a failed completion, where the operation may already have happened.
+type CheckpointError struct {
+	CallID   string
+	Recorded bool
+	Err      error
+}
+
+func (e *CheckpointError) Error() string {
+	if e.Recorded {
+		return fmt.Sprintf("tool %s ran but its completion could not be recorded: %v", e.CallID, e.Err)
+	}
+	return fmt.Sprintf("tool %s was not started because its intent could not be recorded: %v", e.CallID, e.Err)
+}
+
+func (e *CheckpointError) Unwrap() error { return e.Err }
+
 // joinBatchError keeps the first substantive failure and the request
 // cancellation cause together. errors.Is then holds for either one, while the
 // message still leads with the original failure. A batch-local cancel derived
@@ -128,6 +182,9 @@ type Executor struct {
 	Model              string
 	MaxParallelTools   int
 	Coordinator        *ResourceCoordinator
+	// Checkpoint, when set, persists the lifecycle of side-effecting executions
+	// around their execution.
+	Checkpoint CheckpointSink
 }
 
 type BatchHooks struct {
@@ -145,6 +202,8 @@ type preparedCall struct {
 	approvalErr      error
 	state            protocol.CallState
 	control          protocol.BatchControl
+	requestID        string
+	checkpointErr    error
 	queuedAt         time.Time
 	executionStarted time.Time
 	record           AuditRecord
@@ -421,6 +480,14 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			if item.control == protocol.ControlInterruptRequest {
 				interrupted = true
 			}
+			// A lifecycle record that could not be written stops the batch: the
+			// operation may have happened without a record, so no further side
+			// effect may start.
+			if item.checkpointErr != nil {
+				batchErr = joinBatchError(batchErr, item.checkpointErr)
+				cancel()
+				hooks = BatchHooks{}
+			}
 			if hooks.OnResult != nil {
 				if err := hooks.OnResult(finished.result); err != nil {
 					batchErr = joinBatchError(batchErr, err)
@@ -491,6 +558,9 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 	prepared.record.Risk, prepared.record.Decision, prepared.record.Reason = outcome.Risk, outcome.Decision, outcome.Reason
 	prepared.record.Mode, prepared.record.Classification, prepared.record.Warning = outcome.Mode.String(), outcome.Classification, outcome.Warning
 	prepared.record.PolicyRule, prepared.record.PolicySource, prepared.record.PolicyOverride = outcome.Rule, string(outcome.Source), outcome.Override
+	// The request ID is carried into the lifecycle records, so recovery can relate
+	// an intent to the request it belonged to.
+	prepared.requestID = requestID
 	switch outcome.Decision {
 	case policy.DecisionAllow:
 	case policy.DecisionDeny:
@@ -607,6 +677,20 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 	if finalizer, ok := prepared.item.(ExecutionFinalizer); ok {
 		defer finalizer.AfterExecute(prepared.outcome)
 	}
+	// A side-effecting call records its intent before it runs. When that record
+	// cannot be written the call does not start: an operation the host cannot log
+	// must not happen.
+	intent := e.executionIntent(prepared)
+	if e.Checkpoint != nil && intent != nil {
+		if err := e.Checkpoint.RecordIntent(*intent); err != nil {
+			prepared.state = protocol.CallNotExecuted
+			prepared.checkpointErr = &CheckpointError{CallID: prepared.call.ID, Err: err}
+			return protocol.ToolResult{
+				CallID: prepared.call.ID, IsError: true, State: protocol.CallNotExecuted,
+				Content: "tool call was not executed: " + (&CheckpointError{CallID: prepared.call.ID, Err: err}).Error(),
+			}
+		}
+	}
 	prepared.executionStarted = time.Now()
 	executionStarted = prepared.executionStarted
 	toolCtx := ctx
@@ -660,7 +744,59 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 	content, truncated := truncateUTF8(result.Content, maxOutput)
 	result.Content = content
 	result.Truncated = result.Truncated || truncated
+	// The completion is recorded as soon as the operation is over. A failure here
+	// keeps the in-memory result, stops the batch from starting new side effects,
+	// and says explicitly that the operation may have happened.
+	if e.Checkpoint != nil && intent != nil {
+		completion := Completion{
+			RequestID: prepared.requestID, CallID: prepared.call.ID, Tool: prepared.call.Name,
+			State: prepared.state, IsError: result.IsError, TargetPath: intent.TargetPath, ResultHash: resultHash(result),
+		}
+		if err := e.Checkpoint.RecordCompletion(completion); err != nil {
+			prepared.checkpointErr = &CheckpointError{CallID: prepared.call.ID, Recorded: true, Err: err}
+			if result.Metadata == nil {
+				result.Metadata = make(map[string]any, 1)
+			}
+			result.Metadata["checkpoint_incomplete"] = true
+		}
+	}
 	return result
+}
+
+// executionIntent builds the lifecycle record of one side-effecting call. A call
+// that only reads anything, or that is already a terminal result, needs none.
+func (e *Executor) executionIntent(prepared *preparedCall) *Intent {
+	if e.Checkpoint == nil || prepared.item == nil {
+		return nil
+	}
+	switch prepared.outcome.Risk {
+	case policy.RiskRead, policy.RiskSession:
+		return nil
+	}
+	intent := &Intent{
+		RequestID: prepared.requestID, CallID: prepared.call.ID, ParentCallID: prepared.call.ParentCallID,
+		Tool: prepared.call.Name, Risk: prepared.outcome.Risk,
+	}
+	// A tool that can describe its target without running gives the verifiable
+	// recovery hints; otherwise the path from the call arguments is used.
+	if reporter, ok := prepared.item.(IntentReporter); ok {
+		intent.TargetPath, intent.PreviousHash = reporter.ReportIntent(prepared.input)
+		return intent
+	}
+	var fields struct {
+		Path string `json:"path"`
+	}
+	if json.Unmarshal(prepared.input, &fields) == nil {
+		intent.TargetPath = fields.Path
+	}
+	return intent
+}
+
+// resultHash returns the content hash a tool reported for its target, when it has
+// one. It is a recovery hint, not a guarantee.
+func resultHash(result protocol.ToolResult) string {
+	value, _ := result.Metadata["file_hash"].(string)
+	return value
 }
 
 func (e *Executor) finishPrepared(prepared *preparedCall, result protocol.ToolResult, executionDuration time.Duration) protocol.ToolResult {

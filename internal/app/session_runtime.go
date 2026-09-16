@@ -423,6 +423,55 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	return nil
 }
 
+// RecordIntent persists the intent to run one side-effecting call before it
+// starts.
+//
+// The write is synchronous on purpose: the guarantee is that a tool never runs
+// before its intent is durable. An error is returned to the executor, which then
+// refuses to start the call.
+func (s *sessionRuntime) RecordIntent(intent tool.Intent) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := session.ToolIntent{
+		RequestID: intent.RequestID, CallID: intent.CallID, ParentCallID: intent.ParentCallID,
+		Tool: intent.Tool, Risk: string(intent.Risk), TargetPath: intent.TargetPath,
+		PreviousHash: intent.PreviousHash, StartedAt: time.Now().UTC(),
+	}
+	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolExecutionIntent, Intent: &record}})
+	if err != nil {
+		return sessionProtocolError("record tool intent", err)
+	}
+	s.acceptAppended(events)
+	return nil
+}
+
+// RecordCompletion persists the terminal outcome of one call.
+//
+// The operation itself already happened, so an error here is reported as "the
+// result may exist but its record does not": the in-memory result is kept and the
+// batch stops starting new side effects.
+func (s *sessionRuntime) RecordCompletion(completion tool.Completion) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := session.ToolCompletion{
+		CallID: completion.CallID, Tool: completion.Tool, State: string(completion.State),
+		IsError: completion.IsError, TargetPath: completion.TargetPath, ResultHash: completion.ResultHash,
+		CompletedAt: time.Now().UTC(),
+	}
+	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolCompleted, Completion: &record}})
+	if err != nil {
+		return sessionProtocolError("record tool completion", err)
+	}
+	s.acceptAppended(events)
+	return nil
+}
+
 func (s *sessionRuntime) SetAgentTaskSource(source func(string) []tool.AgentTask) {
 	if s == nil {
 		return
@@ -430,6 +479,18 @@ func (s *sessionRuntime) SetAgentTaskSource(source func(string) []tool.AgentTask
 	s.mu.Lock()
 	s.agentTasks = source
 	s.mu.Unlock()
+}
+
+// PendingIntents reports executions that started without a recorded outcome.
+// They are never replayed; the caller reports them so a human can verify the
+// effect with the recorded hints.
+func (s *sessionRuntime) PendingIntents() []session.ToolIntent {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]session.ToolIntent(nil), s.snapshot.PendingIntents...)
 }
 
 func (s *sessionRuntime) AgentTasks() []tool.AgentTask {
