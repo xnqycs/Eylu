@@ -949,7 +949,7 @@ func validEventType(eventType EventType) bool {
 	switch eventType {
 	case EventSessionCreated, EventTurnAppended, EventRuntimeUpdated, EventDriverState,
 		EventPromptRecorded, EventSkillActivated, EventContextUpdated, EventAgentTasksUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened,
-		EventToolExecutionIntent, EventToolCompleted:
+		EventToolExecutionIntent, EventToolCompleted, EventRunReported:
 		return true
 	default:
 		return false
@@ -1054,6 +1054,11 @@ func applyEvent(snapshot *Snapshot, event Event) {
 	case EventToolCompleted:
 		if event.Completion != nil {
 			clearToolIntent(snapshot, event.Completion.CallID)
+		}
+	case EventRunReported:
+		if event.Run != nil {
+			record := *event.Run
+			snapshot.LastRun = &record
 		}
 	}
 }

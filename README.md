@@ -493,6 +493,26 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 - 恢复规则：只有意图没有完成 → 该调用记为 `outcome_unknown`，不会自动重跑；已有完成记录 → 直接使用记录结果；shell、网络等非幂等操作默认需要人工确认。
 - 会话 schema 升级到 3：新增生命周期事件与稳定事件 ID。v2 会话仍可读取，v1 等更早版本在读取时明确拒绝，`Migrate` 可在保留 `.v<旧版本>.bak` 备份的前提下升级。
 
+### 运行观测
+
+每次请求结束都会把一份摘要写入会话日志（`run_reported` 事件，快照中为 `last_run`），因此"为什么停止、执行了什么、哪些结果未知"可以从日志回答，而不只存在于 UI 事件流中：
+
+- 停止原因：模型停止原因，或 `iteration_limit`、`token_budget`、`cancelled`、`abort_request`、`event_sink_failed`。
+- 计数：模型调用次数、工具执行次数，以及 `succeeded`、`failed`、`rejected`、`cancelled`、`not_executed`、`outcome_unknown` 各自的数量。
+- 用量：输入/输出/reasoning token 与是否精确；同时通过 `LoopOptions.Report` 暴露给宿主。
+- 恢复诊断：本次请求中以 `outcome_unknown` 关闭的调用 ID。
+
+同一份摘要不会包含明文密钥或敏感请求头；工具参数与正文仍遵循既有的脱敏、截断与外部化规则。
+
+### 事件投递
+
+- 流式文本与 reasoning delta 会在有界缓冲内合并（4 KiB 上限），因此一次长回答既不会阻塞模型，也不会到结束才一次性显示。
+- 工具、审批、终态与内容事件同步投递，不会被缓冲丢弃；投递失败会立即终止请求并在运行摘要中记为 `event_sink_failed`。
+
+### 核心 loop 的职责拆分
+
+Web 专用逻辑已从 `loop.go` 拆到同包协作者：`web_runtime.go`（方案解析与 MCP 刷新）、`web_calls.go`（批量展开与父子映射）、`web_results.go`（内容/活动/引用聚合）、`tool_events.go`（事件投影）、`run_finalize.go`（终态、pending 关闭与结束原因）、`event_queue.go`（事件投递）。核心循环只负责：取当前运行快照、准备上下文、调用并校验模型、提交响应、执行工具批次、提交结果、判断下一轮或结束。控制流不依赖 Web metadata，也不依赖事件投递细节。
+
 ### 代码上下文与后台子代理
 
 `read_file` 支持 1-based 闭区间参数 `start_line`、`end_line`，并返回 `file_hash`、`slice_hash`、`artifact_id` 和续读游标 `next_start_line`。`search_code` 共享会话级增量三元组索引，支持 `offset` 分页和 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前会替换为稳定引用。

@@ -1,0 +1,154 @@
+package agent
+
+import (
+	"Eylu/internal/protocol"
+)
+
+// RunReport is the durable summary of one finished request.
+//
+// It answers, from the record alone, why a request stopped, which executions it
+// performed, and which calls never reached a terminal state. It is deliberately
+// separate from the UI event stream: a critical execution record must not exist
+// only in a transient event.
+type RunReport struct {
+	RequestID  string `json:"request_id"`
+	Iterations int    `json:"iterations"`
+	// StopReason is why the request ended: a model stop reason, the iteration
+	// limit, the token budget, a cancellation, an interruption or a failure.
+	StopReason string `json:"stop_reason"`
+	// Error states the failure that ended the request, when there was one.
+	Error string `json:"error,omitempty"`
+
+	ModelCalls int `json:"model_calls"`
+	// ToolCalls counts the executions of this request.
+	ToolCalls int `json:"tool_calls"`
+	// The remaining counters are the terminal states of this request's calls, so
+	// "what ran", "what was refused" and "what is unknown" stay distinguishable.
+	Succeeded      int `json:"succeeded"`
+	Failed         int `json:"failed"`
+	Rejected       int `json:"rejected"`
+	Cancelled      int `json:"cancelled"`
+	NotExecuted    int `json:"not_executed"`
+	OutcomeUnknown int `json:"outcome_unknown"`
+
+	InputTokens     int  `json:"input_tokens"`
+	OutputTokens    int  `json:"output_tokens"`
+	ReasoningTokens int  `json:"reasoning_tokens,omitempty"`
+	ExactUsage      bool `json:"exact_usage"`
+	EstimatedUsage  bool `json:"estimated_usage"`
+
+	// RecoveredCalls lists tool call IDs that had no recorded result and were
+	// closed with outcome_unknown when a request was built.
+	RecoveredCalls []string `json:"recovered_calls,omitempty"`
+}
+
+func (r *RunReport) count(state protocol.CallState) {
+	switch state {
+	case protocol.CallSucceeded:
+		r.Succeeded++
+	case protocol.CallFailed:
+		r.Failed++
+	case protocol.CallRejected:
+		r.Rejected++
+	case protocol.CallCancelled:
+		r.Cancelled++
+	case protocol.CallNotExecuted:
+		r.NotExecuted++
+	case protocol.CallOutcomeUnknown:
+		r.OutcomeUnknown++
+	}
+}
+
+// Reasons a request can end with, used in the report when the model did not
+// supply the reason itself.
+const (
+	stopIterationLimit = "iteration_limit"
+	stopTokenBudget    = "token_budget"
+	stopCancelled      = "cancelled"
+	stopAborted        = "aborted"
+	stopInterrupted    = "interrupt_request"
+)
+
+// runFinalizer owns the exit paths of one request.
+//
+// It closes the calls that never reached a terminal state, publishes the
+// accumulated usage and fills the run report. Every return of Run goes through
+// it, so no committed call can be left dangling and no request can end without a
+// stated reason.
+type runFinalizer struct {
+	conversation *Conversation
+	runtime      Runtime
+	calls        []protocol.ToolCall
+	budget       *BudgetTracker
+	usage        *RunUsage
+	report       *RunReport
+	iterations   int
+	// events is the bounded host event queue of this request, when one is active.
+	events *eventQueue
+}
+
+// closePending gives every call of the current response that has no result yet a
+// terminal state. A call that already has a result is never rewritten.
+func (f *runFinalizer) closePending(message string) {
+	f.conversation.mu.Lock()
+	defer f.conversation.mu.Unlock()
+	f.conversation.closeToolCalls(f.runtime, f.calls, protocol.CallNotExecuted, message)
+}
+
+// finish publishes the request outcome and returns what the caller receives.
+// A failure returns the last usable response beside the error, so a caller that
+// stops still sees the work that happened.
+//
+// The host event queue is stopped here, on every exit path, so the events of this
+// request are always drained and a consumer failure is never lost: when the
+// request itself succeeded, the sink failure becomes its error.
+func (f *runFinalizer) finish(response protocol.ModelResponse, last protocol.ModelResponse, err error, stop string) (protocol.ModelResponse, error) {
+	if sinkErr := f.events.stop(); sinkErr != nil && err == nil {
+		err = sinkErr
+		stop = "event_sink_failed"
+	}
+	f.publish(stop, err)
+	if err != nil {
+		return last, err
+	}
+	return response, nil
+}
+
+// publish records the accumulated usage, the stop reason, the terminal states and
+// the recovery diagnostics of this request.
+func (f *runFinalizer) publish(stop string, err error) {
+	usage := f.budget.report()
+	if f.usage != nil {
+		*f.usage = usage
+	}
+	if f.report == nil {
+		return
+	}
+	if stop == "" {
+		stop = "unknown"
+	}
+	f.report.Iterations = f.iterations
+	f.report.StopReason = stop
+	if err != nil {
+		f.report.Error = err.Error()
+	}
+	f.report.ModelCalls = usage.ModelCalls
+	f.report.InputTokens = usage.InputTokens
+	f.report.OutputTokens = usage.OutputTokens
+	f.report.ReasoningTokens = usage.ReasoningTokens
+	f.report.ExactUsage = usage.Exact
+	f.report.EstimatedUsage = usage.Estimated
+	f.report.RecoveredCalls = f.conversation.RecoveryNotes()
+}
+
+// countBatch records the terminal states of one executed batch: what ran, what
+// was refused, what was cancelled and what stayed unknown.
+func (f *runFinalizer) countBatch(states []protocol.CallState) {
+	if f.report == nil {
+		return
+	}
+	f.report.ToolCalls += len(states)
+	for _, state := range states {
+		f.report.count(state)
+	}
+}

@@ -485,16 +485,25 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return nil
 	}
 	sessionID := conversation.SessionID()
+	var runReport agent.RunReport
 	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
 		BeforeModel: func() string { return r.completedAgentNotifications(sessionID) },
+		Report:      &runReport,
 	}, stream, emit)
 	observation.ObserveCodeSlices(conversation.ContextReport().CodeSlices)
 	metric := observation.Finish(response.Usage, err)
 	r.reportMetric(jsonlEncoder, metric)
 	syncErr := error(nil)
 	if r.session != nil {
+		// The report is recorded before the snapshot sync, so the reason a request
+		// stopped survives even when the snapshot write fails. The sync error takes
+		// precedence because it means the session state itself is behind.
+		reportErr := r.session.RecordRunReport(runReport)
 		syncErr = r.session.Sync(conversation, manager, opts, err)
+		if syncErr == nil {
+			syncErr = reportErr
+		}
 	}
 	if err != nil {
 		if r.output == "text" {

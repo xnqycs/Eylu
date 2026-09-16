@@ -522,6 +522,26 @@ A side-effecting tool persists its execution intent before it starts, which shri
 - Recovery rules: an intent without a completion means the call is `outcome_unknown` and is never re-run; a recorded completion is used directly; shell commands and network requests are non-idempotent and need explicit confirmation by default.
 - The session schema is now 3, adding the lifecycle events and the stable event ID. A version 2 session is still readable, an older version is refused explicitly on load, and `Migrate` upgrades one while keeping a `.v<old-version>.bak` backup.
 
+### Run observability
+
+Every finished request writes a summary into the session log (a `run_reported` event, `last_run` in the snapshot), so "why did it stop, what ran, what is unknown" can be answered from the log rather than only from a transient UI event:
+
+- Stop reason: the model's stop reason, or `iteration_limit`, `token_budget`, `cancelled`, `abort_request`, `event_sink_failed`.
+- Counters: model calls, tool executions, and the separate counts of `succeeded`, `failed`, `rejected`, `cancelled`, `not_executed` and `outcome_unknown`.
+- Usage: input, output and reasoning tokens plus whether they are exact; also exposed to the host through `LoopOptions.Report`.
+- Recovery diagnostics: the call IDs this request closed with `outcome_unknown`.
+
+The summary never contains a plaintext key or a sensitive request header, and tool arguments and content still follow the existing redaction, truncation and externalization rules.
+
+### Event delivery
+
+- Streamed text and reasoning deltas are coalesced within a bounded 4 KiB buffer, so a long answer neither blocks the model nor appears only at the end.
+- Tool, approval, terminal and content events are delivered synchronously and are never dropped by buffering; a delivery failure stops the request immediately and is recorded as `event_sink_failed` in the run summary.
+
+### Core loop responsibilities
+
+The Web-specific logic has moved out of `loop.go` into same-package collaborators: `web_runtime.go` (plan resolution and MCP refresh), `web_calls.go` (batch expansion and parent mapping), `web_results.go` (content, activity and citation aggregation), `tool_events.go` (event projection), `run_finalize.go` (terminal states, pending closure and stop reasons), and `event_queue.go` (event delivery). The core loop only obtains the current run snapshot, prepares the context, calls and validates the model, commits the response, executes the tool batch, commits the results, and decides whether to continue. Its control flow depends on neither Web metadata nor event-delivery details.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

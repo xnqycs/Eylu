@@ -39,7 +39,34 @@ const (
 	EventToolExecutionIntent EventType = "tool_execution_intent"
 	// EventToolCompleted records the terminal outcome of one execution.
 	EventToolCompleted EventType = "tool_completed"
+	// EventRunReported records the summary of one finished request, so a request
+	// can be explained from the log instead of only from a transient UI event.
+	EventRunReported EventType = "run_reported"
 )
+
+// RunSummary is the durable record of one finished request.
+//
+// It answers why the request stopped, what executed, what stayed unknown and what
+// it cost. Counters are kept per terminal state so "ran", "refused", "cancelled"
+// and "unknown" never collapse into one number.
+type RunSummary struct {
+	RequestID      string    `json:"request_id"`
+	Iterations     int       `json:"iterations"`
+	StopReason     string    `json:"stop_reason"`
+	Error          string    `json:"error,omitempty"`
+	ModelCalls     int       `json:"model_calls"`
+	ToolCalls      int       `json:"tool_calls"`
+	Succeeded      int       `json:"succeeded"`
+	Failed         int       `json:"failed"`
+	Rejected       int       `json:"rejected"`
+	Cancelled      int       `json:"cancelled"`
+	NotExecuted    int       `json:"not_executed"`
+	OutcomeUnknown int       `json:"outcome_unknown"`
+	InputTokens    int       `json:"input_tokens"`
+	OutputTokens   int       `json:"output_tokens"`
+	ExactUsage     bool      `json:"exact_usage"`
+	ReportedAt     time.Time `json:"reported_at,omitzero"`
+}
 
 // ToolIntent is the durable record of one execution that is about to start.
 //
@@ -121,6 +148,8 @@ type Snapshot struct {
 	// PendingIntents lists executions that started but never recorded a terminal
 	// outcome. Recovery reports them as outcome_unknown and never replays them.
 	PendingIntents []ToolIntent `json:"pending_intents,omitempty"`
+	// LastRun is the summary of the most recent finished request.
+	LastRun *RunSummary `json:"last_run,omitempty"`
 }
 
 type Event struct {
@@ -150,6 +179,7 @@ type Event struct {
 	Ledger         *contextledger.LedgerState `json:"ledger,omitempty"`
 	Error          string                     `json:"error,omitempty"`
 	Intent         *ToolIntent                `json:"intent,omitempty"`
+	Run            *RunSummary                `json:"run,omitempty"`
 	Completion     *ToolCompletion            `json:"completion,omitempty"`
 }
 
@@ -177,3 +207,4 @@ type AttachmentRef struct {
 	SHA256 string `json:"sha256"`
 	Bytes  int    `json:"bytes"`
 }
+

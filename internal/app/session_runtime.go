@@ -451,6 +451,14 @@ func (s *sessionRuntime) RecordIntent(intent tool.Intent) error {
 		return sessionProtocolError("record tool intent", err)
 	}
 	s.acceptAppended(events)
+	// The in-memory snapshot mirrors the log, so the next save carries the intent.
+	for index, existing := range s.snapshot.PendingIntents {
+		if existing.CallID == record.CallID {
+			s.snapshot.PendingIntents[index] = record
+			return nil
+		}
+	}
+	s.snapshot.PendingIntents = append(s.snapshot.PendingIntents, record)
 	return nil
 }
 
@@ -475,6 +483,41 @@ func (s *sessionRuntime) RecordCompletion(completion tool.Completion) error {
 		return sessionProtocolError("record tool completion", err)
 	}
 	s.acceptAppended(events)
+	// A completed execution is no longer pending.
+	kept := s.snapshot.PendingIntents[:0]
+	for _, intent := range s.snapshot.PendingIntents {
+		if intent.CallID == record.CallID {
+			continue
+		}
+		kept = append(kept, intent)
+	}
+	s.snapshot.PendingIntents = kept
+	return nil
+}
+
+// RecordRunReport persists the summary of one finished request, so why it stopped
+// and what it did can be explained from the log instead of only from a transient
+// UI event.
+func (s *sessionRuntime) RecordRunReport(report agent.RunReport) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	summary := session.RunSummary{
+		RequestID: report.RequestID, Iterations: report.Iterations, StopReason: report.StopReason,
+		Error: report.Error, ModelCalls: report.ModelCalls, ToolCalls: report.ToolCalls,
+		Succeeded: report.Succeeded, Failed: report.Failed, Rejected: report.Rejected,
+		Cancelled: report.Cancelled, NotExecuted: report.NotExecuted, OutcomeUnknown: report.OutcomeUnknown,
+		InputTokens: report.InputTokens, OutputTokens: report.OutputTokens, ExactUsage: report.ExactUsage,
+		ReportedAt: time.Now().UTC(),
+	}
+	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventRunReported, Run: &summary}})
+	if err != nil {
+		return sessionProtocolError("record run report", err)
+	}
+	s.acceptAppended(events)
+	s.snapshot.LastRun = &summary
 	return nil
 }
 
@@ -634,6 +677,10 @@ func snapshotFromAgentState(state agent.ConversationState, previous session.Snap
 		Turns:    state.Turns, PromptHistory: append([]string{}, state.PromptHistory...), DriverState: append(json.RawMessage(nil), state.DriverState...), SkillCatalog: state.SkillCatalog,
 		Summary: state.Summary, TodoList: cloneProtocolTodoList(state.TodoList), OmittedTurnIDs: append([]string(nil), state.OmittedTurnIDs...), Ledger: state.Ledger,
 		AgentTasks: append([]tool.AgentTask(nil), previous.AgentTasks...),
+		// The lifecycle records and the last run summary are owned by their events,
+		// so a rebuild carries them forward instead of dropping them.
+		PendingIntents: append([]session.ToolIntent(nil), previous.PendingIntents...),
+		LastRun:        previous.LastRun,
 	}
 	if snapshot.CreatedAt.IsZero() {
 		snapshot.CreatedAt = time.Now().UTC()
