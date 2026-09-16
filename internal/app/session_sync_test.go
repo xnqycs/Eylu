@@ -218,6 +218,119 @@ func TestSyncAppendsStateEventsOnlyWhenTheyChange(t *testing.T) {
 	}
 }
 
+// When the append result is unknown the caller cannot tell whether the log holds
+// the events. The retry re-uses the same event IDs, so the log recognizes them
+// instead of writing a second copy of the same logical change.
+func TestSyncReusesEventIDsWhenAnAppendResultIsUncertain(t *testing.T) {
+	fixture := newSessionSyncFixture(t)
+	conversation := conversationWithPrompts(t, fixture.sessionID, "first")
+	uncertain := true
+	fixture.controller.appendEvents = func(id string, events []session.Event) ([]session.Event, error) {
+		prepared, err := fixture.store.Append(id, events)
+		if err != nil {
+			return prepared, err
+		}
+		if uncertain && len(events) > 0 {
+			uncertain = false
+			// The bytes reached the log, but the caller is told the result is
+			// unknown.
+			return nil, errors.New("append result unknown")
+		}
+		return prepared, nil
+	}
+	if err := fixture.controller.Sync(conversation, fixture.manager, chatOptions{}, nil); err == nil {
+		t.Fatal("expected the uncertain append to be reported")
+	}
+	afterFirst := fixture.events(t)
+	if len(afterFirst) == 0 {
+		t.Fatal("the uncertain append wrote nothing")
+	}
+	if err := fixture.controller.Sync(conversation, fixture.manager, chatOptions{}, nil); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	final := fixture.events(t)
+	if len(final) != len(afterFirst) {
+		t.Fatalf("the retry duplicated events: %d -> %d", len(afterFirst), len(final))
+	}
+	if got := countEvents(final, session.EventTurnAppended); got != 2 {
+		t.Fatalf("turn events = %d, want one per turn", got)
+	}
+	if got := countEvents(final, session.EventPromptRecorded); got != 1 {
+		t.Fatalf("prompt events = %d", got)
+	}
+	identifiers := make(map[string]int, len(final))
+	for _, event := range final {
+		if event.ID == "" {
+			t.Fatal("an appended event has no stable ID")
+		}
+		identifiers[event.ID]++
+	}
+	for id, count := range identifiers {
+		if count != 1 {
+			t.Fatalf("event ID %q appears %d times", id, count)
+		}
+	}
+}
+
+// Two identical prompts are a legitimate repeat, so they are two events.
+func TestSyncKeepsRepeatedIdenticalPrompts(t *testing.T) {
+	fixture := newSessionSyncFixture(t)
+	conversation := conversationWithPrompts(t, fixture.sessionID, "same", "same")
+	if err := fixture.controller.Sync(conversation, fixture.manager, chatOptions{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	events := fixture.events(t)
+	if got := countEvents(events, session.EventPromptRecorded); got != 2 {
+		t.Fatalf("prompt events = %d, want both submissions", got)
+	}
+	seen := map[string]bool{}
+	for _, event := range events {
+		if event.Type != session.EventPromptRecorded {
+			continue
+		}
+		if seen[event.ID] {
+			t.Fatalf("identical prompts shared the event ID %q", event.ID)
+		}
+		seen[event.ID] = true
+	}
+}
+
+// A new runtime for an existing session keeps writing without colliding with the
+// IDs an earlier process wrote.
+func TestSyncEventIDsStayUniqueAcrossRuntimes(t *testing.T) {
+	fixture := newSessionSyncFixture(t)
+	first := conversationWithPrompts(t, fixture.sessionID, "first")
+	if err := fixture.controller.Sync(first, fixture.manager, chatOptions{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A restart: a fresh runtime reads the stored snapshot and continues.
+	snapshot, _, err := fixture.store.Load(fixture.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := newSessionRuntime(fixture.store, snapshot, fixture.workspace, nil)
+	second := conversationWithPrompts(t, fixture.sessionID, "first", "second")
+	if err := restarted.Sync(second, fixture.manager, chatOptions{}, nil); err != nil {
+		t.Fatalf("restarted sync: %v", err)
+	}
+	events := fixture.events(t)
+	if got := countEvents(events, session.EventTurnAppended); got != 4 {
+		t.Fatalf("turn events = %d", got)
+	}
+	if got := countEvents(events, session.EventPromptRecorded); got != 2 {
+		t.Fatalf("prompt events = %d", got)
+	}
+	identifiers := make(map[string]int, len(events))
+	for _, event := range events {
+		identifiers[event.ID]++
+	}
+	for id, count := range identifiers {
+		if count != 1 {
+			t.Fatalf("event ID %q appears %d times across runtimes", id, count)
+		}
+	}
+}
+
 // Recovery from the log alone keeps the conversation usable: the snapshot can be
 // deleted after a failed save and the replayed log still holds every turn once.
 func TestSyncLogAloneRecoversAfterSnapshotFailure(t *testing.T) {

@@ -489,6 +489,15 @@ Stop reasons have an explicit handling table, and a non-`tool_use` stop is not a
 - Reasoning tokens are recorded separately and never counted twice, because every adapter already includes them in its output tokens. The response returned by `Run` still describes only the last call; the accumulated usage is exposed separately through `LoopOptions.Usage` (`RunUsage`).
 - The current drivers do not forward a remaining output limit to the provider, so the budget is soft: Eylu stops starting new requests once the limit is reached, but a single call may still overshoot. A subagent keeps running after the parent request ends, so its cost is reported separately instead of being folded into the same synchronous budget.
 
+### Event IDs and append idempotency
+
+- Every logical event has a stable ID. When an append result is unknown, the retry reuses the ID; the store recognizes an ID it already holds with identical content as a retry and does not write a second copy, while the same ID with different content is reported as a conflict instead of being overwritten.
+- A state event is only appended when its payload changes, and two identical states (A→B→A) get fresh IDs rather than being mistaken for a retry.
+- The same prompt text submitted twice is a legitimate repeat: the event identity includes its position, so identical text is never deduplicated.
+- When a write result is uncertain (Write/Sync/Close reported an error), the store drops its cached tail and event index, and the next append re-reads the log before continuing the sequence, so the in-memory sequence never drifts from the file.
+- Each process uses its own event ID prefix, so a restart cannot collide with IDs an earlier process wrote.
+- Reader compatibility: a log written before IDs existed still loads (its events derive an identity from their sequence); a repeated ID whose content is identical is not applied twice, and a conflicting one is reported as a diagnostic instead of being silently rewritten. A document from another schema version is still refused explicitly rather than misread.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

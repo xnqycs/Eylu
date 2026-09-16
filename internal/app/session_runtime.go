@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +43,13 @@ type appendProgress struct {
 	driverState json.RawMessage
 	// fingerprints identify the last appended payload of each state event type.
 	fingerprints map[session.EventType]string
+	// pending maps the identity of one logical event to the event ID given to it.
+	// An ID stays here until the log confirms it, so a retry after an uncertain
+	// append reuses it and the log recognizes the duplicate instead of writing the
+	// same logical change twice.
+	pending     map[string]string
+	eventPrefix string
+	nextEventID uint64
 }
 
 type sessionRuntime struct {
@@ -66,17 +75,29 @@ type sessionRuntime struct {
 }
 
 // eventFingerprint returns a stable digest of one event payload. The volatile
-// fields a store assigns (version, sequence, session ID, timestamp) are excluded
-// so the same logical state always yields the same fingerprint and a retry after
-// a failed snapshot save is recognized instead of being appended again.
+// fields a store assigns (version, sequence, session ID, timestamp) and the event
+// ID are excluded, so the same logical state always yields the same fingerprint
+// and a retry after a failed snapshot save is recognized instead of being
+// appended again.
 func eventFingerprint(event session.Event) string {
-	event.Version, event.Sequence, event.SessionID, event.At = 0, 0, "", time.Time{}
+	event.Version, event.Sequence, event.SessionID, event.At, event.ID = 0, 0, "", time.Time{}, ""
 	encoded, err := json.Marshal(event)
 	if err != nil {
 		return ""
 	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
+}
+
+// newEventPrefix makes event IDs unique across processes. An ID only has to be
+// stable across the retries of one runtime, so a per-runtime prefix is enough and
+// it can never collide with an ID an earlier process wrote.
+func newEventPrefix() string {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(raw[:])
 }
 
 func (r *runtime) openConversation(ctx context.Context, manager *provider.Manager, opts *chatOptions) (*agent.Conversation, error) {
@@ -191,7 +212,7 @@ func newSessionRuntime(store *session.Store, snapshot session.Snapshot, workspac
 		log: appendProgress{
 			turns: len(snapshot.Turns), prompts: len(snapshot.PromptHistory), skills: digests,
 			sequence: snapshot.Sequence, driverState: append(json.RawMessage(nil), snapshot.DriverState...),
-			fingerprints: make(map[session.EventType]string),
+			fingerprints: make(map[session.EventType]string), eventPrefix: newEventPrefix(),
 		},
 	}
 }
@@ -214,7 +235,11 @@ func (s *sessionRuntime) save(snapshot session.Snapshot) error {
 // confirmed. It is only called after a successful append, so the progress always
 // describes what the log actually holds.
 func (s *sessionRuntime) acceptAppended(prepared []session.Event) {
+	confirmed := make(map[string]struct{}, len(prepared))
 	for _, event := range prepared {
+		if event.ID != "" {
+			confirmed[event.ID] = struct{}{}
+		}
 		switch event.Type {
 		case session.EventTurnAppended:
 			s.log.turns++
@@ -239,6 +264,32 @@ func (s *sessionRuntime) acceptAppended(prepared []session.Event) {
 			s.log.sequence = event.Sequence
 		}
 	}
+	// A confirmed event is no longer pending, so a later state that happens to be
+	// identical gets a fresh ID rather than being mistaken for the same event.
+	for identity, eventID := range s.log.pending {
+		if _, ok := confirmed[eventID]; ok {
+			delete(s.log.pending, identity)
+		}
+	}
+}
+
+// eventIDFor returns the stable ID of one logical event. The first attempt
+// assigns it; a retry of an event the log has not confirmed keeps the same ID, so
+// the log can recognize it as a duplicate instead of writing it again.
+func (s *sessionRuntime) eventIDFor(identity string) string {
+	if identity == "" {
+		return ""
+	}
+	if eventID, ok := s.log.pending[identity]; ok {
+		return eventID
+	}
+	if s.log.pending == nil {
+		s.log.pending = make(map[string]string)
+	}
+	s.log.nextEventID++
+	eventID := fmt.Sprintf("%s-%d", s.log.eventPrefix, s.log.nextEventID)
+	s.log.pending[identity] = eventID
+	return eventID
 }
 
 // stateChanged reports whether a state event has to be appended, comparing it
@@ -282,13 +333,25 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	// Only events the log does not already hold are appended. The progress
 	// counters describe confirmed appends, not saved snapshots, so a retry after
 	// a failed save does not duplicate an earlier append.
-	events := make([]session.Event, 0, len(state.Turns)-s.log.turns+4)
+	//
+	// Each logical event also carries an identity, which gives it a stable event
+	// ID across retries.
+	type pendingEvent struct {
+		identity string
+		event    session.Event
+	}
+	pending := make([]pendingEvent, 0, len(state.Turns)-s.log.turns+4)
 	for index := s.log.turns; index < len(state.Turns); index++ {
 		turn := state.Turns[index]
-		events = append(events, session.Event{Type: session.EventTurnAppended, Turn: &turn})
+		pending = append(pending, pendingEvent{identity: "turn:" + turn.ID, event: session.Event{Type: session.EventTurnAppended, Turn: &turn}})
 	}
 	for index := s.log.prompts; index < len(state.PromptHistory); index++ {
-		events = append(events, session.Event{Type: session.EventPromptRecorded, Prompt: state.PromptHistory[index]})
+		// The position is part of the identity, because the same prompt text
+		// submitted twice is a legitimate repeat rather than a duplicate.
+		pending = append(pending, pendingEvent{
+			identity: fmt.Sprintf("prompt:%d", index),
+			event:    session.Event{Type: session.EventPromptRecorded, Prompt: state.PromptHistory[index]},
+		})
 	}
 	agentTasks := append([]tool.AgentTask(nil), s.snapshot.AgentTasks...)
 	if s.agentTasks != nil {
@@ -317,7 +380,7 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	}
 	for _, event := range stateEvents {
 		if s.stateChanged(event) {
-			events = append(events, event)
+			pending = append(pending, pendingEvent{identity: "state:" + string(event.Type) + ":" + eventFingerprint(event), event: event})
 		}
 	}
 	for _, item := range state.ProtectedSkills {
@@ -325,7 +388,16 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 			continue
 		}
 		skillState := skillStateFromProtected(item)
-		events = append(events, session.Event{Type: session.EventSkillActivated, Skill: &skillState})
+		pending = append(pending, pendingEvent{
+			identity: "skill:" + item.Name + ":" + item.Digest,
+			event:    session.Event{Type: session.EventSkillActivated, Skill: &skillState},
+		})
+	}
+	events := make([]session.Event, 0, len(pending))
+	for _, item := range pending {
+		event := item.event
+		event.ID = s.eventIDFor(item.identity)
+		events = append(events, event)
 	}
 	prepared, err := s.append(state.SessionID, events)
 	if err != nil {

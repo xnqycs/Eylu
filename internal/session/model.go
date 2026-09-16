@@ -82,7 +82,12 @@ type Snapshot struct {
 }
 
 type Event struct {
-	Version        int                        `json:"version"`
+	Version int `json:"version"`
+	// ID is the stable identity of one logical event. A retry after an uncertain
+	// append reuses it, so the log can recognize the duplicate instead of writing
+	// the same logical change twice. An event written before IDs existed simply
+	// has no ID.
+	ID             string                     `json:"id,omitempty"`
 	Sequence       uint64                     `json:"sequence"`
 	Type           EventType                  `json:"type"`
 	SessionID      string                     `json:"session_id"`

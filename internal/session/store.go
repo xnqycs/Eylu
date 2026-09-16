@@ -36,6 +36,38 @@ type Store struct {
 	mu        sync.Mutex
 	root      string
 	sequences map[string]uint64
+	// eventIDs indexes every event ID the log already holds, per session, with a
+	// digest of its content. It lets a repeated append be recognized as a retry of
+	// one logical event instead of being written a second time, and it detects the
+	// same ID carrying different content.
+	eventIDs map[string]map[string]storedEvent
+}
+
+// storedEvent is one entry of the per-session event index.
+type storedEvent struct {
+	fingerprint string
+	sequence    uint64
+}
+
+// eventContentFingerprint returns a stable digest of an event's logical content.
+// The fields the store assigns (version, sequence, session ID, timestamp) and the
+// event ID itself are excluded, so a retried event compares equal to the copy the
+// log already holds.
+func eventContentFingerprint(event Event) string {
+	event.Version, event.Sequence, event.SessionID, event.At, event.ID = 0, 0, "", time.Time{}, ""
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+// derivedEventID names an event that was written before stable IDs existed. The
+// derivation matches what the writer would have produced, so old and new logs
+// share one identity space.
+func derivedEventID(sessionID string, sequence uint64) string {
+	return fmt.Sprintf("%s:%d", sessionID, sequence)
 }
 
 func Open(root string) (*Store, error) {
@@ -49,7 +81,7 @@ func Open(root string) (*Store, error) {
 	if err := os.MkdirAll(absolute, 0o700); err != nil {
 		return nil, fmt.Errorf("create session root: %w", err)
 	}
-	return &Store{root: absolute, sequences: make(map[string]uint64)}, nil
+	return &Store{root: absolute, sequences: make(map[string]uint64), eventIDs: make(map[string]map[string]storedEvent)}, nil
 }
 
 func DefaultRoot() string {
@@ -95,6 +127,17 @@ func (s *Store) Create(snapshot Snapshot) (Snapshot, error) {
 	return snapshot, nil
 }
 
+// Append writes events to the log and returns the events the log now holds.
+//
+// An event that carries an ID the log already contains is either a retry of one
+// logical event (the same content) or a conflict (different content). A retry is
+// reported as accepted without writing a second copy, so re-submitting a batch
+// never duplicates a turn, a prompt or a state change. A conflict is refused
+// instead of silently overwriting the stored event.
+//
+// When the write result is uncertain the cached tail and event index are dropped,
+// so the next attempt re-reads and re-confirms the log before it continues the
+// sequence.
 func (s *Store) Append(id string, events []Event) ([]Event, error) {
 	if !ValidID(id) {
 		return nil, fmt.Errorf("invalid session ID %q", id)
@@ -108,6 +151,10 @@ func (s *Store) Append(id string, events []Event) ([]Event, error) {
 	if err != nil {
 		return nil, err
 	}
+	index, err := s.eventIndexLocked(id, directory)
+	if err != nil {
+		return nil, err
+	}
 	sequence, ok := s.sequences[id]
 	if !ok {
 		sequence, err = lastEventSequence(filepath.Join(directory, "events.jsonl"))
@@ -117,10 +164,12 @@ func (s *Store) Append(id string, events []Event) ([]Event, error) {
 	}
 	var encoded bytes.Buffer
 	prepared := make([]Event, len(events))
-	for index, event := range events {
-		sequence++
+	// The index is only merged into the store once the write succeeded, so a
+	// failed attempt never claims an ID the log does not contain.
+	batch := make(map[string]storedEvent, len(events))
+	written := 0
+	for position, event := range events {
 		event.Version = SchemaVersion
-		event.Sequence = sequence
 		event.SessionID = id
 		if event.At.IsZero() {
 			event.At = time.Now().UTC()
@@ -132,30 +181,92 @@ func (s *Store) Append(id string, events []Event) ([]Event, error) {
 			}
 			event.Turn = &turn
 		}
+		// The digest describes exactly what would be written, so a retry of the
+		// same logical event compares equal to the copy already in the log.
+		fingerprint := eventContentFingerprint(event)
+		if event.ID != "" {
+			existing, duplicate := index[event.ID]
+			if !duplicate {
+				existing, duplicate = batch[event.ID]
+			}
+			if duplicate {
+				if existing.fingerprint != fingerprint {
+					return nil, fmt.Errorf("session event ID %q already exists with different content", event.ID)
+				}
+				retried := event
+				retried.Sequence = existing.sequence
+				prepared[position] = retried
+				continue
+			}
+		}
+		sequence++
+		event.Sequence = sequence
+		if event.ID == "" {
+			event.ID = derivedEventID(id, sequence)
+		}
 		line, marshalErr := json.Marshal(event)
 		if marshalErr != nil {
 			return nil, marshalErr
 		}
 		encoded.Write(line)
 		encoded.WriteByte('\n')
-		prepared[index] = event
+		batch[event.ID] = storedEvent{fingerprint: fingerprint, sequence: sequence}
+		prepared[position] = event
+		written++
+	}
+	if written == 0 {
+		return prepared, nil
 	}
 	file, err := os.OpenFile(filepath.Join(directory, "events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
+		s.forgetSessionLocked(id)
 		return nil, err
 	}
 	if _, err = file.Write(encoded.Bytes()); err == nil {
 		err = file.Sync()
 	}
 	closeErr := file.Close()
-	if err != nil {
-		return nil, err
-	}
-	if closeErr != nil {
+	if err != nil || closeErr != nil {
+		// Bytes may already have reached the log, so the cached tail and index are
+		// no longer trustworthy: the next attempt re-reads the log first.
+		s.forgetSessionLocked(id)
+		if err != nil {
+			return nil, err
+		}
 		return nil, closeErr
 	}
 	s.sequences[id] = sequence
+	for eventID, entry := range batch {
+		index[eventID] = entry
+	}
 	return prepared, nil
+}
+
+// forgetSessionLocked invalidates the cached tail and event index of one session.
+func (s *Store) forgetSessionLocked(id string) {
+	delete(s.sequences, id)
+	delete(s.eventIDs, id)
+}
+
+// eventIndexLocked returns the per-session event index, reading the log once.
+func (s *Store) eventIndexLocked(id, directory string) (map[string]storedEvent, error) {
+	if index, ok := s.eventIDs[id]; ok {
+		return index, nil
+	}
+	events, _, _, err := readEventsDetailed(filepath.Join(directory, "events.jsonl"), id)
+	if err != nil {
+		return nil, err
+	}
+	index := make(map[string]storedEvent, len(events))
+	for _, event := range events {
+		eventID := event.ID
+		if eventID == "" {
+			eventID = derivedEventID(id, event.Sequence)
+		}
+		index[eventID] = storedEvent{fingerprint: eventContentFingerprint(event), sequence: event.Sequence}
+	}
+	s.eventIDs[id] = index
+	return index, nil
 }
 
 func (s *Store) Save(snapshot Snapshot) error {
@@ -250,7 +361,32 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 			return Snapshot{}, diagnostics, fmt.Errorf("repair session event tail: %w", err)
 		}
 	}
-	for _, event := range events {
+	// A duplicate event ID is a conservative diagnostic: an identical copy is the
+	// same logical event replayed, so it is not applied twice, and a conflicting
+	// copy is reported instead of being guessed at. The raw log keeps both.
+	seenEventIDs := make(map[string]string, len(events))
+	skip := make(map[int]struct{})
+	for position, event := range events {
+		if event.ID == "" {
+			continue
+		}
+		fingerprint := eventContentFingerprint(event)
+		previous, duplicate := seenEventIDs[event.ID]
+		if !duplicate {
+			seenEventIDs[event.ID] = fingerprint
+			continue
+		}
+		message := fmt.Sprintf("ignored repeated event ID %q at sequence %d", event.ID, event.Sequence)
+		if previous != fingerprint {
+			message = fmt.Sprintf("ignored conflicting content for event ID %q at sequence %d", event.ID, event.Sequence)
+		}
+		diagnostics = append(diagnostics, Diagnostic{Path: eventsPath, Message: message})
+		skip[position] = struct{}{}
+	}
+	for position, event := range events {
+		if _, ignored := skip[position]; ignored {
+			continue
+		}
 		if event.Sequence <= snapshot.Sequence {
 			continue
 		}
