@@ -668,6 +668,12 @@ scripts/verify_selftest.sh
 pwsh -NoProfile -File scripts/verify_selftest.ps1
 ```
 
+### soak 与压力测试
+
+- `internal/tool/soak_test.go` 以"多轮"方式搜索并发缺陷：冲突资源上的并行批次、反复取消、以及**每轮都注入宿主回调故障**（审计 sink 每调用必 panic、checkpoint 每第 3 次意图失败）。默认 6 轮，`EYLU_SOAK_ROUNDS=<n>` 可在本地拉长。
+- 每轮的断言：每个调用都有终态、协调器不残留 waiter/grant、无 goroutine 增长（`runtime.NumGoroutine` 基线回归）、每个调用在日志里恰好一次意图与一次 completion。
+- **泄漏检测器自身有测试**：`TestSoakLeakDetectorNoticesAnUnfinishedGoroutine` 故意留下一个不结束的 goroutine，证明检测器会报出增长——否则"没泄漏"可能只是检测器没工作。
+- 已知局限（写在测试注释里）："同一路径的两个调用不得重叠"这条搜索**尚未被证明会触发**——分别关掉调度器的 `canStartCall`、协调器的冲突判定、以及两者同时关掉，两个同路径调用仍是串行的，产生该串行的机制尚未定位。witness 确认被执行过，所以这是真实搜索而非空转，但**通过不等于该串行路径被验证过**。
 ### 平台相关分支的测试
 
 - `//go:build !windows` 与 `//go:build unix` 的分支（原子替换、目录 fsync、进程组取消）**不会在 Windows 主机上执行**，因此它们的测试也带同样的构建标签：`internal/session/replace_other_test.go`、`internal/tool/process_tree_unix_test.go`。它们在 CI 的 `ubuntu-latest` 与 `macos-latest` 两个 leg 上真实运行，那才是这两条分支的证据来源。

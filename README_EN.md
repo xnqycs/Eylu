@@ -668,6 +668,13 @@ The matching environment variables are `EYLU_MAX_PARALLEL_AGENTS`, `EYLU_CODE_CO
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): third-party components and applicable terms
 - [docs/go-terminal-agent-development-plan.md](docs/go-terminal-agent-development-plan.md): architecture and phased development history (Chinese)
 
+### Soak and stress tests
+
+- `internal/tool/soak_test.go` searches for concurrency defects over many rounds: parallel batches on conflicting resources, repeated cancellation, and **a host-callback fault injected into every round** (the audit sink panics on every call, the checkpoint fails every third intent). Six rounds by default; `EYLU_SOAK_ROUNDS=<n>` lengthens it locally.
+- Every round asserts: each call reached a terminal state, the coordinator holds no waiter or grant, no goroutine was left behind (a `runtime.NumGoroutine` baseline regression), and each call appears in the log exactly once as an intent and once as a completion.
+- **The leak detector has its own test**: `TestSoakLeakDetectorNoticesAnUnfinishedGoroutine` deliberately leaves a goroutine that never finishes and requires the detector to report growth - otherwise "no leak" could just mean the detector is not working.
+- Known limit, written into the test as well: the "two calls on one path must not overlap" search **has not been shown to fire**. Disabling the scheduler's `canStartCall`, the coordinator's conflict predicate, and both together all left the two same-path calls serialized, so the mechanism producing that has not been identified. The witness is proven to be exercised, so the search is real rather than vacuous - but a pass must not be read as proof that the serialization path was tested.
+
 ### Tests for the platform-specific branches
 
 - The `//go:build !windows` and `//go:build unix` branches (atomic replace, directory fsync, process-group cancellation) **never execute on a Windows host**, so their tests carry the same build tags: `internal/session/replace_other_test.go` and `internal/tool/process_tree_unix_test.go`. They really run on the `ubuntu-latest` and `macos-latest` CI legs, and that is where the evidence for those branches comes from.
