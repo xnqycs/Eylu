@@ -51,6 +51,24 @@ type CheckpointSink interface {
 	RecordCompletion(Completion) error
 }
 
+// BatchCheckpointSink lets a sink record the intents of one batch in a single
+// durable write.
+//
+// The guarantee that matters is "no side effect starts before its intent is
+// durable", and one write for the whole batch keeps it exactly: the write happens
+// after every call of the batch is prepared and before any of them starts. Without
+// it the executor falls back to one write per call, which is what every sink did
+// before this interface existed, so a sink is never required to implement it.
+//
+// Completions are deliberately not batched. Merging them would save one write per
+// call, but it would also delay the record of an operation that already happened
+// past the point where the process could die, and for an effect with no file to
+// inspect afterwards that turns a known result into an unknown one. Paying one
+// write per call keeps the record immediate.
+type BatchCheckpointSink interface {
+	RecordIntents([]Intent) error
+}
+
 // Intent describes one execution that is about to start.
 type Intent struct {
 	RequestID    string
@@ -302,6 +320,9 @@ type preparedCall struct {
 	startNotified    bool
 	running          bool
 	done             bool
+	// intentRecorded reports that the batch already wrote this call's intent, so
+	// the per-call path in executePrepared must not write it a second time.
+	intentRecorded bool
 }
 
 type batchCompletion struct {
@@ -474,6 +495,16 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			cancel()
 			hooks = BatchHooks{}
 		}
+	}
+	// The intents of every call that may still run are written together, before
+	// any of them can start. That is the whole point of the batch write: N
+	// side-effecting calls cost one append instead of N, and the guarantee
+	// "the intent is durable before the side effect" is untouched because the
+	// write still completes before the first call starts.
+	if err := e.recordBatchIntents(batchCtx, prepared); err != nil {
+		batchErr = joinBatchError(batchErr, err)
+		cancel()
+		hooks = BatchHooks{}
 	}
 	if completed == len(prepared) {
 		return finalize()
@@ -770,9 +801,10 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 	}
 	// A side-effecting call records its intent before it runs. When that record
 	// cannot be written the call does not start: an operation the host cannot log
-	// must not happen.
+	// must not happen. A batch that already wrote every intent in one append owns
+	// this, so the call is only skipped, not recorded twice.
 	intent := e.executionIntent(prepared)
-	if e.Checkpoint != nil && intent != nil {
+	if e.Checkpoint != nil && intent != nil && !prepared.intentRecorded {
 		if err := e.Checkpoint.RecordIntent(*intent); err != nil {
 			prepared.state = protocol.CallNotExecuted
 			prepared.checkpointErr = &CheckpointError{CallID: prepared.call.ID, Err: err}
@@ -852,6 +884,60 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 		}
 	}
 	return result
+}
+
+// recordBatchIntents writes the intents of every call that may still run in one
+// durable write, and closes the calls whose intent could not be written.
+//
+// A sink that does not implement BatchCheckpointSink is left alone: the per-call
+// path in executePrepared writes its own intent immediately before its call, which
+// is the same guarantee at a higher cost.
+func (e *Executor) recordBatchIntents(ctx context.Context, prepared []*preparedCall) error {
+	if e == nil || e.Checkpoint == nil {
+		return nil
+	}
+	batch, ok := e.Checkpoint.(BatchCheckpointSink)
+	if !ok {
+		return nil
+	}
+	intents := make([]Intent, 0, len(prepared))
+	owners := make([]*preparedCall, 0, len(prepared))
+	for _, item := range prepared {
+		// A call that already reached a terminal state or was cancelled by the
+		// preflight must not be given an intent: the intent is evidence that the
+		// operation may happen, and this one will not.
+		if item == nil || item.terminal != nil || item.running || item.done {
+			continue
+		}
+		if ctx.Err() != nil {
+			continue
+		}
+		intent := e.executionIntent(item)
+		if intent == nil {
+			continue
+		}
+		intents = append(intents, *intent)
+		owners = append(owners, item)
+	}
+	if len(intents) == 0 {
+		return nil
+	}
+	if err := batch.RecordIntents(intents); err != nil {
+		for _, item := range owners {
+			item.state = protocol.CallNotExecuted
+			item.checkpointErr = &CheckpointError{CallID: item.call.ID, Err: err}
+			result := protocol.ToolResult{
+				CallID: item.call.ID, IsError: true, State: protocol.CallNotExecuted,
+				Content: "tool call was not executed: " + (&CheckpointError{CallID: item.call.ID, Err: err}).Error(),
+			}
+			item.terminal = &result
+		}
+		return &CheckpointError{CallID: owners[0].call.ID, Err: err}
+	}
+	for _, item := range owners {
+		item.intentRecorded = true
+	}
+	return nil
 }
 
 // executionIntent builds the lifecycle record of one side-effecting call. A call

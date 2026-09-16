@@ -53,8 +53,22 @@ func (w *WriteFile) Definition() protocol.ToolDefinition {
 
 func (w *WriteFile) Risk() policy.Risk { return policy.RiskWrite }
 
+// previousHashMaxBytes bounds how much of a file is read to record the intent's
+// evidence. Above it the content is not hashed, because the intent is written
+// before every side effect and hashing a large file would charge that cost to
+// every write.
+const previousHashMaxBytes = 4 << 20
+
 // ReportIntent describes the recovery hints of one call without running it: the
-// resolved path and the hash of the content it found there.
+// resolved path and the evidence of what the target held before.
+//
+// Below the size bound that evidence is the hash of the content, which is strong:
+// if the content still matches, the operation provably did not change the target.
+// Above it only the size and modification time are recorded, marked as weak.
+// That evidence is weaker on purpose and the marker says so - a rewrite that
+// preserves both size and timestamp (within the filesystem's granularity) leaves
+// the same marker, so a match is a hint rather than proof, and recovery reports it
+// as weak instead of drawing a firm conclusion from it.
 func (w *WriteFile) ReportIntent(raw json.RawMessage) (string, string) {
 	var input struct {
 		Path             string `json:"path"`
@@ -67,7 +81,25 @@ func (w *WriteFile) ReportIntent(raw json.RawMessage) (string, string) {
 	if err != nil {
 		return input.Path, ""
 	}
-	return path, fileContentHash(path)
+	return path, previousContentEvidence(path)
+}
+
+// weakEvidencePrefix marks evidence that is a size and a timestamp rather than a
+// content hash, so a reader never mistakes it for a hash.
+const weakEvidencePrefix = "weak:"
+
+// previousContentEvidence returns what the target held before the call: the hash
+// of its content when it is small enough to read, a weak size/timestamp marker
+// when it is not, and nothing when it does not exist.
+func previousContentEvidence(path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+	if info.Size() > previousHashMaxBytes {
+		return fmt.Sprintf("%ssize=%d:mtime=%d", weakEvidencePrefix, info.Size(), info.ModTime().Unix())
+	}
+	return fileContentHash(path)
 }
 
 // fileContentHash returns the hash of a file's current content, or an empty

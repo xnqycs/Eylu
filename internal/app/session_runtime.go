@@ -51,7 +51,6 @@ type appendProgress struct {
 	eventPrefix string
 	nextEventID uint64
 }
-
 type sessionRuntime struct {
 	mu sync.Mutex
 	// store persists the event log and the snapshot.
@@ -72,6 +71,10 @@ type sessionRuntime struct {
 	agentTasks   func(string) []tool.AgentTask
 	workspace    string
 	redact       func(string) string
+	// compensations holds completions whose own append failed. The operation
+	// already happened and the in-memory result is kept, so the record is retried
+	// instead of being reported as an unknown outcome forever.
+	compensations []session.ToolCompletion
 }
 
 // eventFingerprint returns a stable digest of one event payload. The volatile
@@ -299,8 +302,9 @@ func (s *sessionRuntime) eventIDFor(identity string) string {
 	// across runs and processes. Using it as the event ID makes the incremental
 	// write of a turn and a later replay of the same turn literally the same
 	// event, which is what lets the log recognize the second one as a retry
-	// instead of writing the turn twice.
-	if strings.HasPrefix(identity, "turn:") {
+	// instead of writing the turn twice. The same holds for an intent or a
+	// completion named after its call: replaying one is the same event.
+	if strings.HasPrefix(identity, "turn:") || strings.HasPrefix(identity, "intent:") || strings.HasPrefix(identity, "completion:") {
 		return identity
 	}
 	if eventID, ok := s.log.pending[identity]; ok {
@@ -429,6 +433,12 @@ func (s *sessionRuntime) Sync(conversation *agent.Conversation, manager *provide
 	// The append is durable now, so the log progress advances here. A later
 	// snapshot failure marks the checkpoint as behind instead of undoing it.
 	s.acceptAppended(prepared)
+	// A completion whose own append failed is retried here, on the first append
+	// that succeeds, so a transient write failure does not leave the intent in the
+	// log as a permanent unknown outcome.
+	if err := s.flushCompensations(); err != nil {
+		return err
+	}
 	next := snapshotFromAgentState(state, s.snapshot)
 	next.AgentTasks = agentTasks
 	next.Sequence = s.log.sequence
@@ -480,6 +490,56 @@ func (s *sessionRuntime) RecordTurn(turn protocol.Turn) error {
 	return nil
 }
 
+// RecordIntents persists the intents of one batch in a single append.
+//
+// One write for the whole batch is what turns 2N appends for N side-effecting
+// calls into one, without weakening the guarantee: the append still completes
+// before the first call of the batch starts, so no side effect can begin before
+// its intent is durable. A batch that cannot be written prevents every call in it
+// from running, which is the same fail-closed rule as the per-call path.
+func (s *sessionRuntime) RecordIntents(intents []tool.Intent) error {
+	if s == nil || len(intents) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at := time.Now().UTC()
+	events := make([]session.Event, 0, len(intents))
+	records := make([]session.ToolIntent, 0, len(intents))
+	for _, intent := range intents {
+		record := session.ToolIntent{
+			RequestID: intent.RequestID, CallID: intent.CallID, ParentCallID: intent.ParentCallID,
+			Tool: intent.Tool, Risk: string(intent.Risk), TargetPath: intent.TargetPath,
+			PreviousHash: intent.PreviousHash, StartedAt: at,
+		}
+		// The identity is the call, so a retry after an uncertain append is the
+		// same event rather than a second intent.
+		events = append(events, session.Event{Type: session.EventToolExecutionIntent, ID: s.eventIDFor("intent:" + intent.CallID), Intent: &record})
+		records = append(records, record)
+	}
+	appended, err := s.append(s.snapshot.SessionID, events)
+	if err != nil {
+		return sessionProtocolError("record tool intents", err)
+	}
+	s.acceptAppended(appended)
+	for _, record := range records {
+		s.rememberPendingIntent(record)
+	}
+	return nil
+}
+
+// rememberPendingIntent mirrors one confirmed intent into the in-memory snapshot,
+// so the next save carries it.
+func (s *sessionRuntime) rememberPendingIntent(record session.ToolIntent) {
+	for index, existing := range s.snapshot.PendingIntents {
+		if existing.CallID == record.CallID {
+			s.snapshot.PendingIntents[index] = record
+			return
+		}
+	}
+	s.snapshot.PendingIntents = append(s.snapshot.PendingIntents, record)
+}
+
 // RecordIntent persists the intent to run one side-effecting call before it
 // starts.
 //
@@ -503,13 +563,7 @@ func (s *sessionRuntime) RecordIntent(intent tool.Intent) error {
 	}
 	s.acceptAppended(events)
 	// The in-memory snapshot mirrors the log, so the next save carries the intent.
-	for index, existing := range s.snapshot.PendingIntents {
-		if existing.CallID == record.CallID {
-			s.snapshot.PendingIntents[index] = record
-			return nil
-		}
-	}
-	s.snapshot.PendingIntents = append(s.snapshot.PendingIntents, record)
+	s.rememberPendingIntent(record)
 	return nil
 }
 
@@ -529,21 +583,70 @@ func (s *sessionRuntime) RecordCompletion(completion tool.Completion) error {
 		IsError: completion.IsError, TargetPath: completion.TargetPath, ResultHash: completion.ResultHash,
 		CompletedAt: time.Now().UTC(),
 	}
-	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolCompleted, Completion: &record}})
+	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolCompleted, ID: s.eventIDFor("completion:" + record.CallID), Completion: &record}})
 	if err != nil {
+		// The operation already happened, so the result is not thrown away: it is
+		// held here and written by the next successful append. Without this, one
+		// transient write failure left the intent in the log forever and the next
+		// load reported a call whose outcome we knew as "unknown".
+		s.compensations = append(s.compensations, record)
 		return sessionProtocolError("record tool completion", err)
 	}
 	s.acceptAppended(events)
-	// A completed execution is no longer pending.
+	s.forgetPendingIntent(record.CallID)
+	return nil
+}
+
+// forgetPendingIntent drops the intent a confirmed completion closed.
+func (s *sessionRuntime) forgetPendingIntent(callID string) {
 	kept := s.snapshot.PendingIntents[:0]
 	for _, intent := range s.snapshot.PendingIntents {
-		if intent.CallID == record.CallID {
+		if intent.CallID == callID {
 			continue
 		}
 		kept = append(kept, intent)
 	}
 	s.snapshot.PendingIntents = kept
+}
+
+// flushCompensations writes the completions whose own append failed.
+//
+// It is called on every append path, so the record of an operation that really
+// happened is retried as soon as the log accepts writes again. The identity of the
+// event is the call, so replaying it is the same event rather than a second
+// completion, and a caller that never manages another append loses nothing that
+// the in-memory result did not already hold.
+func (s *sessionRuntime) flushCompensations() error {
+	if len(s.compensations) == 0 {
+		return nil
+	}
+	events := make([]session.Event, 0, len(s.compensations))
+	for _, record := range s.compensations {
+		compensation := record
+		events = append(events, session.Event{Type: session.EventToolCompleted, ID: s.eventIDFor("completion:" + record.CallID), Completion: &compensation})
+	}
+	appended, err := s.append(s.snapshot.SessionID, events)
+	if err != nil {
+		return sessionProtocolError("record compensating tool completions", err)
+	}
+	s.acceptAppended(appended)
+	for _, record := range s.compensations {
+		s.forgetPendingIntent(record.CallID)
+	}
+	s.compensations = nil
 	return nil
+}
+
+// Compensations reports how many completions are waiting for the log to accept
+// writes. It is a diagnostic: a nonzero value means the in-memory result is ahead
+// of the record.
+func (s *sessionRuntime) Compensations() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.compensations)
 }
 
 // RecordRunReport persists the summary of one finished request, so why it stopped
@@ -599,19 +702,68 @@ func (s *sessionRuntime) PendingIntents() []session.ToolIntent {
 	return append([]session.ToolIntent(nil), s.snapshot.PendingIntents...)
 }
 
-// describePendingIntent renders one started-without-outcome execution as the
-// host reports it. The wording states the uncertainty instead of claiming the
-// operation either happened or did not happen.
+// describePendingIntent renders one started-without-outcome execution as the host
+// reports it.
+//
+// The conclusion is drawn from evidence, not from a guess, and every message says
+// which evidence it rests on:
+//
+//   - the recorded content hash matches what is on disk now, so the operation
+//     cannot have changed the target: it did not happen, with proof.
+//   - the content differs, so something changed the target after the intent was
+//     written. That is not proof that this call did it, so the outcome stays
+//     unknown and a human is asked to confirm.
+//   - there is no hash evidence at all (the target did not exist, or the call
+//     never described one), so the outcome stays unknown and the message says why
+//     rather than implying the file was inspected.
+//
+// It is never replayed in any case.
 func describePendingIntent(intent session.ToolIntent) string {
 	target := strings.TrimSpace(intent.TargetPath)
 	if target == "" {
-		target = "an unknown target"
+		message := fmt.Sprintf("tool %s started but its outcome was not recorded (outcome unknown; it was not replayed)", intent.Tool)
+		if intent.PreviousHash != "" {
+			message += fmt.Sprintf("; its content before the call had hash %s", intent.PreviousHash)
+		}
+		return message
 	}
-	message := fmt.Sprintf("tool %s on %s started but its outcome was not recorded (outcome unknown; it was not replayed)", intent.Tool, target)
-	if intent.PreviousHash != "" {
-		message += fmt.Sprintf("; its content before the call had hash %s", intent.PreviousHash)
+	current, readable := fileHashEvidence(target)
+	// Evidence that is a size and a timestamp rather than a content hash cannot prove
+	// anything: a rewrite that preserves both leaves the same value. It is reported
+	// as a hint and never as a conclusion.
+	weak := strings.HasPrefix(intent.PreviousHash, "weak:")
+	switch {
+	case weak:
+		state := "still matches"
+		if !readable || current != intent.PreviousHash {
+			state = "no longer matches"
+		}
+		return fmt.Sprintf("tool %s on %s started but its outcome was not recorded (outcome unknown: the evidence recorded for the target is weak (%s) - size and modification time, not a content hash - and it %s now, which is a hint and not proof; it was not replayed)", intent.Tool, target, intent.PreviousHash, state)
+	case intent.PreviousHash != "" && readable && current == intent.PreviousHash:
+		return fmt.Sprintf("tool %s on %s did not change its target: the content still matches the hash recorded before the call (%s), so the operation is judged not to have happened (it was not replayed)", intent.Tool, target, intent.PreviousHash)
+	case intent.PreviousHash != "" && readable:
+		return fmt.Sprintf("tool %s on %s started and its target changed after the intent was recorded; the content before the call had hash %s and it now has %s, so the outcome is unknown: this call is not proven to be the cause (it was not replayed)", intent.Tool, target, intent.PreviousHash, current)
+	case intent.PreviousHash != "":
+		return fmt.Sprintf("tool %s on %s started but its outcome was not recorded (outcome unknown: the target cannot be read now, so the hash recorded before the call (%s) cannot be compared; it was not replayed)", intent.Tool, target, intent.PreviousHash)
+	default:
+		return fmt.Sprintf("tool %s on %s started but its outcome was not recorded (outcome unknown: no hash was recorded before the call, so the current content proves nothing; it was not replayed)", intent.Tool, target)
 	}
-	return message
+}
+
+// fileHashEvidence returns the hash of a file's current content, and whether it
+// could be read at all. A directory or a missing file yields no hash, which is an
+// absence of evidence rather than evidence of absence.
+func fileHashEvidence(path string) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), true
 }
 
 func (s *sessionRuntime) AgentTasks() []tool.AgentTask {

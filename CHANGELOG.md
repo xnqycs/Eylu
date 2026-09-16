@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 检查点成本与失败语义：一个批次里 N 个副作用调用的意图合并为一次 append（仍在任何调用开始之前写入），N=3 从 2N=6 次降到 4 次；completion 写入失败时结果保留在内存并进入待补偿队列，下一次成功的 append 补写同一调用 ID 的 completion（事件 ID 由调用 ID 派生，幂等），因此瞬时写失败不再留下永久 `outcome_unknown`；恢复结论改为三态并必须指出依据（内容哈希一致 → 未发生；不一致 → 未知并给出两个哈希；读不到或无哈希 → 未知且说明是无证据），任何情况都不重放；`write_file` 目标超过 4 MiB 时只记录 `weak:size=…:mtime=…` 弱证据并在诊断中明确标注为提示而非证明。
 - 旧日志重复 turn 改为保守诊断：没有事件 ID 的日志在两条序列上写出同一 turn ID 时，内容一致的只应用一份并产出 `benign` 诊断，内容冲突的保留第一份并产出需要人工确认的诊断；两种情况都不改写原始日志。诊断分级后，`benign` 的诊断不再阻断 `--resume`，重复 turn 的错误信息带上会话 ID、turn ID 与恢复建议。
 - 补齐预算与用量口径：新增 `cached_input_tokens`（`protocol.Usage`、`RunUsage` 与运行摘要），各适配器映射 provider 的缓存明细（Chat 的 `prompt_tokens_details`、Responses 的 `input_tokens_details` / `prompt_tokens_details`、Anthropic 的 `cache_read_input_tokens`）；它明确为 `input_tokens` 的子集，不改动预算总额；准入拦截（`max_total_tokens` 小于提示词估算）现在统一记为 `stop_reason=token_budget`，README 给出判断方式与示例。
 - 隔离宿主回调故障：审计 sink 的失败或 panic 不再穿透请求（不改变调用终态、不重试、不阻塞、不杀死请求），计入运行摘要 `audit_failures` 并在首次失败时于 stderr 出一条诊断；事件投递分为关键事件（同步按序、失败即终止请求）与流式增量（可合并、慢消费者超预算时丢弃并计数 `events_dropped`），运行摘要新增 `warnings` 说明这类不影响终态的故障。
