@@ -63,6 +63,21 @@ func eventContentFingerprint(event Event) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// turnContentFingerprint returns a stable digest of what a turn says.
+//
+// The turn ID is the identity being compared, and the timestamp is what the
+// writer happened to record, so neither is part of the content: two copies of the
+// same turn written by different processes differ only in those.
+func turnContentFingerprint(turn protocol.Turn) string {
+	turn.CreatedAt = time.Time{}
+	encoded, err := json.Marshal(turn)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
 // derivedEventID names an event that was written before stable IDs existed. The
 // derivation matches what the writer would have produced, so old and new logs
 // share one identity space.
@@ -365,8 +380,32 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 	// same logical event replayed, so it is not applied twice, and a conflicting
 	// copy is reported instead of being guessed at. The raw log keeps both.
 	seenEventIDs := make(map[string]string, len(events))
+	// A log written before event IDs existed can hold the same turn twice under
+	// two different (or absent) event IDs. The turn ID is what the transcript is
+	// built from, so a repeated one is diagnosed the same conservative way: an
+	// identical copy is merged, a conflicting one is reported and the raw log is
+	// left exactly as it is. Neither case rewrites the file, because the log is
+	// evidence and a guess about which copy is right would destroy it.
+	seenTurnIDs := make(map[string]string, len(events))
 	skip := make(map[int]struct{})
 	for position, event := range events {
+		if event.Type == EventTurnAppended && event.Turn != nil && event.Turn.ID != "" {
+			fingerprint := turnContentFingerprint(*event.Turn)
+			previous, duplicate := seenTurnIDs[event.Turn.ID]
+			if !duplicate {
+				seenTurnIDs[event.Turn.ID] = fingerprint
+			} else {
+				message := fmt.Sprintf("merged turn %q repeated at sequence %d", event.Turn.ID, event.Sequence)
+				benign := true
+				if previous != fingerprint {
+					message = fmt.Sprintf("turn %q at sequence %d repeats an earlier turn ID with different content: the transcript keeps the first copy and the session needs manual confirmation", event.Turn.ID, event.Sequence)
+					benign = false
+				}
+				diagnostics = append(diagnostics, Diagnostic{Path: eventsPath, Message: message, Benign: benign})
+				skip[position] = struct{}{}
+				continue
+			}
+		}
 		if event.ID == "" {
 			continue
 		}
@@ -377,10 +416,12 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 			continue
 		}
 		message := fmt.Sprintf("ignored repeated event ID %q at sequence %d", event.ID, event.Sequence)
+		benign := true
 		if previous != fingerprint {
 			message = fmt.Sprintf("ignored conflicting content for event ID %q at sequence %d", event.ID, event.Sequence)
+			benign = false
 		}
-		diagnostics = append(diagnostics, Diagnostic{Path: eventsPath, Message: message})
+		diagnostics = append(diagnostics, Diagnostic{Path: eventsPath, Message: message, Benign: benign})
 		skip[position] = struct{}{}
 	}
 	for position, event := range events {

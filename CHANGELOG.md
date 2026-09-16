@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 旧日志重复 turn 改为保守诊断：没有事件 ID 的日志在两条序列上写出同一 turn ID 时，内容一致的只应用一份并产出 `benign` 诊断，内容冲突的保留第一份并产出需要人工确认的诊断；两种情况都不改写原始日志。诊断分级后，`benign` 的诊断不再阻断 `--resume`，重复 turn 的错误信息带上会话 ID、turn ID 与恢复建议。
 - 补齐预算与用量口径：新增 `cached_input_tokens`（`protocol.Usage`、`RunUsage` 与运行摘要），各适配器映射 provider 的缓存明细（Chat 的 `prompt_tokens_details`、Responses 的 `input_tokens_details` / `prompt_tokens_details`、Anthropic 的 `cache_read_input_tokens`）；它明确为 `input_tokens` 的子集，不改动预算总额；准入拦截（`max_total_tokens` 小于提示词估算）现在统一记为 `stop_reason=token_budget`，README 给出判断方式与示例。
 - 隔离宿主回调故障：审计 sink 的失败或 panic 不再穿透请求（不改变调用终态、不重试、不阻塞、不杀死请求），计入运行摘要 `audit_failures` 并在首次失败时于 stderr 出一条诊断；事件投递分为关键事件（同步按序、失败即终止请求）与流式增量（可合并、慢消费者超预算时丢弃并计数 `events_dropped`），运行摘要新增 `warnings` 说明这类不影响终态的故障。
 - 会话改为逐 turn 落盘：模型 turn 与工具 turn 一提交就同步写入事件日志，不再等请求结束的同步，运行中途崩溃最多丢掉仍在进行中的那一轮；turn 事件身份即 turn ID，增量写入与随后同步重放是同一个事件 ID，日志识别为重试而不重复；提交钩子失败按持久化故障处理（保留内存结果、不再启动新的副作用、`stop_reason=persistence_failed`）。

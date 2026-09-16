@@ -186,6 +186,11 @@ type Event struct {
 type Diagnostic struct {
 	Path    string `json:"path"`
 	Message string `json:"message"`
+	// Benign reports that the loader resolved the problem without losing
+	// information, so the session is usable exactly as it stands: a repeated event
+	// or turn whose content was identical to the copy already applied. Anything
+	// else needs a human, and a resume refuses it instead of guessing.
+	Benign bool `json:"benign,omitempty"`
 }
 
 type SessionInfo struct {

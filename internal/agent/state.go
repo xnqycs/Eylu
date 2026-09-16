@@ -80,7 +80,7 @@ func RestoreConversation(state ConversationState) (*Conversation, error) {
 	if state.SessionID == "" {
 		return nil, fmt.Errorf("session ID is required")
 	}
-	if err := validateTurns(state.Turns); err != nil {
+	if err := validateTurns(state.SessionID, state.Turns); err != nil {
 		return nil, err
 	}
 	if err := validateTodoListState(state.TodoList); err != nil {
@@ -240,14 +240,20 @@ func repairDanglingToolCalls(turns []protocol.Turn) ([]protocol.Turn, []string) 
 	return repaired, recovered
 }
 
-func validateTurns(turns []protocol.Turn) error {
+// validateTurns refuses a transcript the protocol cannot use.
+//
+// A duplicate turn ID is the one failure a human can actually fix, so its message
+// names the session, the turn and where to look: a replayed turn usually comes
+// from a log written before stable event IDs existed, and the store reports those
+// as diagnostics rather than rewriting them.
+func validateTurns(sessionID string, turns []protocol.Turn) error {
 	seen := make(map[string]struct{}, len(turns))
 	for _, turn := range turns {
 		if turn.ID == "" {
-			return fmt.Errorf("session contains a turn without an ID")
+			return fmt.Errorf("session %s contains a turn without an ID", sessionID)
 		}
 		if _, duplicate := seen[turn.ID]; duplicate {
-			return fmt.Errorf("session contains duplicate turn ID %q", turn.ID)
+			return fmt.Errorf("session %s contains duplicate turn ID %q: the transcript cannot be paired; reload the session with LoadRecovering to have repeated turns merged, and inspect the session event log if two copies disagree", sessionID, turn.ID)
 		}
 		seen[turn.ID] = struct{}{}
 		switch turn.Role {

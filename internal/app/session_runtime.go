@@ -122,9 +122,18 @@ func (r *runtime) openConversation(ctx context.Context, manager *provider.Manage
 		}
 		stored, diagnostics, loadErr := load(id)
 		if loadErr == nil {
-			if resuming && len(diagnostics) > 0 {
-				diagnostic := diagnostics[0]
-				return nil, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("load session %s: %s: %s", id, diagnostic.Path, diagnostic.Message)}
+			// A diagnostic the loader resolved without losing information - a
+			// repeated event or turn identical to the copy already applied - does
+			// not stop a resume. Anything else needs a human before the session is
+			// used, so the resume refuses it and says what it found instead of
+			// guessing.
+			if resuming {
+				for _, diagnostic := range diagnostics {
+					if diagnostic.Benign {
+						continue
+					}
+					return nil, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("load session %s: %s: %s", id, diagnostic.Path, diagnostic.Message)}
+				}
 			}
 			if stored.Workspace != "" && !sameWorkspace(stored.Workspace, workspace) {
 				return nil, &protocol.Error{Code: protocol.ErrConfig, Message: fmt.Sprintf("session %s belongs to workspace %s; select it with --workspace", id, stored.Workspace)}
