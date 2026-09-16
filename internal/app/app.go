@@ -505,6 +505,12 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	if r.output == "jsonl" {
 		return jsonlEncoder.Encode(map[string]any{"type": "response", "response": response})
 	}
+	// A stop reason that is not a genuine completion is stated explicitly, so a
+	// truncated or cancelled answer is never presented as a finished one. The
+	// structured outputs already carry the stop field.
+	if note := agent.StopNote(response.Stop); note != "" {
+		fmt.Fprintf(r.stderr, "[response] %s\n", note)
+	}
 	fmt.Fprintln(r.stdout)
 	return nil
 }

@@ -467,6 +467,28 @@ A batched web query expands one model call into several concurrent executions. T
 - A web activity ID is derived from the host execution identity, so the start and completion projections agree and the UI does not show a duplicate.
 - Result order still follows the original model call order.
 
+### Stop reasons and the request budget
+
+Stop reasons have an explicit handling table, and a non-`tool_use` stop is not a successful completion:
+
+| Stop | Behavior |
+|---|---|
+| `completed` | Normal completion |
+| `tool_use` | The calls are validated and executed |
+| `length` | The partial response is kept and not presented as complete; its calls are not executed and are closed with `not_executed` |
+| `cancelled` | Usable results are kept and the request ends |
+| `error` | An explicit failure is returned |
+| Unknown value | Protocol error; the response is not written to the transcript |
+| Turn limit reached | A recoverable history is kept and the caller is told the request did not complete normally |
+| Budget exhausted | No further model request is started, and committed calls are closed |
+
+- A length truncation is not continued automatically. When truncation leaves tool arguments incomplete, that call is not treated as executable: the arguments are recorded as an empty object and the call is closed with `not_executed`, an unpairable call is dropped, and the partial answer is kept.
+- The Responses adapter reads the envelope `status` and `incomplete_details`: `incomplete` maps to `length` (whether the cause was the token limit or a content filter), `failed` and `cancelled` map to `error` and `cancelled`, and an unrecognized status is never treated as a completion.
+- Text output states a truncation or cancellation on stderr, while `json`, `jsonl` and the TUI expose the structured `stop` field.
+- The request-level budget covers the main model calls, the context-compaction summaries and the context-recovery retries. Every model call passes a pre-request admission check against the estimated input plus the output reserve, and the provider's real usage calibrates the totals afterwards; a missing usage marks the totals as an estimated lower bound.
+- Reasoning tokens are recorded separately and never counted twice, because every adapter already includes them in its output tokens. The response returned by `Run` still describes only the last call; the accumulated usage is exposed separately through `LoopOptions.Usage` (`RunUsage`).
+- The current drivers do not forward a remaining output limit to the provider, so the budget is soft: Eylu stops starting new requests once the limit is reached, but a single call may still overshoot. A subagent keeps running after the parent request ends, so its cost is reported separately instead of being folded into the same synchronous budget.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

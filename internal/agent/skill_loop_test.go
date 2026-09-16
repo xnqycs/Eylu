@@ -93,7 +93,7 @@ func TestAgentSkillActivationResourceAndProtectedContext(t *testing.T) {
 	runtime := testRuntime(model, 1)
 	runtime.SkillCatalog = registry.Catalog()
 	conversation := NewConversation()
-	response, err := conversation.Run(context.Background(), "use the demo skill", runtime, executor, LoopOptions{MaxTurns: 5, MaxTotalTokens: 1000}, false, nil)
+	response, err := conversation.Run(context.Background(), "use the demo skill", runtime, executor, LoopOptions{MaxTurns: 5, MaxTotalTokens: 1_000_000}, false, nil)
 	if err != nil || response.Turn.Parts[0].Text != "skill complete" || model.request != 4 {
 		t.Fatalf("response=%#v requests=%d err=%v", response, model.request, err)
 	}

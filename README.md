@@ -438,6 +438,28 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 - Web 活动 ID 由宿主执行身份派生，因此启动与完成两次投影结果一致，UI 不会重复显示。
 - 结果顺序仍按原始模型调用顺序。
 
+### 停止原因与请求预算
+
+停止原因有明确处理表，非 `tool_use` 不等于成功完成：
+
+| 停止原因 | 行为 |
+|---|---|
+| `completed` | 正常完成 |
+| `tool_use` | 校验调用后进入执行 |
+| `length` | 保留部分响应，不冒充完成；其中的工具调用不执行并补 `not_executed` |
+| `cancelled` | 保留可用结果，结束请求 |
+| `error` | 返回明确失败 |
+| 未知取值 | 协议错误，响应不写入 transcript |
+| 轮数耗尽 | 保留可恢复历史，明确说明未正常完成 |
+| 预算耗尽 | 不再启动新的模型请求，并闭合已提交调用 |
+
+- 长度截断默认不自动续写。截断导致工具参数不完整时，该调用不会被当作可执行调用：参数按空对象记录并补 `not_executed`，无法配对的调用会被丢弃，部分回答仍然保留。
+- Responses 适配器会读取响应封装体的 `status` 与 `incomplete_details`：`incomplete` 映射为 `length`（不区分 token 上限或内容过滤），`failed` 与 `cancelled` 分别映射为 `error` 与 `cancelled`，无法识别的 status 不视为完成。
+- 文本输出会在 stderr 说明截断或取消；`json`、`jsonl` 与 TUI 直接暴露结构化 `stop` 字段。
+- 请求级预算覆盖主模型调用、上下文压缩摘要与上下文恢复重试。每次模型调用前按估算输入与输出预留做准入检查，返回后用真实 usage 校准；usage 缺失时标记为估算下界。
+- reasoning token 单独记录但不重复计入预算（各适配器已包含在输出 token 中）。`Run` 返回的响应用量仍只描述最后一次调用；累计用量通过 `LoopOptions.Usage`（`RunUsage`）单独暴露。
+- 当前 driver 不向 provider 传递剩余输出上限，因此预算是软预算：额度用尽后不再发起新请求，但单次调用仍可能超出。子代理在父请求结束后继续运行，其费用单独统计，不并入同一同步预算。
+
 ### 代码上下文与后台子代理
 
 `read_file` 支持 1-based 闭区间参数 `start_line`、`end_line`，并返回 `file_hash`、`slice_hash`、`artifact_id` 和续读游标 `next_start_line`。`search_code` 共享会话级增量三元组索引，支持 `offset` 分页和 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前会替换为稳定引用。

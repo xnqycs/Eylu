@@ -57,7 +57,7 @@ func TestAgentLoopParallelCallsAndToolFailureContinue(t *testing.T) {
 	model := &loopDriver{parallel: true}
 	executor := &tool.Executor{Registry: tool.NewRegistry(echoTool{}), Policy: policy.AllowAllChecker{}}
 	conversation := NewConversation()
-	response, err := conversation.Run(context.Background(), "parallel", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, nil)
+	response, err := conversation.Run(context.Background(), "parallel", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, nil)
 	if err != nil || response.Turn.Parts[0].Text != "done" {
 		t.Fatalf("response = %#v, err = %v", response, err)
 	}
@@ -84,7 +84,7 @@ func TestAgentLoopTranscriptAndToolResultPairing(t *testing.T) {
 	runtime.Provider.Config.ReasoningEffort = "high"
 	executor := &tool.Executor{Registry: tool.NewRegistry(echoTool{}), Policy: policy.AllowAllChecker{}, Workspace: t.TempDir()}
 	events := make([]protocol.EventKind, 0)
-	response, err := conversation.Run(context.Background(), "use echo", runtime, executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, func(event protocol.ModelEvent) error {
+	response, err := conversation.Run(context.Background(), "use echo", runtime, executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, func(event protocol.ModelEvent) error {
 		events = append(events, event.Kind)
 		return nil
 	})
@@ -160,12 +160,12 @@ func TestAgentLoopContinuesAfterRejectionWithReason(t *testing.T) {
 func TestAgentLoopLimitsAndDuplicateIDs(t *testing.T) {
 	executor := &tool.Executor{Registry: tool.NewRegistry(echoTool{}), Policy: policy.AllowAllChecker{}}
 	always := &loopDriver{always: true}
-	_, err := NewConversation().Run(context.Background(), "loop", testRuntime(always, 1), executor, LoopOptions{MaxTurns: 2, MaxTotalTokens: 100}, false, nil)
+	_, err := NewConversation().Run(context.Background(), "loop", testRuntime(always, 1), executor, LoopOptions{MaxTurns: 2, MaxTotalTokens: 1_000_000}, false, nil)
 	if typed, ok := err.(*protocol.Error); !ok || !strings.Contains(typed.Message, "iteration limit") {
 		t.Fatalf("iteration error = %#v", err)
 	}
 	duplicate := &loopDriver{duplicate: true}
-	_, err = NewConversation().Run(context.Background(), "duplicate", testRuntime(duplicate, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, nil)
+	_, err = NewConversation().Run(context.Background(), "duplicate", testRuntime(duplicate, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, nil)
 	if typed, ok := err.(*protocol.Error); !ok || !strings.Contains(typed.Message, "duplicate tool call ID") {
 		t.Fatalf("duplicate error = %#v", err)
 	}

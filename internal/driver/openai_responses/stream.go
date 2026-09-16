@@ -245,7 +245,7 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 					return err
 				}
 			}
-		case "response.completed":
+		case "response.completed", "response.incomplete":
 			converted := convertResponse(event.Response)
 			streamCitations = collectStreamWebState(&converted, webActivities, startedWebOrder, streamCitations)
 			for _, callID := range startedWebOrder {

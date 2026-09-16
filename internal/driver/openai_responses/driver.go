@@ -151,8 +151,34 @@ type responseBody struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+	// IncompleteDetails explains why an incomplete envelope stopped early, for
+	// example "max_output_tokens" or "content_filter".
+	IncompleteDetails *struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
 	Output []responseItem `json:"output"`
 	Usage  *responseUsage `json:"usage"`
+}
+
+// stopFromStatus maps the response envelope status to a stop reason.
+//
+// An incomplete envelope is a response the provider stopped early, so it must
+// never be reported as a normal completion: the caller keeps the partial answer
+// and does not present it as finished.
+func stopFromStatus(status, incompleteReason string) protocol.StopKind {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed":
+		return protocol.StopError
+	case "cancelled", "canceled":
+		return protocol.StopCancelled
+	case "incomplete":
+		return protocol.StopLength
+	case "", "completed":
+		return protocol.StopCompleted
+	default:
+		// An unrecognized status is not proof of completion.
+		return protocol.StopLength
+	}
 }
 
 type responseWebAction struct {
@@ -477,9 +503,14 @@ func systemTurnDigests(turns []protocol.Turn) map[string]string {
 }
 
 func convertResponse(decoded responseBody) protocol.ModelResponse {
+	incompleteReason := ""
+	if decoded.IncompleteDetails != nil {
+		incompleteReason = decoded.IncompleteDetails.Reason
+	}
+	status := stopFromStatus(decoded.Status, incompleteReason)
 	result := protocol.ModelResponse{
 		Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()},
-		Stop: protocol.StopCompleted,
+		Stop: status,
 	}
 	if decoded.Usage != nil {
 		result.Usage = protocol.Usage{
@@ -510,7 +541,11 @@ func convertResponse(decoded responseBody) protocol.ModelResponse {
 			}
 			call := protocol.ToolCall{ID: callID, Name: item.Name, Arguments: json.RawMessage(item.Arguments)}
 			result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &call})
-			result.Stop = protocol.StopToolUse
+			// A truncated or failed envelope keeps its own stop reason: the calls
+			// it carried must not be executed.
+			if status == protocol.StopCompleted {
+				result.Stop = protocol.StopToolUse
+			}
 		case "web_search_call", "web_fetch_call", "openrouter_web_search_call", "openrouter_web_fetch_call":
 			activity := webActivityFromItem(item, decoded.Usage)
 			lastWebCall = activity.CallID

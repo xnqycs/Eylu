@@ -71,7 +71,11 @@ func optionsForRuntime(runtime Runtime) contextOptions {
 	return options
 }
 
-func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition) (contextledger.PromptResult, error) {
+// prepareRequestContext builds the request context and, when the context window
+// requires it, compacts the conversation. A compaction summary is a model call
+// inside the same request, so its usage is reported through onSummaryUsage to the
+// caller's budget.
+func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, error) {
 	options := optionsForRuntime(runtime)
 	c.ledger.SetEstimator(options.estimator)
 	c.refreshProjectMap(runtime)
@@ -85,6 +89,11 @@ func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtim
 			var event contextledger.CompressionEvent
 			var err error
 			prepared, event, err = c.compactPrepared(ctx, runtime, definitions, options, prepared, "auto", false)
+			// A summary call is part of this request even when the compaction it
+			// was meant to produce is rejected, so its usage is always reported.
+			if onSummaryUsage != nil && (event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0) {
+				onSummaryUsage(event.Usage)
+			}
 			if err != nil {
 				return contextledger.PromptResult{}, err
 			}
@@ -202,6 +211,9 @@ func (c *Conversation) compactPrepared(ctx context.Context, runtime Runtime, def
 
 	strategy := "model"
 	semantic, usage, semanticErr := c.buildSemanticSummary(ctx, runtime, options, newlyOmitted, stagedSummary)
+	// The summary call already happened, so its usage belongs to the request even
+	// when the compaction is later rejected or falls back.
+	event.Usage = usage
 	if semanticErr != nil {
 		if ctx.Err() != nil {
 			if runtime.ContextEvent != nil {
@@ -238,7 +250,6 @@ func (c *Conversation) compactPrepared(ctx context.Context, runtime Runtime, def
 	event.OmittedTurns = len(newlyOmitted)
 	event.SummaryBytes = len([]byte(semantic))
 	event.DurationMS = time.Since(started).Milliseconds()
-	event.Usage = usage
 	c.ledger.ReplaceBlocks(final.Blocks)
 	c.ledger.RecordCompression(event)
 	if runtime.ContextEvent != nil {

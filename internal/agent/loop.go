@@ -22,9 +22,26 @@ type LoopOptions struct {
 	MaxTotalTokens int
 	RequestID      string
 	BeforeModel    func() string
+	// Usage, when non-nil, receives the accumulated usage of this run. The
+	// response returned by Run keeps its own usage, which describes only the
+	// final model call.
+	Usage *RunUsage
 }
 
 var ErrRequestInterrupted = errors.New("request interrupted by user")
+
+// StopNote describes a stop reason that must not be presented as a normal
+// completion. It returns an empty string for a genuine completion.
+func StopNote(stop protocol.StopKind) string {
+	switch stop {
+	case protocol.StopLength:
+		return "the provider stopped the response before it finished, so the answer may be incomplete"
+	case protocol.StopCancelled:
+		return "the provider reported that the response was cancelled"
+	default:
+		return ""
+	}
+}
 
 func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, executor *tool.Executor, options LoopOptions, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	c.mu.Lock()
@@ -59,10 +76,20 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 	c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 	c.rebuildLedger(runtime)
 	seenCalls := make(map[string]struct{})
-	totalTokens := 0
+	budget := newBudgetTracker(options.MaxTotalTokens)
+	if options.Usage != nil {
+		*options.Usage = RunUsage{}
+	}
 	requestID := options.RequestID
 	if requestID == "" {
 		requestID = uuid.NewString()
+	}
+	// reportUsage publishes the accumulated usage, so a caller never has to
+	// mistake the final model call's usage for the whole request.
+	reportUsage := func() {
+		if options.Usage != nil {
+			*options.Usage = budget.report()
+		}
 	}
 	var last protocol.ModelResponse
 	for iteration := 0; iteration < maxTurns; iteration++ {
@@ -90,14 +117,18 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 		c.rebuildLedger(runtime)
 		parallelToolCalls := executor.ParallelLimit() > 1 && driver.CapabilitiesFor(runtime.Driver, capabilityTarget(runtime)).ParallelTools
-		response, effectiveRuntime, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit)
+		response, effectiveRuntime, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit, budget)
 		if err != nil {
-			return protocol.ModelResponse{}, err
+			// The last usable response is preserved, so a caller that stops on a
+			// budget still sees the work that did happen.
+			reportUsage()
+			return last, err
 		}
 		// Validate before committing: a malformed response must not become part
 		// of the history the next request is built from.
 		response, err = normalizeModelResponse(response, seenCalls)
 		if err != nil {
+			reportUsage()
 			c.driverState = nil
 			c.rebuildLedger(runtime)
 			return last, err
@@ -116,33 +147,50 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 		if err := recordHostedWebActivities(executor, runtime, requestID, response.Turn, plan, webBudget); err != nil {
 			closePending("tool call was not executed: hosted web activity was rejected")
+			reportUsage()
 			return last, err
 		}
-		totalTokens += response.Usage.InputTokens + response.Usage.OutputTokens
-		if options.MaxTotalTokens > 0 && totalTokens > options.MaxTotalTokens {
+		budget.add(callMain, response.Usage)
+		if budget.exceeded() {
+			// The request spent more than it was allowed to. The response that
+			// caused it is kept and its calls are closed without executing, so the
+			// history stays usable and no side effect runs on an exhausted budget.
 			closePending("tool call was not executed: the request token budget was exhausted before execution")
-			return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "agent token budget exceeded"}
+			reportUsage()
+			return last, budgetError(options.MaxTotalTokens, false)
 		}
-		if response.Stop != protocol.StopToolUse {
-			// A truncated or interrupted response may still carry a partial tool
-			// call. It is never executed here, but it is closed so the next
-			// request never contains an unresolved call.
-			closePending("tool call was not executed: the model response stopped before tool use")
+		// The stop reason decides what happens next. Only a genuine completion or a
+		// tool-use request is a normal outcome; everything else is reported as
+		// such instead of being presented as a completion.
+		switch response.Stop {
+		case protocol.StopCompleted:
+			reportUsage()
 			return response, nil
+		case protocol.StopLength, protocol.StopCancelled:
+			closePending("tool call was not executed: " + StopNote(response.Stop))
+			reportUsage()
+			return response, nil
+		case protocol.StopError:
+			closePending("tool call was not executed: the provider reported a failed response")
+			reportUsage()
+			return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model reported a failed response"}
 		}
 		if len(calls) == 0 {
 			closePending("tool call was not executed: the model requested tool use without tool calls")
+			reportUsage()
 			return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model stopped for tool use without tool calls"}
 		}
 		toolTurn := protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleTool, CreatedAt: time.Now().UTC()}
 		runtime, err = c.refreshMCPRuntime(runtime, executor, baseTools)
 		if err != nil {
 			closePending("tool call was not executed: the tool registry could not be refreshed")
+			reportUsage()
 			return last, err
 		}
 		plan, err = c.resolveWebRuntime(runtime, executor, webBudget)
 		if err != nil {
 			closePending("tool call was not executed: web tools could not be resolved")
+			reportUsage()
 			return last, err
 		}
 		definitions = plan.Definitions
@@ -214,11 +262,14 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		// so an external tool cannot interrupt or abort the host request.
 		switch batchOutcome.Control {
 		case protocol.ControlInterruptRequest:
+			reportUsage()
 			return last, ErrRequestInterrupted
 		case protocol.ControlCancelRequest, protocol.ControlAbortRequest:
+			reportUsage()
 			return last, batchOutcome.Cause
 		}
 	}
+	reportUsage()
 	return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("agent iteration limit exceeded (%d)", maxTurns)}
 }
 

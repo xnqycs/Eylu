@@ -107,13 +107,17 @@ func TestRunBudgetExceededClosesCommittedToolCalls(t *testing.T) {
 	item := &countingEchoTool{}
 	model := &funcDriver{name: "loop", generate: func(number int, _ driver.Request) (protocol.ModelResponse, error) {
 		if number == 1 {
-			return toolUseResponse("agent-1", protocol.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)}), nil
+			response := toolUseResponse("agent-1", protocol.ToolCall{ID: "call-1", Name: "echo", Arguments: json.RawMessage(`{}`)})
+			// The provider reports far more usage than the request was allowed.
+			response.Usage = protocol.Usage{InputTokens: 5_000, OutputTokens: 5_000, Exact: true}
+			return response, nil
 		}
 		return textResponse("agent-"+strconv.Itoa(number), "done"), nil
 	}}
 	executor := &tool.Executor{Registry: tool.NewRegistry(item), Policy: policy.AllowAllChecker{}}
 	conversation := NewConversation()
-	_, err := conversation.Run(context.Background(), "budget", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 5}, false, nil)
+	// The budget admits the first call and is exceeded by its real usage.
+	_, err := conversation.Run(context.Background(), "budget", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 4000}, false, nil)
 	var protocolErr *protocol.Error
 	if !errors.As(err, &protocolErr) || !strings.Contains(protocolErr.Message, "token budget") {
 		t.Fatalf("err = %v", err)
@@ -132,13 +136,36 @@ func TestRunBudgetExceededClosesCommittedToolCalls(t *testing.T) {
 	}
 
 	// The session keeps working, and the next request has no dangling call.
-	response, err := conversation.Run(context.Background(), "again", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, nil)
+	response, err := conversation.Run(context.Background(), "again", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, nil)
 	if err != nil || response.Stop != protocol.StopCompleted {
 		t.Fatalf("response = %#v, err = %v", response, err)
 	}
 	assertPairedCalls(t, conversation.Transcript())
 	for _, request := range model.recorded() {
 		assertPairedCalls(t, request.Model.Turns)
+	}
+}
+
+// A request that cannot fit in its budget is refused before the model is called
+// at all, and the caller still receives the previous response.
+func TestRunRefusesModelCallThatCannotFitTheBudget(t *testing.T) {
+	model := &funcDriver{name: "loop", generate: func(int, driver.Request) (protocol.ModelResponse, error) {
+		return textResponse("agent-1", "should not run"), nil
+	}}
+	executor := &tool.Executor{Registry: tool.NewRegistry(&countingEchoTool{}), Policy: policy.AllowAllChecker{}}
+	conversation := NewConversation()
+	_, err := conversation.Run(context.Background(), "tiny", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1}, false, nil)
+	var protocolErr *protocol.Error
+	if !errors.As(err, &protocolErr) || !strings.Contains(protocolErr.Message, "token budget") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(model.recorded()) != 0 {
+		t.Fatalf("the model was called %d times", len(model.recorded()))
+	}
+	// The user message stays, so the session is still usable.
+	turns := conversation.Transcript()
+	if len(turns) != 1 || turns[0].Role != protocol.RoleUser {
+		t.Fatalf("turns = %#v", turns)
 	}
 }
 
@@ -278,7 +305,7 @@ func TestRunResultCallbackFailureKeepsSuccessAndClosesRemaining(t *testing.T) {
 	executor := &tool.Executor{Registry: tool.NewRegistry(item), Policy: policy.AllowAllChecker{}, MaxParallelTools: 1}
 	conversation := NewConversation()
 	sinkErr := errors.New("event sink closed")
-	_, err := conversation.Run(context.Background(), "callback", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, func(event protocol.ModelEvent) error {
+	_, err := conversation.Run(context.Background(), "callback", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, func(event protocol.ModelEvent) error {
 		if event.Kind == protocol.EventToolResult {
 			return sinkErr
 		}
@@ -427,14 +454,14 @@ func TestExportRestoreAndRunKeepsPairing(t *testing.T) {
 	}}
 	executor := &tool.Executor{Registry: tool.NewRegistry(item), Policy: policy.AllowAllChecker{}}
 	conversation := NewConversation()
-	if _, err := conversation.Run(context.Background(), "first", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, nil); err != nil {
+	if _, err := conversation.Run(context.Background(), "first", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	restored, err := RestoreConversation(conversation.ExportState())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := restored.Run(context.Background(), "second", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 100}, false, nil); err != nil {
+	if _, err := restored.Run(context.Background(), "second", testRuntime(model, 1), executor, LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	assertPairedCalls(t, restored.Transcript())

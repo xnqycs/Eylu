@@ -248,7 +248,7 @@ func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime,
 	}
 	c.appendUser(prompt)
 	c.toolDefinitions = nil
-	response, effectiveRuntime, err := c.generate(ctx, runtime, nil, false, stream, emit)
+	response, effectiveRuntime, err := c.generate(ctx, runtime, nil, false, stream, emit, nil)
 	if err != nil {
 		return protocol.ModelResponse{}, err
 	}
@@ -405,7 +405,12 @@ func (c *Conversation) appendUser(prompt string) {
 // generate builds one request and calls the model. It returns the response
 // before it is committed, together with the runtime that was actually used, so
 // the caller decides whether the response may become part of the history.
-func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, parallelToolCalls, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, Runtime, error) {
+//
+// The budget covers the whole request: the main call, any context-compaction
+// summary and any context-recovery retry. A model call is only started after the
+// pre-request admission check, and the provider's real usage calibrates the
+// totals afterwards.
+func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, parallelToolCalls, stream bool, emit driver.EmitFunc, budget *BudgetTracker) (protocol.ModelResponse, Runtime, error) {
 	if runtime.LimitResolver != nil {
 		resolved, err := runtime.LimitResolver.Resolve(ctx, runtime.Provider, runtime.APIKey)
 		if err != nil {
@@ -415,9 +420,16 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 	}
 	responseStarted := false
 	for attempt := 0; attempt <= 3; attempt++ {
-		prepared, err := c.prepareRequestContext(ctx, runtime, definitions)
+		prepared, err := c.prepareRequestContext(ctx, runtime, definitions, func(usage protocol.Usage) {
+			budget.add(callSummary, usage)
+		})
 		if err != nil {
 			return protocol.ModelResponse{}, runtime, err
+		}
+		// Admission check: a call that cannot fit in the remaining budget is not
+		// started at all.
+		if !budget.admits(prepared.InputTokens(), runtime.OutputReserveTokens) {
+			return protocol.ModelResponse{}, runtime, budgetError(budget.limit, true)
 		}
 		request := driver.Request{
 			BaseURL:           runtime.Provider.Config.BaseURL,
@@ -459,6 +471,9 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 		if err != nil {
 			var providerError *protocol.Error
 			if errors.As(err, &providerError) && providerError.Code == protocol.ErrContextWindow && !visible && runtime.LimitResolver != nil && attempt < 3 {
+				// A context-recovery retry is part of the same request, so it is
+				// counted against the same budget.
+				budget.add(callRetry, protocol.Usage{})
 				runtime.Provider = runtime.LimitResolver.LearnOverflow(runtime.Provider, providerError.ContextLimit)
 				c.driverState = nil
 				continue
@@ -493,8 +508,14 @@ func normalizeModelResponse(response protocol.ModelResponse, seenCalls map[strin
 	if response.Turn.Role != protocol.RoleAgent {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned a turn with role %q", response.Turn.Role)}
 	}
+	// executeToolUse reports whether this response is expected to run its calls.
+	// A truncated, cancelled or failed response may still carry a partial call:
+	// that call is kept so the model sees it closed, but it is never executed and
+	// a part that cannot be paired at all is dropped so the history stays usable.
+	executeToolUse := response.Stop == protocol.StopToolUse
 	calls := 0
 	local := make(map[string]struct{})
+	parts := make([]protocol.Part, 0, len(response.Turn.Parts))
 	for index, part := range response.Turn.Parts {
 		switch part.Kind {
 		case protocol.PartToolCall:
@@ -502,28 +523,48 @@ func normalizeModelResponse(response protocol.ModelResponse, seenCalls map[strin
 				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned an empty tool call at part %d", index)}
 			}
 			call := *part.ToolCall
-			if call.ID == "" {
-				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned a tool call without an ID"}
-			}
-			if call.Name == "" {
+			switch {
+			case call.ID == "":
+				if executeToolUse {
+					return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned a tool call without an ID"}
+				}
+				continue
+			case call.Name == "" && executeToolUse:
 				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned tool call %q without a name", call.ID)}
 			}
-			if !json.Valid(call.Arguments) {
-				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned tool call %q with invalid JSON arguments", call.ID)}
-			}
 			if _, duplicate := local[call.ID]; duplicate {
-				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned duplicate tool call ID %q", call.ID)}
+				if executeToolUse {
+					return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned duplicate tool call ID %q", call.ID)}
+				}
+				continue
+			}
+			if _, duplicate := seenCalls[call.ID]; duplicate {
+				if executeToolUse {
+					return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("duplicate tool call ID %q", call.ID)}
+				}
+				continue
+			}
+			if !json.Valid(call.Arguments) {
+				if executeToolUse {
+					return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned tool call %q with invalid JSON arguments", call.ID)}
+				}
+				// A length or cancellation cut can truncate the arguments in the
+				// middle. The call is kept, with unusable arguments, so the caller
+				// can close it with a terminal state instead of dropping the
+				// partial answer the model did produce.
+				call.Arguments = json.RawMessage(`{}`)
 			}
 			local[call.ID] = struct{}{}
-			if _, duplicate := seenCalls[call.ID]; duplicate {
-				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("duplicate tool call ID %q", call.ID)}
-			}
 			calls++
+			part.ToolCall = &call
+			parts = append(parts, part)
 		case protocol.PartText, protocol.PartReasoning, protocol.PartToolResult, protocol.PartWebActivity, protocol.PartCitation:
+			parts = append(parts, part)
 		default:
 			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned a part with unknown kind %q", part.Kind)}
 		}
 	}
+	response.Turn.Parts = parts
 	switch response.Stop {
 	case protocol.StopToolUse:
 		if calls == 0 {
@@ -536,9 +577,10 @@ func normalizeModelResponse(response protocol.ModelResponse, seenCalls map[strin
 			// that never happened.
 			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model reported completion while returning tool calls"}
 		}
+	case protocol.StopLength, protocol.StopCancelled, protocol.StopError:
+		// The caller closes any call this response carried without executing it.
 	default:
-		// A truncated or interrupted response may still carry a partial tool
-		// call. The caller closes those calls without executing them.
+		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned an unknown stop reason %q", response.Stop)}
 	}
 	return response, nil
 }
