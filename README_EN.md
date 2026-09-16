@@ -290,6 +290,21 @@ eylu --mode plan
 
 In the TUI, press `Shift+Tab` to cycle through all four modes. A mode change made during a run takes effect on the next turn.
 
+### Read-only command classification and policy composition
+
+`plan` mode only allows commands that can be proven free of side effects, and the `auto` mode allowlist prefix does not bypass that check.
+
+- A command line is parsed segment by segment, and it is classified read-only only when every segment is proven side-effect free.
+- Arguments are validated per command. `find -delete`, `-exec`, `-execdir`, `-fprint`; `git branch -d`, `-D`, `-m`, `-M`, `-c`, `-C`, `--delete`, `--set-upstream-to`; `git diff`/`git log`/`git show --ext-diff`, `--textconv`, `--output`, `--show-signature`; `git grep -O`; and `git -c`, `--config-env`, `--exec-path`, `--paginate` are reported as dangerous rather than read-only.
+- Short options are case sensitive, so `pwd -P` stays read-only while `git grep -O` is dangerous.
+- Inputs that cannot be interpreted reliably fall back to unknown: unterminated quotes, variable or command substitution (`$VAR`, `$(...)`), pipes, redirections, backticks, and any argument to a command from `read_only_commands` that has no built-in argument rules. `plan` mode denies unknown, while `manual` and `auto` require confirmation according to their own rules.
+- Policy is layered: non-relaxable prohibitions, mode defaults, tool-domain policy (such as the independent web permission), and explicit approvals. An explicit global prohibition is never relaxed by tool-level policy, and a zero or unrecognized decision is always treated as a denial.
+- Audit records keep the mode, the matched rule, the final decision, and the override source.
+
+Behavior change: argument forms that were previously allowed by a command prefix alone (`find . -delete`, `git branch -D`, `git diff --ext-diff`) are now reported as dangerous or unknown.
+
+Command classification is application-level policy, not an operating-system sandbox: `working_directory` only selects where a command starts, it does not restrict which paths the command can reach.
+
 ## Skills and MCP
 
 Eylu discovers Agent Skills in this order:

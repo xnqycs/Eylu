@@ -96,12 +96,20 @@ func (t *LocalTool) Definition() protocol.ToolDefinition {
 func (t *LocalTool) Risk() policy.Risk  { return policy.RiskNetwork }
 func (t *LocalTool) ParallelSafe() bool { return true }
 
+// OverridePolicy applies the independently configured web permission. Web
+// access is a domain the operator grants separately, so this decision replaces
+// the workspace mode decision. It is still composed through policy.Compose, so
+// it can never relax a non-relaxable workspace prohibition, and the audit keeps
+// the session mode and the override source.
 func (t *LocalTool) OverridePolicy(json.RawMessage) (policy.Outcome, bool) {
 	permission := strings.ToLower(strings.TrimSpace(t.permission))
 	if permission == "" {
 		permission = config.WebPermissionAllow
 	}
-	outcome := policy.Outcome{Risk: policy.RiskNetwork, Classification: policy.CommandNotApplicable, Reason: "web access policy"}
+	outcome := policy.Outcome{
+		Risk: policy.RiskNetwork, Classification: policy.CommandNotApplicable,
+		Source: policy.SourceTool, Rule: "web_permission:" + permission, Reason: "web access policy",
+	}
 	switch permission {
 	case config.WebPermissionAllow:
 		outcome.Decision = policy.DecisionAllow

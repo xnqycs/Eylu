@@ -49,6 +49,9 @@ type AuditRecord struct {
 	ExitCode            int                 `json:"exit_code,omitempty"`
 	Mode                string              `json:"mode"`
 	Classification      policy.CommandClass `json:"classification"`
+	PolicyRule          string              `json:"policy_rule,omitempty"`
+	PolicySource        string              `json:"policy_source,omitempty"`
+	PolicyOverride      string              `json:"policy_override_ignored,omitempty"`
 	Confirmations       int                 `json:"confirmations"`
 	Warning             bool                `json:"warning"`
 	SkillName           string              `json:"skill_name,omitempty"`
@@ -367,16 +370,22 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 		checker = policy.BaselineChecker{}
 	}
 	policyRequest := policy.Request{Tool: call.Name, Input: call.Arguments, Workspace: e.Workspace, Risk: item.Risk()}
-	outcome := checker.Check(ctx, policyRequest)
-	if override, ok := item.(PolicyOverride); ok {
-		if domainOutcome, applied := override.OverridePolicy(call.Arguments); applied {
-			outcome = domainOutcome
+	var override *policy.Outcome
+	if toolOverride, ok := item.(PolicyOverride); ok {
+		if domainOutcome, applied := toolOverride.OverridePolicy(call.Arguments); applied {
+			override = &domainOutcome
 		}
 	}
+	// The workspace layer keeps a non-relaxable prohibition, the mode and the
+	// risk; a tool-level policy may only decide inside its own granted domain.
+	// An unrecognized decision fails closed instead of executing.
+	outcome := policy.Compose(checker.Check(ctx, policyRequest), override)
 	prepared.outcome = outcome
 	prepared.record.Risk, prepared.record.Decision, prepared.record.Reason = outcome.Risk, outcome.Decision, outcome.Reason
 	prepared.record.Mode, prepared.record.Classification, prepared.record.Warning = outcome.Mode.String(), outcome.Classification, outcome.Warning
+	prepared.record.PolicyRule, prepared.record.PolicySource, prepared.record.PolicyOverride = outcome.Rule, string(outcome.Source), outcome.Override
 	switch outcome.Decision {
+	case policy.DecisionAllow:
 	case policy.DecisionDeny:
 		result := protocol.ToolResult{CallID: call.ID, Content: "permission denied: " + outcome.Reason, IsError: true}
 		prepared.terminal = &result
@@ -414,6 +423,12 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 			prepared.record.Confirmations++
 		}
 		prepared.record.Confirmed = true
+	default:
+		// Defense in depth: Compose already fails closed, but an unrecognized
+		// decision must never reach a tool execution.
+		result := protocol.ToolResult{CallID: call.ID, Content: "permission denied: unrecognized policy decision", IsError: true}
+		prepared.terminal = &result
+		return prepared
 	}
 	prepared.input = call.Arguments
 	if !schemaHasProperty(item.Definition().InputSchema, "reason") {

@@ -261,6 +261,21 @@ eylu --mode plan
 
 TUI 中可通过 `Shift+Tab` 在四种模式间循环。运行期间的切换会在下一轮生效。
 
+### 只读命令判定与权限组合
+
+`plan` 模式只放行能够证明无副作用的命令；`auto` 模式的白名单前缀不会绕过这一判定。
+
+- 命令按命令行逐段解析，只有每一段都能证明无副作用时才归类为只读。
+- 参数按命令单独校验。`find` 的 `-delete`、`-exec`、`-execdir`、`-fprint`，`git branch` 的 `-d`、`-D`、`-m`、`-M`、`-c`、`-C`、"`--delete`"、"`--set-upstream-to`"，`git diff`/`git log`/`git show` 的 `--ext-diff`、`--textconv`、`--output`、`--show-signature`，`git grep -O`，以及 `git -c`、`--config-env`、`--exec-path`、`--paginate` 等参数被判定为高危，而不是只读。
+- 只读命令的短选项区分大小写，因此 `pwd -P` 是只读，`git grep -O` 会被判定为高危。
+- 无法可靠解释的输入回退为 unknown：未闭合引号、变量或命令替换（`$VAR`、`$(...)`）、管道、重定向、反引号，以及在 `read_only_commands` 中自定义、但没有内置参数规则的命令所携带的参数。`plan` 模式拒绝 unknown，`manual`/`auto` 按各自模式要求确认。
+- 权限分层为：不可绕过的禁止规则、模式默认策略、工具领域策略（例如 Web 独立权限）、显式审批结果。明确的全局禁止不会被工具级策略放宽；零值或无法识别的权限决策一律按拒绝处理。
+- 审计记录保留模式、命中的规则、最终决策和覆盖来源。
+
+行为变化：此前仅按命令前缀无条件放行的参数形式（如 `find . -delete`、`git branch -D`、`git diff --ext-diff`）现在会被判定为高危或 unknown。
+
+命令分类只是应用层策略，不等同于操作系统沙箱：`working_directory` 只决定命令的启动目录，不限制命令自身能访问的路径。
+
 ## Skills 与 MCP
 
 Eylu 按以下优先级发现 Agent Skills：
