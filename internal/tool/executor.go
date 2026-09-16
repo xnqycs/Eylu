@@ -62,6 +62,7 @@ type AuditRecord struct {
 	ProviderGeneration  uint64              `json:"provider_generation,omitempty"`
 	Model               string              `json:"model,omitempty"`
 	CallID              string              `json:"call_id"`
+	ParentCallID        string              `json:"parent_call_id,omitempty"`
 	BatchID             string              `json:"batch_id,omitempty"`
 	BatchIndex          int                 `json:"batch_index"`
 	Tool                string              `json:"tool"`
@@ -438,7 +439,7 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 
 func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time) (prepared *preparedCall) {
 	prepared = &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}}
-	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
+	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, ParentCallID: call.ParentCallID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
 	if e != nil {
 		prepared.record.SessionID, prepared.record.ProviderName = e.SessionID, e.ProviderName
 		prepared.record.ProviderGeneration, prepared.record.Model = e.ProviderGeneration, e.Model
@@ -566,7 +567,7 @@ func cancelledExecution(prepared *preparedCall, err error) protocol.ToolResult {
 
 func (e *Executor) cancelledPrepared(requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time, message string) *preparedCall {
 	prepared := &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}, state: protocol.CallNotExecuted}
-	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
+	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, ParentCallID: call.ParentCallID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
 	if e != nil {
 		prepared.record.SessionID, prepared.record.ProviderName = e.SessionID, e.ProviderName
 		prepared.record.ProviderGeneration, prepared.record.Model = e.ProviderGeneration, e.Model

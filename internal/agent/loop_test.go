@@ -555,10 +555,18 @@ func TestAgentLoopFansOutRelayBatchWebSearchConcurrentlyAndCollapsesResult(t *te
 	if len(results) != 1 || results[0].CallID != "search-batch" || results[0].IsError || len(activities) != 6 {
 		t.Fatalf("tool turn = %#v", toolTurn)
 	}
+	// The collapsed result is reported under the model call ID, while every
+	// activity carries a host-owned execution identity that is never derived from
+	// it.
+	seenActivities := make(map[string]bool, len(activities))
 	for index, query := range []string{"one", "two", "three", "four", "five", "six"} {
-		if !strings.Contains(results[0].Content, query) || activities[index].Query != query || activities[index].CallID != fmt.Sprintf("search-batch:%d", index+1) {
+		if !strings.Contains(results[0].Content, query) || activities[index].Query != query {
 			t.Fatalf("query[%d]=%q result=%#v activity=%#v", index, query, results[0], activities[index])
 		}
+		if !strings.HasPrefix(activities[index].CallID, "exec-") || strings.Contains(activities[index].CallID, "search-batch") || seenActivities[activities[index].CallID] {
+			t.Fatalf("activity[%d] identity = %q", index, activities[index].CallID)
+		}
+		seenActivities[activities[index].CallID] = true
 	}
 	started := make(map[string]bool)
 	completed := make(map[string]bool)

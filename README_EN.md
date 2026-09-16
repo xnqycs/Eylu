@@ -457,6 +457,16 @@ Conflict detection uses one canonical resource key, and Bash, the file tools, th
 - When a resource identity cannot be established (empty path, unknown resource kind, unknown access mode) the call falls back to exclusive execution.
 - Known boundaries: hard links and other aliases that reach one file through different paths, a UNC path versus the mapped drive letter, and per-directory case sensitivity on Windows are not recognized; those cases degrade to serial execution.
 
+### Web fan-out and execution identity
+
+A batched web query expands one model call into several concurrent executions. Three identities are kept apart:
+
+- The model call ID is supplied by the model and is only used to pair a result with the provider protocol; the collapsed tool result still carries the parent call ID.
+- The execution ID is allocated by the host, is never built from a model-controllable ID, and skips every model call ID already used in the turn. A model that returns both `a` and `a:1` therefore cannot make the fan-out of `a` collide with `a:1`.
+- The parent call ID is recorded explicitly on the tool call and in the audit record. Events, audit entries and child results use the execution ID and carry the parent relation; no code parses a string prefix to infer it.
+- A web activity ID is derived from the host execution identity, so the start and completion projections agree and the UI does not show a duplicate.
+- Result order still follows the original model call order.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

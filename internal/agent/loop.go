@@ -148,7 +148,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		definitions = plan.Definitions
 		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 		c.rebuildLedger(runtime)
-		expansion := expandToolCalls(calls, plan)
+		expansion := expandToolCalls(calls, plan, newExecutionAllocator(callIDs(calls)))
 		hooks := tool.BatchHooks{}
 		if emit != nil {
 			hooks.OnStart = func(call protocol.ToolCall) error {
@@ -165,7 +165,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 						part := &parts[index]
 						switch {
 						case part.WebActivity != nil:
-							if part.WebActivity.CallID != info.callID {
+							if part.WebActivity.CallID != activityCallID(info.executionID, 0) {
 								started := *part.WebActivity
 								started.Status = protocol.WebStatusRunning
 								started.Error = ""
@@ -420,7 +420,10 @@ type expandedWebCall struct {
 	childIndex  int
 	kind        protocol.ToolKind
 	value       string
-	callID      string
+	// executionID is the host-owned identity of this execution.
+	executionID string
+	// parentCallID is the model call ID of the request that produced it.
+	parentCallID string
 }
 
 type toolCallExpansion struct {
@@ -429,7 +432,13 @@ type toolCallExpansion struct {
 	web            map[string]expandedWebCall
 }
 
-func expandToolCalls(calls []protocol.ToolCall, plan webtool.ResolvedWebToolPlan) toolCallExpansion {
+// expandToolCalls turns one model response into the calls the executor runs.
+//
+// A call the host expands into several executions gets a host-owned execution ID;
+// the model call ID is only kept as the explicit parent relation and as the ID the
+// collapsed result is reported under. Calls the host does not expand are already
+// provider-level calls, so their model ID is their execution identity.
+func expandToolCalls(calls []protocol.ToolCall, plan webtool.ResolvedWebToolPlan, allocator *executionAllocator) toolCallExpansion {
 	expansion := toolCallExpansion{
 		calls: make([]protocol.ToolCall, 0, len(calls)), parentChildren: make([][]int, len(calls)),
 		web: make(map[string]expandedWebCall),
@@ -446,7 +455,7 @@ func expandToolCalls(calls []protocol.ToolCall, plan webtool.ResolvedWebToolPlan
 			expansion.calls = append(expansion.calls, call)
 			expansion.parentChildren[parentIndex] = append(expansion.parentChildren[parentIndex], index)
 			if isWeb {
-				expansion.web[call.ID] = expandedWebCall{parentIndex: parentIndex, kind: resolved.Definition.Kind, callID: call.ID}
+				expansion.web[call.ID] = expandedWebCall{parentIndex: parentIndex, kind: resolved.Definition.Kind, executionID: call.ID, parentCallID: call.ID}
 			}
 			continue
 		}
@@ -455,17 +464,15 @@ func expandToolCalls(calls []protocol.ToolCall, plan webtool.ResolvedWebToolPlan
 			field = "url"
 		}
 		for childIndex, value := range values {
-			childID := call.ID
-			if len(values) > 1 {
-				childID = fmt.Sprintf("%s:%d", call.ID, childIndex+1)
-			}
+			executionID := allocator.allocate()
 			arguments, _ := json.Marshal(map[string]any{field: value, "_eylu_batch_id": call.ID})
-			child := protocol.ToolCall{ID: childID, Name: call.Name, Arguments: arguments}
+			child := protocol.ToolCall{ID: executionID, Name: call.Name, Arguments: arguments, ParentCallID: call.ID}
 			index := len(expansion.calls)
 			expansion.calls = append(expansion.calls, child)
 			expansion.parentChildren[parentIndex] = append(expansion.parentChildren[parentIndex], index)
-			expansion.web[childID] = expandedWebCall{
-				parentIndex: parentIndex, childIndex: childIndex, kind: resolved.Definition.Kind, value: value, callID: childID,
+			expansion.web[executionID] = expandedWebCall{
+				parentIndex: parentIndex, childIndex: childIndex, kind: resolved.Definition.Kind, value: value,
+				executionID: executionID, parentCallID: call.ID,
 			}
 		}
 	}
@@ -669,7 +676,7 @@ func webPartsForResult(info expandedWebCall, result protocol.ToolResult) []proto
 		_ = json.Unmarshal(result.StructuredContent, &payload)
 	}
 	if len(payload.Activities) == 0 {
-		activity := webActivityForCall(protocol.ToolCall{ID: info.callID}, info)
+		activity := webActivityForCall(protocol.ToolCall{ID: info.executionID}, info)
 		activity.Status = protocol.WebStatusCompleted
 		if result.IsError {
 			activity.Status = protocol.WebStatusError
@@ -682,10 +689,10 @@ func webPartsForResult(info expandedWebCall, result protocol.ToolResult) []proto
 	for index, source := range payload.Activities {
 		activity := source
 		providerCallID := activity.CallID
-		activity.CallID = info.callID
-		if index > 0 {
-			activity.CallID = fmt.Sprintf("%s:%d", info.callID, index+1)
-		}
+		// The activity identity is derived from the host-owned execution identity,
+		// so it is stable across projections and can never collide with a model
+		// call ID.
+		activity.CallID = activityCallID(info.executionID, index)
 		if providerCallID != "" {
 			callIDs[providerCallID] = activity.CallID
 		}
@@ -722,7 +729,7 @@ func webPartsForResult(info expandedWebCall, result protocol.ToolResult) []proto
 		if mapped := callIDs[citation.CallID]; mapped != "" {
 			citation.CallID = mapped
 		} else {
-			citation.CallID = info.callID
+			citation.CallID = activityCallID(info.executionID, 0)
 		}
 		parts = append(parts, protocol.Part{Kind: protocol.PartCitation, Citation: &citation})
 	}
@@ -758,4 +765,15 @@ func toolCalls(turn protocol.Turn) []protocol.ToolCall {
 		}
 	}
 	return result
+}
+
+// callIDs lists the model call IDs of one response. They are reserved for the
+// execution allocator, so a host execution can never take an identity the model
+// already used.
+func callIDs(calls []protocol.ToolCall) []string {
+	ids := make([]string, 0, len(calls))
+	for _, call := range calls {
+		ids = append(ids, call.ID)
+	}
+	return ids
 }

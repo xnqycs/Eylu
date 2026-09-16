@@ -47,6 +47,11 @@ type ToolCall struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+	// ParentCallID records the model call that produced this call when the host
+	// expanded one model call into several executions. It is host-owned and never
+	// taken from the model, so a provider never sees it and no caller has to parse
+	// a string to recover the parent relation.
+	ParentCallID string `json:"parent_call_id,omitempty"`
 }
 
 type ToolCallDelta struct {
