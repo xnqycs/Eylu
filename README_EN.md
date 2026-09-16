@@ -516,7 +516,9 @@ Stop reasons have an explicit handling table, and a non-`tool_use` stop is not a
   With it on, that response is executed as `tool_use` and recorded as `accept_tool_calls_with_stop` on the response, in the run report (`interop`) and in the audit trail. It is configured per provider and covers only this one row: a failed response, a cancelled one and an unrecognized value are never relaxed. Turning it on makes a response that used to "look successful" actually run its calls, so enable it only after confirming what the gateway means.
 - Text output states a truncation or cancellation on stderr, while `json`, `jsonl` and the TUI expose the structured `stop` field.
 - The request-level budget covers the main model calls, the context-compaction summaries and the context-recovery retries. Every model call passes a pre-request admission check against the estimated input plus the output reserve, and the provider's real usage calibrates the totals afterwards; a missing usage marks the totals as an estimated lower bound.
+- **Admission semantics.** The estimated input plus the output reserve has to fit in what is left of the budget, otherwise that call is not started at all: the request is refused before the model is called. Setting `max_total_tokens` below the estimated prompt therefore fails the request outright instead of spending one call first. How to tell: the run summary records `stop_reason: token_budget`, the error is `agent token budget exhausted before the next model call` and carries the limit, and stderr shows it. With `max_total_tokens = 1000` and an estimated prompt of 1200, the model is never called.
 - Reasoning tokens are recorded separately and never counted twice, because every adapter already includes them in its output tokens. The response returned by `Run` still describes only the last call; the accumulated usage is exposed separately through `LoopOptions.Usage` (`RunUsage`).
+- **Cache accounting.** `cached_input_tokens` is a **subset** of `input_tokens`, never an addition: every provider counts a cached prompt token in its input tokens as well, so the figure exists to tell a cache hit from a miss for cost accounting and does not change what the budget is charged. A provider that reports no cache breakdown leaves it at 0, which does not make the usage inexact. Both `RunUsage` and the run summary expose it.
 - The current drivers do not forward a remaining output limit to the provider, so the budget is soft: Eylu stops starting new requests once the limit is reached, but a single call may still overshoot. A subagent keeps running after the parent request ends, so its cost is reported separately instead of being folded into the same synchronous budget.
 
 ### Tightening safety settings while a request runs
@@ -566,7 +568,7 @@ Every finished request writes a summary into the session log (a `run_reported` e
 
 - Stop reason: the model's stop reason, or `iteration_limit`, `token_budget`, `cancelled`, `abort_request`, `event_sink_failed`.
 - Counters: model calls, tool executions, and the separate counts of `succeeded`, `failed`, `rejected`, `cancelled`, `not_executed` and `outcome_unknown`.
-- Usage: input, output and reasoning tokens plus whether they are exact; also exposed to the host through `LoopOptions.Report`.
+- Usage: input, output, reasoning and cached-input tokens plus whether they are exact; also exposed to the host through `LoopOptions.Report`.
 - Recovery diagnostics: the call IDs this request closed with `outcome_unknown`.
 
 The summary never contains a plaintext key or a sensitive request header, and tool arguments and content still follow the existing redaction, truncation and externalization rules.

@@ -212,8 +212,14 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		response, effectiveRuntime, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit, budget)
 		if err != nil {
 			// The last usable response is preserved, so a caller that stops on a
-			// budget still sees the work that did happen.
-			return finish(protocol.ModelResponse{}, last, err, stopAborted)
+			// budget still sees the work that did happen. A budget stop is reported
+			// as such whether the limit was hit by a call or by the admission check
+			// that refused to start one.
+			stop := stopAborted
+			if errors.Is(err, ErrTokenBudget) {
+				stop = stopTokenBudget
+			}
+			return finish(protocol.ModelResponse{}, last, err, stop)
 		}
 		// Validate before committing: a malformed response must not become part
 		// of the history the next request is built from.

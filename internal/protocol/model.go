@@ -293,6 +293,13 @@ type Usage struct {
 	OutputTokens    int  `json:"output_tokens"`
 	ReasoningTokens int  `json:"reasoning_tokens,omitempty"`
 	Exact           bool `json:"exact"`
+	// CachedInputTokens is the part of InputTokens the provider served from its
+	// own cache. It is a subset, never an addition: every supported provider
+	// counts a cached prompt token in its input tokens as well, so adding this to
+	// the totals would count it twice. It is reported so cost accounting can tell
+	// a cache hit from a miss, and it stays 0 when the provider does not report
+	// it, which leaves Exact unaffected.
+	CachedInputTokens int `json:"cached_input_tokens,omitempty"`
 }
 
 type ModelResponse struct {

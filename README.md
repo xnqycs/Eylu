@@ -489,7 +489,9 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 - Responses 适配器不需要该开关：该方言用 `status: "completed"` 表达正常的函数调用，没有独立的工具调用状态，因此这一形状本来就按 `tool_use` 处理。
 - 文本输出会在 stderr 说明截断或取消；`json`、`jsonl` 与 TUI 直接暴露结构化 `stop` 字段。
 - 请求级预算覆盖主模型调用、上下文压缩摘要与上下文恢复重试。每次模型调用前按估算输入与输出预留做准入检查，返回后用真实 usage 校准；usage 缺失时标记为估算下界。
+- **准入语义**：估算输入 + 输出预留必须能装进剩余额度，否则该次调用根本不发起——请求在调用模型之前就被拒。因此把 `max_total_tokens` 设得比提示词估算还小，请求会直接失败而不是先花掉一次调用。判断方式：运行摘要 `stop_reason=token_budget`，错误信息为 `agent token budget exhausted before the next model call` 并带上额度，stderr 也会显示该错误。例如 `max_total_tokens = 1000` 而提示词估算已是 1200，请求不会调用模型。
 - reasoning token 单独记录但不重复计入预算（各适配器已包含在输出 token 中）。`Run` 返回的响应用量仍只描述最后一次调用；累计用量通过 `LoopOptions.Usage`（`RunUsage`）单独暴露。
+- **缓存 token 口径**：`cached_input_tokens` 是 `input_tokens` 的**子集**，不是额外增量——各 provider 都把命中缓存的提示词 token 计入 input tokens，所以它只用于区分命中与未命中（成本核算），不改动预算总额。provider 不报缓存明细时为 0，且不影响 `exact`。`RunUsage` 与运行摘要都暴露该字段。
 - 当前 driver 不向 provider 传递剩余输出上限，因此预算是软预算：额度用尽后不再发起新请求，但单次调用仍可能超出。子代理在父请求结束后继续运行，其费用单独统计，不并入同一同步预算。
 
 ### 运行中安全收紧
@@ -539,7 +541,7 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 
 - 停止原因：模型停止原因，或 `iteration_limit`、`token_budget`、`cancelled`、`abort_request`、`event_sink_failed`。
 - 计数：模型调用次数、工具执行次数，以及 `succeeded`、`failed`、`rejected`、`cancelled`、`not_executed`、`outcome_unknown` 各自的数量。
-- 用量：输入/输出/reasoning token 与是否精确；同时通过 `LoopOptions.Report` 暴露给宿主。
+- 用量：输入/输出/reasoning/缓存命中 token 与是否精确；同时通过 `LoopOptions.Report` 暴露给宿主。
 - 恢复诊断：本次请求中以 `outcome_unknown` 关闭的调用 ID。
 
 同一份摘要不会包含明文密钥或敏感请求头；工具参数与正文仍遵循既有的脱敏、截断与外部化规则。

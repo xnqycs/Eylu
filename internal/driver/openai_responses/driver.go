@@ -238,8 +238,28 @@ type responseUsage struct {
 	OutputDetail struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"output_tokens_details"`
+	// InputDetail carries the cache breakdown. A cached input token is already
+	// inside input_tokens, so it is reported separately rather than added.
+	InputDetail struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+	// PromptDetail is the same breakdown under the Chat Completions name, which
+	// some gateways emit on this endpoint.
+	PromptDetail struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 	WebSearchCalls int `json:"web_search_calls"`
 	WebFetchCalls  int `json:"web_fetch_calls"`
+}
+
+// cachedInputTokens reads the cache breakdown whichever name the provider used.
+// A provider that reports neither leaves it at 0, which is a missing figure
+// rather than an inexact one.
+func (u responseUsage) cachedInputTokens() int {
+	if u.InputDetail.CachedTokens > 0 {
+		return u.InputDetail.CachedTokens
+	}
+	return u.PromptDetail.CachedTokens
 }
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
@@ -514,7 +534,8 @@ func convertResponse(decoded responseBody, acceptToolCallsWithStop bool) (protoc
 	if decoded.Usage != nil {
 		result.Usage = protocol.Usage{
 			InputTokens: decoded.Usage.InputTokens, OutputTokens: decoded.Usage.OutputTokens,
-			ReasoningTokens: decoded.Usage.OutputDetail.ReasoningTokens, Exact: true,
+			ReasoningTokens:   decoded.Usage.OutputDetail.ReasoningTokens,
+			CachedInputTokens: decoded.Usage.cachedInputTokens(), Exact: true,
 		}
 	}
 	lastWebCall := ""

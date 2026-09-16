@@ -171,6 +171,7 @@ func aggregateNativeResponse(target *protocol.ModelResponse, next protocol.Model
 	target.Usage.InputTokens += next.Usage.InputTokens
 	target.Usage.OutputTokens += next.Usage.OutputTokens
 	target.Usage.ReasoningTokens += next.Usage.ReasoningTokens
+	target.Usage.CachedInputTokens += next.Usage.CachedInputTokens
 	target.Usage.Exact = target.Usage.Exact || next.Usage.Exact
 	target.DriverState = append(target.DriverState[:0], next.DriverState...)
 	// A relaxation the provider needed belongs to the response that used it, so
@@ -400,6 +401,21 @@ type nativeError struct {
 type nativeUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// CacheReadInputTokens is the Anthropic name for the cached part of the
+	// prompt. InputDetail is the Responses name for the same figure; a provider
+	// that reports either one still counts it inside input_tokens.
+	CacheReadInputTokens int `json:"cache_read_input_tokens"`
+	InputDetail          struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+}
+
+// cachedInputTokens reads the cache breakdown whichever name the dialect used.
+func (u nativeUsage) cachedInputTokens() int {
+	if u.CacheReadInputTokens > 0 {
+		return u.CacheReadInputTokens
+	}
+	return u.InputDetail.CachedTokens
 }
 
 type nativeItem struct {
@@ -454,7 +470,7 @@ func convertOutputItems(raw []byte, acceptToolCallsWithStop bool) (protocol.Mode
 	if decoded.Error != nil {
 		return protocol.ModelResponse{}, protocol.ClassifyProviderMessage(decoded.Error.Message)
 	}
-	result := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted, Usage: protocol.Usage{InputTokens: decoded.Usage.InputTokens, OutputTokens: decoded.Usage.OutputTokens, Exact: decoded.Usage.InputTokens > 0 || decoded.Usage.OutputTokens > 0}}
+	result := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted, Usage: protocol.Usage{InputTokens: decoded.Usage.InputTokens, OutputTokens: decoded.Usage.OutputTokens, CachedInputTokens: decoded.Usage.cachedInputTokens(), Exact: decoded.Usage.InputTokens > 0 || decoded.Usage.OutputTokens > 0}}
 	lastCall := ""
 	for _, item := range decoded.Output {
 		switch {
@@ -534,6 +550,10 @@ type anthropicEnvelope struct {
 			WebSearchRequests int `json:"web_search_requests"`
 			WebFetchRequests  int `json:"web_fetch_requests"`
 		} `json:"server_tool_use"`
+		// CacheReadInputTokens is the cached part of the prompt. It is already
+		// inside input_tokens, so it is reported separately rather than added.
+		CacheReadInputTokens int `json:"cache_read_input_tokens"`
+		CacheCreationInput   int `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 	Error *nativeError `json:"error"`
 }
@@ -562,7 +582,7 @@ func convertAnthropic(raw []byte, acceptToolCallsWithStop bool) (protocol.ModelR
 	if decoded.Error != nil {
 		return protocol.ModelResponse{}, protocol.ClassifyProviderMessage(decoded.Error.Message)
 	}
-	result := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted, Usage: protocol.Usage{InputTokens: decoded.Usage.InputTokens, OutputTokens: decoded.Usage.OutputTokens, Exact: true}}
+	result := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted, Usage: protocol.Usage{InputTokens: decoded.Usage.InputTokens, OutputTokens: decoded.Usage.OutputTokens, CachedInputTokens: decoded.Usage.CacheReadInputTokens, Exact: true}}
 	activities := make(map[string]*protocol.WebActivity)
 	order := make([]string, 0)
 	for _, content := range decoded.Content {

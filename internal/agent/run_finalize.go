@@ -38,6 +38,9 @@ type RunReport struct {
 	ReasoningTokens int  `json:"reasoning_tokens,omitempty"`
 	ExactUsage      bool `json:"exact_usage"`
 	EstimatedUsage  bool `json:"estimated_usage"`
+	// CachedInputTokens is the part of InputTokens the providers served from their
+	// own cache, for cost accounting. It is a subset, so the budget is unaffected.
+	CachedInputTokens int `json:"cached_input_tokens,omitempty"`
 
 	// AuditFailures counts host audit records that could not be delivered. A
 	// nonzero value means the audit trail is incomplete for this request, and the
@@ -220,6 +223,7 @@ func (f *runFinalizer) publish(stop string, err error) {
 	f.report.InputTokens = usage.InputTokens
 	f.report.OutputTokens = usage.OutputTokens
 	f.report.ReasoningTokens = usage.ReasoningTokens
+	f.report.CachedInputTokens = usage.CachedInputTokens
 	f.report.ExactUsage = usage.Exact
 	f.report.EstimatedUsage = usage.Estimated
 	f.report.RecoveredCalls = f.conversation.RecoveryNotes()

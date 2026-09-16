@@ -129,6 +129,12 @@ type chatResponse struct {
 		CompletionDetail struct {
 			ReasoningTokens int `json:"reasoning_tokens"`
 		} `json:"completion_tokens_details"`
+		// PromptDetail carries the cache breakdown. A cached prompt token is
+		// already inside prompt_tokens, so it is reported separately rather than
+		// added to the totals.
+		PromptDetail struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
@@ -629,7 +635,12 @@ func boundedRaw(raw []byte) json.RawMessage {
 }
 
 func usageFromChat(decoded chatResponse) protocol.Usage {
-	return protocol.Usage{InputTokens: decoded.Usage.PromptTokens, OutputTokens: decoded.Usage.CompletionTokens, ReasoningTokens: decoded.Usage.CompletionDetail.ReasoningTokens, Exact: true}
+	return protocol.Usage{
+		InputTokens: decoded.Usage.PromptTokens, OutputTokens: decoded.Usage.CompletionTokens,
+		ReasoningTokens:   decoded.Usage.CompletionDetail.ReasoningTokens,
+		CachedInputTokens: decoded.Usage.PromptDetail.CachedTokens,
+		Exact:             true,
+	}
 }
 
 // stopReasonFromFinishReason translates the Chat Completions finish_reason

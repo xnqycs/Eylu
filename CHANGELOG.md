@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 补齐预算与用量口径：新增 `cached_input_tokens`（`protocol.Usage`、`RunUsage` 与运行摘要），各适配器映射 provider 的缓存明细（Chat 的 `prompt_tokens_details`、Responses 的 `input_tokens_details` / `prompt_tokens_details`、Anthropic 的 `cache_read_input_tokens`）；它明确为 `input_tokens` 的子集，不改动预算总额；准入拦截（`max_total_tokens` 小于提示词估算）现在统一记为 `stop_reason=token_budget`，README 给出判断方式与示例。
 - 隔离宿主回调故障：审计 sink 的失败或 panic 不再穿透请求（不改变调用终态、不重试、不阻塞、不杀死请求），计入运行摘要 `audit_failures` 并在首次失败时于 stderr 出一条诊断；事件投递分为关键事件（同步按序、失败即终止请求）与流式增量（可合并、慢消费者超预算时丢弃并计数 `events_dropped`），运行摘要新增 `warnings` 说明这类不影响终态的故障。
 - 会话改为逐 turn 落盘：模型 turn 与工具 turn 一提交就同步写入事件日志，不再等请求结束的同步，运行中途崩溃最多丢掉仍在进行中的那一轮；turn 事件身份即 turn ID，增量写入与随后同步重放是同一个事件 ID，日志识别为重试而不重复；提交钩子失败按持久化故障处理（保留内存结果、不再启动新的副作用、`stop_reason=persistence_failed`）。
 - 安全收紧改为在当前请求内生效：把模式由宽变窄、新增 `deny_tools`、禁用 MCP server 或把 Web 权限收为 `deny` 时，正在运行的请求会在下一个批次边界之前停止，未启动的调用闭合为 `not_executed`，已产生的副作用与结果保留；运行摘要记为 `stop_reason=policy_tightened` 并附原因，TUI/CLI 显示"已按新设置停止当前请求"。放宽只对下一个请求生效。

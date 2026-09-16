@@ -1,6 +1,10 @@
 package agent
 
-import "Eylu/internal/protocol"
+import (
+	"errors"
+
+	"Eylu/internal/protocol"
+)
 
 // RunUsage is the accumulated usage of one Run.
 //
@@ -11,6 +15,11 @@ type RunUsage struct {
 	InputTokens     int `json:"input_tokens"`
 	OutputTokens    int `json:"output_tokens"`
 	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	// CachedInputTokens is the part of InputTokens the providers served from their
+	// own cache. It is a subset of InputTokens, never an addition, so the budget
+	// total is unchanged by it; it is reported so cost accounting can tell a cache
+	// hit from a miss.
+	CachedInputTokens int `json:"cached_input_tokens,omitempty"`
 	// ModelCalls counts the main model calls of the request.
 	ModelCalls int `json:"model_calls"`
 	// SummaryCalls counts the context-compaction summary calls the request made.
@@ -71,6 +80,9 @@ func (b *BudgetTracker) add(kind callKind, usage protocol.Usage) {
 	b.usage.InputTokens += usage.InputTokens
 	b.usage.OutputTokens += usage.OutputTokens
 	b.usage.ReasoningTokens += usage.ReasoningTokens
+	// A cached input token is already inside the input tokens of the same call, so
+	// it is accumulated separately and never added to the total.
+	b.usage.CachedInputTokens += usage.CachedInputTokens
 	if !usage.Exact {
 		// The provider did not report usage, so the contribution is an estimate
 		// and the totals are a lower bound.
@@ -111,11 +123,19 @@ func (b *BudgetTracker) report() RunUsage {
 	return b.usage
 }
 
+// ErrTokenBudget marks a request that could not continue within its token budget.
+//
+// It is a sentinel rather than a separate error type so the request still fails
+// with the protocol error callers already classify, while the loop can tell a
+// budget stop from any other failure and report token_budget as the reason - both
+// when a call overspent and when the admission check refused to start one.
+var ErrTokenBudget = errors.New("agent token budget")
+
 // budgetError reports that the request reached its token budget.
 func budgetError(limit int, closing bool) error {
 	message := "agent token budget exceeded"
 	if closing {
 		message = "agent token budget exhausted before the next model call"
 	}
-	return &protocol.Error{Code: protocol.ErrProtocol, Message: message, ContextLimit: limit}
+	return &protocol.Error{Code: protocol.ErrProtocol, Message: message, ContextLimit: limit, Cause: ErrTokenBudget}
 }
