@@ -505,7 +505,22 @@ func contextualizeTurn(turn protocol.Turn, maxToolBytes int) (protocol.Turn, boo
 		if part.ToolResult != nil {
 			toolResult := *part.ToolResult
 			toolResult.Metadata = cloneMetadata(part.ToolResult.Metadata)
-			toolResult.Content = contextSnippet(part.ToolResult.Content, maxToolBytes)
+			snippet := contextSnippet(part.ToolResult.Content, maxToolBytes)
+			if snippet != part.ToolResult.Content {
+				// The body no longer covers the line range its metadata
+				// declares, so the copy is explicitly marked incomplete. The
+				// dedup layer may only treat a complete body with a reliable
+				// range as a canonical code slice.
+				toolResult.Content = snippet
+				toolResult.Truncated = true
+				if toolResult.Metadata == nil {
+					toolResult.Metadata = make(map[string]any, 2)
+				}
+				toolResult.Metadata["context_truncated"] = true
+				if _, declared := toolResult.Metadata["lines_complete"]; declared {
+					toolResult.Metadata["lines_complete"] = false
+				}
+			}
 			copy.ToolResult = &toolResult
 		}
 		result.Parts = append(result.Parts, copy)

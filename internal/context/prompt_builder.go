@@ -102,7 +102,14 @@ func (b *PromptBuilder) AddTurn(turn protocol.Turn) {
 			category, source := toolResultCategory(part.ToolResult)
 			metadata := map[string]any{"call_id": part.ToolResult.CallID, "is_error": part.ToolResult.IsError, "truncated": part.ToolResult.Truncated}
 			content := part.ToolResult.Content
-			if codeSlice, ok := parseCodeSlice(part.ToolResult.Metadata); ok && !part.ToolResult.IsError {
+			codeSlice, isSlice := parseCodeSlice(part.ToolResult.Metadata)
+			if isSlice {
+				// A body that was trimmed for the context window no longer
+				// covers the declared range, so it is not a reliable canonical
+				// code slice.
+				codeSlice.complete = codeSlice.complete && !part.ToolResult.Truncated
+			}
+			if isSlice && !part.ToolResult.IsError {
 				category, source = CategoryCodeSlice, codeSlice.path
 				for key, value := range codeSlice.metadata() {
 					metadata[key] = value
@@ -115,17 +122,20 @@ func (b *PromptBuilder) AddTurn(turn protocol.Turn) {
 				metadata["stale"] = stale
 			}
 			b.addTextBlock(id, category, source, content, false, metadata)
-			if codeSlice, ok := parseCodeSlice(part.ToolResult.Metadata); ok {
+			if isSlice && !part.ToolResult.IsError {
 				canonicalID, _ := metadata["canonical_artifact_id"].(string)
-				if canonicalID == "" {
-					b.slices = append(b.slices, canonicalSlice{
-						path: codeSlice.path, fileHash: codeSlice.fileHash, artifactID: codeSlice.artifactID,
+				switch {
+				case canonicalID != "":
+					b.references = append(b.references, sliceReferenceRecord{
+						canonicalID: canonicalID, path: codeSlice.path, fileHash: codeSlice.fileHash,
 						startLine: codeSlice.startLine, endLine: codeSlice.endLine,
 						turnIndex: turnIndex, partIndex: index, blockIndex: len(b.result.Blocks) - 1,
 					})
-				} else {
-					b.references = append(b.references, sliceReferenceRecord{
-						canonicalID: canonicalID, path: codeSlice.path, fileHash: codeSlice.fileHash,
+				case codeSlice.complete:
+					// Only a complete fragment may act as a canonical slice for
+					// later fragments to reference.
+					b.slices = append(b.slices, canonicalSlice{
+						path: codeSlice.path, fileHash: codeSlice.fileHash, artifactID: codeSlice.artifactID,
 						startLine: codeSlice.startLine, endLine: codeSlice.endLine,
 						turnIndex: turnIndex, partIndex: index, blockIndex: len(b.result.Blocks) - 1,
 					})
@@ -142,12 +152,16 @@ type codeSliceMetadata struct {
 	startLine  int
 	endLine    int
 	cacheHit   bool
+	// complete reports whether the body actually covers the whole declared line
+	// range. Only a complete fragment may act as a canonical code slice.
+	complete bool
 }
 
 func (s codeSliceMetadata) metadata() map[string]any {
 	return map[string]any{
 		"path": s.path, "file_hash": s.fileHash, "artifact_id": s.artifactID,
 		"start_line": s.startLine, "end_line": s.endLine, "cache_hit": s.cacheHit,
+		"slice_complete": s.complete,
 	}
 }
 
@@ -167,7 +181,16 @@ func parseCodeSlice(metadata map[string]any) (codeSliceMetadata, bool) {
 	if path == "" || fileHash == "" || artifactID == "" || !startOK || !endOK || startLine <= 0 || endLine < startLine {
 		return codeSliceMetadata{}, false
 	}
-	return codeSliceMetadata{path: path, fileHash: fileHash, artifactID: artifactID, startLine: startLine, endLine: endLine, cacheHit: cacheHit}, true
+	complete := true
+	// The tool declares whether it returned the whole requested range, and the
+	// context layer declares whether it later trimmed the body.
+	if value, ok := metadata["lines_complete"].(bool); ok && !value {
+		complete = false
+	}
+	if value, ok := metadata["context_truncated"].(bool); ok && value {
+		complete = false
+	}
+	return codeSliceMetadata{path: path, fileHash: fileHash, artifactID: artifactID, startLine: startLine, endLine: endLine, cacheHit: cacheHit, complete: complete}, true
 }
 
 func promptInt(value any) (int, bool) {
@@ -204,6 +227,12 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 	if containing != nil {
 		b.result.SliceStats.Deduplicated++
 		return sliceReference(containing.artifactID, current.path, current.startLine, current.endLine, current.fileHash), containing.artifactID, stale
+	}
+	// An incomplete fragment does not actually contain the range it declares, so
+	// it may not replace a complete canonical fragment, may not redirect the
+	// references that point at one, and may not become canonical itself.
+	if !current.complete {
+		return content, "", stale
 	}
 	kept := b.slices[:0]
 	for _, existing := range b.slices {

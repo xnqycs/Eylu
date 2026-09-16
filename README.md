@@ -398,6 +398,16 @@ max_parallel_tools = 4
 - 已保存的 transcript 保持原样。构建模型请求时，历史上没有结果记录的调用会以 `outcome_unknown` 补全，并且不会自动重放；诊断可通过 `RecoveryNotes` 读取。
 - `Send` 与 `Adopt` 不执行工具，它们记录的调用同样会被闭合。
 
+### 代码片段引用与上下文裁剪
+
+代码切片去重（重复读取被替换为稳定引用）只对**正文完整且行范围可靠**的片段生效：
+
+- 上下文窗口裁剪会保留首尾并插入摘要标记。被裁剪的副本会显式标记为不完整（`context_truncated`、`Truncated`），因此不会再被当作 canonical 片段。
+- 不完整的大片段不会覆盖更小的完整片段，不会让后续读取退化为引用，也不会重定向已有引用；否则模型会拿到指向并不包含该范围正文的引用。
+- 工具自身声明不完整（`lines_complete = false`，例如达到 `max_read_lines`）的读取同样不作为 canonical。
+- 文件 hash 变化时不会引用旧版本内容。
+- 原始 transcript 不会被修改，被省略的正文不会成为去重依据。token 节省可以让步，内容正确性不能让步。
+
 ### 代码上下文与后台子代理
 
 `read_file` 支持 1-based 闭区间参数 `start_line`、`end_line`，并返回 `file_hash`、`slice_hash`、`artifact_id` 和续读游标 `next_start_line`。`search_code` 共享会话级增量三元组索引，支持 `offset` 分页和 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前会替换为稳定引用。

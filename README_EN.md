@@ -427,6 +427,16 @@ The default concurrency limit is `4`. Set it to `1` for serial execution, or ove
 - The stored transcript is left as it is. When a model request is built, a historical call with no recorded result is closed with `outcome_unknown` and is never replayed automatically; the diagnostic is available through `RecoveryNotes`.
 - `Send` and `Adopt` do not run tools, so the calls they record are closed too.
 
+### Code slice references and context trimming
+
+Code slice deduplication — replacing a repeated read with a stable reference — only applies to a fragment whose **body is complete and whose line range is reliable**:
+
+- Trimming for the context window keeps the head and tail and inserts a summary marker. The trimmed copy is explicitly marked incomplete (`context_truncated`, `Truncated`) and is therefore no longer treated as a canonical fragment.
+- An incomplete large fragment does not overwrite a smaller complete fragment, does not make later reads degrade into references, and does not redirect existing references; otherwise the model would receive a reference to a body that does not contain the range.
+- A read the tool itself declared incomplete (`lines_complete = false`, for example when it reached `max_read_lines`) is not canonical either.
+- A changed file hash never references an older generation of the content.
+- The original transcript is never modified, and omitted text never becomes a basis for deduplication. Token savings may suffer; content correctness may not.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.
