@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 四种输出一致：判词集中到 `agent.RunStopNote`（覆盖 `length`/`cancelled`/`error`/`token_budget`/`iteration_limit`/`policy_tightened`/`persistence_failed`/`event_sink_failed`），TUI 历史对非正常结束写出一行说明、计时行改为 `Stopped after`（不再用 "Completed in" 为截断答案计时），CLI 与 TUI 不再各说一套；新增 `/run` 展示最近一次运行摘要（`stop_reason`、调用次数与各终态计数、token 与缓存命中、恢复诊断、`warnings`），内容取自运行摘要本身。
 - 补齐生命周期事件表：新增 `request_started`（首次模型调用前写入）与 `tool_prepared`（以 pending 集合为来源，携带调用/请求/轮次），并新增可选 `request_id` 事件字段；两者是**证据而非状态**——不改写快照、不改变恢复结论，存在意义是让"已准备但从未写入意图"的调用可判定为未执行。§13.3 的 `model_turn_committed` 由 `turn_appended`（逐 turn 落盘）承担、`request_finished` 由 `run_reported` 承担，README 给出完整对照表。
 - pending 视图：`Conversation` 为当前请求维护显式的已提交调用集合（`PendingCalls()` / `OpenPendingCalls()`：调用 ID、工具、父调用、turn 与轮次、是否已被执行器接受、终态），终态闭合改为消费该集合而不再扫描 transcript（扫描只保留在恢复路径）；请求结束时集合必为空，运行摘要新增 `pending_at_end` 与对应 `warnings`，把"仍有未闭合调用"作为缺陷信号报出来。
 - 检查点成本与失败语义：一个批次里 N 个副作用调用的意图合并为一次 append（仍在任何调用开始之前写入），N=3 从 2N=6 次降到 4 次；completion 写入失败时结果保留在内存并进入待补偿队列，下一次成功的 append 补写同一调用 ID 的 completion（事件 ID 由调用 ID 派生，幂等），因此瞬时写失败不再留下永久 `outcome_unknown`；恢复结论改为三态并必须指出依据（内容哈希一致 → 未发生；不一致 → 未知并给出两个哈希；读不到或无哈希 → 未知且说明是无证据），任何情况都不重放；`write_file` 目标超过 4 MiB 时只记录 `weak:size=…:mtime=…` 弱证据并在诊断中明确标注为提示而非证明。

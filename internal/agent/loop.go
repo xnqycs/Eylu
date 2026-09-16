@@ -130,6 +130,50 @@ func StopNote(stop protocol.StopKind) string {
 	}
 }
 
+// RunStopNote describes why one request ended, in the one wording every output
+// uses.
+//
+// It answers for the request as a whole rather than for the final response: a
+// request can also end at its token budget, on a persistence fault, because the
+// host narrowed a safety setting, or because the host event consumer failed, and
+// none of those is a protocol stop kind. The text output and the TUI history both
+// read this one function, so the same request cannot be described two ways - which
+// is exactly what an answer shown without a note gets wrong.
+func RunStopNote(stop protocol.StopKind, report RunReport) string {
+	// For the reasons only a request can have, the report's own error is already the
+	// sentence a human should read, so it is used rather than reworded.
+	if detail := strings.TrimSpace(report.Error); detail != "" {
+		switch report.StopReason {
+		case stopPolicyTightened, stopPersistenceFailed, eventSinkFailedStop:
+			return detail
+		}
+	}
+	switch report.StopReason {
+	case stopPolicyTightened:
+		return "the request stopped because the safety settings were tightened"
+	case stopPersistenceFailed:
+		return "the request stopped because a committed turn could not be persisted"
+	case eventSinkFailedStop:
+		return "the request stopped because the host event consumer failed"
+	case stopTokenBudget:
+		return "the request stopped at its token budget, so the work it had done is kept and nothing new was started"
+	case stopIterationLimit:
+		return "the request stopped at its turn limit, so the work it had done is kept"
+	case stopInterrupted:
+		return "the request was interrupted"
+	case string(protocol.StopError):
+		return "the model reported a failed response"
+	}
+	if note := StopNote(stop); note != "" {
+		return note
+	}
+	switch report.StopReason {
+	case stopCancelled, stopAborted:
+		return "the request did not finish"
+	}
+	return ""
+}
+
 // Run performs one request.
 //
 // The conversation has a single writer: Run claims it for the whole request and a

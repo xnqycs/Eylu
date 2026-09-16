@@ -539,7 +539,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	// A stop reason that is not a genuine completion is stated explicitly, so a
 	// truncated or cancelled answer is never presented as a finished one. The
 	// structured outputs already carry the stop field.
-	if note := agent.StopNote(response.Stop); note != "" {
+	if note := agent.RunStopNote(response.Stop, runReport); note != "" {
 		fmt.Fprintf(r.stderr, "[response] %s\n", note)
 	}
 	fmt.Fprintln(r.stdout)

@@ -106,6 +106,7 @@ func slashCompletionItems(value string, snapshot Snapshot) []completionItem {
 		{label: "/agents", description: "Browse subagent conversations", insert: "/agents ", expand: true},
 		{label: "/compact", description: "Compact the current context", insert: "/compact"},
 		{label: "/context", description: "Inspect context usage", insert: "/context"},
+		{label: "/run", description: "Show the last run summary", insert: "/run"},
 		{label: "/effort", description: "Choose the reasoning effort", insert: "/effort ", expand: true},
 		{label: "/gradient", description: "Toggle the animated theme gradient", insert: "/gradient ", expand: true},
 		{label: "/help", description: "Show available commands", insert: "/help"},

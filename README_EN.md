@@ -612,6 +612,13 @@ The audit callback contract is equally explicit:
 
   The two new events are **evidence, not state**: they do not rewrite the snapshot and they change no recovery conclusion (a committed call's outcome is still decided by its intent and its completion). They exist so the log can answer the question the intent alone cannot - a call that was prepared and never got an intent is **provably not executed**. Both carry an optional `request_id`; a log written before the field existed simply has none and reads the same.
 
+### One conclusion from four outputs
+
+- The same request reaches the **same conclusion** in `--output text`, `json`, `jsonl` and the TUI history. The wording has one source (`agent.RunStopNote`): `length`, `cancelled`, `error`, `token_budget`, `iteration_limit`, `policy_tightened`, `persistence_failed` and `event_sink_failed` all come from it, so the CLI and the TUI cannot describe one request differently.
+- **The TUI no longer shows half an answer with no explanation**: a request that did not finish writes one line into the history, in the same sentence the CLI uses, and the timing line says `Stopped after` rather than `Completed in` - "Completed in 1ms" above a truncated answer is the same defect as no note at all.
+- When the failure's own sentence is the note, only one line is written instead of two.
+- `/run` shows the summary of the most recent request (`stop_reason`, model and tool call counts, the terminal-state counts, tokens, cache hits, recovery diagnostics, warnings). It renders the run report itself rather than the transcript, so the interface and the log cannot diverge. `/run` is in the TUI completion list.
+
 ### Core loop responsibilities
 
 The Web-specific logic has moved out of `loop.go` into same-package collaborators: `web_runtime.go` (plan resolution and MCP refresh), `web_calls.go` (batch expansion and parent mapping), `web_results.go` (content, activity and citation aggregation), `tool_events.go` (event projection), `run_finalize.go` (terminal states, pending closure and stop reasons), and `event_queue.go` (event delivery). The core loop only obtains the current run snapshot, prepares the context, calls and validates the model, commits the response, executes the tool batch, commits the results, and decides whether to continue. Its control flow depends on neither Web metadata nor event-delivery details.

@@ -584,6 +584,13 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 - 失败计入运行摘要的 `audit_failures`，首次失败在 stderr 出一条 `[audit]` 诊断（同一请求内只诊断一次）。
 - "请求成功"与"审计不完整"可以同时为真，并且两者都可见：`warnings` 里会写明有多少条审计记录没能写入以及最近一次的原因。
 
+### 四种输出的一致结论
+
+- 同一次请求在 `--output text`、`json`、`jsonl` 与 TUI 历史里给出**同一结论**。判词只有一处来源（`agent.RunStopNote`）：`length`、`cancelled`、`error`、`token_budget`、`iteration_limit`、`policy_tightened`、`persistence_failed`、`event_sink_failed` 都由它给出，CLI 与 TUI 不会各说一套。
+- **TUI 不再只显示半截答案**：非正常结束会在历史里写一行说明（与 CLI 同一句），计时行也改为 `Stopped after` 而不是 `Completed in`——"Completed in 1ms" 配一个被截断的答案，与完全不提示是同一种错误。
+- 请求的失败句与说明句相同时只输出一行，不重复。
+- `/run` 展示最近一次请求的运行摘要（`stop_reason`、模型/工具调用次数、各终态计数、token、缓存命中、恢复诊断、`warnings`），内容取自运行摘要本身而不是 transcript，因此界面与日志不会分叉。TUI 命令补全里也加入了 `/run`。
+
 ### 核心 loop 的职责拆分
 
 Web 专用逻辑已从 `loop.go` 拆到同包协作者：`web_runtime.go`（方案解析与 MCP 刷新）、`web_calls.go`（批量展开与父子映射）、`web_results.go`（内容/活动/引用聚合）、`tool_events.go`（事件投影）、`run_finalize.go`（终态、pending 关闭与结束原因）、`event_queue.go`（事件投递）。核心循环只负责：取当前运行快照、准备上下文、调用并校验模型、提交响应、执行工具批次、提交结果、判断下一轮或结束。控制流不依赖 Web metadata，也不依赖事件投递细节。

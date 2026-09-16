@@ -120,6 +120,11 @@ const (
 	// stopPersistenceFailed is the reason a request whose committed turn could not
 	// be made durable gets. The work already done is kept; nothing new starts.
 	stopPersistenceFailed = "persistence_failed"
+	// eventSinkFailedStop is the reason a request whose host event consumer failed
+	// gets. It is the one host-callback failure that still ends a request, because a
+	// critical event that cannot be delivered leaves the host's view of the request
+	// wrong rather than merely incomplete.
+	eventSinkFailedStop = "event_sink_failed"
 	// stopPolicyTightened is the reason a host that narrowed a safety setting
 	// gets: the request stopped because it would otherwise have run under the
 	// settings that were just replaced.
@@ -189,7 +194,7 @@ func (f *runFinalizer) closePending(message string) {
 func (f *runFinalizer) finish(response protocol.ModelResponse, last protocol.ModelResponse, err error, stop string) (protocol.ModelResponse, error) {
 	if sinkErr := f.events.stop(); sinkErr != nil && err == nil {
 		err = sinkErr
-		stop = "event_sink_failed"
+		stop = eventSinkFailedStop
 	}
 	// A host that narrowed a safety setting owns the reason this request stopped
 	// for: the cancellation is only how it got there. A request that finished on

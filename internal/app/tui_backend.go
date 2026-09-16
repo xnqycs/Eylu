@@ -51,6 +51,9 @@ type tuiBackend struct {
 	// admitted under, so a later change can be compared with them.
 	safetyBaseline    policy.SafetySettings
 	safetyBaselineSet bool
+	// lastRun is the summary of the most recent finished request, so /run can show
+	// what happened without re-reading the session log.
+	lastRun agent.RunReport
 }
 
 type tuiAuditSink struct {
@@ -614,24 +617,39 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 			return err
 		}
 	}
+	var runReport agent.RunReport
 	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
+		Report:          &runReport,
 		BeforeModel:     func() string { return b.runtime.completedAgentNotifications(sessionID) },
 		OnTurnCommitted: onTurnCommitted,
 		OnToolPrepared:  onToolPrepared,
 	}, true, modelEvents)
 	flushText()
+	// The report is kept so the history can state why the request ended and so
+	// /run can show the summary of the most recent one.
+	b.mu.Lock()
+	b.lastRun = runReport
+	b.mu.Unlock()
 	report := b.conversation.ContextReport()
 	observation.ObserveCodeSlices(report.CodeSlices)
 	metric := observation.Finish(response.Usage, err)
 	interrupted := errors.Is(err, agent.ErrRequestInterrupted)
-	// A request stopped because the host narrowed a safety setting is reported as
-	// the deliberate stop it is, not as a failure of the model or the tools.
-	var policyStop *agent.PolicyStopError
-	if errors.As(err, &policyStop) {
-		emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: "Stopped on the new settings: " + policyStop.Reason})
+	// A request that did not finish normally says so in the history, in the same
+	// wording the text output uses, so a truncated answer is never left looking
+	// finished and the two outputs cannot describe one request differently.
+	//
+	// When the request also failed, the note is the failure's own sentence and the
+	// error notice below already carries it: emitting both would say one thing
+	// twice in the same history.
+	note := agent.RunStopNote(response.Stop, runReport)
+	if note != "" && (err == nil || note != err.Error()) {
+		emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: note, Error: err != nil})
 	}
-	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: formatRequestCompletion(metric, interrupted)})
+	// The timing line must not claim completion for a request that did not finish:
+	// "Completed in 1ms" above a truncated answer is the same defect as showing the
+	// answer with no note at all.
+	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: formatRequestCompletion(metric, interrupted, note != "")})
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &report})
 	if interrupted {
 		return ui.ErrRequestInterrupted
@@ -639,10 +657,13 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	return err
 }
 
-func formatRequestCompletion(metric metrics.RequestMetric, interrupted bool) string {
+func formatRequestCompletion(metric metrics.RequestMetric, interrupted, stopped bool) string {
 	label := "Completed in"
-	if interrupted {
+	switch {
+	case interrupted:
 		label = "Interrupted after"
+	case stopped:
+		label = "Stopped after"
 	}
 	ttft := "n/a"
 	if metric.FirstTokenMS > 0 {
@@ -998,6 +1019,41 @@ func approvalRequestDetails(toolName string, input json.RawMessage) (string, str
 	}
 }
 
+// renderLastRun renders the summary of the most recent finished request.
+//
+// It answers, from the record rather than from the transcript, why the request
+// stopped, what it executed, and what stayed unknown - the same questions the
+// run report exists for, which is what makes the interface and the log agree.
+func (b *tuiBackend) renderLastRun() string {
+	b.mu.Lock()
+	report := b.lastRun
+	b.mu.Unlock()
+	if report.RequestID == "" && report.StopReason == "" {
+		return "No request has finished yet."
+	}
+	note := agent.RunStopNote("", report)
+	lines := []string{fmt.Sprintf("Run %s: stop_reason=%s", report.RequestID, report.StopReason)}
+	if note != "" {
+		lines = append(lines, note)
+	}
+	lines = append(lines,
+		fmt.Sprintf("iterations=%d model_calls=%d tool_calls=%d", report.Iterations, report.ModelCalls, report.ToolCalls),
+		fmt.Sprintf("calls: succeeded=%d failed=%d rejected=%d cancelled=%d not_executed=%d outcome_unknown=%d",
+			report.Succeeded, report.Failed, report.Rejected, report.Cancelled, report.NotExecuted, report.OutcomeUnknown),
+		fmt.Sprintf("tokens: input=%d output=%d reasoning=%d cached_input=%d exact=%t estimated=%t",
+			report.InputTokens, report.OutputTokens, report.ReasoningTokens, report.CachedInputTokens, report.ExactUsage, report.EstimatedUsage),
+	)
+	if report.PendingAtEnd != 0 {
+		lines = append(lines, fmt.Sprintf("still open at the end: %d", report.PendingAtEnd))
+	}
+	if len(report.RecoveredCalls) != 0 {
+		lines = append(lines, "recovery closed without a result: "+strings.Join(report.RecoveredCalls, ", "))
+	}
+	for _, warning := range report.Warnings {
+		lines = append(lines, "warning: "+warning)
+	}
+	return strings.Join(lines, "\n")
+}
 func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
@@ -1006,6 +1062,8 @@ func (b *tuiBackend) Command(ctx context.Context, line string) (string, error) {
 	switch fields[0] {
 	case "/mcp":
 		return b.handleTUIMCPCommand(ctx, fields[1:])
+	case "/run":
+		return b.renderLastRun(), nil
 	case "/new":
 		b.mu.Lock()
 		opts := b.opts

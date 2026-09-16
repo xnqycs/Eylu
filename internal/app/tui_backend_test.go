@@ -35,16 +35,16 @@ import (
 
 func TestFormatRequestCompletionUsesInterruptedLabelAndScaledDurations(t *testing.T) {
 	metric := metrics.RequestMetric{DurationMS: 18023, FirstTokenMS: 3053, GenerationMS: 2000, TokensPerSecond: 42.64, Usage: protocol.Usage{OutputTokens: 85, Exact: true}}
-	got := formatRequestCompletion(metric, true)
+	got := formatRequestCompletion(metric, true, false)
 	want := "Interrupted after 18.023s; TTFT 3.053s; TPS 42.6 t/s."
 	if got != want {
 		t.Fatalf("formatRequestCompletion() = %q, want %q", got, want)
 	}
-	estimated := formatRequestCompletion(metrics.RequestMetric{DurationMS: 1000, TokensPerSecond: 8, Usage: protocol.Usage{OutputTokens: 8}}, false)
+	estimated := formatRequestCompletion(metrics.RequestMetric{DurationMS: 1000, TokensPerSecond: 8, Usage: protocol.Usage{OutputTokens: 8}}, false, false)
 	if estimated != "Completed in 1s; TTFT n/a; TPS ~8.0 t/s." {
 		t.Fatalf("estimated completion = %q", estimated)
 	}
-	empty := formatRequestCompletion(metrics.RequestMetric{DurationMS: 10}, false)
+	empty := formatRequestCompletion(metrics.RequestMetric{DurationMS: 10}, false, false)
 	if empty != "Completed in 10ms; TTFT n/a; TPS n/a." {
 		t.Fatalf("empty completion = %q", empty)
 	}
