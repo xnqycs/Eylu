@@ -599,6 +599,19 @@ The audit callback contract is equally explicit:
 - The failure is counted in the run summary as `audit_failures`, and the first one is stated once on stderr as an `[audit]` diagnostic.
 - "The request succeeded" and "the audit trail is incomplete" can both be true and both be visible: `warnings` names how many records could not be written and the reason for the most recent one.
 
+- **The six-event lifecycle table** (`docs/Eylu Agent Loop 改进计划.md` §13.3) maps onto the events that are actually recorded:
+
+  | §13.3 event | Recorded as |
+  |---|---|
+  | `request_started` | `request_started` (new), written before the first model call |
+  | `model_turn_committed` | `turn_appended`: the per-turn write from PR-21 *is* the durable record of a committed model turn, and a second event carrying the same turn would only duplicate it |
+  | `tool_prepared` | `tool_prepared` (new), sourced from the pending set and carrying the call, the request and the round |
+  | `tool_execution_intent` | `tool_execution_intent` (existing), written before the side effect |
+  | `tool_completed` | `tool_completed` (existing), with the compensation path behind it |
+  | `request_finished` | `run_reported` (existing), carrying the run summary |
+
+  The two new events are **evidence, not state**: they do not rewrite the snapshot and they change no recovery conclusion (a committed call's outcome is still decided by its intent and its completion). They exist so the log can answer the question the intent alone cannot - a call that was prepared and never got an intent is **provably not executed**. Both carry an optional `request_id`; a log written before the field existed simply has none and reads the same.
+
 ### Core loop responsibilities
 
 The Web-specific logic has moved out of `loop.go` into same-package collaborators: `web_runtime.go` (plan resolution and MCP refresh), `web_calls.go` (batch expansion and parent mapping), `web_results.go` (content, activity and citation aggregation), `tool_events.go` (event projection), `run_finalize.go` (terminal states, pending closure and stop reasons), and `event_queue.go` (event delivery). The core loop only obtains the current run snapshot, prepares the context, calls and validates the model, commits the response, executes the tool batch, commits the results, and decides whether to continue. Its control flow depends on neither Web metadata nor event-delivery details.

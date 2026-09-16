@@ -42,7 +42,31 @@ const (
 	// EventRunReported records the summary of one finished request, so a request
 	// can be explained from the log instead of only from a transient UI event.
 	EventRunReported EventType = "run_reported"
+	// EventRequestStarted brackets a request. It is written before the first model
+	// call, so a request that has log evidence but no report was interrupted
+	// rather than never begun.
+	EventRequestStarted EventType = "request_started"
+	// EventToolPrepared records that the executor accepted one call for execution.
+	// It is written before the execution intent, so a call that was prepared and
+	// never got an intent is evidence that it never started - which is the one
+	// thing the intent alone cannot say.
+	EventToolPrepared EventType = "tool_prepared"
 )
+
+// ToolPrepared is the payload of EventToolPrepared.
+//
+// It carries identity rather than state: the call, the request it belongs to and
+// the round it was prepared in. Nothing is applied to the snapshot from it, because
+// it is evidence about a call whose outcome is decided by the intent and the
+// completion; it exists so a reader can tell "prepared and never intended" (it did
+// not run) from "no trace at all".
+type ToolPrepared struct {
+	RequestID  string    `json:"request_id"`
+	CallID     string    `json:"call_id"`
+	Tool       string    `json:"tool"`
+	Iteration  int       `json:"iteration"`
+	PreparedAt time.Time `json:"prepared_at"`
+}
 
 // RunSummary is the durable record of one finished request.
 //
@@ -181,6 +205,11 @@ type Event struct {
 	Intent         *ToolIntent                `json:"intent,omitempty"`
 	Run            *RunSummary                `json:"run,omitempty"`
 	Completion     *ToolCompletion            `json:"completion,omitempty"`
+	// RequestID is the request an event brackets or belongs to. It is optional: a
+	// log written before it existed simply has none, and the payloads that already
+	// carry a request ID are unaffected.
+	RequestID string        `json:"request_id,omitempty"`
+	Prepared  *ToolPrepared `json:"prepared,omitempty"`
 }
 
 type Diagnostic struct {

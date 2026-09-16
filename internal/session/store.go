@@ -990,7 +990,8 @@ func validEventType(eventType EventType) bool {
 	switch eventType {
 	case EventSessionCreated, EventTurnAppended, EventRuntimeUpdated, EventDriverState,
 		EventPromptRecorded, EventSkillActivated, EventContextUpdated, EventAgentTasksUpdated, EventErrorRecorded, EventSessionClosed, EventSessionReopened,
-		EventToolExecutionIntent, EventToolCompleted, EventRunReported:
+		EventToolExecutionIntent, EventToolCompleted, EventRunReported,
+		EventRequestStarted, EventToolPrepared:
 		return true
 	default:
 		return false
@@ -1063,6 +1064,11 @@ func applyEvent(snapshot *Snapshot, event Event) {
 		if event.Provider != nil {
 			snapshot.Provider = *event.Provider
 		}
+	case EventRequestStarted, EventToolPrepared:
+		// Evidence, not state: both are read from the log when a human asks what
+		// happened, and neither changes how a session is rebuilt. Applying them to
+		// the snapshot would duplicate what the intent and the completion already
+		// say about a call's outcome.
 	case EventDriverState:
 		snapshot.DriverState = append(snapshot.DriverState[:0], event.DriverState...)
 	case EventSkillActivated:

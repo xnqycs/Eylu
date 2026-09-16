@@ -490,6 +490,67 @@ func (s *sessionRuntime) RecordTurn(turn protocol.Turn) error {
 	return nil
 }
 
+// RecordRequestStarted brackets a request in the log, before its first model call.
+//
+// It exists so a log entry that is followed by no report can be read as "the
+// request was interrupted" rather than as "no request happened", which is the one
+// question the completion-side records cannot answer on their own.
+func (s *sessionRuntime) RecordRequestStarted(requestID string) error {
+	if s == nil || requestID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	events := []session.Event{{Type: session.EventRequestStarted, RequestID: requestID, ID: s.eventIDFor("request:" + requestID)}}
+	appended, err := s.append(s.snapshot.SessionID, events)
+	if err != nil {
+		return sessionProtocolError("record request start", err)
+	}
+	s.acceptAppended(appended)
+	return nil
+}
+
+// RecordToolPrepared records that the executor accepted one call for execution.
+//
+// The call's identity comes from the conversation's pending set, which is the same
+// source the set itself is built from, so the event and the view cannot disagree
+// about which call was prepared or which round it belonged to.
+func (s *sessionRuntime) RecordToolPrepared(conversation *agent.Conversation, call protocol.ToolCall) error {
+	if s == nil || call.ID == "" {
+		return nil
+	}
+	entry, ok := pendingEntryFor(conversation, call.ID)
+	if !ok {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prepared := session.ToolPrepared{
+		RequestID: entry.RequestID, CallID: call.ID, Tool: call.Name,
+		Iteration: entry.Iteration, PreparedAt: time.Now().UTC(),
+	}
+	events := []session.Event{{Type: session.EventToolPrepared, Prepared: &prepared, ID: s.eventIDFor("prepared:" + call.ID)}}
+	appended, err := s.append(s.snapshot.SessionID, events)
+	if err != nil {
+		return sessionProtocolError("record prepared tool call", err)
+	}
+	s.acceptAppended(appended)
+	return nil
+}
+
+// pendingEntryFor looks one call up in the conversation's pending view.
+func pendingEntryFor(conversation *agent.Conversation, callID string) (agent.PendingCall, bool) {
+	if conversation == nil {
+		return agent.PendingCall{}, false
+	}
+	for _, entry := range conversation.PendingCalls() {
+		if entry.CallID == callID {
+			return entry, true
+		}
+	}
+	return agent.PendingCall{}, false
+}
+
 // RecordIntents persists the intents of one batch in a single append.
 //
 // One write for the whole batch is what turns 2N appends for N side-effecting

@@ -25,6 +25,9 @@ type PendingCall struct {
 	// own RequestID is the same value, so the two records can be joined.
 	TurnID    string `json:"turn_id"`
 	Iteration int    `json:"iteration"`
+	// RequestID is the request the call belongs to, and is the same value the
+	// executor sees, so the log's records and this view can be joined.
+	RequestID string `json:"request_id"`
 	// Prepared reports that the executor accepted the call for execution. Until it
 	// is set the call provably has not run.
 	Prepared bool `json:"prepared"`
@@ -47,7 +50,7 @@ func (c *Conversation) trackCommittedCalls(requestID string, iteration int, turn
 		}
 		c.pendingCalls = append(c.pendingCalls, PendingCall{
 			CallID: call.ID, Tool: call.Name, ParentCallID: call.ParentCallID,
-			TurnID: turn.ID, Iteration: iteration,
+			TurnID: turn.ID, Iteration: iteration, RequestID: requestID,
 		})
 	}
 }

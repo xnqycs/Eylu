@@ -489,14 +489,23 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	// Every committed turn is written while the request is still running, so a
 	// crash in the middle cannot lose a turn whose side effect already happened.
 	var onTurnCommitted func(protocol.Turn) error
+	var onToolPrepared func(protocol.ToolCall) error
 	if r.session != nil {
 		onTurnCommitted = r.session.RecordTurn
+		// The prepared-event source is the pending set of this conversation, so the
+		// log and the view cannot disagree about which call was prepared.
+		session := r.session
+		onToolPrepared = func(call protocol.ToolCall) error { return session.RecordToolPrepared(conversation, call) }
+		if err := session.RecordRequestStarted(observation.RequestID()); err != nil {
+			return err
+		}
 	}
 	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
 		BeforeModel:     func() string { return r.completedAgentNotifications(sessionID) },
 		Report:          &runReport,
 		OnTurnCommitted: onTurnCommitted,
+		OnToolPrepared:  onToolPrepared,
 	}, stream, emit)
 	observation.ObserveCodeSlices(conversation.ContextReport().CodeSlices)
 	metric := observation.Finish(response.Usage, err)
