@@ -23,26 +23,31 @@ type Metadata struct {
 }
 
 type RequestMetric struct {
-	Timestamp             time.Time         `json:"timestamp"`
-	RequestID             string            `json:"request_id"`
-	SessionID             string            `json:"session_id"`
-	Provider              string            `json:"provider_name"`
-	ProviderGeneration    uint64            `json:"provider_generation"`
-	Model                 string            `json:"model"`
-	Task                  string            `json:"task,omitempty"`
-	FirstTokenMS          int64             `json:"first_token_ms,omitempty"`
-	GenerationMS          int64             `json:"generation_ms,omitempty"`
-	TokensPerSecond       float64           `json:"tokens_per_second,omitempty"`
-	DurationMS            int64             `json:"duration_ms"`
-	ToolCalls             int               `json:"tool_calls"`
-	ToolSuccesses         int               `json:"tool_successes"`
-	ToolSuccessRate       float64           `json:"tool_success_rate"`
-	CompressionCount      int               `json:"compression_count"`
-	CompactionDurationMS  int64             `json:"compaction_duration_ms,omitempty"`
-	CompactionFallbacks   int               `json:"compaction_fallbacks,omitempty"`
-	CompactionUsage       protocol.Usage    `json:"compaction_usage,omitzero"`
-	CompactionCost        float64           `json:"compaction_estimated_cost,omitempty"`
+	Timestamp            time.Time      `json:"timestamp"`
+	RequestID            string         `json:"request_id"`
+	SessionID            string         `json:"session_id"`
+	Provider             string         `json:"provider_name"`
+	ProviderGeneration   uint64         `json:"provider_generation"`
+	Model                string         `json:"model"`
+	Task                 string         `json:"task,omitempty"`
+	FirstTokenMS         int64          `json:"first_token_ms,omitempty"`
+	GenerationMS         int64          `json:"generation_ms,omitempty"`
+	TokensPerSecond      float64        `json:"tokens_per_second,omitempty"`
+	DurationMS           int64          `json:"duration_ms"`
+	ToolCalls            int            `json:"tool_calls"`
+	ToolSuccesses        int            `json:"tool_successes"`
+	ToolSuccessRate      float64        `json:"tool_success_rate"`
+	CompressionCount     int            `json:"compression_count"`
+	CompactionDurationMS int64          `json:"compaction_duration_ms,omitempty"`
+	CompactionFallbacks  int            `json:"compaction_fallbacks,omitempty"`
+	CompactionUsage      protocol.Usage `json:"compaction_usage,omitzero"`
+	CompactionCost       float64        `json:"compaction_estimated_cost,omitempty"`
+	// Usage describes the last model call of the request. RequestUsage describes
+	// the whole request. They answer different questions - a single diagnostic
+	// versus what the request cost - so both are reported and named apart.
 	Usage                 protocol.Usage    `json:"usage"`
+	RequestUsage          protocol.Usage    `json:"request_usage,omitzero"`
+	RequestModelCalls     int               `json:"request_model_calls,omitempty"`
 	EstimatedCost         float64           `json:"estimated_cost"`
 	ErrorCode             string            `json:"error_code,omitempty"`
 	WebActivities         int               `json:"web_activities,omitempty"`
@@ -54,19 +59,24 @@ type RequestMetric struct {
 }
 
 type Summary struct {
-	Requests              int               `json:"requests"`
-	Failures              int               `json:"failures"`
-	AverageFirstTokenMS   float64           `json:"average_first_token_ms"`
-	AverageDurationMS     float64           `json:"average_duration_ms"`
-	ToolCalls             int               `json:"tool_calls"`
-	ToolSuccesses         int               `json:"tool_successes"`
-	ToolSuccessRate       float64           `json:"tool_success_rate"`
-	CompressionCount      int               `json:"compression_count"`
-	CompactionDurationMS  int64             `json:"compaction_duration_ms,omitempty"`
-	CompactionFallbacks   int               `json:"compaction_fallbacks,omitempty"`
-	CompactionUsage       protocol.Usage    `json:"compaction_usage,omitzero"`
-	CompactionCost        float64           `json:"compaction_estimated_cost,omitempty"`
+	Requests             int            `json:"requests"`
+	Failures             int            `json:"failures"`
+	AverageFirstTokenMS  float64        `json:"average_first_token_ms"`
+	AverageDurationMS    float64        `json:"average_duration_ms"`
+	ToolCalls            int            `json:"tool_calls"`
+	ToolSuccesses        int            `json:"tool_successes"`
+	ToolSuccessRate      float64        `json:"tool_success_rate"`
+	CompressionCount     int            `json:"compression_count"`
+	CompactionDurationMS int64          `json:"compaction_duration_ms,omitempty"`
+	CompactionFallbacks  int            `json:"compaction_fallbacks,omitempty"`
+	CompactionUsage      protocol.Usage `json:"compaction_usage,omitzero"`
+	CompactionCost       float64        `json:"compaction_estimated_cost,omitempty"`
+	// Usage describes the last model call of the request. RequestUsage describes
+	// the whole request. They answer different questions - a single diagnostic
+	// versus what the request cost - so both are reported and named apart.
 	Usage                 protocol.Usage    `json:"usage"`
+	RequestUsage          protocol.Usage    `json:"request_usage,omitzero"`
+	RequestModelCalls     int               `json:"request_model_calls,omitempty"`
 	EstimatedCost         float64           `json:"estimated_cost"`
 	WebActivities         int               `json:"web_activities,omitempty"`
 	WebCitations          int               `json:"web_citations,omitempty"`
@@ -287,6 +297,12 @@ func (c *Collector) Snapshot() Summary {
 		summary.Usage.OutputTokens += metric.Usage.OutputTokens
 		summary.Usage.ReasoningTokens += metric.Usage.ReasoningTokens
 		summary.Usage.Exact = summary.Usage.Exact || metric.Usage.Exact
+		summary.RequestUsage.InputTokens += metric.RequestUsage.InputTokens
+		summary.RequestUsage.OutputTokens += metric.RequestUsage.OutputTokens
+		summary.RequestUsage.ReasoningTokens += metric.RequestUsage.ReasoningTokens
+		summary.RequestUsage.CachedInputTokens += metric.RequestUsage.CachedInputTokens
+		summary.RequestUsage.Exact = summary.RequestUsage.Exact || metric.RequestUsage.Exact
+		summary.RequestModelCalls += metric.RequestModelCalls
 		summary.EstimatedCost += metric.EstimatedCost
 		summary.WebActivities += metric.WebActivities
 		summary.WebCitations += metric.WebCitations

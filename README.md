@@ -509,6 +509,11 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 - 请求级预算覆盖主模型调用、上下文压缩摘要与上下文恢复重试。每次模型调用前按估算输入与输出预留做准入检查，返回后用真实 usage 校准；usage 缺失时标记为估算下界。
 - **准入语义**：估算输入 + 输出预留必须能装进剩余额度，否则该次调用根本不发起——请求在调用模型之前就被拒。因此把 `max_total_tokens` 设得比提示词估算还小，请求会直接失败而不是先花掉一次调用。判断方式：运行摘要 `stop_reason=token_budget`，错误信息为 `agent token budget exhausted before the next model call` 并带上额度，stderr 也会显示该错误。例如 `max_total_tokens = 1000` 而提示词估算已是 1200，请求不会调用模型。
 - reasoning token 单独记录但不重复计入预算（各适配器已包含在输出 token 中）。`Run` 返回的响应用量仍只描述最后一次调用；累计用量通过 `LoopOptions.Usage`（`RunUsage`）单独暴露。
+- **两套用量口径，命名分开，不互相冒充**：`response.usage`（或 `json` 顶层既有字段 `usage`）描述**最后一次模型调用**，适合单次诊断；累计用量描述**整次请求**，来自 `RunUsage`，适合成本核算。`LoopOptions.Usage` 现在有生产调用点（此前没有，累计数字根本没被采集），并且：
+  - `json` 在**不改动既有字段名**的前提下新增顶层 `request_usage` 与 `request_model_calls`（内嵌结构展开，`turn`/`stop`/`usage` 原样保留）；
+  - `jsonl` 新增独立的 `{"type":"request_usage",...}` 行，既有 `response` 行不变；
+  - metrics 同时记录两者，`Summary` 分别累计，`/run` 也显示累计口径。
+- **缓存 token 口径**
 - **缓存 token 口径**：`cached_input_tokens` 是 `input_tokens` 的**子集**，不是额外增量——各 provider 都把命中缓存的提示词 token 计入 input tokens，所以它只用于区分命中与未命中（成本核算），不改动预算总额。provider 不报缓存明细时为 0，且不影响 `exact`。`RunUsage` 与运行摘要都暴露该字段。
 - 当前 driver 不向 provider 传递剩余输出上限，因此预算是软预算：额度用尽后不再发起新请求，但单次调用仍可能超出。子代理在父请求结束后继续运行，其费用单独统计，不并入同一同步预算。
 

@@ -618,9 +618,13 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 		}
 	}
 	var runReport agent.RunReport
+	// The accumulated usage of the whole request is collected separately from the
+	// last call's, so the two can never be read as each other.
+	var runUsage agent.RunUsage
 	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
 		Report:          &runReport,
+		Usage:           &runUsage,
 		BeforeModel:     func() string { return b.runtime.completedAgentNotifications(sessionID) },
 		OnTurnCommitted: onTurnCommitted,
 		OnToolPrepared:  onToolPrepared,
@@ -634,6 +638,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	report := b.conversation.ContextReport()
 	observation.ObserveCodeSlices(report.CodeSlices)
 	metric := observation.Finish(response.Usage, err)
+	metric.RequestUsage, metric.RequestModelCalls = requestUsageTotals(runUsage)
 	interrupted := errors.Is(err, agent.ErrRequestInterrupted)
 	// A request that did not finish normally says so in the history, in the same
 	// wording the text output uses, so a truncated answer is never left looking

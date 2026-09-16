@@ -486,6 +486,9 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	}
 	sessionID := conversation.SessionID()
 	var runReport agent.RunReport
+	// The accumulated usage of the whole request is collected separately from the
+	// last call's, so the two can never be read as each other.
+	var runUsage agent.RunUsage
 	// Every committed turn is written while the request is still running, so a
 	// crash in the middle cannot lose a turn whose side effect already happened.
 	var onTurnCommitted func(protocol.Turn) error
@@ -504,11 +507,13 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
 		BeforeModel:     func() string { return r.completedAgentNotifications(sessionID) },
 		Report:          &runReport,
+		Usage:           &runUsage,
 		OnTurnCommitted: onTurnCommitted,
 		OnToolPrepared:  onToolPrepared,
 	}, stream, emit)
 	observation.ObserveCodeSlices(conversation.ContextReport().CodeSlices)
 	metric := observation.Finish(response.Usage, err)
+	metric.RequestUsage, metric.RequestModelCalls = requestUsageTotals(runUsage)
 	r.reportMetric(jsonlEncoder, metric)
 	syncErr := error(nil)
 	if r.session != nil {
@@ -531,9 +536,25 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return syncErr
 	}
 	if r.output == "json" {
-		return json.NewEncoder(r.stdout).Encode(response)
+		// The response keeps every field it had, under the same names, and the
+		// request totals are added beside them: a reader that only knows the old
+		// shape is unaffected, and a reader that wants the cost of the whole
+		// request no longer has to mistake the last call for it.
+		totals, modelCalls := requestUsageTotals(runUsage)
+		return json.NewEncoder(r.stdout).Encode(struct {
+			protocol.ModelResponse
+			RequestUsage      protocol.Usage `json:"request_usage"`
+			RequestModelCalls int            `json:"request_model_calls"`
+		}{ModelResponse: response, RequestUsage: totals, RequestModelCalls: modelCalls})
 	}
 	if r.output == "jsonl" {
+		// The stream is already a sequence of typed objects, so the request totals
+		// are one more of them rather than a change to the response the caller
+		// already reads.
+		totals, modelCalls := requestUsageTotals(runUsage)
+		if err := jsonlEncoder.Encode(map[string]any{"type": "request_usage", "request_usage": totals, "request_model_calls": modelCalls}); err != nil {
+			return err
+		}
 		return jsonlEncoder.Encode(map[string]any{"type": "response", "response": response})
 	}
 	// A stop reason that is not a genuine completion is stated explicitly, so a
@@ -546,6 +567,17 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	return nil
 }
 
+// requestUsageTotals turns the accumulated usage of one request into the wire shape
+// metrics reports, so nothing downstream has to know about the agent's own type.
+func requestUsageTotals(usage agent.RunUsage) (protocol.Usage, int) {
+	return protocol.Usage{
+		InputTokens:       usage.InputTokens,
+		OutputTokens:      usage.OutputTokens,
+		ReasoningTokens:   usage.ReasoningTokens,
+		CachedInputTokens: usage.CachedInputTokens,
+		Exact:             usage.Exact,
+	}, usage.ModelCalls
+}
 func runConversationWithProfile(ctx context.Context, conversation *agent.Conversation, prompt string, runtime agent.Runtime, executor *tool.Executor, options agent.LoopOptions, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
 	profile := agent.ProfileForMode(runtime.PermissionMode)
 	options.MaxTurns = profile.LimitTurns(options.MaxTurns)
