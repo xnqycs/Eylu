@@ -668,6 +668,13 @@ The matching environment variables are `EYLU_MAX_PARALLEL_AGENTS`, `EYLU_CODE_CO
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): third-party components and applicable terms
 - [docs/go-terminal-agent-development-plan.md](docs/go-terminal-agent-development-plan.md): architecture and phased development history (Chinese)
 
+### Tests for the platform-specific branches
+
+- The `//go:build !windows` and `//go:build unix` branches (atomic replace, directory fsync, process-group cancellation) **never execute on a Windows host**, so their tests carry the same build tags: `internal/session/replace_other_test.go` and `internal/tool/process_tree_unix_test.go`. They really run on the `ubuntu-latest` and `macos-latest` CI legs, and that is where the evidence for those branches comes from.
+- The strongest local evidence a Windows host can produce is **cross-linking**: `GOOS=linux|darwin go vet ./...` and `GOOS=linux|darwin go test -c ./internal/session/ ./internal/tool/` both pass (the test binaries build and link), but nothing is executed. Do not read "it compiles" as "it was verified".
+- The symlink behaviour (including `EvalSymlinks` resolution and the out-of-workspace refusal) already has a test that skips on Windows when creating a symlink is not permitted and really runs on POSIX; the path key's case policy is parameterised through `resourceKeyFor(goos, path)`, so both policies are asserted on any platform.
+- The local way to exercise the Unix script path on Windows is Git Bash: `scripts/verify.sh` and `scripts/smoke.sh` run through `%ProgramFiles%\Git\bin\bash.exe`.
+
 ## Development and Verification
 
 ```bash

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- POSIX 运行时验证：新增 `//go:build !windows` / `unix` 的显式测试（`internal/session/replace_other_test.go` 的原子替换与目录 fsync、`internal/tool/process_tree_unix_test.go` 的进程组取消），它们在 CI 的 Linux/macOS leg 上真实运行；README 写明"本机能做的最强验证只是交叉链接，能编译不等于已验证"。
+
 - 累计用量与指标口径：`LoopOptions.Usage` 补上生产调用点（此前累计数字根本没被采集），两套口径命名分开——`usage` 是最后一次调用、`request_usage` 是整次请求；`json` 在不改名任何既有字段的前提下新增顶层 `request_usage`/`request_model_calls`，`jsonl` 新增独立 `request_usage` 行，metrics 与 `Summary` 分别记录并累计两者，`/run` 显示累计口径。
 - 四种输出一致：判词集中到 `agent.RunStopNote`（覆盖 `length`/`cancelled`/`error`/`token_budget`/`iteration_limit`/`policy_tightened`/`persistence_failed`/`event_sink_failed`），TUI 历史对非正常结束写出一行说明、计时行改为 `Stopped after`（不再用 "Completed in" 为截断答案计时），CLI 与 TUI 不再各说一套；新增 `/run` 展示最近一次运行摘要（`stop_reason`、调用次数与各终态计数、token 与缓存命中、恢复诊断、`warnings`），内容取自运行摘要本身。
 - 补齐生命周期事件表：新增 `request_started`（首次模型调用前写入）与 `tool_prepared`（以 pending 集合为来源，携带调用/请求/轮次），并新增可选 `request_id` 事件字段；两者是**证据而非状态**——不改写快照、不改变恢复结论，存在意义是让"已准备但从未写入意图"的调用可判定为未执行。§13.3 的 `model_turn_committed` 由 `turn_appended`（逐 turn 落盘）承担、`request_finished` 由 `run_reported` 承担，README 给出完整对照表。

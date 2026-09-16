@@ -668,6 +668,12 @@ scripts/verify_selftest.sh
 pwsh -NoProfile -File scripts/verify_selftest.ps1
 ```
 
+### 平台相关分支的测试
+
+- `//go:build !windows` 与 `//go:build unix` 的分支（原子替换、目录 fsync、进程组取消）**不会在 Windows 主机上执行**，因此它们的测试也带同样的构建标签：`internal/session/replace_other_test.go`、`internal/tool/process_tree_unix_test.go`。它们在 CI 的 `ubuntu-latest` 与 `macos-latest` 两个 leg 上真实运行，那才是这两条分支的证据来源。
+- 本机（Windows）能给出的最强本地证据是**交叉链接**：`GOOS=linux|darwin go vet ./...` 与 `GOOS=linux|darwin go test -c ./internal/session/ ./internal/tool/` 均通过（测试二进制能构建、能链接），但**没有运行**。别把"能编译"当成"已验证"。
+- symlink 相关行为（含 `EvalSymlinks` 解析与越界拒绝）已有测试在 Windows 上因缺少创建符号链接的权限而跳过，在 POSIX 上真实执行；路径键的大小写策略由 `resourceKeyFor(goos, path)` 参数化，两种策略在任何平台上都能断言。
+- Windows 上本地执行 Unix 脚本路径的办法是 Git Bash：`scripts/verify.sh` 与 `scripts/smoke.sh` 可用 `%ProgramFiles%\Git\bin\bash.exe` 跑（见上文提交前门禁）。
 `-race` 需要 CGO，本机（Windows 默认工具链）通常不可用，只在 CI 的 `quality` job 上执行；**"未跑 race" 不等于通过**，涉及并发、锁、取消与恢复的改动必须看 CI 结论。
 
 CI 会在 Linux、Windows、macOS 上执行测试、原生构建和 smoke test；发布标签会进一步生成六个平台归档、SHA-256 校验与 Sigstore 签名。
