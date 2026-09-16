@@ -447,6 +447,16 @@ The event log (`events.jsonl`) and the snapshot (`snapshot.json`) track their pr
 - When the snapshot is missing or behind, the event log alone restores the session, and recovered turns are not duplicated.
 - Stable event IDs, uncertain append results (Write/Sync/Close failures) and schema migration belong to a later stage (PR-10).
 
+### Resource conflict keys
+
+Conflict detection uses one canonical resource key, and Bash, the file tools, the directory and search tools and the resource coordinator all build their claims through the same entry point:
+
+- A key is cleaned, separator-normalized to `/`, and stripped of a trailing separator (a volume root keeps its separator).
+- Windows applies a conservative case normalization: it may serialize two names that Windows would treat as distinct, but it never misses a conflict, and a missed conflict is the dangerous direction. POSIX never lowercases unconditionally.
+- A read-only Bash command's whole-workspace tree claim and a write inside that tree always conflict.
+- When a resource identity cannot be established (empty path, unknown resource kind, unknown access mode) the call falls back to exclusive execution.
+- Known boundaries: hard links and other aliases that reach one file through different paths, a UNC path versus the mapped drive letter, and per-directory case sensitivity on Windows are not recognized; those cases degrade to serial execution.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

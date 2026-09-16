@@ -82,7 +82,10 @@ func (b *Bash) Risk() policy.Risk { return policy.RiskExec }
 
 func (b *Bash) ClassifyConcurrency(_ json.RawMessage, outcome policy.Outcome) ConcurrencySpec {
 	if outcome.Classification == policy.CommandReadOnly {
-		return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceTree, Path: b.workspace, Access: ResourceRead}}}
+		// The tree claim uses the same canonical key as the file tools, so a
+		// read-only command and a write to the same tree are always detected as
+		// conflicting on every platform.
+		return ConcurrencySpec{Mode: ConcurrencyClaimed, Claims: []ResourceClaim{{Kind: ResourceTree, Path: b.paths.rootResourceKey(), Access: ResourceRead}}}
 	}
 	return ConcurrencySpec{Mode: ConcurrencyExclusive}
 }

@@ -137,11 +137,47 @@ func (r *pathResolver) resourcePath(path string) (string, error) {
 	for index := len(tail) - 1; index >= 0; index-- {
 		resolved = filepath.Join(resolved, tail[index])
 	}
-	resolved = filepath.ToSlash(filepath.Clean(resolved))
-	if runtime.GOOS == "windows" {
-		resolved = strings.ToLower(resolved)
+	return resourceKey(resolved), nil
+}
+
+// rootResourceKey is the canonical key of the workspace tree itself.
+func (r *pathResolver) rootResourceKey() string {
+	return resourceKey(r.real)
+}
+
+// resourceKey is the single entry point that turns a path into the canonical key
+// used to detect conflicting work. Every tool and the coordinator build their
+// claims through it, so two aliases of the same file always produce one key.
+func resourceKey(path string) string {
+	return resourceKeyFor(runtime.GOOS, path)
+}
+
+// resourceKeyFor implements the platform policy of resourceKey and is exported to
+// tests so both policies can be verified from any platform.
+//
+// The key is cleaned, separator-normalized and stripped of a trailing separator
+// (except for a volume root). On Windows the key is additionally lowercased,
+// because the filesystem is case-insensitive there: this may serialize two names
+// that Windows would treat as distinct, but it never misses a conflict, and a
+// missed conflict is the dangerous direction.
+//
+// Known boundaries, which deliberately fall back to serialization rather than to
+// a guess: hard links and other path aliases that resolve to the same file
+// through different paths, a UNC path versus the drive letter it is mapped to,
+// and per-directory case sensitivity on Windows. A path whose identity cannot be
+// established must stay exclusive.
+func resourceKeyFor(goos, path string) string {
+	key := filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+	if key == "." || key == "" {
+		return ""
 	}
-	return resolved, nil
+	if goos == "windows" {
+		key = strings.ToLower(key)
+	}
+	if key == "/" || strings.HasSuffix(key, ":/") {
+		return key
+	}
+	return strings.TrimSuffix(key, "/")
 }
 
 func inside(root, candidate string) bool {

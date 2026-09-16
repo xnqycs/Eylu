@@ -749,10 +749,9 @@ func normalizeConcurrencySpec(spec ConcurrencySpec) ConcurrencySpec {
 	case ConcurrencyClaimed:
 		claims := make([]ResourceClaim, 0, len(spec.Claims))
 		for _, claim := range spec.Claims {
-			claim.Path = strings.ReplaceAll(strings.TrimSpace(claim.Path), "\\", "/")
-			if claim.Path != "/" && !strings.HasSuffix(claim.Path, ":/") {
-				claim.Path = strings.TrimSuffix(claim.Path, "/")
-			}
+			// Claims are canonicalized through the same entry point as the tools,
+			// so aliases of one path always compare as one resource.
+			claim.Path = resourceKey(claim.Path)
 			if claim.Path == "" || claim.Kind != ResourceFile && claim.Kind != ResourceTree || claim.Access != ResourceRead && claim.Access != ResourceWrite {
 				return ConcurrencySpec{Mode: ConcurrencyExclusive}
 			}
@@ -843,6 +842,9 @@ func resourceClaimsOverlap(left, right ResourceClaim) bool {
 }
 
 func resourceTreeContains(tree, candidate string) bool {
+	if tree == "" || candidate == "" {
+		return false
+	}
 	prefix := tree
 	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
