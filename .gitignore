@@ -20,6 +20,7 @@ Desktop.ini
 *.pem
 *.p12
 *.pfx
+build.bat
 
 # Logs
 *.log
