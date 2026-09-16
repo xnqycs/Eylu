@@ -43,16 +43,37 @@ func StopNote(stop protocol.StopKind) string {
 	}
 }
 
+// Run performs one request.
+//
+// The conversation has a single writer: Run claims it for the whole request and a
+// concurrent Run is refused with ErrConversationBusy. The state mutex is only
+// held for short reads and commits, so the model call, the approval callback, the
+// tool batch, the host event callbacks and every host-supplied function run with
+// the state unlocked. A caller may therefore read ContextReport or ExportState
+// from inside a callback, and during a blocked model call.
 func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, executor *tool.Executor, options LoopOptions, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
+	if err := c.gate.begin(); err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	defer c.gate.release()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c.gate.attach(cancel)
+	ctx = runCtx
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := c.prepareRuntime(prompt, runtime); err != nil {
+		c.mu.Unlock()
 		return protocol.ModelResponse{}, err
 	}
 	if executor == nil {
+		c.mu.Unlock()
 		return protocol.ModelResponse{}, fmt.Errorf("tool executor is nil")
 	}
 	baseTools := registryToolsExcluding(executor.Registry, runtime.MCPToolServers)
+	c.appendUser(prompt)
+	c.mu.Unlock()
+
 	webBudget := webtool.NewUsageBudget()
 	hostedAuthorized := false
 	var err error
@@ -64,7 +85,6 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 	if maxTurns <= 0 {
 		maxTurns = 20
 	}
-	c.appendUser(prompt)
 	plan, err := c.resolveWebRuntime(runtime, executor, webBudget)
 	if err != nil {
 		return protocol.ModelResponse{}, err
@@ -72,9 +92,8 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 	if err := authorizeHostedWeb(ctx, executor, runtime, plan, &hostedAuthorized); err != nil {
 		return protocol.ModelResponse{}, err
 	}
+	c.applyToolDefinitions(runtime, plan.Definitions)
 	definitions := plan.Definitions
-	c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
-	c.rebuildLedger(runtime)
 	seenCalls := make(map[string]struct{})
 	budget := newBudgetTracker(options.MaxTotalTokens)
 	if options.Usage != nil {
@@ -96,10 +115,20 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		if err := ctx.Err(); err != nil {
 			return protocol.ModelResponse{}, err
 		}
+		// A provider change that arrived during the previous round is applied here,
+		// at the round boundary, instead of in the middle of a request.
+		if snapshot, ok := c.takePendingSnapshot(); ok {
+			c.mu.Lock()
+			c.applyProviderSnapshotLocked(snapshot)
+			c.mu.Unlock()
+		}
+		// Host callbacks run outside the state lock.
 		if options.BeforeModel != nil {
 			if message := strings.TrimSpace(options.BeforeModel()); message != "" {
+				c.mu.Lock()
 				c.appendUser(message)
 				c.rebuildLedger(runtime)
+				c.mu.Unlock()
 			}
 		}
 		runtime, err = c.refreshMCPRuntime(runtime, executor, baseTools)
@@ -114,8 +143,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			return protocol.ModelResponse{}, err
 		}
 		definitions = plan.Definitions
-		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
-		c.rebuildLedger(runtime)
+		c.applyToolDefinitions(runtime, definitions)
 		parallelToolCalls := executor.ParallelLimit() > 1 && driver.CapabilitiesFor(runtime.Driver, capabilityTarget(runtime)).ParallelTools
 		response, effectiveRuntime, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit, budget)
 		if err != nil {
@@ -129,11 +157,15 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		response, err = normalizeModelResponse(response, seenCalls)
 		if err != nil {
 			reportUsage()
+			c.mu.Lock()
 			c.driverState = nil
 			c.rebuildLedger(runtime)
+			c.mu.Unlock()
 			return last, err
 		}
+		c.mu.Lock()
 		c.commitResponse(response, effectiveRuntime)
+		c.mu.Unlock()
 		last = response
 		for _, call := range toolCalls(response.Turn) {
 			seenCalls[call.ID] = struct{}{}
@@ -143,7 +175,9 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		// that already has a result untouched.
 		calls := toolCalls(response.Turn)
 		closePending := func(message string) {
+			c.mu.Lock()
 			c.closeToolCalls(runtime, calls, protocol.CallNotExecuted, message)
+			c.mu.Unlock()
 		}
 		if err := recordHostedWebActivities(executor, runtime, requestID, response.Turn, plan, webBudget); err != nil {
 			closePending("tool call was not executed: hosted web activity was rejected")
@@ -194,8 +228,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			return last, err
 		}
 		definitions = plan.Definitions
-		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
-		c.rebuildLedger(runtime)
+		c.applyToolDefinitions(runtime, definitions)
 		expansion := expandToolCalls(calls, plan, newExecutionAllocator(callIDs(calls)))
 		hooks := tool.BatchHooks{}
 		if emit != nil {
@@ -241,6 +274,9 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		}
 		executedResults, batchOutcome := executor.ExecuteBatchOutcome(ctx, requestID, expansion.calls, hooks, limit)
 		results, webParts := collapseToolResults(calls, expansion, executedResults, batchOutcome)
+		// The batch results are committed under the state lock, after every tool
+		// and every callback has finished.
+		c.mu.Lock()
 		for index := range results {
 			result := results[index]
 			c.captureSkillResult(result)
@@ -257,6 +293,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			c.driverState = nil
 		}
 		c.rebuildLedger(runtime)
+		c.mu.Unlock()
 		// The request-level control state is owned by the executor. It is never
 		// derived from tool content or from metadata rebuilt by Web aggregation,
 		// so an external tool cannot interrupt or abort the host request.
@@ -330,10 +367,24 @@ func webActivityInputBytes(activity *protocol.WebActivity) int {
 	return len([]byte(strings.Join(values, ""))) + len([]byte(activity.URL))
 }
 
+// refreshMCPRuntime reads the live MCP catalog and applies it.
+//
+// The host callback that supplies the catalog runs outside the state lock, so it
+// may read the conversation; the resulting state is applied under the lock.
 func (c *Conversation) refreshMCPRuntime(runtime Runtime, executor *tool.Executor, baseTools []tool.Tool) (Runtime, error) {
+	live := MCPRuntimeState{}
+	if runtime.MCPState != nil {
+		live = runtime.MCPState()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.applyMCPRuntimeLocked(runtime, executor, baseTools, live)
+}
+
+func (c *Conversation) applyMCPRuntimeLocked(runtime Runtime, executor *tool.Executor, baseTools []tool.Tool, live MCPRuntimeState) (Runtime, error) {
 	state := MCPRuntimeState{}
 	if runtime.MCPState != nil {
-		state = filterMCPRuntimeState(runtime.MCPState(), runtime.PermissionMode)
+		state = filterMCPRuntimeState(live, runtime.PermissionMode)
 		if c.profile != nil {
 			filtered := state.Tools[:0]
 			servers := make(map[string]string)
@@ -366,6 +417,15 @@ func (c *Conversation) refreshMCPRuntime(runtime Runtime, executor *tool.Executo
 	}
 	c.rebuildLedger(runtime)
 	return runtime, nil
+}
+
+// applyToolDefinitions records the tool set of the current round and rebuilds the
+// ledger under the state lock.
+func (c *Conversation) applyToolDefinitions(runtime Runtime, definitions []protocol.ToolDefinition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
+	c.rebuildLedger(runtime)
 }
 
 func (c *Conversation) resolveWebRuntime(runtime Runtime, executor *tool.Executor, budget *webtool.UsageBudget) (webtool.ResolvedWebToolPlan, error) {

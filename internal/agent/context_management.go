@@ -71,11 +71,21 @@ func optionsForRuntime(runtime Runtime) contextOptions {
 	return options
 }
 
-// prepareRequestContext builds the request context and, when the context window
-// requires it, compacts the conversation. A compaction summary is a model call
-// inside the same request, so its usage is reported through onSummaryUsage to the
-// caller's budget.
-func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, error) {
+// prepareRequestContext builds the request context and buffers the host context
+// events it would report. The caller delivers them after the state lock is
+// released, so a context callback can read the conversation without deadlocking.
+func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, []contextledger.Event, error) {
+	var collected []contextledger.Event
+	if runtime.ContextEvent != nil {
+		runtime.ContextEvent = func(event contextledger.Event) { collected = append(collected, event) }
+	}
+	prepared, err := c.prepareRequestContextLocked(ctx, runtime, definitions, onSummaryUsage)
+	return prepared, collected, err
+}
+
+// prepareRequestContextLocked does the work and assumes the caller holds the
+// state lock.
+func (c *Conversation) prepareRequestContextLocked(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, error) {
 	options := optionsForRuntime(runtime)
 	c.ledger.SetEstimator(options.estimator)
 	c.refreshProjectMap(runtime)

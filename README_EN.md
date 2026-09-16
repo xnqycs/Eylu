@@ -498,6 +498,19 @@ Stop reasons have an explicit handling table, and a non-`tool_use` stop is not a
 - Each process uses its own event ID prefix, so a restart cannot collide with IDs an earlier process wrote.
 - Reader compatibility: a log written before IDs existed still loads (its events derive an identity from their sequence); a repeated ID whose content is identical is not applied twice, and a conflicting one is reported as a diagnostic instead of being silently rewritten. A document from another schema version is still refused explicitly rather than misread.
 
+### Conversation concurrency, lock boundaries and callbacks
+
+A Conversation has exactly one writer:
+
+- Run mutual exclusion is separate from the state lock: run ownership covers a whole request, while the state lock is only held for brief reads and commits.
+- A second concurrent request on the same conversation returns `ErrConversationBusy` immediately instead of blocking indefinitely, and ownership is released as soon as the request finishes or is cancelled.
+- The model call, the tool batch, the approval callback, `BeforeModel`, emitted events, `ContextEvent`, persistence and any other host-supplied function all run outside the state lock. A callback can therefore call `ContextReport` or `ExportState` without deadlocking, and committed state stays readable while a model call is blocked.
+- Context events are buffered by the context layer and delivered to the host after the state lock is released.
+- An immutable request snapshot (turns, tools, driver state) is taken at the start of each round, so a model call never reads half-updated state.
+- A provider change that arrives during a request is queued and applied at the next round boundary, and `CancelRun` lets a host stop the current request immediately when it tightens a safety setting, so no further tool call starts.
+- Rotating to a new session waits for the running request (cancelling it first if it overruns the grace period), so it can never interleave with a request that is still committing state.
+- The lock order is always run ownership then state lock, and the session persistence lock never forms a reverse dependency with the state lock.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

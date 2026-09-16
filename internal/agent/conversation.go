@@ -106,7 +106,13 @@ type ProtectedSkill struct {
 }
 
 type Conversation struct {
-	mu                         sync.Mutex
+	// mu protects the conversation state. It is only held for short reads and
+	// commits: the model call, the tool batch, the approval callback and every
+	// host callback run without it.
+	mu sync.Mutex
+	// gate grants the single-writer slot of this conversation. It is held for a
+	// whole request, so a rotation or a second request cannot interleave with it.
+	gate                       runGate
 	sessionID                  string
 	turns                      []protocol.Turn
 	promptHistory              []string
@@ -136,6 +142,9 @@ type Conversation struct {
 	lastCompressionFingerprint string
 	profile                    *Profile
 	recoveryNotes              []string
+	// pendingSnapshot holds a provider change that arrived while a request was
+	// running. Run applies it at the next round boundary.
+	pendingSnapshot *provider.Snapshot
 }
 
 // RecoveryNotes reports the tool call IDs that had no recorded result and were
@@ -204,7 +213,14 @@ func (c *Conversation) NewSession() string {
 	return c.NewSessionWithEnvironment(environment.Context{})
 }
 
+// NewSessionWithEnvironment rotates the conversation to a new session.
+//
+// Rotation changes the conversation as a whole, so it waits for an active request
+// to finish before it touches any state: a rotation can never interleave with a
+// request that is still committing its transcript. A request that does not finish
+// within the grace period is cancelled first.
 func (c *Conversation) NewSessionWithEnvironment(environmentContext environment.Context) string {
+	c.gate.await()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	old := c.sessionID
@@ -241,13 +257,25 @@ func (c *Conversation) NewSessionWithEnvironment(environmentContext environment.
 }
 
 func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
+	if err := c.gate.begin(); err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	defer c.gate.release()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c.gate.attach(cancel)
+	ctx = runCtx
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := c.prepareRuntime(prompt, runtime); err != nil {
+		c.mu.Unlock()
 		return protocol.ModelResponse{}, err
 	}
 	c.appendUser(prompt)
 	c.toolDefinitions = nil
+	c.mu.Unlock()
+
+	// The model call runs outside the state lock, exactly as it does in Run.
 	response, effectiveRuntime, err := c.generate(ctx, runtime, nil, false, stream, emit, nil)
 	if err != nil {
 		return protocol.ModelResponse{}, err
@@ -256,14 +284,18 @@ func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime,
 	if err != nil {
 		// A malformed response is never committed: the user message stays and
 		// the untrustworthy remote state is dropped.
+		c.mu.Lock()
 		c.driverState = nil
 		c.rebuildLedger(effectiveRuntime)
+		c.mu.Unlock()
 		return protocol.ModelResponse{}, err
 	}
+	c.mu.Lock()
 	c.commitResponse(response, effectiveRuntime)
 	// Send never executes tools, so a tool call it returns is closed with a
 	// terminal state instead of being left dangling.
 	c.closeToolCalls(effectiveRuntime, toolCalls(response.Turn), protocol.CallNotExecuted, "tool call was not executed: this request does not run tools")
+	c.mu.Unlock()
 	return response, nil
 }
 
@@ -420,17 +452,12 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 	}
 	responseStarted := false
 	for attempt := 0; attempt <= 3; attempt++ {
-		prepared, err := c.prepareRequestContext(ctx, runtime, definitions, func(usage protocol.Usage) {
+		// The request is prepared and the immutable snapshot is taken under the
+		// state lock; the model call itself runs outside it.
+		c.mu.Lock()
+		prepared, contextEvents, err := c.prepareRequestContext(ctx, runtime, definitions, func(usage protocol.Usage) {
 			budget.add(callSummary, usage)
 		})
-		if err != nil {
-			return protocol.ModelResponse{}, runtime, err
-		}
-		// Admission check: a call that cannot fit in the remaining budget is not
-		// started at all.
-		if !budget.admits(prepared.InputTokens(), runtime.OutputReserveTokens) {
-			return protocol.ModelResponse{}, runtime, budgetError(budget.limit, true)
-		}
 		request := driver.Request{
 			BaseURL:           runtime.Provider.Config.BaseURL,
 			APIKey:            runtime.APIKey,
@@ -450,6 +477,22 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 				Tools:           prepared.Tools,
 				DriverState:     append(json.RawMessage(nil), c.driverState...),
 			},
+		}
+		c.mu.Unlock()
+		// Host context callbacks are delivered after the lock is released, so a
+		// callback may read the conversation without deadlocking.
+		for _, event := range contextEvents {
+			if runtime.ContextEvent != nil {
+				runtime.ContextEvent(event)
+			}
+		}
+		if err != nil {
+			return protocol.ModelResponse{}, runtime, err
+		}
+		// Admission check: a call that cannot fit in the remaining budget is not
+		// started at all.
+		if !budget.admits(prepared.InputTokens(), runtime.OutputReserveTokens) {
+			return protocol.ModelResponse{}, runtime, budgetError(budget.limit, true)
 		}
 		visible := false
 		wrappedEmit := emit
@@ -475,11 +518,15 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 				// counted against the same budget.
 				budget.add(callRetry, protocol.Usage{})
 				runtime.Provider = runtime.LimitResolver.LearnOverflow(runtime.Provider, providerError.ContextLimit)
+				c.mu.Lock()
 				c.driverState = nil
+				c.mu.Unlock()
 				continue
 			}
+			c.mu.Lock()
 			c.lastRuntime = runtime
 			c.rebuildLedger(runtime)
+			c.mu.Unlock()
 			return protocol.ModelResponse{}, runtime, err
 		}
 		if len(response.Turn.Parts) == 0 {
@@ -655,9 +702,24 @@ func (c *Conversation) ContextReport() contextledger.Report {
 	})
 }
 
+// ApplyProviderSnapshot records a new provider snapshot.
+//
+// A request that is running must not have its provider changed underneath it, so
+// the change is queued while a request is active and applied by Run at the next
+// round boundary. The lock order is always gate then state, never the reverse.
 func (c *Conversation) ApplyProviderSnapshot(snapshot provider.Snapshot) {
+	if !c.gate.idle() {
+		c.mu.Lock()
+		c.pendingSnapshot = &snapshot
+		c.mu.Unlock()
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.applyProviderSnapshotLocked(snapshot)
+}
+
+func (c *Conversation) applyProviderSnapshotLocked(snapshot provider.Snapshot) {
 	if c.providerName != snapshot.Name || c.providerGeneration != snapshot.Generation || c.providerAdapter != snapshot.Config.Adapter || c.providerBaseURL != snapshot.Config.BaseURL || c.providerModel != snapshot.Config.Model || c.lastRuntime.Provider.Config.ReasoningEffort != snapshot.Config.ReasoningEffort {
 		c.driverState = nil
 	}
@@ -668,6 +730,32 @@ func (c *Conversation) ApplyProviderSnapshot(snapshot provider.Snapshot) {
 	c.providerModel = snapshot.Config.Model
 	c.lastRuntime.Provider = snapshot
 	c.rebuildLedger(c.lastRuntime)
+}
+
+// takePendingSnapshot returns and clears a snapshot that arrived while a request
+// was running. Run applies it at a round boundary.
+func (c *Conversation) takePendingSnapshot() (provider.Snapshot, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingSnapshot == nil {
+		return provider.Snapshot{}, false
+	}
+	snapshot := *c.pendingSnapshot
+	c.pendingSnapshot = nil
+	return snapshot, true
+}
+
+// CancelRun cancels the request that is currently running, if any.
+//
+// A host that tightens a safety setting uses it so the request stops before it
+// starts another tool batch, instead of letting the old setting finish the work.
+func (c *Conversation) CancelRun() {
+	c.gate.mu.Lock()
+	cancel := c.gate.cancel
+	c.gate.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (c *Conversation) TodoList() protocol.TodoList {

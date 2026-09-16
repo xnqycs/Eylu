@@ -229,9 +229,14 @@ func TestCompactionUsesConfiguredWatermarksAndModelSummary(t *testing.T) {
 		ContextRecentRounds: 2, ContextCompactTrigger: 85, ContextCompactTarget: 60, MaxSummaryBytes: 512,
 		ContextEvent: func(event contextledger.Event) { events = append(events, event) },
 	}
-	prepared, err := conversation.prepareRequestContext(context.Background(), runtime, nil, nil)
+	prepared, contextEvents, err := conversation.prepareRequestContext(context.Background(), runtime, nil, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The host events are buffered by the context layer and delivered by the
+	// caller once the state lock is released.
+	for _, event := range contextEvents {
+		runtime.ContextEvent(event)
 	}
 	report := conversation.ContextReport()
 	if prepared.InputTokens()+200 > 7_200 || report.CompressionCount != 1 || len(model.requests) != 1 {
