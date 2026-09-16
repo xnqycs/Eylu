@@ -559,16 +559,33 @@ timeout_seconds = 120
 
 ## 开发与验证
 
+### 提交前门禁
+
+提交前的门禁来源是仓库内的脚本，它对齐 CI 的 `test` 与 `quality` 两个 job：
+
 ```bash
-gofmt -l .
-go mod verify
-go vet ./...
-go test ./...
-go test -race ./...
-go run ./scripts/generate-third-party-notices -check
-staticcheck ./...
-actionlint
+scripts/verify.sh                             # Linux / macOS / Git Bash
 ```
+
+```powershell
+pwsh -NoProfile -File scripts/verify.ps1      # Windows PowerShell
+```
+
+脚本依次执行：gofmt、`go mod verify`、`go vet ./...`、`staticcheck ./...`（v0.7.0，与 CI 相同）、第三方声明检查、`actionlint`、`go test ./...`，最后构建 `dist/eylu[.exe]` 并运行 `scripts/smoke.sh` 与 `scripts/smoke.ps1`。快速迭代时可传 `--skip-static`/`-SkipStatic`、`--skip-extras`/`-SkipExtras`、`--skip-smoke`/`-SkipSmoke`。
+
+gofmt 检查的是**内容**，不是原始工作树。`core.autocrlf=true` 的检出让每个文件在工作树里都是 CRLF，而 `gofmt -l` 会把 CRLF 文件一律列为待格式化——即使没有任何改动。脚本因此使用两个来源：
+
+- **提交内容**：索引中的字节（`git checkout-index`，并强制关闭 `core.autocrlf`），也就是 CI 实际检出的内容；
+- **工作树**：去掉 CR 之后的内容，未提交的真实格式错误仍然会被发现，而 CRLF 检出产物不会被误报。
+
+改动 `scripts/verify.*` 后必须运行自检；它用临时仓库覆盖四个方向（CRLF 误报、CRLF 下的真实格式错误、已提交的 CRLF、staticcheck 专属失败）：
+
+```bash
+scripts/verify_selftest.sh
+pwsh -NoProfile -File scripts/verify_selftest.ps1
+```
+
+`-race` 需要 CGO，本机（Windows 默认工具链）通常不可用，只在 CI 的 `quality` job 上执行；**"未跑 race" 不等于通过**，涉及并发、锁、取消与恢复的改动必须看 CI 结论。
 
 CI 会在 Linux、Windows、macOS 上执行测试、原生构建和 smoke test；发布标签会进一步生成六个平台归档、SHA-256 校验与 Sigstore 签名。
 

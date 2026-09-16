@@ -40,17 +40,27 @@ git status --short --branch
 git rev-parse HEAD origin/main
 ```
 
-执行本地质量检查：
+执行本地质量检查（提交前与发布前门禁的唯一来源）：
 
 ```bash
-go mod verify
-go test ./...
-go vet ./...
-go run ./scripts/generate-third-party-notices -check
+scripts/verify.sh
+```
+
+Windows：
+
+```powershell
+pwsh -NoProfile -File scripts/verify.ps1
+```
+
+脚本覆盖 gofmt（按**提交内容**比对，因此 `core.autocrlf=true` 的检出不会把未改动文件误报为待格式化）、`go mod verify`、`go vet ./...`、`staticcheck ./...`（v0.7.0，与 CI 相同）、第三方声明检查、`actionlint` 和 `go test ./...`，并构建 `dist/eylu[.exe]` 后运行 `scripts/smoke.sh` 与 `scripts/smoke.ps1`。改动 `scripts/verify.*` 后必须运行 `scripts/verify_selftest.sh` / `scripts/verify_selftest.ps1`。
+
+发布前还需要：
+
+```bash
 goreleaser check
 ```
 
-完整 CI 还会执行三平台 smoke test、race detector、格式检查、Staticcheck 和 `actionlint`。Windows 本地执行 race detector 需要启用 CGO 并安装 `gcc`。
+完整 CI 还会执行三平台 smoke test 与 `go test -race ./...`。Windows 本地执行 race detector 需要启用 CGO 并安装 `gcc`；**未在本地跑 race 不代表通过**。
 
 需要预览最终归档时执行：
 
