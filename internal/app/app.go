@@ -637,6 +637,12 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 		Confirm: confirm, Audit: audit, Workspace: r.workspace,
 		Timeout: time.Duration(cfg.ToolTimeoutSec) * time.Second, MaxOutputBytes: cfg.MaxOutputBytes,
 		MaxParallelTools: cfg.MaxParallelTools, Coordinator: coordinator,
+		// An audit sink that fails is counted and reported in the run summary; the
+		// first failure is also stated once on stderr, because a host that cannot
+		// record what happened should hear about it immediately.
+		AuditDiagnostic: func(message string) {
+			fmt.Fprintf(r.stderr, "[audit] %s; the call itself is unaffected\n", message)
+		},
 	}, nil
 }
 

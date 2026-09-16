@@ -156,6 +156,10 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		conversation: c, runtime: runtime, budget: budget,
 		usage: options.Usage, report: options.Report,
 	}
+	if executor != nil {
+		finalizer.auditFailures = executor.AuditFailures
+		finalizer.auditDetail = executor.AuditFailureDetail
+	}
 	// Host events go through a coalescing queue: streamed text is merged within a
 	// bound so a burst never stalls the model, while every terminal, control or
 	// content event is delivered synchronously and its failure stops the request.

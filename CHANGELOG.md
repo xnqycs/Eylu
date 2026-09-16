@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 隔离宿主回调故障：审计 sink 的失败或 panic 不再穿透请求（不改变调用终态、不重试、不阻塞、不杀死请求），计入运行摘要 `audit_failures` 并在首次失败时于 stderr 出一条诊断；事件投递分为关键事件（同步按序、失败即终止请求）与流式增量（可合并、慢消费者超预算时丢弃并计数 `events_dropped`），运行摘要新增 `warnings` 说明这类不影响终态的故障。
 - 会话改为逐 turn 落盘：模型 turn 与工具 turn 一提交就同步写入事件日志，不再等请求结束的同步，运行中途崩溃最多丢掉仍在进行中的那一轮；turn 事件身份即 turn ID，增量写入与随后同步重放是同一个事件 ID，日志识别为重试而不重复；提交钩子失败按持久化故障处理（保留内存结果、不再启动新的副作用、`stop_reason=persistence_failed`）。
 - 安全收紧改为在当前请求内生效：把模式由宽变窄、新增 `deny_tools`、禁用 MCP server 或把 Web 权限收为 `deny` 时，正在运行的请求会在下一个批次边界之前停止，未启动的调用闭合为 `not_executed`，已产生的副作用与结果保留；运行摘要记为 `stop_reason=policy_tightened` 并附原因，TUI/CLI 显示"已按新设置停止当前请求"。放宽只对下一个请求生效。
 - 统一 Provider 停止原因映射：所有适配器共用一处策略表（`internal/driver` 的 `StopKindFor`），各自只负责把方言翻译成统一词表；`completed` 且带工具调用、`tool_use` 却没有调用、以及无法识别的取值都按协议错误拒绝，不再默认当作完成。为只返回 `finish_reason: "stop"` 的网关新增按 Provider 配置的放宽开关 `accept_tool_calls_with_stop`（默认关闭），开启后按 `tool_use` 执行并留痕在响应、运行摘要 `interop` 与审计中。

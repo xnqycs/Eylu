@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"fmt"
+
 	"Eylu/internal/protocol"
 )
 
@@ -36,6 +38,19 @@ type RunReport struct {
 	ReasoningTokens int  `json:"reasoning_tokens,omitempty"`
 	ExactUsage      bool `json:"exact_usage"`
 	EstimatedUsage  bool `json:"estimated_usage"`
+
+	// AuditFailures counts host audit records that could not be delivered. A
+	// nonzero value means the audit trail is incomplete for this request, and the
+	// request itself is unaffected.
+	AuditFailures int `json:"audit_failures,omitempty"`
+	// EventsDropped counts non-critical host events - streamed text and reasoning
+	// deltas - that were dropped because the consumer could not keep up. The
+	// transcript is complete either way; the host's view of the stream is not.
+	EventsDropped int `json:"events_dropped,omitempty"`
+	// Warnings lists diagnostics that did not stop the request but that a caller
+	// must be able to see: a host callback that failed, a consumer that fell
+	// behind.
+	Warnings []string `json:"warnings,omitempty"`
 
 	// RecoveredCalls lists tool call IDs that had no recorded result and were
 	// closed with outcome_unknown when a request was built.
@@ -142,6 +157,10 @@ type runFinalizer struct {
 	iterations   int
 	// events is the bounded host event queue of this request, when one is active.
 	events *eventQueue
+	// auditFailures reports how many host audit records this request could not
+	// deliver, and auditDetail describes the most recent one.
+	auditFailures func() int
+	auditDetail   func() string
 }
 
 // closePending gives every call of the current response that has no result yet a
@@ -204,6 +223,23 @@ func (f *runFinalizer) publish(stop string, err error) {
 	f.report.ExactUsage = usage.Exact
 	f.report.EstimatedUsage = usage.Estimated
 	f.report.RecoveredCalls = f.conversation.RecoveryNotes()
+	// A host callback that failed is reported beside the outcome it did not
+	// change, so "the request succeeded" and "the audit trail is incomplete" can
+	// both be true and both be visible.
+	if f.auditFailures != nil {
+		f.report.AuditFailures = f.auditFailures()
+	}
+	if f.report.AuditFailures > 0 && f.auditDetail != nil {
+		if detail := f.auditDetail(); detail != "" {
+			f.report.Warnings = append(f.report.Warnings, fmt.Sprintf("%d host audit record(s) could not be recorded: %s", f.report.AuditFailures, detail))
+		}
+	}
+	if f.events != nil {
+		f.report.EventsDropped = f.events.droppedCount()
+		if note := f.events.slowDiagnostic(); note != "" {
+			f.report.Warnings = append(f.report.Warnings, note)
+		}
+	}
 }
 
 // countBatch records the terminal states of one executed batch: what ran, what

@@ -185,6 +185,97 @@ type Executor struct {
 	// Checkpoint, when set, persists the lifecycle of side-effecting executions
 	// around their execution.
 	Checkpoint CheckpointSink
+	// AuditDiagnostic, when set, receives one message the first time a host audit
+	// record cannot be delivered. The failure is counted whether or not a
+	// diagnostic is installed, so it never disappears silently.
+	AuditDiagnostic func(string)
+	// audit holds the per-executor audit counters. It is a pointer because an
+	// Executor stays copyable: the app clones one to build the subagent executor.
+	// A structural clone shares the counters, which is the same sharing its other
+	// fields already have.
+	audit *auditCounters
+}
+
+// auditCounters counts the host audit records one executor could not deliver.
+//
+// The counters are per executor, which is per request, because "the audit trail
+// is incomplete" is a fact about one request rather than about the process.
+type auditCounters struct {
+	mu        sync.Mutex
+	failures  int
+	last      string
+	diagnosed bool
+}
+
+// executorAuditInit guards the lazy allocation of Executor.audit. It is a package
+// mutex rather than a struct field so that an Executor stays copyable: a copied
+// pointer is fine, a copied lock is a bug.
+var executorAuditInit sync.Mutex
+
+func (e *Executor) auditCounter() *auditCounters {
+	executorAuditInit.Lock()
+	defer executorAuditInit.Unlock()
+	if e.audit == nil {
+		e.audit = &auditCounters{}
+	}
+	return e.audit
+}
+
+// AuditFailures reports how many host audit records could not be delivered.
+func (e *Executor) AuditFailures() int {
+	if e == nil {
+		return 0
+	}
+	counters := e.auditCounter()
+	counters.mu.Lock()
+	defer counters.mu.Unlock()
+	return counters.failures
+}
+
+// AuditFailureDetail describes the most recent audit failure, or an empty string.
+func (e *Executor) AuditFailureDetail() string {
+	if e == nil {
+		return ""
+	}
+	counters := e.auditCounter()
+	counters.mu.Lock()
+	defer counters.mu.Unlock()
+	return counters.last
+}
+
+// recordAudit hands one record to the host without letting the host kill the
+// request.
+//
+// Auditing is an observation, not a step of the execution: a sink that fails or
+// panics changes neither the call state nor the result, is never retried, and
+// never blocks the batch. The contract is explicit because the alternative -
+// letting a host callback end a request that already committed a side effect -
+// loses the result of work that really happened. The failure is counted and
+// diagnosed once, so it stays visible instead of disappearing.
+func (e *Executor) recordAudit(record AuditRecord) {
+	if e == nil || e.Audit == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			e.auditFailed(fmt.Sprintf("audit sink panicked: %v", recovered))
+		}
+	}()
+	e.Audit.Record(record)
+}
+
+// auditFailed counts one undeliverable audit record and reports the first one.
+func (e *Executor) auditFailed(reason string) {
+	counters := e.auditCounter()
+	counters.mu.Lock()
+	counters.failures++
+	counters.last = reason
+	first := !counters.diagnosed
+	counters.diagnosed = true
+	counters.mu.Unlock()
+	if first && e.AuditDiagnostic != nil {
+		e.AuditDiagnostic(reason)
+	}
 }
 
 type BatchHooks struct {
@@ -844,7 +935,9 @@ func (e *Executor) finishPrepared(prepared *preparedCall, result protocol.ToolRe
 			prepared.record.UntrustedWebContent, _ = result.Metadata["untrusted_web_content"].(bool)
 		}
 		if e != nil && e.Audit != nil {
-			e.Audit.Record(prepared.record)
+			// A host audit failure is isolated here: it changes neither the call
+			// state nor the result, and it never ends the request.
+			e.recordAudit(prepared.record)
 		}
 	})
 	return result

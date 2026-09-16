@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -364,14 +365,111 @@ func (d *poisonedBatchDriver) Generate(_ context.Context, _ driver.Request, _ dr
 	return protocol.ModelResponse{Turn: turn, Stop: protocol.StopToolUse}, nil
 }
 
-// Characterisation, not approval: today an audit sink panic is not isolated, so
-// it escapes the request and preempts everything after it. The event sink still
-// reports its own failure first, because the tool-start event is delivered
-// before the audit record is written, but the request ends by panicking instead
-// of reporting both faults and closing the batch. PR-18 of the hardening plan
-// owns the fix and will rewrite this case into "the request finishes, the audit
-// failure is counted, and the side effect still happens exactly once".
-func TestAuditPanicTodayPreemptsTheEventSink(t *testing.T) {
+// panickingTool fails the way an untrusted tool can: by panicking.
+type panickingTool struct{ calls atomic.Int32 }
+
+func (*panickingTool) Definition() protocol.ToolDefinition {
+	return protocol.ToolDefinition{Name: "explode", Description: "panics", InputSchema: json.RawMessage(`{"type":"object"}`)}
+}
+func (*panickingTool) Risk() policy.Risk { return policy.RiskWrite }
+func (p *panickingTool) Execute(context.Context, json.RawMessage) protocol.ToolResult {
+	p.calls.Add(1)
+	panic("the tool exploded")
+}
+
+// panicBatchDriver asks for a tool that panics and then one that would write.
+type panicBatchDriver struct{ requests int }
+
+func (*panicBatchDriver) Name() string { return "stub" }
+func (*panicBatchDriver) Capabilities() driver.Capabilities {
+	return driver.Capabilities{ToolCalling: true}
+}
+
+func (d *panicBatchDriver) Generate(_ context.Context, _ driver.Request, _ driver.EmitFunc) (protocol.ModelResponse, error) {
+	d.requests++
+	if d.requests > 1 {
+		done := protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "done"}}}
+		return protocol.ModelResponse{Turn: done, Stop: protocol.StopCompleted}, nil
+	}
+	explode := protocol.ToolCall{ID: "explode-1", Name: "explode", Arguments: json.RawMessage(`{}`)}
+	write := protocol.ToolCall{ID: "write-1", Name: "write_file", Arguments: json.RawMessage(`{"path":"target.txt","content":"written","reason":"test"}`)}
+	turn := protocol.Turn{Role: protocol.RoleAgent, Parts: []protocol.Part{
+		{Kind: protocol.PartToolCall, ToolCall: &explode},
+		{Kind: protocol.PartToolCall, ToolCall: &write},
+	}}
+	return protocol.ModelResponse{Turn: turn, Stop: protocol.StopToolUse}, nil
+}
+
+// Three faults at once: a tool panics, the audit sink cannot record anything, and
+// the host event consumer fails. Host faults are isolated, tool faults are
+// contained, and the request still reports an accurate outcome instead of dying.
+func TestToolPanicWithAuditAndEventFailuresStillReportsAnOutcome(t *testing.T) {
+	fixture := newSessionSyncFixture(t)
+	write, err := tool.NewWriteFile(fixture.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explode := &panickingTool{}
+	audit := &testfault.AuditFaults{Fault: testfault.NewFault("audit.Record", testfault.Always())}
+	// The tool-start event is delivered, the panicking tool runs, and the result
+	// event is the one that cannot be delivered.
+	events := &testfault.EventFaults{Fault: testfault.NewFault("event.Emit", testfault.Nth(2))}
+	executor := &tool.Executor{
+		Registry: tool.NewRegistry(explode, write), Policy: policy.AllowAllChecker{},
+		Audit: audit, Checkpoint: fixture.controller, Workspace: fixture.workspace,
+		MaxParallelTools: 1,
+	}
+	runtime := agent.Runtime{
+		Provider: provider.Snapshot{Name: "stub", Config: config.ProviderConfig{Adapter: "stub", BaseURL: "https://example.test/v1", Model: "stub-model"}},
+		Driver:   &panicBatchDriver{}, Workspace: fixture.workspace, PermissionMode: "full",
+	}
+	conversation := conversationWithPrompts(t, fixture.sessionID)
+	report := agent.RunReport{}
+	recovered, runErr := runAndRecover(func() error {
+		_, err := conversation.Run(context.Background(), "write the file", runtime, executor,
+			agent.LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000, Report: &report}, false, events.Emit)
+		return err
+	})
+	if recovered != nil {
+		t.Fatalf("a fault escaped the request: %v", recovered)
+	}
+	if runErr == nil {
+		t.Fatal("the undeliverable critical event was not reported")
+	}
+	if explode.calls.Load() != 1 {
+		t.Fatalf("the panicking tool ran %d times", explode.calls.Load())
+	}
+	// The panicking call is reported as a tool failure, not as a success and not
+	// as a request-level crash.
+	contents := ""
+	for _, turn := range conversation.Transcript() {
+		for _, part := range turn.Parts {
+			if part.ToolResult != nil {
+				contents += part.ToolResult.Content + "\n"
+			}
+		}
+	}
+	if !strings.Contains(contents, "tool execution panicked") {
+		t.Fatalf("the tool panic was not contained: %q", contents)
+	}
+	if report.AuditFailures == 0 {
+		t.Fatal("the audit failures were not counted")
+	}
+	// The write behind the panicking call never started.
+	if _, err := os.Stat(filepath.Join(fixture.workspace, "target.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a side effect started after the batch was cancelled")
+	}
+	// The transcript stays structurally valid through all three faults.
+	if _, err := agent.RestoreConversation(conversation.ExportState()); err != nil {
+		t.Fatalf("restore = %v", err)
+	}
+}
+
+// failure is counted, and the work that really happened is reported as having
+// happened. The event sink failure beside it is still critical - a tool-start
+// event that cannot be delivered ends the request - so the call behind it never
+// starts.
+func TestAuditPanicIsIsolatedAndCountedBesideAnEventSinkFailure(t *testing.T) {
 	fixture := newSessionSyncFixture(t)
 	write, err := tool.NewWriteFile(fixture.workspace)
 	if err != nil {
@@ -379,35 +477,98 @@ func TestAuditPanicTodayPreemptsTheEventSink(t *testing.T) {
 	}
 	audit := &testfault.AuditFaults{Fault: testfault.NewFault("audit.Record", testfault.Always())}
 	events := &testfault.EventFaults{Fault: testfault.NewFault("event.Emit", testfault.Always())}
+	diagnostics := 0
 	executor := &tool.Executor{
 		Registry: tool.NewRegistry(write), Policy: policy.AllowAllChecker{},
 		Audit: audit, Checkpoint: fixture.controller, Workspace: fixture.workspace,
+		AuditDiagnostic: func(string) { diagnostics++ },
 	}
 	runtime := agent.Runtime{
 		Provider: provider.Snapshot{Name: "stub", Config: config.ProviderConfig{Adapter: "stub", BaseURL: "https://example.test/v1", Model: "stub-model"}},
 		Driver:   &poisonedBatchDriver{}, Workspace: fixture.workspace, PermissionMode: "full",
 	}
 	conversation := conversationWithPrompts(t, fixture.sessionID)
-	recovered, _ := runAndRecover(func() error {
+	report := agent.RunReport{}
+	recovered, runErr := runAndRecover(func() error {
 		_, err := conversation.Run(context.Background(), "write the file", runtime, executor,
-			agent.LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000}, false, events.Emit)
+			agent.LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000, Report: &report}, false, events.Emit)
 		return err
 	})
-	if recovered == nil {
-		t.Fatal("the audit panic was isolated; PR-18 owns that change, so this case must be rewritten with it")
+	if recovered != nil {
+		t.Fatalf("the audit panic escaped the request: %v", recovered)
 	}
-	if audit.Fault.Failures() != 1 || len(audit.Records()) != 1 {
-		t.Fatalf("audit failures = %d records = %d, want the one call it was told about", audit.Fault.Failures(), len(audit.Records()))
+	// The event sink failure is the reason the request ended, and it is reported
+	// as such rather than being masked by the audit failure.
+	if runErr == nil {
+		t.Fatal("the undeliverable critical event was not reported")
+	}
+	// Both calls of the batch reached the audit step - the one that could not run
+	// and the one behind it - so both records failed, and only the first failure
+	// is diagnosed.
+	if report.AuditFailures != 2 {
+		t.Fatalf("audit failures = %d, want one per call of the batch", report.AuditFailures)
+	}
+	if diagnostics != 1 {
+		t.Fatalf("audit diagnostics = %d, want exactly one", diagnostics)
+	}
+	if audit.Fault.Failures() != 2 || len(audit.Records()) != 2 {
+		t.Fatalf("audit failures = %d records = %d", audit.Fault.Failures(), len(audit.Records()))
 	}
 	if events.Fault.Failures() != 1 {
 		t.Fatalf("event failures = %d, want the tool-start delivery", events.Fault.Failures())
 	}
-	if events.KindCount(protocol.EventToolResult) != 0 {
-		t.Fatal("a tool result reached the host although the request panicked before it")
+	if len(report.Warnings) == 0 {
+		t.Fatal("the audit failure left no warning on the report")
 	}
-	// The panicking report belongs to the call that could not run, so the call
+	// The call whose audit report panicked could not run, so the side effect
 	// behind it never started.
 	if _, err := os.Stat(filepath.Join(fixture.workspace, "target.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("a side effect started after the host callback panicked")
+	}
+}
+
+// A failing audit sink does not change the request: the tool runs, the request
+// completes, and the incomplete audit trail is reported rather than hidden.
+func TestAuditPanicLeavesASuccessfulRequestSuccessful(t *testing.T) {
+	fixture := newSessionSyncFixture(t)
+	write, err := tool.NewWriteFile(fixture.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit := &testfault.AuditFaults{Fault: testfault.NewFault("audit.Record", testfault.Always())}
+	diagnostics := make([]string, 0, 1)
+	executor := &tool.Executor{
+		Registry: tool.NewRegistry(write), Policy: policy.AllowAllChecker{},
+		Audit: audit, Checkpoint: fixture.controller, Workspace: fixture.workspace,
+		AuditDiagnostic: func(message string) { diagnostics = append(diagnostics, message) },
+	}
+	runtime := agent.Runtime{
+		Provider: provider.Snapshot{Name: "stub", Config: config.ProviderConfig{Adapter: "stub", BaseURL: "https://example.test/v1", Model: "stub-model"}},
+		Driver:   &writeDriver{path: "target.txt", content: "written"}, Workspace: fixture.workspace, PermissionMode: "full",
+	}
+	conversation := conversationWithPrompts(t, fixture.sessionID)
+	report := agent.RunReport{}
+	if _, err := conversation.Run(context.Background(), "write the file", runtime, executor,
+		agent.LoopOptions{MaxTurns: 3, MaxTotalTokens: 1_000_000, Report: &report}, false, nil); err != nil {
+		t.Fatalf("the request failed because its audit sink did: %v", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(fixture.workspace, "target.txt"))
+	if readErr != nil || string(data) != "written" {
+		t.Fatalf("the side effect did not happen: %q err = %v", data, readErr)
+	}
+	if report.AuditFailures != 1 || report.StopReason != string(protocol.StopCompleted) {
+		t.Fatalf("report = %#v", report)
+	}
+	if len(diagnostics) != 1 || len(report.Warnings) != 1 {
+		t.Fatalf("diagnostics = %#v warnings = %#v", diagnostics, report.Warnings)
+	}
+	// The tool's own record of what it did is unaffected: the lifecycle log still
+	// holds both sides.
+	events := fixture.events(t)
+	if got := countEvents(events, session.EventToolExecutionIntent); got != 1 {
+		t.Fatalf("intents = %d", got)
+	}
+	if got := countEvents(events, session.EventToolCompleted); got != 1 {
+		t.Fatalf("completions = %d", got)
 	}
 }

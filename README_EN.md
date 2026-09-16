@@ -573,8 +573,21 @@ The summary never contains a plaintext key or a sensitive request header, and to
 
 ### Event delivery
 
-- Streamed text and reasoning deltas are coalesced within a bounded 4 KiB buffer, so a long answer neither blocks the model nor appears only at the end.
-- Tool, approval, terminal and content events are delivered synchronously and are never dropped by buffering; a delivery failure stops the request immediately and is recorded as `event_sink_failed` in the run summary.
+Delivery has two classes with different contracts:
+
+- **Critical events** (a tool starting or finishing, an approval result, usage, the terminal report — anything carrying control or durable state) are delivered synchronously and in order. They are never dropped by buffering; a delivery failure stops the request immediately and is recorded as `event_sink_failed` in the run summary.
+- **Streamed deltas** (text and reasoning) are progress rather than state: their content is the concatenation of the pieces and the transcript holds the full answer regardless. They are coalesced within a bounded 4 KiB buffer, so a long answer neither blocks the model nor appears only at the end.
+
+A slow consumer has an explicit meaning:
+
+- One delivery that overruns a 250 ms budget marks the host as behind. From then on streamed deltas are not pushed to it at all: they are dropped and counted in the run summary as `events_dropped`. Critical events keep being delivered synchronously and in order. A delivery that completes in time marks the host as caught up and delivery resumes.
+- A slow consumer therefore cannot hold the model stream open forever. The price is that the host's view of the streamed text may be incomplete, and that price is **observable**: `events_dropped` and `warnings` are both recorded in the run summary, while the transcript stays complete.
+
+The audit callback contract is equally explicit:
+
+- A host audit sink that fails or panics is isolated: it changes neither the call state nor the result, is never retried, never blocks, and never ends the request. The reason is direct — letting a host callback end a request that already committed a side effect would lose the result of work that really happened.
+- The failure is counted in the run summary as `audit_failures`, and the first one is stated once on stderr as an `[audit]` diagnostic.
+- "The request succeeded" and "the audit trail is incomplete" can both be true and both be visible: `warnings` names how many records could not be written and the reason for the most recent one.
 
 ### Core loop responsibilities
 
