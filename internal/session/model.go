@@ -207,4 +207,3 @@ type AttachmentRef struct {
 	SHA256 string `json:"sha256"`
 	Bytes  int    `json:"bytes"`
 }
-

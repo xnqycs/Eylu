@@ -113,7 +113,7 @@ func TestOlderSchemaIsRefusedOnLoadAndMigratedWithABackup(t *testing.T) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	original := []byte(fmt.Sprintf(`{"version":1,"session_id":"ancient"}`))
+	original := []byte(`{"version":1,"session_id":"ancient"}`)
 	snapshotPath := filepath.Join(directory, "snapshot.json")
 	if err := os.WriteFile(snapshotPath, original, 0o600); err != nil {
 		t.Fatal(err)

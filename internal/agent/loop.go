@@ -94,7 +94,9 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		return protocol.ModelResponse{}, err
 	}
 	c.applyToolDefinitions(runtime, plan.Definitions)
-	definitions := plan.Definitions
+	// definitions is assigned per round from the resolved plan, so it is declared
+	// here and never carries a value across iterations.
+	var definitions []protocol.ToolDefinition
 	seenCalls := make(map[string]struct{})
 	budget := newBudgetTracker(options.MaxTotalTokens)
 	if options.Usage != nil {
