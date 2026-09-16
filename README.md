@@ -389,6 +389,15 @@ max_parallel_tools = 4
 - Web 扇出折叠只负责内容与展示：保留父调用 ID、保留每个子调用的终态、并在折叠结果中保留已成功查询的内容；控制状态不经过聚合层，因此多查询与单查询的控制语义一致。未执行或被拒绝的查询不会被投影成已执行的搜索活动。
 - 为兼容旧 UI，结果中仍会输出 `interrupt_request`、`approval_rejected`、`rejection_reason`、`batch_cancelled` 等过渡 metadata；新控制逻辑不读取它们。
 
+### 调用提交与终态闭合
+
+- 模型响应在提交前完成校验：turn 角色与 part 结构、工具调用 ID 是否为空、同一响应内是否重复、参数是否为合法 JSON、调用 ID 在会话历史中的唯一性，以及 Stop 与工具调用是否一致。校验失败的响应不会写入 transcript，用户消息保留，不可信的 driverState 被清除。
+- 提交之后的每个工具调用都必须有终态。预算耗尽、工具注册刷新失败、Web 工具解析失败、取消与中断等所有退出路径都会为尚未执行的调用补上 `not_executed` 终态；已经产生的成功结果不会被改写。
+- `Stop` 声明完成却仍返回工具调用属于协议矛盾：按协议错误返回，而不是当作正常完成，也不会留下悬空调用。
+- 长度截断（`length`）响应保留部分内容，其中的工具调用不会执行，并补上 `not_executed` 终态。
+- 已保存的 transcript 保持原样。构建模型请求时，历史上没有结果记录的调用会以 `outcome_unknown` 补全，并且不会自动重放；诊断可通过 `RecoveryNotes` 读取。
+- `Send` 与 `Adopt` 不执行工具，它们记录的调用同样会被闭合。
+
 ### 代码上下文与后台子代理
 
 `read_file` 支持 1-based 闭区间参数 `start_line`、`end_line`，并返回 `file_hash`、`slice_hash`、`artifact_id` 和续读游标 `next_start_line`。`search_code` 共享会话级增量三元组索引，支持 `offset` 分页和 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前会替换为稳定引用。

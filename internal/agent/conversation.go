@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -134,6 +135,16 @@ type Conversation struct {
 	mcpFingerprint             string
 	lastCompressionFingerprint string
 	profile                    *Profile
+	recoveryNotes              []string
+}
+
+// RecoveryNotes reports the tool call IDs that had no recorded result and were
+// closed with outcome_unknown while building the most recent model request.
+// They are a diagnostic only: the stored transcript is never rewritten.
+func (c *Conversation) RecoveryNotes() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.recoveryNotes...)
 }
 
 func NewConversation() *Conversation {
@@ -237,7 +248,23 @@ func (c *Conversation) Send(ctx context.Context, prompt string, runtime Runtime,
 	}
 	c.appendUser(prompt)
 	c.toolDefinitions = nil
-	return c.generate(ctx, runtime, nil, false, stream, emit)
+	response, effectiveRuntime, err := c.generate(ctx, runtime, nil, false, stream, emit)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	response, err = normalizeModelResponse(response, nil)
+	if err != nil {
+		// A malformed response is never committed: the user message stays and
+		// the untrustworthy remote state is dropped.
+		c.driverState = nil
+		c.rebuildLedger(effectiveRuntime)
+		return protocol.ModelResponse{}, err
+	}
+	c.commitResponse(response, effectiveRuntime)
+	// Send never executes tools, so a tool call it returns is closed with a
+	// terminal state instead of being left dangling.
+	c.closeToolCalls(effectiveRuntime, toolCalls(response.Turn), protocol.CallNotExecuted, "tool call was not executed: this request does not run tools")
+	return response, nil
 }
 
 func (c *Conversation) Fork(profile Profile) (*Conversation, error) {
@@ -270,7 +297,14 @@ func (c *Conversation) Adopt(prompt string, runtime Runtime, response *protocol.
 	}
 	c.appendUser(prompt)
 	if response != nil {
-		c.turns = append(c.turns, cloneTurns([]protocol.Turn{response.Turn})[0])
+		adopted := cloneTurns([]protocol.Turn{response.Turn})[0]
+		if adopted.ID == "" {
+			adopted.ID = uuid.NewString()
+		}
+		if adopted.Role == "" {
+			adopted.Role = protocol.RoleAgent
+		}
+		c.turns = append(c.turns, adopted)
 	}
 	for _, item := range protectedSkills {
 		if item.Name != "" && item.Digest != "" && item.Content != "" {
@@ -284,6 +318,9 @@ func (c *Conversation) Adopt(prompt string, runtime Runtime, response *protocol.
 	c.rebuildLedger(runtime)
 	if response != nil {
 		c.ledger.SetLastUsage(response.Usage)
+		// An adopted answer never ran tools in this conversation, so any tool
+		// call it carries is closed instead of being left dangling.
+		c.closeToolCalls(runtime, toolCalls(response.Turn), protocol.CallNotExecuted, "tool call was not executed: the answer was adopted from a detached run")
 	}
 	return nil
 }
@@ -365,11 +402,14 @@ func (c *Conversation) appendUser(prompt string) {
 	c.turns = append(c.turns, userTurn)
 }
 
-func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, parallelToolCalls, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, error) {
+// generate builds one request and calls the model. It returns the response
+// before it is committed, together with the runtime that was actually used, so
+// the caller decides whether the response may become part of the history.
+func (c *Conversation) generate(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, parallelToolCalls, stream bool, emit driver.EmitFunc) (protocol.ModelResponse, Runtime, error) {
 	if runtime.LimitResolver != nil {
 		resolved, err := runtime.LimitResolver.Resolve(ctx, runtime.Provider, runtime.APIKey)
 		if err != nil {
-			return protocol.ModelResponse{}, err
+			return protocol.ModelResponse{}, runtime, err
 		}
 		runtime.Provider = resolved
 	}
@@ -377,7 +417,7 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 	for attempt := 0; attempt <= 3; attempt++ {
 		prepared, err := c.prepareRequestContext(ctx, runtime, definitions)
 		if err != nil {
-			return protocol.ModelResponse{}, err
+			return protocol.ModelResponse{}, runtime, err
 		}
 		request := driver.Request{
 			BaseURL:           runtime.Provider.Config.BaseURL,
@@ -425,19 +465,136 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 			}
 			c.lastRuntime = runtime
 			c.rebuildLedger(runtime)
-			return protocol.ModelResponse{}, err
+			return protocol.ModelResponse{}, runtime, err
 		}
 		if len(response.Turn.Parts) == 0 {
-			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned an empty turn"}
+			return protocol.ModelResponse{}, runtime, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned an empty turn"}
 		}
-		c.turns = append(c.turns, response.Turn)
-		c.driverState = append(c.driverState[:0], response.DriverState...)
-		c.lastRuntime = runtime
-		c.rebuildLedger(runtime)
-		c.ledger.SetLastUsage(response.Usage)
-		return response, nil
+		// The response is validated and committed by the caller, so a malformed
+		// response can never become part of the history.
+		return response, runtime, nil
 	}
-	return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrContextWindow, Message: "context recovery attempts exhausted"}
+	return protocol.ModelResponse{}, runtime, &protocol.Error{Code: protocol.ErrContextWindow, Message: "context recovery attempts exhausted"}
+}
+
+// normalizeModelResponse validates a model response before it is committed to
+// the transcript, and repairs the host-owned identity fields it is allowed to
+// supply. A response that fails validation is never committed, so the next
+// request is always built from history the protocol can actually use.
+func normalizeModelResponse(response protocol.ModelResponse, seenCalls map[string]struct{}) (protocol.ModelResponse, error) {
+	if response.Turn.ID == "" {
+		// The turn ID is host-owned identity, not model identity, so assigning
+		// one is unambiguous.
+		response.Turn.ID = uuid.NewString()
+	}
+	if response.Turn.Role == "" {
+		response.Turn.Role = protocol.RoleAgent
+	}
+	if response.Turn.Role != protocol.RoleAgent {
+		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned a turn with role %q", response.Turn.Role)}
+	}
+	calls := 0
+	local := make(map[string]struct{})
+	for index, part := range response.Turn.Parts {
+		switch part.Kind {
+		case protocol.PartToolCall:
+			if part.ToolCall == nil {
+				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned an empty tool call at part %d", index)}
+			}
+			call := *part.ToolCall
+			if call.ID == "" {
+				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned a tool call without an ID"}
+			}
+			if call.Name == "" {
+				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned tool call %q without a name", call.ID)}
+			}
+			if !json.Valid(call.Arguments) {
+				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned tool call %q with invalid JSON arguments", call.ID)}
+			}
+			if _, duplicate := local[call.ID]; duplicate {
+				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned duplicate tool call ID %q", call.ID)}
+			}
+			local[call.ID] = struct{}{}
+			if _, duplicate := seenCalls[call.ID]; duplicate {
+				return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("duplicate tool call ID %q", call.ID)}
+			}
+			calls++
+		case protocol.PartText, protocol.PartReasoning, protocol.PartToolResult, protocol.PartWebActivity, protocol.PartCitation:
+		default:
+			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("model returned a part with unknown kind %q", part.Kind)}
+		}
+	}
+	switch response.Stop {
+	case protocol.StopToolUse:
+		if calls == 0 {
+			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model stopped for tool use without tool calls"}
+		}
+	case protocol.StopCompleted:
+		if calls > 0 {
+			// Completion and an unresolved tool request contradict each other:
+			// committing it would either strand the calls or claim a completion
+			// that never happened.
+			return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "model reported completion while returning tool calls"}
+		}
+	default:
+		// A truncated or interrupted response may still carry a partial tool
+		// call. The caller closes those calls without executing them.
+	}
+	return response, nil
+}
+
+// commitResponse records a validated model response together with the remote
+// driver state that produced it.
+func (c *Conversation) commitResponse(response protocol.ModelResponse, runtime Runtime) {
+	c.turns = append(c.turns, response.Turn)
+	c.driverState = append(c.driverState[:0], response.DriverState...)
+	c.lastRuntime = runtime
+	c.rebuildLedger(runtime)
+	c.ledger.SetLastUsage(response.Usage)
+}
+
+// resolvedCallIDs collects the call IDs that already carry a terminal result.
+func (c *Conversation) resolvedCallIDs() map[string]struct{} {
+	resolved := make(map[string]struct{})
+	for _, turn := range c.turns {
+		for _, part := range turn.Parts {
+			if part.ToolResult != nil && part.ToolResult.CallID != "" {
+				resolved[part.ToolResult.CallID] = struct{}{}
+			}
+		}
+	}
+	return resolved
+}
+
+// closeToolCalls gives every call that has no terminal result yet one synthetic
+// terminal state. It is the single exit path for committed calls, so a request
+// never ends with a tool call the next model request cannot pair, and a call
+// that already has a result is never rewritten.
+func (c *Conversation) closeToolCalls(runtime Runtime, calls []protocol.ToolCall, state protocol.CallState, message string) {
+	resolved := c.resolvedCallIDs()
+	pending := make([]protocol.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		if call.ID == "" {
+			continue
+		}
+		if _, ok := resolved[call.ID]; ok {
+			continue
+		}
+		pending = append(pending, call)
+	}
+	if len(pending) == 0 {
+		return
+	}
+	turn := protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleTool, CreatedAt: time.Now().UTC()}
+	for _, call := range pending {
+		result := protocol.ToolResult{CallID: call.ID, Content: message, IsError: true, State: state}
+		turn.Parts = append(turn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
+	}
+	c.turns = append(c.turns, turn)
+	// The remote driver state belongs to a response whose calls never all
+	// completed, so the next request must be rebuilt from the local transcript.
+	c.driverState = nil
+	c.rebuildLedger(runtime)
 }
 
 func (c *Conversation) ContextReport() contextledger.Report {

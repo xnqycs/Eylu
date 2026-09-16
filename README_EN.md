@@ -418,6 +418,15 @@ The default concurrency limit is `4`. Set it to `1` for serial execution, or ove
 - Web fan-out aggregation only handles content and display: it keeps the parent call ID, keeps each child's terminal state, and keeps the content of the queries that succeeded. Control never passes through the aggregation layer, so single-query and multi-query calls share one control semantics. A query that never ran, or that was refused, is not projected as a search that executed.
 - For compatibility with older UI, results still publish transitional metadata such as `interrupt_request`, `approval_rejected`, `rejection_reason`, and `batch_cancelled`; the new control logic does not read them.
 
+### Tool call commit and terminal closure
+
+- A model response is validated before it is committed: turn role and part structure, empty tool call IDs, duplicates inside one response, argument JSON validity, call ID uniqueness in the session history, and consistency between `Stop` and the tool calls. A response that fails validation is never written to the transcript; the user message stays and the untrustworthy driver state is dropped.
+- Every committed tool call must reach a terminal state. Budget exhaustion, tool registry refresh failure, web tool resolution failure, cancellation and interruption all close the calls that never executed with `not_executed`; a success that already happened is never rewritten.
+- A response that reports completion while returning tool calls is a protocol contradiction: it is returned as a protocol error instead of being treated as a normal completion, and it never strands a call.
+- A truncated (`length`) response keeps its partial content, its tool calls are not executed, and they are closed with `not_executed`.
+- The stored transcript is left as it is. When a model request is built, a historical call with no recorded result is closed with `outcome_unknown` and is never replayed automatically; the diagnostic is available through `RecoveryNotes`.
+- `Send` and `Adopt` do not run tools, so the calls they record are closed too.
+
 ### Code context and background subagents
 
 `read_file` accepts 1-based inclusive `start_line` and `end_line` ranges and returns stable file and slice hashes. `search_code` shares the session's incremental code index, supports pagination, and deduplicates overlapping code slices before model calls.

@@ -186,6 +186,60 @@ func configForState(state ProviderState) config.ProviderConfig {
 	return config.ProviderConfig{Adapter: state.Adapter, BaseURL: state.BaseURL, Model: state.Model, ReasoningEffort: state.ReasoningEffort, CatalogProvider: state.CatalogProvider, ContextWindow: state.ContextWindow}
 }
 
+// repairDanglingToolCalls returns the turns used to build one model request.
+//
+// A tool call that never received a result is closed with an outcome_unknown
+// result, so a provider never receives an unresolved call and the next request
+// stays usable. The stored transcript keeps its original data: the repair is a
+// request-time view, not a rewrite of history.
+//
+// The repair is deliberately conservative. "Unknown" is neither "succeeded" nor
+// "not executed", and an unknown call is never retried automatically.
+func repairDanglingToolCalls(turns []protocol.Turn) ([]protocol.Turn, []string) {
+	resolved := make(map[string]struct{})
+	for _, turn := range turns {
+		for _, part := range turn.Parts {
+			if part.ToolResult != nil && part.ToolResult.CallID != "" {
+				resolved[part.ToolResult.CallID] = struct{}{}
+			}
+		}
+	}
+	repaired := make([]protocol.Turn, 0, len(turns))
+	recovered := make([]string, 0)
+	for _, turn := range turns {
+		repaired = append(repaired, turn)
+		if turn.Role != protocol.RoleAgent {
+			continue
+		}
+		missing := make([]protocol.ToolCall, 0)
+		for _, part := range turn.Parts {
+			if part.ToolCall == nil || part.ToolCall.ID == "" {
+				continue
+			}
+			if _, ok := resolved[part.ToolCall.ID]; !ok {
+				missing = append(missing, *part.ToolCall)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		synthetic := protocol.Turn{ID: "recovered-" + turn.ID, Role: protocol.RoleTool, CreatedAt: turn.CreatedAt}
+		for _, call := range missing {
+			result := protocol.ToolResult{
+				CallID: call.ID, IsError: true, State: protocol.CallOutcomeUnknown,
+				Content: "recovered: no result was recorded for this tool call. It may or may not have run, and it was not retried automatically. Verify any side effect before relying on it.",
+			}
+			synthetic.Parts = append(synthetic.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
+			recovered = append(recovered, call.ID)
+		}
+		repaired = append(repaired, synthetic)
+	}
+	if len(recovered) == 0 {
+		return turns, nil
+	}
+	return repaired, recovered
+}
+
 func validateTurns(turns []protocol.Turn) error {
 	seen := make(map[string]struct{}, len(turns))
 	for _, turn := range turns {

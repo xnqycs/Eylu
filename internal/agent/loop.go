@@ -90,41 +90,59 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		c.toolDefinitions = append(c.toolDefinitions[:0], definitions...)
 		c.rebuildLedger(runtime)
 		parallelToolCalls := executor.ParallelLimit() > 1 && driver.CapabilitiesFor(runtime.Driver, capabilityTarget(runtime)).ParallelTools
-		response, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit)
+		response, effectiveRuntime, err := c.generate(ctx, runtime, definitions, parallelToolCalls, stream, emit)
 		if err != nil {
 			return protocol.ModelResponse{}, err
 		}
+		// Validate before committing: a malformed response must not become part
+		// of the history the next request is built from.
+		response, err = normalizeModelResponse(response, seenCalls)
+		if err != nil {
+			c.driverState = nil
+			c.rebuildLedger(runtime)
+			return last, err
+		}
+		c.commitResponse(response, effectiveRuntime)
 		last = response
+		for _, call := range toolCalls(response.Turn) {
+			seenCalls[call.ID] = struct{}{}
+		}
+		// Every committed call must end with a terminal state. closePending is
+		// the single exit path for the calls of this response; it leaves a call
+		// that already has a result untouched.
+		calls := toolCalls(response.Turn)
+		closePending := func(message string) {
+			c.closeToolCalls(runtime, calls, protocol.CallNotExecuted, message)
+		}
 		if err := recordHostedWebActivities(executor, runtime, requestID, response.Turn, plan, webBudget); err != nil {
+			closePending("tool call was not executed: hosted web activity was rejected")
 			return last, err
 		}
 		totalTokens += response.Usage.InputTokens + response.Usage.OutputTokens
 		if options.MaxTotalTokens > 0 && totalTokens > options.MaxTotalTokens {
+			closePending("tool call was not executed: the request token budget was exhausted before execution")
 			return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "agent token budget exceeded"}
 		}
 		if response.Stop != protocol.StopToolUse {
+			// A truncated or interrupted response may still carry a partial tool
+			// call. It is never executed here, but it is closed so the next
+			// request never contains an unresolved call.
+			closePending("tool call was not executed: the model response stopped before tool use")
 			return response, nil
 		}
-		calls := toolCalls(response.Turn)
 		if len(calls) == 0 {
+			closePending("tool call was not executed: the model requested tool use without tool calls")
 			return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model stopped for tool use without tool calls"}
 		}
 		toolTurn := protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleTool, CreatedAt: time.Now().UTC()}
-		for _, call := range calls {
-			if call.ID == "" {
-				return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned a tool call without an ID"}
-			}
-			if _, duplicate := seenCalls[call.ID]; duplicate {
-				return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("duplicate tool call ID %q", call.ID)}
-			}
-			seenCalls[call.ID] = struct{}{}
-		}
 		runtime, err = c.refreshMCPRuntime(runtime, executor, baseTools)
 		if err != nil {
+			closePending("tool call was not executed: the tool registry could not be refreshed")
 			return last, err
 		}
 		plan, err = c.resolveWebRuntime(runtime, executor, webBudget)
 		if err != nil {
+			closePending("tool call was not executed: web tools could not be resolved")
 			return last, err
 		}
 		definitions = plan.Definitions

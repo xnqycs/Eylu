@@ -424,10 +424,21 @@ func (c *Conversation) buildPromptContextWithState(runtime Runtime, definitions 
 	if summary != "" {
 		builder.AddTextTurn("conversation-summary", protocol.RoleSystem, summary, contextledger.CategorySummary, "compression", true, nil)
 	}
+	// Omitted turns are filtered before recovery, so a revived tool result is
+	// never attached to a call the request does not contain.
+	visible := make([]protocol.Turn, 0, len(c.turns))
 	for _, turn := range c.turns {
 		if _, omitted := omittedTurnIDs[turn.ID]; omitted {
 			continue
 		}
+		visible = append(visible, turn)
+	}
+	// A historical call without a result is closed for this request only; the
+	// stored transcript keeps its original data and the diagnostic is reported
+	// separately.
+	visible, recovered := repairDanglingToolCalls(visible)
+	c.recoveryNotes = recovered
+	for _, turn := range visible {
 		contextTurn, keep := contextualizeTurn(turn, options.toolContextBytes)
 		if keep {
 			builder.AddTurn(contextTurn)
