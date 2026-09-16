@@ -504,9 +504,15 @@ func (s *sessionRuntime) RecordRunReport(report agent.RunReport) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// A provider error can echo a credential, so it goes through the same
+	// redaction as the session's own last error before it is written to the log.
+	message := report.Error
+	if message != "" && s.redact != nil {
+		message = s.redact(message)
+	}
 	summary := session.RunSummary{
 		RequestID: report.RequestID, Iterations: report.Iterations, StopReason: report.StopReason,
-		Error: report.Error, ModelCalls: report.ModelCalls, ToolCalls: report.ToolCalls,
+		Error: message, ModelCalls: report.ModelCalls, ToolCalls: report.ToolCalls,
 		Succeeded: report.Succeeded, Failed: report.Failed, Rejected: report.Rejected,
 		Cancelled: report.Cancelled, NotExecuted: report.NotExecuted, OutcomeUnknown: report.OutcomeUnknown,
 		InputTokens: report.InputTokens, OutputTokens: report.OutputTokens, ExactUsage: report.ExactUsage,

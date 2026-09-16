@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"Eylu/internal/agent"
+
 	"Eylu/internal/session"
 )
 
@@ -79,5 +81,38 @@ func TestSessionLogRecordsWhyARequestStopped(t *testing.T) {
 				t.Fatalf("summary = %#v", summary)
 			}
 		})
+	}
+}
+
+// A provider error stored in the run report is redacted like the session's own
+// last error, so a credential echoed by a provider never reaches the log.
+func TestRunReportRedactsTheStoredError(t *testing.T) {
+	fixture := newSessionSyncFixture(t)
+	redacted := false
+	fixture.controller.redact = func(value string) string {
+		redacted = true
+		return strings.ReplaceAll(value, "sk-secret", "[REDACTED]")
+	}
+	if err := fixture.controller.RecordRunReport(agent.RunReport{
+		RequestID: "request-1", StopReason: "aborted", Error: "provider rejected sk-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !redacted {
+		t.Fatal("the run report error was stored without redaction")
+	}
+	store, err := session.Open(fixture.store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := store.Load(fixture.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.LastRun == nil || strings.Contains(snapshot.LastRun.Error, "sk-secret") {
+		t.Fatalf("stored summary = %#v", snapshot.LastRun)
+	}
+	if !strings.Contains(snapshot.LastRun.Error, "[REDACTED]") {
+		t.Fatalf("stored summary = %#v", snapshot.LastRun)
 	}
 }
