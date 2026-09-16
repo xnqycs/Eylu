@@ -515,6 +515,14 @@ Stop reasons have an explicit handling table, and a non-`tool_use` stop is not a
 - Reasoning tokens are recorded separately and never counted twice, because every adapter already includes them in its output tokens. The response returned by `Run` still describes only the last call; the accumulated usage is exposed separately through `LoopOptions.Usage` (`RunUsage`).
 - The current drivers do not forward a remaining output limit to the provider, so the budget is soft: Eylu stops starting new requests once the limit is reached, but a single call may still overshoot. A subagent keeps running after the parent request ends, so its cost is reported separately instead of being folded into the same synchronous budget.
 
+### Tightening safety settings while a request runs
+
+- Narrowing a safety setting takes effect **inside the current request**, not on the next one: narrowing the mode (`full → auto`, `auto → plan`, `plan → manual`), adding a `deny_tools` entry, disabling an MCP server, or moving the hosted-web permission from `allow`/`ask` to `deny` makes the host stop the running request before its next batch boundary.
+- Stopping is not rolling back: a side effect that already happened is not undone and a result that was already obtained is kept; calls that had not started are closed with `not_executed`, and a call waiting for approval does not start even once the approval arrives.
+- The run report records `stop_reason: policy_tightened` with the reason, and the TUI and CLI say the request stopped on the new settings instead of presenting it as a request failure or a model fault.
+- Widening only applies to the next request; the running one finishes normally, because a request is never granted a permission it did not have when it started.
+- The decision has one implementation (`Tightening` in `internal/policy`), so every entry point answers "did this narrow?" the same way, and an unrecognized hosted-web permission can only ever stop a request, never widen one.
+
 ### Event IDs and append idempotency
 
 - Every logical event has a stable ID. When an append result is unknown, the retry reuses the ID; the store recognizes an ID it already holds with identical content as a retry and does not write a second copy, while the same ID with different content is reported as a conflict instead of being overwritten.

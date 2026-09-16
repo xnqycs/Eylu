@@ -94,7 +94,34 @@ const (
 	stopCancelled      = "cancelled"
 	stopAborted        = "aborted"
 	stopInterrupted    = "interrupt_request"
+	// stopPolicyTightened is the reason a host that narrowed a safety setting
+	// gets: the request stopped because it would otherwise have run under the
+	// settings that were just replaced.
+	stopPolicyTightened = "policy_tightened"
 )
+
+// PolicyStopError reports that a request ended because its host narrowed a safety
+// setting while it was running.
+//
+// It is not a failure of the request: the work already done is kept and the
+// results already obtained are preserved, so a caller presents it as "stopped on
+// the new settings" rather than as an error, and the run report says
+// policy_tightened with the reason.
+type PolicyStopError struct {
+	// Reason names the setting that narrowed, in the words of the host.
+	Reason string
+	// Cause is the cancellation that carried the stop, when there was one.
+	Cause error
+}
+
+func (e *PolicyStopError) Error() string {
+	if e.Reason == "" {
+		return "the request stopped because the safety settings were tightened"
+	}
+	return "the request stopped because the safety settings were tightened: " + e.Reason
+}
+
+func (e *PolicyStopError) Unwrap() error { return e.Cause }
 
 // runFinalizer owns the exit paths of one request.
 //
@@ -133,6 +160,14 @@ func (f *runFinalizer) finish(response protocol.ModelResponse, last protocol.Mod
 	if sinkErr := f.events.stop(); sinkErr != nil && err == nil {
 		err = sinkErr
 		stop = "event_sink_failed"
+	}
+	// A host that narrowed a safety setting owns the reason this request stopped
+	// for: the cancellation is only how it got there. A request that finished on
+	// its own is never rewritten, so a stop request that arrives at the very end
+	// cannot turn a completion into a failure.
+	if reason, ok := f.conversation.takePolicyStop(); ok && (stop == stopCancelled || stop == stopAborted) {
+		stop = stopPolicyTightened
+		err = &PolicyStopError{Reason: reason, Cause: err}
 	}
 	f.publish(stop, err)
 	if err != nil {

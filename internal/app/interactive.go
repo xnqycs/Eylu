@@ -379,11 +379,21 @@ func (r *runtime) handleSlashCommand(ctx context.Context, reader *bufio.Reader, 
 		if err != nil {
 			return &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 		}
+		previous := safetySettings(manager.Config(), *opts)
+		modeName := opts.mode
 		opts.mode = mode.String()
 		if r.session != nil {
 			if err := r.session.Sync(conversation, manager, *opts, nil); err != nil {
+				opts.mode = modeName
 				return err
 			}
+		}
+		// The prompt is only reachable between requests, so this normally has
+		// nothing to stop; the check is here so the rule does not depend on which
+		// interface asked for the change.
+		next := safetySettings(manager.Config(), *opts)
+		if reason := policy.Tightening(previous, next); reason != "" && conversation.RequestStop(reason) {
+			fmt.Fprintf(r.stdout, "Stopped the running request on the new settings: %s\n", reason)
 		}
 		fmt.Fprintf(r.stdout, "Permission mode: %s\n", opts.mode)
 		return nil

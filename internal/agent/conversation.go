@@ -145,6 +145,11 @@ type Conversation struct {
 	// pendingSnapshot holds a provider change that arrived while a request was
 	// running. Run applies it at the next round boundary.
 	pendingSnapshot *provider.Snapshot
+	// stopReason holds the reason a host asked the running request to stop,
+	// because it narrowed a safety setting. It is set by RequestStop, cleared
+	// when a request starts, and read on the way out so the run report says why
+	// the request stopped instead of only that it was cancelled.
+	stopReason string
 }
 
 // RecoveryNotes reports the tool call IDs that had no recorded result and were
@@ -757,6 +762,42 @@ func (c *Conversation) CancelRun() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// RequestStop stops the running request because the host narrowed a safety
+// setting, and records why.
+//
+// It reports whether a request was running. The cancellation is only the
+// mechanism: work that already happened is kept, the results already obtained are
+// preserved, and no new side effect starts, but the request ends with
+// policy_tightened and the reason instead of a bare cancellation. Nothing is
+// recorded when no request is running, so a narrowing that arrives between
+// requests belongs to the next one and is applied when that request is built.
+func (c *Conversation) RequestStop(reason string) bool {
+	c.gate.mu.Lock()
+	active := c.gate.active
+	cancel := c.gate.cancel
+	c.gate.mu.Unlock()
+	if !active || cancel == nil {
+		return false
+	}
+	c.mu.Lock()
+	c.stopReason = reason
+	c.mu.Unlock()
+	cancel()
+	return true
+}
+
+// takePolicyStop reports the reason a host asked this request to stop, if any,
+// and forgets it. It is consumed exactly once, on the way out, so a narrowing
+// can never leak into the next request: a stop request that belongs to the next
+// request is made while that one is running.
+func (c *Conversation) takePolicyStop() (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	reason := c.stopReason
+	c.stopReason = ""
+	return reason, reason != ""
 }
 
 func (c *Conversation) TodoList() protocol.TodoList {

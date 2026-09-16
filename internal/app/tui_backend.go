@@ -47,6 +47,10 @@ type tuiBackend struct {
 	skills          *skill.Registry
 	skillSession    *skill.Session
 	repositoryIndex *tool.RepositoryIndex
+	// safetyBaseline is the safety-relevant settings the running request was
+	// admitted under, so a later change can be compared with them.
+	safetyBaseline    policy.SafetySettings
+	safetyBaselineSet bool
 }
 
 type tuiAuditSink struct {
@@ -591,6 +595,10 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
 	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
 	defer cancel()
+	// The request is admitted under the settings that are in effect now; a later
+	// narrowing is measured against them rather than against the current values.
+	b.beginSafetyBaseline()
+	defer b.endSafetyBaseline()
 	sessionID := b.conversation.SessionID()
 	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{
 		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
@@ -601,6 +609,12 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	observation.ObserveCodeSlices(report.CodeSlices)
 	metric := observation.Finish(response.Usage, err)
 	interrupted := errors.Is(err, agent.ErrRequestInterrupted)
+	// A request stopped because the host narrowed a safety setting is reported as
+	// the deliberate stop it is, not as a failure of the model or the tools.
+	var policyStop *agent.PolicyStopError
+	if errors.As(err, &policyStop) {
+		emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: "Stopped on the new settings: " + policyStop.Reason})
+	}
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: formatRequestCompletion(metric, interrupted)})
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &report})
 	if interrupted {
@@ -1196,10 +1210,16 @@ func (b *tuiBackend) SetMode(_ context.Context, value string) error {
 			return err
 		}
 	}
+	// A mode that narrows what the request may do reaches the request that is
+	// already running; a mode that widens it belongs to the next request.
+	b.stopIfTightened()
 	return nil
 }
 
 func (b *tuiBackend) UpsertProvider(ctx context.Context, form ui.ProviderForm) (ui.ModelSelection, error) {
+	// Editing a provider can narrow the hosted-web permission or the deny rules the
+	// running request was admitted under.
+	defer b.stopIfTightened()
 	patch := config.ProviderPatch{}
 	effortResetFrom := ""
 	if form.OriginalName == "" {
@@ -1256,6 +1276,7 @@ func (b *tuiBackend) UpsertProvider(ctx context.Context, form ui.ProviderForm) (
 }
 
 func (b *tuiBackend) DeleteProvider(ctx context.Context, name string) error {
+	defer b.stopIfTightened()
 	replacement := ""
 	active, _ := b.manager.Active()
 	if active.Name == name {
@@ -1278,6 +1299,7 @@ func (b *tuiBackend) DeleteProvider(ctx context.Context, name string) error {
 }
 
 func (b *tuiBackend) UseProvider(ctx context.Context, name string) error {
+	defer b.stopIfTightened()
 	if err := b.manager.Use(name); err != nil {
 		return err
 	}
@@ -1450,6 +1472,11 @@ func (b *tuiBackend) MCPAction(ctx context.Context, name string, action ui.MCPAc
 	}
 	if err != nil {
 		return errors.New(b.runtime.redact(err.Error()))
+	}
+	// Disabling a server takes tools away from the request that is running, so it
+	// is a narrowing like any other; enabling one only affects the next request.
+	if action == ui.MCPActionDisable {
+		b.stopForNarrowedTools("MCP server " + name + " was disabled")
 	}
 	return nil
 }
