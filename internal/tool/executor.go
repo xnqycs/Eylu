@@ -338,9 +338,9 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 		if batchErr == nil && batchCtx.Err() == nil {
 			for len(active) < limit {
 				// A cancellation observed at any point before this call starts
-				// must prevent the call from starting.
+				// must prevent the call from starting. The cancellation reaches
+				// the caller through resolveBatchControl.
 				if batchCtx.Err() != nil {
-					batchErr = joinBatchError(batchErr, ctx.Err())
 					break
 				}
 				index := nextRunnable(prepared, active)
@@ -358,9 +358,10 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 					item.startNotified = true
 				}
 				// OnStart may itself observe or trigger a cancellation, so the
-				// check is repeated before the call is actually started.
+				// check is repeated before the call is actually started. The
+				// cancellation is reported by resolveBatchControl rather than
+				// being folded into the infrastructure failure.
 				if batchCtx.Err() != nil {
-					batchErr = joinBatchError(batchErr, ctx.Err())
 					break
 				}
 				item.running = true

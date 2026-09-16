@@ -377,6 +377,39 @@ func TestWriteFileAtomicallyCleansUpTemporaryArtifact(t *testing.T) {
 	assertNoWriteArtifacts(t, workspace)
 }
 
+// A cancellation raised inside OnStart must stop the write before any side
+// effect, leaving the target untouched and no temporary artifact behind.
+func TestExecuteBatchOnStartCancellationLeavesFileUntouched(t *testing.T) {
+	workspace := t.TempDir()
+	write, err := NewWriteFile(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(workspace, "target.txt")
+	if err := os.WriteFile(target, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	executor := &Executor{Registry: NewRegistry(write), Policy: policy.AllowAllChecker{}}
+	results, outcome := executor.ExecuteBatchOutcome(ctx, "request", []protocol.ToolCall{{
+		ID: "write", Name: "write_file", Arguments: json.RawMessage(`{"path":"target.txt","content":"replaced","reason":"test"}`),
+	}}, BatchHooks{OnStart: func(protocol.ToolCall) error {
+		cancel()
+		return nil
+	}}, 0)
+	if outcome.Control != protocol.ControlCancelRequest || !errors.Is(outcome.Err(), context.Canceled) {
+		t.Fatalf("outcome = %#v", outcome)
+	}
+	if len(results) != 1 || results[0].State != protocol.CallNotExecuted || !results[0].IsError {
+		t.Fatalf("results = %#v", results)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "original" {
+		t.Fatalf("target = %q err = %v", data, err)
+	}
+	assertNoWriteArtifacts(t, workspace)
+}
+
 func assertNoWriteArtifacts(t *testing.T, workspace string) {
 	t.Helper()
 	entries, err := os.ReadDir(workspace)
