@@ -110,7 +110,6 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model stopped for tool use without tool calls"}
 		}
 		toolTurn := protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleTool, CreatedAt: time.Now().UTC()}
-		interrupted := false
 		for _, call := range calls {
 			if call.ID == "" {
 				return last, &protocol.Error{Code: protocol.ErrProtocol, Message: "model returned a tool call without an ID"}
@@ -174,13 +173,10 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		if len(expansion.web) > limit {
 			limit = min(len(expansion.web), webtool.MaxBatchQueries)
 		}
-		executedResults, batchErr := executor.ExecuteBatchWithLimit(ctx, requestID, expansion.calls, hooks, limit)
-		results, webParts := collapseToolResults(calls, expansion, executedResults)
+		executedResults, batchOutcome := executor.ExecuteBatchOutcome(ctx, requestID, expansion.calls, hooks, limit)
+		results, webParts := collapseToolResults(calls, expansion, executedResults, batchOutcome)
 		for index := range results {
 			result := results[index]
-			if result.Metadata != nil && result.Metadata["interrupt_request"] == true {
-				interrupted = true
-			}
 			c.captureSkillResult(result)
 			c.captureTodoListResult(result)
 			toolTurn.Parts = append(toolTurn.Parts, protocol.Part{Kind: protocol.PartToolResult, ToolResult: &result})
@@ -188,15 +184,21 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		toolTurn.Parts = append(toolTurn.Parts, webParts...)
 		c.turns = append(c.turns, toolTurn)
 		c.projectMapDirty = true
-		if interrupted {
+		if batchOutcome.Control != protocol.ControlContinue {
+			// A remote driver state built from a response whose calls did not all
+			// complete cannot be reused; the next request rebuilds it from the
+			// local transcript.
 			c.driverState = nil
 		}
 		c.rebuildLedger(runtime)
-		if batchErr != nil {
-			return last, batchErr
-		}
-		if interrupted {
+		// The request-level control state is owned by the executor. It is never
+		// derived from tool content or from metadata rebuilt by Web aggregation,
+		// so an external tool cannot interrupt or abort the host request.
+		switch batchOutcome.Control {
+		case protocol.ControlInterruptRequest:
 			return last, ErrRequestInterrupted
+		case protocol.ControlCancelRequest, protocol.ControlAbortRequest:
+			return last, batchOutcome.Cause
 		}
 	}
 	return last, &protocol.Error{Code: protocol.ErrProtocol, Message: fmt.Sprintf("agent iteration limit exceeded (%d)", maxTurns)}
@@ -452,20 +454,20 @@ func expandToolCalls(calls []protocol.ToolCall, plan webtool.ResolvedWebToolPlan
 	return expansion
 }
 
-func collapseToolResults(calls []protocol.ToolCall, expansion toolCallExpansion, executed []protocol.ToolResult) ([]protocol.ToolResult, []protocol.Part) {
+func collapseToolResults(calls []protocol.ToolCall, expansion toolCallExpansion, executed []protocol.ToolResult, outcome protocol.BatchOutcome) ([]protocol.ToolResult, []protocol.Part) {
 	results := make([]protocol.ToolResult, len(calls))
 	webParts := make([]protocol.Part, 0, len(expansion.web)*2)
 	for parentIndex, parent := range calls {
 		children := expansion.parentChildren[parentIndex]
 		if len(children) == 0 {
-			results[parentIndex] = protocol.ToolResult{CallID: parent.ID, Content: "tool call was not scheduled", IsError: true}
+			results[parentIndex] = protocol.ToolResult{CallID: parent.ID, Content: "tool call was not scheduled", IsError: true, State: protocol.CallNotExecuted}
 			continue
 		}
 		for _, resultIndex := range children {
 			if resultIndex >= len(executed) {
 				continue
 			}
-			if info, ok := expansion.web[expansion.calls[resultIndex].ID]; ok {
+			if info, ok := expansion.web[expansion.calls[resultIndex].ID]; ok && webActivityProjected(executed[resultIndex]) {
 				webParts = append(webParts, webPartsForResult(info, executed[resultIndex])...)
 			}
 		}
@@ -475,23 +477,31 @@ func collapseToolResults(calls []protocol.ToolCall, expansion toolCallExpansion,
 			results[parentIndex] = result
 			continue
 		}
-		results[parentIndex] = collapseWebBatch(parent, children, expansion, executed)
+		results[parentIndex] = collapseWebBatch(parent, children, expansion, executed, outcome)
 	}
 	return results, webParts
 }
 
-func collapseWebBatch(parent protocol.ToolCall, children []int, expansion toolCallExpansion, executed []protocol.ToolResult) protocol.ToolResult {
+// collapseWebBatch aggregates an expanded Web fan-out for display.
+//
+// It only handles content, activity and per-child state. The request-level
+// control state belongs to the executor, so it is deliberately neither derived
+// nor dropped here; the transitional metadata merge exists solely for UI
+// consumers that have not moved to the typed fields yet.
+func collapseWebBatch(parent protocol.ToolCall, children []int, expansion toolCallExpansion, executed []protocol.ToolResult, outcome protocol.BatchOutcome) protocol.ToolResult {
 	type batchItem struct {
-		Query             string          `json:"query,omitempty"`
-		URL               string          `json:"url,omitempty"`
-		Content           string          `json:"content"`
-		StructuredContent json.RawMessage `json:"structured_content,omitempty"`
-		IsError           bool            `json:"is_error,omitempty"`
-		Truncated         bool            `json:"truncated,omitempty"`
+		Query             string             `json:"query,omitempty"`
+		URL               string             `json:"url,omitempty"`
+		Content           string             `json:"content"`
+		State             protocol.CallState `json:"call_state,omitempty"`
+		StructuredContent json.RawMessage    `json:"structured_content,omitempty"`
+		IsError           bool               `json:"is_error,omitempty"`
+		Truncated         bool               `json:"truncated,omitempty"`
 	}
 	items := make([]batchItem, 0, len(children))
 	activities := make([]protocol.WebActivity, 0, len(children))
 	citations := make([]protocol.URLCitation, 0)
+	states := make([]protocol.CallState, 0, len(children))
 	metadata := map[string]any{"web_status": string(protocol.WebStatusCompleted), "web_query_count": len(children), "untrusted_web_content": true}
 	failed := 0
 	truncated := false
@@ -499,7 +509,12 @@ func collapseWebBatch(parent protocol.ToolCall, children []int, expansion toolCa
 	for position, resultIndex := range children {
 		result := executed[resultIndex]
 		info := expansion.web[expansion.calls[resultIndex].ID]
-		item := batchItem{Content: result.Content, StructuredContent: result.StructuredContent, IsError: result.IsError, Truncated: result.Truncated}
+		state := result.State
+		if state == "" && resultIndex < len(outcome.States) {
+			state = outcome.States[resultIndex]
+		}
+		states = append(states, state)
+		item := batchItem{Content: result.Content, State: state, StructuredContent: result.StructuredContent, IsError: result.IsError, Truncated: result.Truncated}
 		if info.kind == protocol.ToolWebFetch {
 			item.URL = info.value
 		} else {
@@ -514,15 +529,18 @@ func collapseWebBatch(parent protocol.ToolCall, children []int, expansion toolCa
 			content.WriteString("\n\n")
 		}
 		fmt.Fprintf(&content, "[%d] %s\n%s", position+1, info.value, result.Content)
-		for _, part := range webPartsForResult(info, result) {
-			if part.WebActivity != nil {
-				activities = append(activities, *part.WebActivity)
-			}
-			if part.Citation != nil {
-				citations = append(citations, *part.Citation)
+		if webActivityProjected(result) {
+			for _, part := range webPartsForResult(info, result) {
+				if part.WebActivity != nil {
+					activities = append(activities, *part.WebActivity)
+				}
+				if part.Citation != nil {
+					citations = append(citations, *part.Citation)
+				}
 			}
 		}
 		mergeWebResultMetadata(metadata, result.Metadata)
+		mergeLegacyControlMetadata(metadata, result.Metadata)
 	}
 	metadata["web_failed_count"] = failed
 	metadata["activity_count"] = len(activities)
@@ -533,7 +551,66 @@ func collapseWebBatch(parent protocol.ToolCall, children []int, expansion toolCa
 	structured, _ := json.Marshal(map[string]any{"results": items, "activities": activities, "citations": citations})
 	return protocol.ToolResult{
 		CallID: parent.ID, Content: content.String(), StructuredContent: structured,
-		IsError: failed == len(children), Truncated: truncated, Metadata: metadata,
+		IsError: failed == len(children), Truncated: truncated, State: aggregateCallState(states), Metadata: metadata,
+	}
+}
+
+// aggregateCallState reduces the child states of an expanded batch to one state
+// for the parent call. A mixed outcome never claims that every child succeeded.
+func aggregateCallState(states []protocol.CallState) protocol.CallState {
+	observed := make([]protocol.CallState, 0, len(states))
+	for _, state := range states {
+		if state != "" {
+			observed = append(observed, state)
+		}
+	}
+	if len(observed) == 0 {
+		return protocol.CallNotExecuted
+	}
+	uniform := true
+	for _, state := range observed[1:] {
+		if state != observed[0] {
+			uniform = false
+			break
+		}
+	}
+	if uniform {
+		return observed[0]
+	}
+	for _, candidate := range []protocol.CallState{
+		protocol.CallOutcomeUnknown, protocol.CallFailed, protocol.CallCancelled,
+		protocol.CallRejected, protocol.CallNotExecuted,
+	} {
+		for _, state := range observed {
+			if state == candidate {
+				return candidate
+			}
+		}
+	}
+	return protocol.CallFailed
+}
+
+// webActivityProjected reports whether a child call produced an observable web
+// activity. A call that never ran, or that was refused before execution, must
+// not be projected as a completed search that failed.
+func webActivityProjected(result protocol.ToolResult) bool {
+	switch result.State {
+	case protocol.CallNotExecuted, protocol.CallRejected:
+		return false
+	default:
+		return true
+	}
+}
+
+// mergeLegacyControlMetadata copies the transitional control metadata that UI
+// consumers built before the typed states still read. New control logic must
+// never read these keys: they are display-only and untrusted tool content can
+// set them.
+func mergeLegacyControlMetadata(target, source map[string]any) {
+	for _, key := range []string{"interrupt_request", "approval_rejected", "rejection_reason", "batch_cancelled", "cancelled"} {
+		if target[key] == nil && source[key] != nil {
+			target[key] = source[key]
+		}
 	}
 }
 

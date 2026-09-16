@@ -42,6 +42,18 @@ func (*Ask) Risk() policy.Risk { return policy.RiskSession }
 
 func (*Ask) UseExecutorTimeout() bool { return false }
 
+// ReportControl turns a dismissed question into a typed user interruption.
+//
+// The key is produced by this host tool itself for the same result, and the
+// executor only consults ControlReporter for host-registered tools, so the
+// decision never depends on untrusted content.
+func (*Ask) ReportControl(result protocol.ToolResult) (protocol.BatchControl, protocol.CallState) {
+	if result.Metadata["ask_dismissed"] == true {
+		return protocol.ControlInterruptRequest, protocol.CallRejected
+	}
+	return "", ""
+}
+
 func (a *Ask) Execute(ctx context.Context, raw json.RawMessage) protocol.ToolResult {
 	var request protocol.AskRequest
 	if err := decodeStrict(raw, &request); err != nil {

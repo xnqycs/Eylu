@@ -160,6 +160,72 @@ type AskResponse struct {
 	Answers map[string][]string `json:"answers"`
 }
 
+// CallState is the terminal execution state of one tool call.
+//
+// The values are assigned by the host executor so that "not executed", "failed",
+// "rejected", "cancelled" and "result unknown" stay distinguishable. Tool
+// content, MCP annotations and other untrusted metadata never decide them.
+type CallState string
+
+const (
+	// CallSucceeded means the call ran and reported success.
+	CallSucceeded CallState = "succeeded"
+	// CallFailed means the call ran, or was prepared, and reported a failure the
+	// model is expected to adjust to.
+	CallFailed CallState = "failed"
+	// CallRejected means policy or the user refused the call before execution.
+	CallRejected CallState = "rejected"
+	// CallCancelled means the call was cancelled around its execution.
+	CallCancelled CallState = "cancelled"
+	// CallNotExecuted means the call was never started.
+	CallNotExecuted CallState = "not_executed"
+	// CallOutcomeUnknown means the call may have produced a side effect but its
+	// result could not be confirmed. It is never retried automatically.
+	CallOutcomeUnknown CallState = "outcome_unknown"
+)
+
+// BatchControl is the request-level control state of one tool batch. It is
+// derived by the executor and the approval layer only, never from tool content
+// or external metadata.
+type BatchControl string
+
+const (
+	// ControlContinue lets the model adjust to ordinary tool failures.
+	ControlContinue BatchControl = "continue"
+	// ControlInterruptRequest records a user refusal without a reason.
+	ControlInterruptRequest BatchControl = "interrupt_request"
+	// ControlCancelRequest records that the request context was cancelled.
+	ControlCancelRequest BatchControl = "cancel_request"
+	// ControlAbortRequest records an approval-channel or execution
+	// infrastructure failure.
+	ControlAbortRequest BatchControl = "abort_request"
+)
+
+// BatchOutcome is the request-level control state of one tool batch.
+type BatchOutcome struct {
+	// Control is the highest-precedence control state observed in the batch.
+	// Infrastructure failures outrank a request cancellation, which outranks a
+	// user interruption request, which outranks a normal continuation.
+	Control BatchControl
+	// Cause is the primary failure with any additional causes joined, so that
+	// errors.Is holds for each of them. It is nil for ControlContinue and
+	// ControlInterruptRequest, which are not failures.
+	Cause error
+	// States lists the terminal state of each call in request order.
+	States []CallState
+}
+
+// Err returns the failure that ends the request, if any. A user interruption is
+// not an error: the caller decides how to surface it.
+func (o BatchOutcome) Err() error {
+	switch o.Control {
+	case ControlCancelRequest, ControlAbortRequest:
+		return o.Cause
+	default:
+		return nil
+	}
+}
+
 type ToolResult struct {
 	CallID            string          `json:"call_id"`
 	Content           string          `json:"content"`
@@ -167,8 +233,10 @@ type ToolResult struct {
 	StructuredContent json.RawMessage `json:"structured_content,omitempty"`
 	IsError           bool            `json:"is_error,omitempty"`
 	Truncated         bool            `json:"truncated,omitempty"`
-	Metadata          map[string]any  `json:"metadata,omitempty"`
-	TodoList          *TodoList       `json:"todo_list,omitempty"`
+	// State is the terminal execution state assigned by the host executor.
+	State    CallState      `json:"call_state,omitempty"`
+	Metadata map[string]any `json:"metadata,omitempty"`
+	TodoList *TodoList      `json:"todo_list,omitempty"`
 }
 
 type ToolDefinition struct {

@@ -82,6 +82,19 @@ type ExecutionFinalizer interface {
 	AfterExecute(policy.Outcome)
 }
 
+// ControlReporter lets a built-in host tool raise a request-level control state
+// and call state that its result content alone cannot express, for example a
+// dismissed interactive question.
+//
+// The executor consults this interface only for tools the host registered
+// itself. Remote and MCP adapters do not implement it, so external tool content
+// and metadata can never interrupt or abort a host request.
+type ControlReporter interface {
+	// ReportControl returns the control state and call state implied by one
+	// result. Empty values keep the executor's own classification.
+	ReportControl(protocol.ToolResult) (protocol.BatchControl, protocol.CallState)
+}
+
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool

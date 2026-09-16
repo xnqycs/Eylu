@@ -142,6 +142,8 @@ type preparedCall struct {
 	spec             ConcurrencySpec
 	terminal         *protocol.ToolResult
 	approvalErr      error
+	state            protocol.CallState
+	control          protocol.BatchControl
 	queuedAt         time.Time
 	executionStarted time.Time
 	record           AuditRecord
@@ -206,42 +208,77 @@ func (e *Executor) Execute(ctx context.Context, requestID string, call protocol.
 }
 
 func (e *Executor) ExecuteBatch(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks) ([]protocol.ToolResult, error) {
-	return e.executeBatch(ctx, requestID, calls, hooks, e.ParallelLimit())
+	results, outcome := e.ExecuteBatchOutcome(ctx, requestID, calls, hooks, e.ParallelLimit())
+	return results, outcome.Err()
 }
 
 func (e *Executor) ExecuteBatchWithLimit(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks, limit int) ([]protocol.ToolResult, error) {
+	results, outcome := e.ExecuteBatchOutcome(ctx, requestID, calls, hooks, limit)
+	return results, outcome.Err()
+}
+
+// ExecuteBatchOutcome runs a batch and also returns its request-level control
+// state. Callers that decide the fate of a request must use this form: the
+// control state is owned by the executor and never derived from tool metadata.
+func (e *Executor) ExecuteBatchOutcome(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks, limit int) ([]protocol.ToolResult, protocol.BatchOutcome) {
 	if limit <= 0 {
 		limit = e.ParallelLimit()
 	}
 	return e.executeBatch(ctx, requestID, calls, hooks, limit)
 }
 
-func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks, limit int) ([]protocol.ToolResult, error) {
+// resolveBatchControl maps the failures observed by one batch to its
+// request-level control state.
+//
+// batchErr only ever holds an approval-channel, hook or scheduler failure: an
+// ordinary tool failure never reaches it, so the model keeps the chance to
+// adjust. The request cancellation is a separate cause and is preserved beside
+// an infrastructure failure.
+func resolveBatchControl(ctx context.Context, batchErr error, interrupted bool) (protocol.BatchControl, error) {
+	if batchErr != nil {
+		return protocol.ControlAbortRequest, joinBatchError(batchErr, ctx.Err())
+	}
+	if err := ctx.Err(); err != nil {
+		return protocol.ControlCancelRequest, err
+	}
+	if interrupted {
+		return protocol.ControlInterruptRequest, nil
+	}
+	return protocol.ControlContinue, nil
+}
+
+func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks, limit int) ([]protocol.ToolResult, protocol.BatchOutcome) {
 	results := make([]protocol.ToolResult, len(calls))
 	if len(calls) == 0 {
-		return results, nil
+		return results, protocol.BatchOutcome{Control: protocol.ControlContinue}
 	}
 	batchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	queuedAt := time.Now()
 	batchID := uuid.NewString()
 	prepared := make([]*preparedCall, len(calls))
-	interrupt := false
+	interrupted := false
+	// batchErr holds an approval-channel, hook or scheduler failure. Ordinary
+	// tool failures never reach it, so the model keeps the chance to adjust.
 	var batchErr error
-	// finalize reports a cancellation that the batch observed even when every
-	// call already produced a result. The results themselves are kept: once a
-	// call committed a side effect, its outcome is never replaced.
-	finalize := func() ([]protocol.ToolResult, error) {
-		if batchCtx.Err() != nil {
-			batchErr = joinBatchError(batchErr, ctx.Err())
+	// finalize reports the control state the batch observed even when every call
+	// already produced a result. The results themselves are kept: once a call
+	// committed a side effect, its outcome is never replaced.
+	finalize := func() ([]protocol.ToolResult, protocol.BatchOutcome) {
+		control, cause := resolveBatchControl(ctx, batchErr, interrupted)
+		states := make([]protocol.CallState, len(prepared))
+		for index, item := range prepared {
+			if item != nil {
+				states[index] = item.state
+			}
 		}
-		return results, batchErr
+		return results, protocol.BatchOutcome{Control: control, Cause: cause, States: states}
 	}
 	for index, call := range calls {
 		// Observe a request cancellation before preparing the next call, so a
 		// cancelled request never reaches the approval or execution stage.
 		batchErr = joinBatchError(batchErr, ctx.Err())
-		if interrupt || batchErr != nil {
+		if interrupted || batchErr != nil {
 			prepared[index] = e.cancelledPrepared(requestID, batchID, index, call, queuedAt, "tool execution cancelled by batch preflight")
 			continue
 		}
@@ -252,11 +289,11 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 		if prepared[index].approvalErr != nil {
 			batchErr = joinBatchError(batchErr, prepared[index].approvalErr)
 		}
-		if prepared[index].terminal != nil && prepared[index].terminal.Metadata != nil && prepared[index].terminal.Metadata["interrupt_request"] == true {
-			interrupt = true
+		if prepared[index].control == protocol.ControlInterruptRequest {
+			interrupted = true
 		}
 	}
-	if interrupt || batchErr != nil {
+	if interrupted || batchErr != nil {
 		message := "tool execution cancelled by batch preflight"
 		if batchErr != nil {
 			message = "tool execution cancelled"
@@ -267,6 +304,7 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			} else if item.terminal == nil {
 				result := protocol.ToolResult{CallID: item.call.ID, Content: message, IsError: true, Metadata: map[string]any{"batch_cancelled": true}}
 				item.terminal = &result
+				item.state = protocol.CallNotExecuted
 			}
 		}
 	}
@@ -336,14 +374,16 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			}
 		}
 		if batchCtx.Err() != nil {
-			// Report the request cancellation. A batch-local cancel derived from
-			// a hook failure is deliberately not reported again, so the original
-			// failure stays the leading error.
-			batchErr = joinBatchError(batchErr, ctx.Err())
+			// Drain the calls that never started. The cancellation itself is
+			// reported by resolveBatchControl, which owns the request-level
+			// control state; a batch-local cancel derived from a hook failure is
+			// deliberately not reported again, so the original failure stays the
+			// leading cause.
 			for index, item := range prepared {
 				if item.done || item.running {
 					continue
 				}
+				item.state = protocol.CallNotExecuted
 				result := protocol.ToolResult{CallID: item.call.ID, Content: "tool execution cancelled", IsError: true, Metadata: map[string]any{"batch_cancelled": true}}
 				result, hookErr := e.deliverTerminal(item, result, hooks)
 				results[index] = result
@@ -375,6 +415,10 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			item.done = true
 			results[finished.index] = finished.result
 			completed++
+			// A host tool may have requested a user interruption while it ran.
+			if item.control == protocol.ControlInterruptRequest {
+				interrupted = true
+			}
 			if hooks.OnResult != nil {
 				if err := hooks.OnResult(finished.result); err != nil {
 					batchErr = joinBatchError(batchErr, err)
@@ -383,10 +427,8 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 				}
 			}
 		case <-contextDone:
-			batchErr = joinBatchError(batchErr, ctx.Err())
-			if batchErr == nil {
-				batchErr = batchCtx.Err()
-			}
+			// The cancellation is picked up by the next iteration and reported
+			// once by resolveBatchControl.
 			contextDone = nil
 		}
 	}
@@ -408,24 +450,24 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 	}()
 	if e == nil || e.Registry == nil {
 		result := protocol.ToolResult{CallID: call.ID, Content: "tool executor is unavailable", IsError: true}
-		prepared.terminal = &result
+		prepared.terminal, prepared.state = &result, protocol.CallFailed
 		return prepared
 	}
 	if ctx.Err() != nil {
 		result := protocol.ToolResult{CallID: call.ID, Content: "tool execution cancelled", IsError: true}
-		prepared.terminal = &result
+		prepared.terminal, prepared.state = &result, protocol.CallNotExecuted
 		return prepared
 	}
 	item, ok := e.Registry.Get(call.Name)
 	if !ok {
 		result := protocol.ToolResult{CallID: call.ID, Content: fmt.Sprintf("unknown tool %q", call.Name), IsError: true}
-		prepared.terminal = &result
+		prepared.terminal, prepared.state = &result, protocol.CallFailed
 		return prepared
 	}
 	prepared.item = item
 	if !json.Valid(call.Arguments) {
 		result := protocol.ToolResult{CallID: call.ID, Content: "tool input is invalid JSON", IsError: true}
-		prepared.terminal = &result
+		prepared.terminal, prepared.state = &result, protocol.CallFailed
 		return prepared
 	}
 	checker := e.Policy
@@ -451,12 +493,12 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 	case policy.DecisionAllow:
 	case policy.DecisionDeny:
 		result := protocol.ToolResult{CallID: call.ID, Content: "permission denied: " + outcome.Reason, IsError: true}
-		prepared.terminal = &result
+		prepared.terminal, prepared.state = &result, protocol.CallRejected
 		return prepared
 	case policy.DecisionConfirm:
 		if e.Confirm == nil {
 			result := protocol.ToolResult{CallID: call.ID, Content: "confirmation required: " + outcome.Reason, IsError: true}
-			prepared.terminal = &result
+			prepared.terminal, prepared.state = &result, protocol.CallFailed
 			return prepared
 		}
 		confirmations := outcome.Confirmations
@@ -470,16 +512,21 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 			if err != nil {
 				prepared.approvalErr = &ApprovalError{Tool: call.Name, Err: err}
 				result := protocol.ToolResult{CallID: call.ID, Content: "confirmation failed: " + err.Error(), IsError: true}
-				prepared.terminal = &result
+				prepared.terminal, prepared.state = &result, protocol.CallFailed
 				return prepared
 			}
 			if !confirmation.Approved {
 				result := protocol.ToolResult{CallID: call.ID, Content: "approval rejected", IsError: true, Metadata: map[string]any{"approval_rejected": true}}
+				prepared.state = protocol.CallRejected
 				if reason := strings.TrimSpace(confirmation.RejectionReason); reason != "" {
+					// A reasoned refusal keeps the reason and lets the model
+					// adjust, so it does not interrupt the request.
 					result.Content += ": " + reason
 					result.Metadata["rejection_reason"] = reason
 				} else {
+					// An unexplained refusal is a user interruption request.
 					result.Metadata["interrupt_request"] = true
+					prepared.control = protocol.ControlInterruptRequest
 				}
 				prepared.terminal = &result
 				return prepared
@@ -491,7 +538,7 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 		// Defense in depth: Compose already fails closed, but an unrecognized
 		// decision must never reach a tool execution.
 		result := protocol.ToolResult{CallID: call.ID, Content: "permission denied: unrecognized policy decision", IsError: true}
-		prepared.terminal = &result
+		prepared.terminal, prepared.state = &result, protocol.CallRejected
 		return prepared
 	}
 	prepared.input = call.Arguments
@@ -508,6 +555,7 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 // The batch already reports the request-level cancellation, so the result only
 // has to be recognizable and must never claim success.
 func cancelledExecution(prepared *preparedCall, err error) protocol.ToolResult {
+	prepared.state = protocol.CallNotExecuted
 	message := "tool execution cancelled"
 	if err != nil {
 		message += ": " + err.Error()
@@ -516,7 +564,7 @@ func cancelledExecution(prepared *preparedCall, err error) protocol.ToolResult {
 }
 
 func (e *Executor) cancelledPrepared(requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time, message string) *preparedCall {
-	prepared := &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}}
+	prepared := &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}, state: protocol.CallNotExecuted}
 	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
 	if e != nil {
 		prepared.record.SessionID, prepared.record.ProviderName = e.SessionID, e.ProviderName
@@ -532,6 +580,7 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result = protocol.ToolResult{CallID: prepared.call.ID, Content: fmt.Sprintf("tool execution panicked: %v", recovered), IsError: true}
+			prepared.state = protocol.CallFailed
 		}
 		result.CallID = prepared.call.ID
 		duration := time.Duration(0)
@@ -581,8 +630,25 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 		switch {
 		case useTimeout && toolCtx.Err() == context.DeadlineExceeded:
 			result.Content = "tool execution timed out"
+			prepared.state = protocol.CallFailed
 		case toolCtx.Err() == context.Canceled:
 			result.Content = "tool execution cancelled"
+			prepared.state = protocol.CallCancelled
+		default:
+			prepared.state = protocol.CallFailed
+		}
+	} else {
+		prepared.state = protocol.CallSucceeded
+	}
+	// Only host-registered tools can raise a request-level control state from
+	// their result. Untrusted tool content and metadata cannot.
+	if reporter, ok := prepared.item.(ControlReporter); ok {
+		control, state := reporter.ReportControl(result)
+		if control != "" {
+			prepared.control = control
+		}
+		if state != "" {
+			prepared.state = state
 		}
 	}
 	maxOutput := e.MaxOutputBytes
@@ -597,6 +663,16 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 
 func (e *Executor) finishPrepared(prepared *preparedCall, result protocol.ToolResult, executionDuration time.Duration) protocol.ToolResult {
 	result.CallID = prepared.call.ID
+	// Every terminal result carries a host-owned state, so a caller can always
+	// tell "not executed" from "failed" from "succeeded".
+	if prepared.state == "" {
+		if result.IsError {
+			prepared.state = protocol.CallFailed
+		} else {
+			prepared.state = protocol.CallSucceeded
+		}
+	}
+	result.State = prepared.state
 	prepared.auditOnce.Do(func() {
 		prepared.record.DurationMS = time.Since(prepared.queuedAt).Milliseconds()
 		if !prepared.executionStarted.IsZero() {

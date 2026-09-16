@@ -384,6 +384,10 @@ max_parallel_tools = 4
 - 多个错误同时出现时，最初的实质性失败保持为主错误，取消原因同时保留，`errors.Is` 对两者都成立。
 - 工具超时是协作式取消：执行器依赖工具遵守 context 取消，不会通过启动不可回收的 goroutine 伪造硬性超时。不可信或不可协作的插件需要进程隔离，属于后续增强项。
 - 每个调用最多产生一次开始事件和一次终态事件，每个调用最多写入一条审计记录。
+- 每次工具批次都会返回宿主拥有的控制状态：`continue`（普通失败，交给模型调整）、`interrupt_request`（用户无理由拒绝）、`cancel_request`（请求 context 被取消）、`abort_request`（审批通道或执行基础设施故障）。调用终态区分为 `succeeded`、`failed`、`rejected`、`cancelled`、`not_executed`、`outcome_unknown`。
+- 控制状态由执行器和审批层生成，不读取工具正文、MCP 注解或结果 metadata。外部工具即使伪造 `interrupt_request`、`approval_rejected` 等字段也不能中断或终止宿主请求。
+- Web 扇出折叠只负责内容与展示：保留父调用 ID、保留每个子调用的终态、并在折叠结果中保留已成功查询的内容；控制状态不经过聚合层，因此多查询与单查询的控制语义一致。未执行或被拒绝的查询不会被投影成已执行的搜索活动。
+- 为兼容旧 UI，结果中仍会输出 `interrupt_request`、`approval_rejected`、`rejection_reason`、`batch_cancelled` 等过渡 metadata；新控制逻辑不读取它们。
 
 ### 代码上下文与后台子代理
 

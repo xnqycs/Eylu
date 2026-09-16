@@ -413,6 +413,10 @@ The default concurrency limit is `4`. Set it to `1` for serial execution, or ove
 - When several errors coincide, the first substantive failure stays the leading error and the cancellation cause is preserved beside it, so `errors.Is` holds for both.
 - A tool timeout is a cooperative cancellation: the executor relies on the tool honouring context cancellation and never starts an unreclaimable goroutine to fake a hard timeout. Untrusted or non-cooperative plugins would need process isolation, which is a separate enhancement.
 - Every call produces at most one start event and one terminal event, and at most one audit record.
+- Every tool batch reports a host-owned control state: `continue` (ordinary failure, left to the model), `interrupt_request` (user refusal without a reason), `cancel_request` (the request context was cancelled), and `abort_request` (approval-channel or execution infrastructure failure). Call states are `succeeded`, `failed`, `rejected`, `cancelled`, `not_executed`, and `outcome_unknown`.
+- Control states are produced by the executor and the approval layer; they never read tool content, MCP annotations, or result metadata. An external tool cannot interrupt or abort a host request by forging `interrupt_request` or similar fields.
+- Web fan-out aggregation only handles content and display: it keeps the parent call ID, keeps each child's terminal state, and keeps the content of the queries that succeeded. Control never passes through the aggregation layer, so single-query and multi-query calls share one control semantics. A query that never ran, or that was refused, is not projected as a search that executed.
+- For compatibility with older UI, results still publish transitional metadata such as `interrupt_request`, `approval_rejected`, `rejection_reason`, and `batch_cancelled`; the new control logic does not read them.
 
 ### Code context and background subagents
 
