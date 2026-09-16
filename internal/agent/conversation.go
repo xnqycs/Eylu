@@ -459,12 +459,13 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 			budget.add(callSummary, usage)
 		})
 		request := driver.Request{
-			BaseURL:           runtime.Provider.Config.BaseURL,
-			APIKey:            runtime.APIKey,
-			Headers:           runtime.Provider.Config.Headers,
-			ReasoningEffort:   runtime.Provider.Config.ReasoningEffort,
-			ParallelToolCalls: parallelToolCalls,
-			Stream:            stream,
+			BaseURL:                 runtime.Provider.Config.BaseURL,
+			APIKey:                  runtime.APIKey,
+			Headers:                 runtime.Provider.Config.Headers,
+			ReasoningEffort:         runtime.Provider.Config.ReasoningEffort,
+			ParallelToolCalls:       parallelToolCalls,
+			Stream:                  stream,
+			AcceptToolCallsWithStop: runtime.Provider.Config.AcceptToolCallsWithStop,
 			Target: driver.CapabilityTarget{
 				Provider: runtime.Provider.Config.CatalogProvider,
 				Protocol: runtime.Provider.Config.Adapter,

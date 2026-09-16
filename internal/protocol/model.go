@@ -300,6 +300,11 @@ type ModelResponse struct {
 	Stop        StopKind        `json:"stop"`
 	Usage       Usage           `json:"usage"`
 	DriverState json.RawMessage `json:"driver_state,omitempty"`
+	// Interop names every deliberate relaxation of the interoperability policy
+	// this response needed. An empty list means the provider behaved as the
+	// client expects; a named entry means the run report and the audit trail
+	// must say so.
+	Interop []string `json:"interop,omitempty"`
 }
 
 type EventKind string

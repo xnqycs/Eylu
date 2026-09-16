@@ -160,24 +160,26 @@ type responseBody struct {
 	Usage  *responseUsage `json:"usage"`
 }
 
-// stopFromStatus maps the response envelope status to a stop reason.
+// stopReasonFromStatus translates the response envelope status into the
+// canonical stop reasons the interoperability policy is written in.
 //
-// An incomplete envelope is a response the provider stopped early, so it must
-// never be reported as a normal completion: the caller keeps the partial answer
-// and does not present it as finished.
-func stopFromStatus(status, incompleteReason string) protocol.StopKind {
+// An unrecognized status is read as "the response stopped early" rather than as
+// a completion: the partial answer is kept and never presented as finished, and
+// the calls it carried are closed without being executed. Failing the whole
+// request instead would discard an answer the provider did produce, and the
+// keep-but-do-not-finish reading is already the strict one.
+func stopReasonFromStatus(status string) driver.StopReason {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "failed":
-		return protocol.StopError
+		return driver.StopReasonFailed
 	case "cancelled", "canceled":
-		return protocol.StopCancelled
+		return driver.StopReasonCancelled
 	case "incomplete":
-		return protocol.StopLength
+		return driver.StopReasonLength
 	case "", "completed":
-		return protocol.StopCompleted
+		return driver.StopReasonCompleted
 	default:
-		// An unrecognized status is not proof of completion.
-		return protocol.StopLength
+		return driver.StopReasonLength
 	}
 }
 
@@ -330,7 +332,7 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		}
 	}
 	if req.Stream {
-		result, streamErr := d.readStream(ctx, resp.Body, emit)
+		result, streamErr := d.readStream(ctx, resp.Body, emit, req.AcceptToolCallsWithStop)
 		if streamErr != nil {
 			return protocol.ModelResponse{}, streamErr
 		}
@@ -353,7 +355,10 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	if decoded.Error != nil {
 		return protocol.ModelResponse{}, protocol.ClassifyProviderMessage(decoded.Error.Message)
 	}
-	result := convertResponse(decoded)
+	result, err := convertResponse(decoded, req.AcceptToolCallsWithStop)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
 	if len(result.Turn.Parts) == 0 {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "provider returned no text or tool calls"}
 	}
@@ -502,15 +507,9 @@ func systemTurnDigests(turns []protocol.Turn) map[string]string {
 	return digests
 }
 
-func convertResponse(decoded responseBody) protocol.ModelResponse {
-	incompleteReason := ""
-	if decoded.IncompleteDetails != nil {
-		incompleteReason = decoded.IncompleteDetails.Reason
-	}
-	status := stopFromStatus(decoded.Status, incompleteReason)
+func convertResponse(decoded responseBody, acceptToolCallsWithStop bool) (protocol.ModelResponse, error) {
 	result := protocol.ModelResponse{
 		Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()},
-		Stop: status,
 	}
 	if decoded.Usage != nil {
 		result.Usage = protocol.Usage{
@@ -541,21 +540,39 @@ func convertResponse(decoded responseBody) protocol.ModelResponse {
 			}
 			call := protocol.ToolCall{ID: callID, Name: item.Name, Arguments: json.RawMessage(item.Arguments)}
 			result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &call})
-			// A truncated or failed envelope keeps its own stop reason: the calls
-			// it carried must not be executed.
-			if status == protocol.StopCompleted {
-				result.Stop = protocol.StopToolUse
-			}
 		case "web_search_call", "web_fetch_call", "openrouter_web_search_call", "openrouter_web_fetch_call":
 			activity := webActivityFromItem(item, decoded.Usage)
 			lastWebCall = activity.CallID
 			result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartWebActivity, WebActivity: &activity})
 		}
 	}
+	hasCalls := false
+	for _, part := range result.Turn.Parts {
+		if part.Kind == protocol.PartToolCall {
+			hasCalls = true
+			break
+		}
+	}
+	reason := stopReasonFromStatus(decoded.Status)
+	if reason == driver.StopReasonCompleted && hasCalls {
+		// In this dialect a completed envelope carrying function calls is the
+		// normal way to ask for tools: unlike Chat Completions there is no
+		// separate "tool_calls" status, so this shape is a tool request rather
+		// than the contradiction the policy refuses.
+		reason = driver.StopReasonToolUse
+	}
+	kind, interop, err := driver.StopKindFor(reason, hasCalls, acceptToolCallsWithStop)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	result.Stop = kind
+	if interop != "" {
+		result.Interop = append(result.Interop, interop)
+	}
 	if decoded.ID != "" {
 		result.DriverState, _ = json.Marshal(map[string]string{"response_id": decoded.ID})
 	}
-	return result
+	return result, nil
 }
 
 func mapToolDefinition(definition protocol.ToolDefinition, target driver.CapabilityTarget) (tool, bool, error) {

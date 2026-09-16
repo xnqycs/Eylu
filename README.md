@@ -458,7 +458,31 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 | 预算耗尽 | 不再启动新的模型请求，并闭合已提交调用 |
 
 - 长度截断默认不自动续写。截断导致工具参数不完整时，该调用不会被当作可执行调用：参数按空对象记录并补 `not_executed`，无法配对的调用会被丢弃，部分回答仍然保留。
-- Responses 适配器会读取响应封装体的 `status` 与 `incomplete_details`：`incomplete` 映射为 `length`（不区分 token 上限或内容过滤），`failed` 与 `cancelled` 分别映射为 `error` 与 `cancelled`，无法识别的 status 不视为完成。
+- Responses 适配器会读取响应封装体的 `status` 与 `incomplete_details`：`incomplete` 映射为 `length`（不区分 token 上限或内容过滤），`failed` 与 `cancelled` 分别映射为 `error` 与 `cancelled`，无法识别的 status 不视为完成（按 `length` 处理：保留部分回答、不执行其中的调用，也不冒充完成）。
+- 停止原因映射只有一处实现（`internal/driver` 的 `StopKindFor`）。各适配器只负责把自己的方言翻译成统一词表，是否拒绝、是否执行调用由同一张策略表决定：
+
+  | provider 表现 | 默认处置 | 可放宽 |
+  |---|---|---|
+  | `tool_calls` / `function_call`（要求调用工具） | `tool_use`，校验后执行 | 否 |
+  | `length` / `content_filter` / `max_tokens` 等截断 | `length`，保留部分响应，其中的调用补 `not_executed` | 否 |
+  | `completed`，没有调用 | `completed` | 否 |
+  | `completed`，**带**调用 | 协议错误，响应不写入 transcript | 是：见下 |
+  | `failed` / `cancelled` | `error` / `cancelled` | 否 |
+  | 无法识别的取值 | 协议错误，响应不写入 transcript | 否 |
+
+- **互操作放宽开关（有风险）**：部分网关在返回工具调用时把 `finish_reason` 报成 `"stop"`。默认行为是拒绝该响应，因为"已完成"与"还有调用要跑"互相矛盾：提交它要么让调用悬空，要么谎称已经完成。若该 provider 确实如此，可在该 provider 的配置里显式打开：
+
+  ```toml
+  [providers.gateway]
+  adapter = "openai_chat"
+  base_url = "https://gateway.example/v1"
+  model = "some-model"
+  accept_tool_calls_with_stop = true
+  ```
+
+  打开后该响应按 `tool_use` 执行，并在响应、运行摘要（`interop`）与审计留痕为 `accept_tool_calls_with_stop`。它按 provider 配置，只覆盖这一行；失败的响应、取消的响应与无法识别的取值都不可放宽。放宽会让一次"看起来成功"的响应变成真的执行，请只在确认该网关的语义后启用。
+
+- Responses 适配器不需要该开关：该方言用 `status: "completed"` 表达正常的函数调用，没有独立的工具调用状态，因此这一形状本来就按 `tool_use` 处理。
 - 文本输出会在 stderr 说明截断或取消；`json`、`jsonl` 与 TUI 直接暴露结构化 `stop` 字段。
 - 请求级预算覆盖主模型调用、上下文压缩摘要与上下文恢复重试。每次模型调用前按估算输入与输出预留做准入检查，返回后用真实 usage 校准；usage 缺失时标记为估算下界。
 - reasoning token 单独记录但不重复计入预算（各适配器已包含在输出 token 中）。`Run` 返回的响应用量仍只描述最后一次调用；累计用量通过 `LoopOptions.Usage`（`RunUsage`）单独暴露。

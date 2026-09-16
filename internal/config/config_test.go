@@ -795,3 +795,36 @@ func TestStoreDoesNotPersistEnvironmentOverrides(t *testing.T) {
 		t.Fatalf("environment override was persisted: %s", saved)
 	}
 }
+
+// The interoperability relaxation documented in the README is a real per-provider
+// key: it parses from the file, survives a round trip, and is left out when it is
+// off so an unconfigured provider cannot look like it opted in.
+func TestProviderAcceptToolCallsWithStopRoundTripsOnlyWhenEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	data := "version = 1\nactive_provider = 'gateway'\n\n[providers.gateway]\nadapter = 'openai_chat'\nbase_url = 'https://gateway.example/v1'\nmodel = 'some-model'\naccept_tool_calls_with_stop = true\n"
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(LoadOptions{ExplicitPath: path, Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Config.Providers["gateway"].AcceptToolCallsWithStop {
+		t.Fatalf("the documented key did not parse: %#v", loaded.Config.Providers["gateway"])
+	}
+
+	off := filepath.Join(t.TempDir(), "config.toml")
+	cfg := Default()
+	cfg.ActiveProvider = "gateway"
+	cfg.Providers["gateway"] = validProvider("https://gateway.example/v1", "some-model")
+	if err := Save(off, cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), "accept_tool_calls_with_stop") {
+		t.Fatalf("a disabled relaxation was persisted: %s", saved)
+	}
+}

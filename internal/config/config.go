@@ -29,18 +29,25 @@ const (
 var allReasoningEfforts = []string{"auto", "low", "medium", "high", "xhigh", "max", "ultra"}
 
 type ProviderConfig struct {
-	Adapter         string                 `toml:"adapter" json:"adapter"`
-	BaseURL         string                 `toml:"base_url" json:"base_url"`
-	APIKey          string                 `toml:"api_key,omitempty" json:"-"`
-	Model           string                 `toml:"model" json:"model"`
-	ReasoningEffort string                 `toml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
-	CatalogProvider string                 `toml:"catalog_provider,omitempty" json:"catalog_provider,omitempty"`
-	ContextWindow   int                    `toml:"context_window,omitempty" json:"context_window,omitempty"`
-	TimeoutSeconds  int                    `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
-	Headers         map[string]string      `toml:"headers,omitempty" json:"headers,omitempty"`
-	Routing         ProviderRouting        `toml:"routing,omitempty" json:"routing,omitempty"`
-	WebTools        WebToolsConfig         `toml:"web_tools,omitempty" json:"web_tools,omitempty"`
-	WebCapabilities WebCapabilityOverrides `toml:"web_capabilities,omitempty" json:"web_capabilities,omitempty"`
+	Adapter         string `toml:"adapter" json:"adapter"`
+	BaseURL         string `toml:"base_url" json:"base_url"`
+	APIKey          string `toml:"api_key,omitempty" json:"-"`
+	Model           string `toml:"model" json:"model"`
+	ReasoningEffort string `toml:"reasoning_effort,omitempty" json:"reasoning_effort,omitempty"`
+	CatalogProvider string `toml:"catalog_provider,omitempty" json:"catalog_provider,omitempty"`
+	ContextWindow   int    `toml:"context_window,omitempty" json:"context_window,omitempty"`
+	TimeoutSeconds  int    `toml:"timeout_seconds,omitempty" json:"timeout_seconds,omitempty"`
+	// AcceptToolCallsWithStop is the explicit interoperability relaxation for a
+	// provider that reports a normal completion while returning tool calls.
+	// Refusing that response is the default because it is ambiguous: committing
+	// it would either strand the calls or claim a completion that never
+	// happened. Turning it on makes this client run the calls instead, and the
+	// run report records that the relaxation was used.
+	AcceptToolCallsWithStop bool                   `toml:"accept_tool_calls_with_stop,omitempty" json:"accept_tool_calls_with_stop,omitempty"`
+	Headers                 map[string]string      `toml:"headers,omitempty" json:"headers,omitempty"`
+	Routing                 ProviderRouting        `toml:"routing,omitempty" json:"routing,omitempty"`
+	WebTools                WebToolsConfig         `toml:"web_tools,omitempty" json:"web_tools,omitempty"`
+	WebCapabilities         WebCapabilityOverrides `toml:"web_capabilities,omitempty" json:"web_capabilities,omitempty"`
 }
 
 type WebToolsConfig struct {

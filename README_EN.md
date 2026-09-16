@@ -487,7 +487,29 @@ Stop reasons have an explicit handling table, and a non-`tool_use` stop is not a
 | Budget exhausted | No further model request is started, and committed calls are closed |
 
 - A length truncation is not continued automatically. When truncation leaves tool arguments incomplete, that call is not treated as executable: the arguments are recorded as an empty object and the call is closed with `not_executed`, an unpairable call is dropped, and the partial answer is kept.
-- The Responses adapter reads the envelope `status` and `incomplete_details`: `incomplete` maps to `length` (whether the cause was the token limit or a content filter), `failed` and `cancelled` map to `error` and `cancelled`, and an unrecognized status is never treated as a completion.
+- The Responses adapter reads the envelope `status` and `incomplete_details`: `incomplete` maps to `length` (whether the cause was the token limit or a content filter), `failed` and `cancelled` map to `error` and `cancelled`, and an unrecognized status is never treated as a completion — it is read as `length`, so the partial answer is kept, its calls do not run, and the response is not presented as finished.
+- The stop-reason mapping has exactly one implementation (`StopKindFor` in `internal/driver`). An adapter only translates its own dialect into the shared vocabulary; whether a response is refused and whether its calls run is decided by the same policy table:
+
+  | Provider behaviour | Default | Relaxable |
+  |---|---|---|
+  | `tool_calls` / `function_call` (asks for tools) | `tool_use`; the calls are validated and executed | no |
+  | `length` / `content_filter` / `max_tokens` and other truncations | `length`; the partial response is kept and its calls are closed with `not_executed` | no |
+  | `completed` without calls | `completed` | no |
+  | `completed` **with** calls | Protocol error; the response is not written to the transcript | yes, see below |
+  | `failed` / `cancelled` | `error` / `cancelled` | no |
+  | Unrecognized value | Protocol error; the response is not written to the transcript | no |
+
+- **Interoperability relaxation (risky).** Some gateways report `finish_reason: "stop"` while returning tool calls. That response is refused by default, because "finished" and "there are still calls to run" contradict each other: committing it would either strand the calls or claim a completion that never happened. If a provider really behaves that way, it can be trusted explicitly, per provider:
+
+  ```toml
+  [providers.gateway]
+  adapter = "openai_chat"
+  base_url = "https://gateway.example/v1"
+  model = "some-model"
+  accept_tool_calls_with_stop = true
+  ```
+
+  With it on, that response is executed as `tool_use` and recorded as `accept_tool_calls_with_stop` on the response, in the run report (`interop`) and in the audit trail. It is configured per provider and covers only this one row: a failed response, a cancelled one and an unrecognized value are never relaxed. Turning it on makes a response that used to "look successful" actually run its calls, so enable it only after confirming what the gateway means.
 - Text output states a truncation or cancellation on stderr, while `json`, `jsonl` and the TUI expose the structured `stop` field.
 - The request-level budget covers the main model calls, the context-compaction summaries and the context-recovery retries. Every model call passes a pre-request admission check against the estimated input plus the output reserve, and the provider's real usage calibrates the totals afterwards; a missing usage marks the totals as an estimated lower bound.
 - Reasoning tokens are recorded separately and never counted twice, because every adapter already includes them in its output tokens. The response returned by `Run` still describes only the last call; the accumulated usage is exposed separately through `LoopOptions.Usage` (`RunUsage`).

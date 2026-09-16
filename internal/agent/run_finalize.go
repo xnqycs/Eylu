@@ -40,6 +40,33 @@ type RunReport struct {
 	// RecoveredCalls lists tool call IDs that had no recorded result and were
 	// closed with outcome_unknown when a request was built.
 	RecoveredCalls []string `json:"recovered_calls,omitempty"`
+	// Interop names every deliberate relaxation of the provider interoperability
+	// policy this request used, so a relaxed request is never indistinguishable
+	// from a conforming one. An empty list is the normal case.
+	Interop []string `json:"interop,omitempty"`
+}
+
+// recordInterop adds the relaxations a provider needed to the report, keeping
+// the order they were observed in and never repeating one.
+func recordInterop(report *RunReport, notes []string) {
+	if report == nil {
+		return
+	}
+	for _, note := range notes {
+		if note == "" {
+			continue
+		}
+		seen := false
+		for _, existing := range report.Interop {
+			if existing == note {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			report.Interop = append(report.Interop, note)
+		}
+	}
 }
 
 func (r *RunReport) count(state protocol.CallState) {

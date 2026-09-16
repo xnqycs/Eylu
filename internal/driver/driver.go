@@ -70,8 +70,14 @@ type Request struct {
 	ReasoningEffort   string
 	ParallelToolCalls bool
 	Stream            bool
-	Target            CapabilityTarget
-	Model             protocol.ModelRequest
+	// AcceptToolCallsWithStop is the per-provider interoperability relaxation:
+	// it lets a response that reports completion while returning tool calls be
+	// executed instead of being refused as a protocol error. It is off by
+	// default, and a driver that uses it names it on the response so the run
+	// report and the audit trail record it.
+	AcceptToolCallsWithStop bool
+	Target                  CapabilityTarget
+	Model                   protocol.ModelRequest
 }
 
 type EmitFunc func(protocol.ModelEvent) error

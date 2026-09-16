@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 统一 Provider 停止原因映射：所有适配器共用一处策略表（`internal/driver` 的 `StopKindFor`），各自只负责把方言翻译成统一词表；`completed` 且带工具调用、`tool_use` 却没有调用、以及无法识别的取值都按协议错误拒绝，不再默认当作完成。为只返回 `finish_reason: "stop"` 的网关新增按 Provider 配置的放宽开关 `accept_tool_calls_with_stop`（默认关闭），开启后按 `tool_use` 执行并留痕在响应、运行摘要 `interop` 与审计中。
+
 - 增加跨 Provider 的 hosted `web_search` / `web_fetch` 协议、目标能力解析、稳定工具规划、流式生命周期、引用、Web usage 和原始 Provider metadata；新增 Responses、Chat、Messages、Interactions、Conversations 与 Agent wire mapping。
 - 增加 delegated 与 MCP client fallback、提交级 `max_uses`、可选 Web 审批、URL/域名/公网地址校验、可信网络边界、TUI 活动与引用展示，以及 JSON/JSONL、指标和审计投影；Web 默认直接执行，兼容 Responses 中转上的 GPT 搜索支持单批最多 10 条客户端并发扇出与稳定归并；TUI 展示批量查询词和打开 URL，并以最多 5 项的动画窗口折叠旧活动，隐藏计数行支持点击展开。
 - 修复恢复会话后的空历史视图：TUI 和 `--no-tui` 交互模式回显用户、助手与工具历史，TUI 默认定位到最新内容。

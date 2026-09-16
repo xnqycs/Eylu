@@ -107,11 +107,11 @@ func (d *Driver) Generate(ctx context.Context, request driver.Request, emit driv
 		var result protocol.ModelResponse
 		var raw json.RawMessage
 		if request.Stream {
-			result, raw, err = d.readStream(ctx, response.Body, emit)
+			result, raw, err = d.readStream(ctx, response.Body, emit, request.AcceptToolCallsWithStop)
 		} else {
 			raw, err = io.ReadAll(io.LimitReader(response.Body, 8<<20))
 			if err == nil {
-				result, err = d.convert(raw)
+				result, err = d.convert(raw, request.AcceptToolCallsWithStop)
 			}
 		}
 		response.Body.Close()
@@ -173,6 +173,9 @@ func aggregateNativeResponse(target *protocol.ModelResponse, next protocol.Model
 	target.Usage.ReasoningTokens += next.Usage.ReasoningTokens
 	target.Usage.Exact = target.Usage.Exact || next.Usage.Exact
 	target.DriverState = append(target.DriverState[:0], next.DriverState...)
+	// A relaxation the provider needed belongs to the response that used it, so
+	// it travels with the stop reason rather than being dropped by aggregation.
+	target.Interop = append(target.Interop[:0], next.Interop...)
 }
 
 func anthropicPause(raw json.RawMessage) bool {
@@ -376,11 +379,11 @@ func (d *Driver) applyHeaders(request *http.Request, source driver.Request) {
 	}
 }
 
-func (d *Driver) convert(raw []byte) (protocol.ModelResponse, error) {
+func (d *Driver) convert(raw []byte, acceptToolCallsWithStop bool) (protocol.ModelResponse, error) {
 	if d.dialect == DialectAnthropic {
-		return convertAnthropic(raw)
+		return convertAnthropic(raw, acceptToolCallsWithStop)
 	}
-	return convertOutputItems(raw)
+	return convertOutputItems(raw, acceptToolCallsWithStop)
 }
 
 type nativeEnvelope struct {
@@ -443,7 +446,7 @@ func (item *nativeItem) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func convertOutputItems(raw []byte) (protocol.ModelResponse, error) {
+func convertOutputItems(raw []byte, acceptToolCallsWithStop bool) (protocol.ModelResponse, error) {
 	var decoded nativeEnvelope
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "decode native web response", Cause: err}
@@ -486,10 +489,38 @@ func convertOutputItems(raw []byte) (protocol.ModelResponse, error) {
 			}
 			call := protocol.ToolCall{ID: callID, Name: item.Name, Arguments: json.RawMessage(item.Arguments)}
 			result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &call})
-			result.Stop = protocol.StopToolUse
 		}
 	}
+	// This dialect has no separate "tool calls" status: a response that carries
+	// calls is asking for them. The policy still owns the outcome, so an
+	// unrecognized condition is never read as a completion.
+	kind, interop, err := driver.StopKindFor(stopReasonForCalls(result.Turn.Parts), hasToolCalls(result.Turn.Parts), acceptToolCallsWithStop)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	result.Stop = kind
+	if interop != "" {
+		result.Interop = append(result.Interop, interop)
+	}
 	return result, nil
+}
+
+// stopReasonForCalls is the canonical stopping condition of a dialect that only
+// distinguishes "asked for tools" from "finished".
+func stopReasonForCalls(parts []protocol.Part) driver.StopReason {
+	if hasToolCalls(parts) {
+		return driver.StopReasonToolUse
+	}
+	return driver.StopReasonCompleted
+}
+
+func hasToolCalls(parts []protocol.Part) bool {
+	for _, part := range parts {
+		if part.Kind == protocol.PartToolCall && part.ToolCall != nil {
+			return true
+		}
+	}
+	return false
 }
 
 type anthropicEnvelope struct {
@@ -523,7 +554,7 @@ type anthropicContent struct {
 	Citations []nativeAnnotation `json:"citations"`
 }
 
-func convertAnthropic(raw []byte) (protocol.ModelResponse, error) {
+func convertAnthropic(raw []byte, acceptToolCallsWithStop bool) (protocol.ModelResponse, error) {
 	var decoded anthropicEnvelope
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "decode Anthropic response", Cause: err}
@@ -581,7 +612,6 @@ func convertAnthropic(raw []byte) (protocol.ModelResponse, error) {
 		case "tool_use":
 			call := protocol.ToolCall{ID: content.ID, Name: content.Name, Arguments: content.Input}
 			result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &call})
-			result.Stop = protocol.StopToolUse
 		}
 	}
 	activityParts := make([]protocol.Part, 0, len(order))
@@ -595,10 +625,44 @@ func convertAnthropic(raw []byte) (protocol.ModelResponse, error) {
 		activityParts = append(activityParts, protocol.Part{Kind: protocol.PartWebActivity, WebActivity: activity})
 	}
 	result.Turn.Parts = append(activityParts, result.Turn.Parts...)
+	// This dialect reports its own stopping condition, so it is authoritative
+	// here: a value this client cannot explain is carried through and refused by
+	// the policy instead of being guessed from the content.
+	kind, interop, err := driver.StopKindFor(stopReasonFromAnthropic(decoded.StopReason), hasToolCalls(result.Turn.Parts), acceptToolCallsWithStop)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	result.Stop = kind
+	if interop != "" {
+		result.Interop = append(result.Interop, interop)
+	}
 	return result, nil
 }
 
-func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc) (protocol.ModelResponse, json.RawMessage, error) {
+// stopReasonFromAnthropic translates the Anthropic stop_reason vocabulary into
+// the canonical stop reasons the interoperability policy is written in.
+//
+// A value this client cannot explain is carried through unchanged: the policy
+// then refuses it by name, so a new stop reason fails loudly instead of being
+// presented as a finished answer.
+func stopReasonFromAnthropic(reason string) driver.StopReason {
+	trimmed := strings.ToLower(strings.TrimSpace(reason))
+	switch trimmed {
+	case "tool_use":
+		return driver.StopReasonToolUse
+	case "max_tokens", "model_context_window_exceeded", "refusal":
+		// The provider cut the answer short, so it is kept without being
+		// presented as finished and without running the calls it happened to
+		// carry.
+		return driver.StopReasonLength
+	case "", "end_turn", "stop_sequence", "pause_turn":
+		return driver.StopReasonCompleted
+	default:
+		return driver.StopReason(trimmed)
+	}
+}
+
+func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc, acceptToolCallsWithStop bool) (protocol.ModelResponse, json.RawMessage, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
 	started := make(map[string]bool)
@@ -665,7 +729,7 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 			finalRaw = event.Message
 		}
 		if len(finalRaw) > 0 && (strings.Contains(event.Type, "completed") || strings.Contains(event.Type, "done") || strings.Contains(event.Type, "stop")) {
-			converted, err := d.convert(finalRaw)
+			converted, err := d.convert(finalRaw, acceptToolCallsWithStop)
 			if err != nil {
 				return protocol.ModelResponse{}, nil, err
 			}

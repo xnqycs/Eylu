@@ -202,7 +202,7 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 		}
 	}
 	if req.Stream {
-		return d.readStream(ctx, resp.Body, emit, hostedKind)
+		return d.readStream(ctx, resp.Body, emit, hostedKind, req.AcceptToolCallsWithStop)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
@@ -215,7 +215,10 @@ func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.E
 	if decoded.Error != nil {
 		return protocol.ModelResponse{}, protocol.ClassifyProviderMessage(decoded.Error.Message)
 	}
-	result := convertResponse(decoded, hostedKind, raw)
+	result, err := convertResponse(decoded, hostedKind, raw, req.AcceptToolCallsWithStop)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
 	if len(result.Turn.Parts) == 0 {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "provider returned no text or tool calls"}
 	}
@@ -282,13 +285,18 @@ func parallelToolCallsUnsupported(status int, raw []byte) bool {
 	return false
 }
 
-func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc, hostedKind protocol.ToolKind) (protocol.ModelResponse, error) {
+// readStream reads one streamed chat response. finishReason carries the
+// provider's own stopping condition to the end of the stream, where the calls
+// that arrived alongside it are known and the interoperability policy can decide
+// both together.
+func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc, hostedKind protocol.ToolKind, acceptToolCallsWithStop bool) (protocol.ModelResponse, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
 	text := strings.Builder{}
 	calls := make(map[int]*chatToolCall)
 	deltaBuffers := make(map[int]*driver.StreamDeltaBuffer)
 	result := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted}
+	finishReason := ""
 	completed := false
 	emitToolDelta := func(index int, call *chatToolCall, delta string, done bool) error {
 		if emit == nil || call == nil {
@@ -388,7 +396,9 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 					}
 				}
 			}
-			result.Stop = stopFromFinishReason(choice.FinishReason)
+			if reason := strings.TrimSpace(choice.FinishReason); reason != "" {
+				finishReason = reason
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -411,7 +421,24 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 		}
 		toolCall := protocol.ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: json.RawMessage(call.Function.Arguments)}
 		result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &toolCall})
-		result.Stop = protocol.StopToolUse
+	}
+	hasCalls := false
+	for _, part := range result.Turn.Parts {
+		if part.Kind == protocol.PartToolCall {
+			hasCalls = true
+			break
+		}
+	}
+	// The stopping condition and the calls are decided together, exactly as in
+	// the non-streaming path: the provider's finish_reason is translated into
+	// the canonical vocabulary and the interoperability policy owns the outcome.
+	kind, interop, err := driver.StopKindFor(stopReasonFromFinishReason(finishReason), hasCalls, acceptToolCallsWithStop)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	result.Stop = kind
+	if interop != "" {
+		result.Interop = append(result.Interop, interop)
 	}
 	if len(result.Turn.Parts) == 0 {
 		return protocol.ModelResponse{}, &protocol.Error{Code: protocol.ErrProtocol, Message: "provider stream returned no text or tool calls"}
@@ -427,10 +454,10 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 	return result, nil
 }
 
-func convertResponse(decoded chatResponse, hostedKind protocol.ToolKind, raw []byte) protocol.ModelResponse {
+func convertResponse(decoded chatResponse, hostedKind protocol.ToolKind, raw []byte, acceptToolCallsWithStop bool) (protocol.ModelResponse, error) {
 	result := protocol.ModelResponse{Turn: protocol.Turn{ID: uuid.NewString(), Role: protocol.RoleAgent, CreatedAt: time.Now().UTC()}, Stop: protocol.StopCompleted, Usage: usageFromChat(decoded)}
 	if len(decoded.Choices) == 0 {
-		return result
+		return result, nil
 	}
 	choice := decoded.Choices[0]
 	callID := ""
@@ -466,8 +493,18 @@ func convertResponse(decoded chatResponse, hostedKind protocol.ToolKind, raw []b
 		call := protocol.ToolCall{ID: item.ID, Name: item.Function.Name, Arguments: json.RawMessage(item.Function.Arguments)}
 		result.Turn.Parts = append(result.Turn.Parts, protocol.Part{Kind: protocol.PartToolCall, ToolCall: &call})
 	}
-	result.Stop = stopFromFinishReason(choice.FinishReason)
-	return result
+	// The stopping condition and the calls the response carries are decided
+	// together: a provider that reports a normal stop while returning tool calls
+	// is refused unless the provider has explicitly been trusted to do so.
+	kind, interop, err := driver.StopKindFor(stopReasonFromFinishReason(choice.FinishReason), len(choice.Message.ToolCalls) > 0, acceptToolCallsWithStop)
+	if err != nil {
+		return protocol.ModelResponse{}, err
+	}
+	result.Stop = kind
+	if interop != "" {
+		result.Interop = append(result.Interop, interop)
+	}
+	return result, nil
 }
 
 func mapChatTools(body *chatRequest, definitions []protocol.ToolDefinition, target driver.CapabilityTarget) (protocol.ToolKind, bool, error) {
@@ -595,14 +632,27 @@ func usageFromChat(decoded chatResponse) protocol.Usage {
 	return protocol.Usage{InputTokens: decoded.Usage.PromptTokens, OutputTokens: decoded.Usage.CompletionTokens, ReasoningTokens: decoded.Usage.CompletionDetail.ReasoningTokens, Exact: true}
 }
 
-func stopFromFinishReason(reason string) protocol.StopKind {
-	switch reason {
+// stopReasonFromFinishReason translates the Chat Completions finish_reason
+// vocabulary into the canonical stop reasons the interoperability policy is
+// written in.
+//
+// A value this client cannot explain is carried through unchanged instead of
+// being defaulted to a completion: the policy then refuses it by name, so a
+// gateway that invents a finish reason fails loudly rather than producing a
+// request that looks finished.
+func stopReasonFromFinishReason(reason string) driver.StopReason {
+	trimmed := strings.ToLower(strings.TrimSpace(reason))
+	switch trimmed {
 	case "tool_calls", "function_call":
-		return protocol.StopToolUse
-	case "length":
-		return protocol.StopLength
+		return driver.StopReasonToolUse
+	case "length", "content_filter":
+		// A filtered answer was cut short by the provider, so it is kept and
+		// never presented as finished.
+		return driver.StopReasonLength
+	case "", "stop", "end_turn":
+		return driver.StopReasonCompleted
 	default:
-		return protocol.StopCompleted
+		return driver.StopReason(trimmed)
 	}
 }
 

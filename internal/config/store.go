@@ -58,18 +58,21 @@ type FileConfig struct {
 }
 
 type FileProviderConfig struct {
-	Adapter         *string                 `toml:"adapter,omitempty"`
-	BaseURL         *string                 `toml:"base_url,omitempty"`
-	APIKey          *string                 `toml:"api_key,omitempty"`
-	Model           *string                 `toml:"model,omitempty"`
-	ReasoningEffort *string                 `toml:"reasoning_effort,omitempty"`
-	CatalogProvider *string                 `toml:"catalog_provider,omitempty"`
-	ContextWindow   *int                    `toml:"context_window,omitempty"`
-	TimeoutSeconds  *int                    `toml:"timeout_seconds,omitempty"`
-	Headers         *map[string]string      `toml:"headers,omitempty"`
-	Routing         *FileProviderRouting    `toml:"routing,omitempty"`
-	WebTools        *WebToolsConfig         `toml:"web_tools,omitempty"`
-	WebCapabilities *WebCapabilityOverrides `toml:"web_capabilities,omitempty"`
+	Adapter         *string `toml:"adapter,omitempty"`
+	BaseURL         *string `toml:"base_url,omitempty"`
+	APIKey          *string `toml:"api_key,omitempty"`
+	Model           *string `toml:"model,omitempty"`
+	ReasoningEffort *string `toml:"reasoning_effort,omitempty"`
+	CatalogProvider *string `toml:"catalog_provider,omitempty"`
+	ContextWindow   *int    `toml:"context_window,omitempty"`
+	TimeoutSeconds  *int    `toml:"timeout_seconds,omitempty"`
+	// AcceptToolCallsWithStop is presence-aware: leaving it out keeps the strict
+	// default, and only an explicit true opts a provider into the relaxation.
+	AcceptToolCallsWithStop *bool                   `toml:"accept_tool_calls_with_stop,omitempty"`
+	Headers                 *map[string]string      `toml:"headers,omitempty"`
+	Routing                 *FileProviderRouting    `toml:"routing,omitempty"`
+	WebTools                *WebToolsConfig         `toml:"web_tools,omitempty"`
+	WebCapabilities         *WebCapabilityOverrides `toml:"web_capabilities,omitempty"`
 }
 
 type FileProviderRouting struct {
@@ -592,6 +595,9 @@ func applyFileProvider(provider *ProviderConfig, file FileProviderConfig) {
 	assign(provider.CatalogProvider, file.CatalogProvider, func(value string) { provider.CatalogProvider = value })
 	assign(provider.ContextWindow, file.ContextWindow, func(value int) { provider.ContextWindow = value })
 	assign(provider.TimeoutSeconds, file.TimeoutSeconds, func(value int) { provider.TimeoutSeconds = value })
+	if file.AcceptToolCallsWithStop != nil {
+		provider.AcceptToolCallsWithStop = *file.AcceptToolCallsWithStop
+	}
 	if file.Headers != nil {
 		provider.Headers = cloneStringMap(*file.Headers)
 	}
@@ -766,6 +772,11 @@ func fileProvider(provider ProviderConfig) FileProviderConfig {
 	}
 	if provider.TimeoutSeconds != 0 {
 		file.TimeoutSeconds = ptr(provider.TimeoutSeconds)
+	}
+	if provider.AcceptToolCallsWithStop {
+		// Only an explicit opt-in is persisted, so the absence of the key always
+		// means the strict default.
+		file.AcceptToolCallsWithStop = ptr(true)
 	}
 	if provider.Headers != nil {
 		value := cloneStringMap(provider.Headers)

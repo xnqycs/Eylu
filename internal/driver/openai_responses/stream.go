@@ -40,7 +40,7 @@ type callAccumulator struct {
 	Deltas    driver.StreamDeltaBuffer
 }
 
-func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc) (protocol.ModelResponse, error) {
+func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.EmitFunc, acceptToolCallsWithStop bool) (protocol.ModelResponse, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 8<<20)
 	var data strings.Builder
@@ -246,7 +246,10 @@ func (d *Driver) readStream(ctx context.Context, body io.Reader, emit driver.Emi
 				}
 			}
 		case "response.completed", "response.incomplete":
-			converted := convertResponse(event.Response)
+			converted, convertErr := convertResponse(event.Response, acceptToolCallsWithStop)
+			if convertErr != nil {
+				return convertErr
+			}
 			streamCitations = collectStreamWebState(&converted, webActivities, startedWebOrder, streamCitations)
 			for _, callID := range startedWebOrder {
 				if terminalWeb[callID] {

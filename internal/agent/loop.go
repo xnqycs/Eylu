@@ -183,6 +183,10 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		c.mu.Lock()
 		c.commitResponse(response, effectiveRuntime)
 		c.mu.Unlock()
+		// An interoperability relaxation the provider needed is durable evidence,
+		// so it is recorded on the report instead of only existing in the driver
+		// that applied it.
+		recordInterop(options.Report, response.Interop)
 		last = response
 		for _, call := range toolCalls(response.Turn) {
 			seenCalls[call.ID] = struct{}{}
