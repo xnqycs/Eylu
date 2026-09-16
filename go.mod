@@ -15,6 +15,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/spf13/cobra v1.10.1
 	golang.org/x/mod v0.38.0
+	golang.org/x/oauth2 v0.35.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.46.0
 	golang.org/x/term v0.34.0
@@ -49,7 +50,6 @@ require (
 	github.com/yuin/goldmark v1.7.8 // indirect
 	github.com/yuin/goldmark-emoji v1.0.5 // indirect
 	golang.org/x/net v0.39.0 // indirect
-	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/text v0.24.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
