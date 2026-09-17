@@ -430,10 +430,15 @@ type flakySink struct {
 func (s *flakySink) RecordIntent(Intent) error {
 	s.mu.Lock()
 	s.calls++
-	fail := s.failEvery > 0 && s.calls%s.failEvery == 0
+	// The count is read here and used from here: reading s.calls again after the
+	// unlock raced with the next intent, which the race detector found in CI. The
+	// executor calls this from a goroutine per call, so anything read outside the
+	// lock is shared state.
+	call := s.calls
+	fail := s.failEvery > 0 && call%s.failEvery == 0
 	s.mu.Unlock()
 	if fail {
-		return fmt.Errorf("soak: log unavailable on intent %d", s.calls)
+		return fmt.Errorf("soak: log unavailable on intent %d", call)
 	}
 	return nil
 }
