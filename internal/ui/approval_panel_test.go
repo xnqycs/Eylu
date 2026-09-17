@@ -8,6 +8,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
+
+	"Eylu/internal/protocol"
 )
 
 // approvalFixture is one pending approval with a long summary, so the panel has
@@ -121,5 +123,68 @@ func TestPlanGateFeedbackIsVisibleWhileTyping(t *testing.T) {
 				t.Fatalf("the panel overflows the terminal: %d rows in %d", got, height)
 			}
 		})
+	}
+}
+
+// The ask panel holds a third inline input - the custom answer behind Tab - and it
+// is clipped the same way: the label and the text the user is typing are the last
+// rows of the panel.
+func TestAskCustomAnswerIsVisibleWhileTyping(t *testing.T) {
+	for _, height := range []int{12, 14, 16, 18, 24, 30, 40} {
+		t.Run(fmt.Sprintf("height=%d", height), func(t *testing.T) {
+			model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: height})
+			model.ask = newAskState(&AskRequest{Questions: []protocol.AskQuestion{{
+				ID: "q1", Header: "Choice", Question: "Which one?",
+				Options: []protocol.AskOption{
+					{Label: "One", Description: "first choice"},
+					{Label: "Two", Description: "second choice"},
+					{Label: "Three", Description: "third choice"},
+					{Label: "Four", Description: "fourth choice"},
+				},
+			}}}, model.width)
+
+			if _, _ = model.handleAskKey("tab"); !model.ask.editing {
+				t.Fatal("tab did not start the custom answer")
+			}
+			_, _ = model.Update(tea.PasteMsg{Content: "a custom answer"})
+
+			view := ansi.Strip(model.View().Content)
+			if !strings.Contains(view, "a custom answer") {
+				t.Fatalf("the typed custom answer is not visible at height %d:\n%s", height, view)
+			}
+			if !strings.Contains(view, "Custom answer") {
+				t.Fatalf("the custom input has no label at height %d:\n%s", height, view)
+			}
+			if !strings.Contains(view, "Other") {
+				t.Fatalf("the custom option is missing at height %d:\n%s", height, view)
+			}
+			if got := lipgloss.Height(view); got > height {
+				t.Fatalf("the panel overflows the terminal: %d rows in %d", got, height)
+			}
+		})
+	}
+}
+
+// A custom answer that has been committed stays readable after the input loses
+// focus, so the answer about to be submitted is the one on screen.
+func TestAskCustomAnswerStaysVisibleAfterLeavingTheInput(t *testing.T) {
+	model := NewModel(&fakeBackend{}, Options{NoAnimation: true, NoColor: true, Width: 80, Height: 24})
+	model.ask = newAskState(&AskRequest{Questions: []protocol.AskQuestion{{
+		ID: "q1", Header: "Choice", Question: "Which one?",
+		Options: []protocol.AskOption{
+			{Label: "One", Description: "first choice"},
+			{Label: "Two", Description: "second choice"},
+		},
+	}}}, model.width)
+	if _, _ = model.handleAskKey("tab"); !model.ask.editing {
+		t.Fatal("tab did not start the custom answer")
+	}
+	_, _ = model.Update(tea.PasteMsg{Content: "neither of them"})
+	if _, _ = model.handleAskKey("tab"); model.ask.editing {
+		t.Fatal("tab did not leave the custom answer")
+	}
+	view := ansi.Strip(model.View().Content)
+	if !strings.Contains(view, "neither of them") {
+		t.Fatalf("the committed custom answer disappeared when the input lost focus:\n%s", view)
 	}
 }

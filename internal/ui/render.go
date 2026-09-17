@@ -63,35 +63,57 @@ func (m *Model) decisionPanelHeight() int {
 	maximum := max(1, m.height-1-minViewportRows)
 	if m.ask != nil {
 		desired := max(8, min(12, m.height/2))
+		// The custom answer is a label and either the input or the answer it holds.
+		desired += m.panelEditRows()
 		return min(desired, maximum)
 	}
 	desired := max(6, m.height/3)
-	// A decision panel can hold an inline input - the rejection reason of an approval
-	// or the revision feedback of a plan gate - and that input is three more rows. A
-	// height that does not ask for them cannot show them, and the input is the panel's
-	// last row: the user would type into a field that is never rendered.
-	if m.panelEditVisible() {
-		desired += panelEditRows
-	}
+	// A decision panel can hold an inline input - the rejection reason of an approval,
+	// the feedback that revises a plan - and that input is three more rows. A height
+	// that does not ask for them cannot show them, and the input is the panel's last
+	// row: the user would type into a field that is never rendered.
+	desired += m.panelEditRows()
 	return min(desired, maximum)
 }
 
-// panelEditRows is the number of rows an inline panel input occupies: a blank line,
-// its label, and the input itself.
-const panelEditRows = 3
-
-// panelEditVisible reports whether the panel on screen is showing its inline input.
+// panelEditRows reports how many rows the inline input of the panel on screen adds,
+// and zero when it adds none.
 //
-// The input stays visible after it loses focus while it holds something, so the
-// decision about to be submitted is the one on screen.
-func (m *Model) panelEditVisible() bool {
-	if m.approval != nil {
-		return m.approvalEditing || strings.TrimSpace(m.approvalReason.Value()) != ""
+// It is the single answer both the height and the renderer use, so the panel cannot
+// ask for fewer rows than it renders.
+func (m *Model) panelEditRows() int {
+	switch {
+	case m.approval != nil:
+		if m.approvalEditing || strings.TrimSpace(m.approvalReason.Value()) != "" {
+			return panelInputRows
+		}
+	case m.planGate != nil:
+		if m.planGate.editing || strings.TrimSpace(m.planGate.feedback.Value()) != "" {
+			return panelInputRows
+		}
+	case m.ask != nil:
+		if m.ask.editing {
+			// The label and the input.
+			return 2
+		}
+		if strings.TrimSpace(m.ask.custom[m.askQuestionID()]) != "" {
+			// The committed answer shares its row with the label.
+			return 1
+		}
 	}
-	if m.planGate != nil {
-		return m.planGate.editing || strings.TrimSpace(m.planGate.feedback.Value()) != ""
+	return 0
+}
+
+// panelInputRows is the number of rows an inline panel input occupies: a blank line,
+// its label, and the input itself.
+const panelInputRows = 3
+
+// askQuestionID is the ID of the question the ask panel is showing.
+func (m *Model) askQuestionID() string {
+	if m.ask == nil || m.ask.request == nil || m.ask.question < 0 || m.ask.question >= len(m.ask.request.Questions) {
+		return ""
 	}
-	return false
+	return m.ask.request.Questions[m.ask.question].ID
 }
 
 func (m *Model) View() tea.View {
@@ -1607,62 +1629,103 @@ func (m *Model) renderAsk(height int) string {
 	if m.ask.err != "" {
 		meta = m.ask.err
 	}
-	lines := []string{panelHeader(m.styles.Accent.Bold(true).Render(question.Header), meta, contentWidth, m.styles)}
-	if height <= 7 {
-		lines = append(lines, m.styles.Agent.Render(truncateColumns(question.Question, contentWidth)))
-		label, description := "Other", "Type a custom answer"
-		if m.ask.cursor < len(question.Options) {
-			label = question.Options[m.ask.cursor].Label
-			description = question.Options[m.ask.cursor].Description
-		}
-		lines = append(lines, m.styles.Active.Render("> "+label)+"  "+m.styles.Muted.Render(truncateColumns(description, max(8, contentWidth-lipgloss.Width(label)-4))))
-	} else {
-		lines = append(lines, m.styles.Agent.Render(wrapLimited(question.Question, contentWidth, 2)))
-		selected := m.ask.selections[question.ID]
-		for index, option := range question.Options {
-			marker := "( )"
-			if question.Multiple {
-				marker = "[ ]"
-			}
-			if selected[index] {
-				if question.Multiple {
-					marker = "[x]"
-				} else {
-					marker = "(*)"
-				}
-			}
-			cursor := "  "
-			if index == m.ask.cursor {
-				cursor = "> "
-			}
-			line := cursor + marker + " " + option.Label + "  " + m.styles.Muted.Render(option.Description)
-			lines = append(lines, truncateColumns(line, contentWidth))
-		}
-		otherMarker := "( )"
-		if question.Multiple {
-			otherMarker = "[ ]"
-		}
-		if strings.TrimSpace(m.ask.custom[question.ID]) != "" {
-			if question.Multiple {
-				otherMarker = "[x]"
-			} else {
-				otherMarker = "(*)"
-			}
-		}
-		cursor := "  "
-		if m.ask.cursor == len(question.Options) {
-			cursor = "> "
-		}
-		lines = append(lines, cursor+otherMarker+" Other  "+m.styles.Muted.Render("Type a custom answer"))
+	header := panelHeader(m.styles.Accent.Bold(true).Render(question.Header), meta, contentWidth, m.styles)
+
+	// The rows are spent from the most important down: the choices always fit, the
+	// custom answer keeps its rows because it is what the user is typing into, and the
+	// question text is what a short panel gives up first - it is also the row that can
+	// be re-read from the request above.
+	contentRows := max(0, height-2)
+	editLines := m.askCustomLines(question, contentWidth)
+	optionLines := m.askOptionLines(question, contentWidth)
+	if 1+len(optionLines)+len(editLines) > contentRows {
+		optionLines = m.askCompactOptionLine(question, contentWidth)
 	}
-	if m.ask.editing {
-		lines = append(lines, m.styles.Muted.Render("Custom answer"), m.ask.input.View())
+	questionBudget := max(0, contentRows-1-len(optionLines)-len(editLines))
+	questionLines := []string(nil)
+	if questionBudget > 0 {
+		questionLines = strings.Split(wrapLimited(question.Question, contentWidth, questionBudget), "\n")
 	}
+
+	lines := make([]string, 0, contentRows)
+	lines = append(lines, header)
+	lines = append(lines, questionLines...)
+	lines = append(lines, optionLines...)
+	lines = append(lines, editLines...)
 	footer := "↑/↓ select  ·  Space toggle  ·  Enter submit  ·  Tab custom  ·  ← previous  ·  Esc cancel"
 	if m.height < 18 {
 		footer = "↑/↓ select  ·  Enter submit  ·  Tab custom  ·  Esc cancel"
 	}
 	return m.renderBottomPanel(lines, footer, height)
+}
+
+// askOptionLines renders the choice list of one question: every option, and the
+// custom-answer row that is always offered last.
+func (m *Model) askOptionLines(question protocol.AskQuestion, contentWidth int) []string {
+	lines := make([]string, 0, len(question.Options)+1)
+	selected := m.ask.selections[question.ID]
+	for index, option := range question.Options {
+		marker := "( )"
+		if question.Multiple {
+			marker = "[ ]"
+		}
+		if selected[index] {
+			if question.Multiple {
+				marker = "[x]"
+			} else {
+				marker = "(*)"
+			}
+		}
+		cursor := "  "
+		if index == m.ask.cursor {
+			cursor = "> "
+		}
+		line := cursor + marker + " " + option.Label + "  " + m.styles.Muted.Render(option.Description)
+		lines = append(lines, truncateColumns(line, contentWidth))
+	}
+	return append(lines, m.askOtherLine(question, contentWidth))
+}
+
+// askCompactOptionLine renders only the highlighted choice, which is what a panel
+// with room for a single option row can still offer.
+func (m *Model) askCompactOptionLine(question protocol.AskQuestion, contentWidth int) []string {
+	if m.ask.cursor < len(question.Options) {
+		option := question.Options[m.ask.cursor]
+		line := m.styles.Active.Render("> "+option.Label) + "  " + m.styles.Muted.Render(truncateColumns(option.Description, max(8, contentWidth-lipgloss.Width(option.Label)-4)))
+		return []string{truncateColumns(line, contentWidth)}
+	}
+	return []string{m.askOtherLine(question, contentWidth)}
+}
+
+func (m *Model) askOtherLine(question protocol.AskQuestion, contentWidth int) string {
+	otherMarker := "( )"
+	if question.Multiple {
+		otherMarker = "[ ]"
+	}
+	if strings.TrimSpace(m.ask.custom[question.ID]) != "" {
+		if question.Multiple {
+			otherMarker = "[x]"
+		} else {
+			otherMarker = "(*)"
+		}
+	}
+	cursor := "  "
+	if m.ask.cursor == len(question.Options) {
+		cursor = "> "
+	}
+	return truncateColumns(cursor+otherMarker+" Other  "+m.styles.Muted.Render("Type a custom answer"), contentWidth)
+}
+
+// askCustomLines renders the custom answer: the input while it is focused, and what
+// was typed once it is not, so the answer about to be submitted stays readable.
+func (m *Model) askCustomLines(question protocol.AskQuestion, contentWidth int) []string {
+	if m.ask.editing {
+		return []string{m.styles.Muted.Render("Custom answer"), m.ask.input.View()}
+	}
+	if custom := strings.TrimSpace(m.ask.custom[question.ID]); custom != "" {
+		return []string{m.styles.Muted.Render("Custom answer  ") + truncateColumns(custom, max(8, contentWidth-15))}
+	}
+	return nil
 }
 
 func (m *Model) renderApproval(height int) string {
@@ -1682,10 +1745,7 @@ func (m *Model) renderApproval(height int) string {
 	// reason nobody can correct, and the tool's summary is already on the request line
 	// above the panel.
 	contentRows := max(0, height-2)
-	reasonRows := 0
-	if m.panelEditVisible() {
-		reasonRows = panelEditRows
-	}
+	reasonRows := m.panelEditRows()
 	detailRows := max(0, contentRows-1-1-reasonRows)
 	var details []string
 	if detailRows >= 4 {
@@ -1743,10 +1803,7 @@ func (m *Model) renderPlanGate(height int) string {
 	// Same rule as the approval panel: the revision feedback is the row the user is
 	// typing into, so the description above it is what a short panel gives up.
 	contentRows := max(0, height-2)
-	editRows := 0
-	if m.panelEditVisible() {
-		editRows = panelEditRows
-	}
+	editRows := m.panelEditRows()
 	detailRows := max(0, contentRows-1-1-editRows)
 	var details []string
 	if detailRows >= 2 {
