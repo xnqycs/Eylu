@@ -50,12 +50,6 @@
 - 安全收紧改为在当前请求内生效：把模式由宽变窄、新增 `deny_tools`、禁用 MCP server 或把 Web 权限收为 `deny` 时，正在运行的请求会在下一个批次边界之前停止，未启动的调用闭合为 `not_executed`，已产生的副作用与结果保留；运行摘要记为 `stop_reason=policy_tightened` 并附原因，TUI/CLI 显示"已按新设置停止当前请求"。放宽只对下一个请求生效。
 - 统一 Provider 停止原因映射：所有适配器共用一处策略表（`internal/driver` 的 `StopKindFor`），各自只负责把方言翻译成统一词表；`completed` 且带工具调用、`tool_use` 却没有调用、以及无法识别的取值都按协议错误拒绝，不再默认当作完成。为只返回 `finish_reason: "stop"` 的网关新增按 Provider 配置的放宽开关 `accept_tool_calls_with_stop`（默认关闭），开启后按 `tool_use` 执行并留痕在响应、运行摘要 `interop` 与审计中。
 
-- 增加跨 Provider 的 hosted `web_search` / `web_fetch` 协议、目标能力解析、稳定工具规划、流式生命周期、引用、Web usage 和原始 Provider metadata；新增 Responses、Chat、Messages、Interactions、Conversations 与 Agent wire mapping。
-- 增加 delegated 与 MCP client fallback、提交级 `max_uses`、可选 Web 审批、URL/域名/公网地址校验、可信网络边界、TUI 活动与引用展示，以及 JSON/JSONL、指标和审计投影；Web 默认直接执行，兼容 Responses 中转上的 GPT 搜索支持单批最多 10 条客户端并发扇出与稳定归并；TUI 展示批量查询词和打开 URL，并以最多 5 项的动画窗口折叠旧活动，隐藏计数行支持点击展开。
-- 修复恢复会话后的空历史视图：TUI 和 `--no-tui` 交互模式回显用户、助手与工具历史，TUI 默认定位到最新内容。
-- 修复 MCP 管理体验：启动加载期间在 Banner 下展示动画并在终态后清除；完整输入 `/mcp` 后可直接打开，详情页支持左右方向键切换，Tools 页仅展示工具列表，按 Enter 进入工具详情、Esc 返回；连接错误进入内容区并去重显示，原始配置与诊断 JSON 不再挤占详情页或输入区。
-- 优化 MCP 启动与连接稳定性：TUI 首轮请求复用启动时建立的 manager，多个 server 最多并行连接 4 个；Streamable HTTP 握手中的每个 POST 独立应用 60 秒期限并携带稳定 User-Agent，工具目录就绪即进入 connected，日志级别、资源、资源模板和提示词改为后台加载；临时连接错误最多自动重试 3 次，最终失败后可手动执行 `reconnect`，退出清理采用有界等待。
-
 兼容性：生命周期事件 ID 形状变化（`intent:`/`prepared:`/`completion:` 现在携带 request ID，逐调用意图路径此前完全没有事件 ID），增量字段 `ToolCompletion.request_id`、`AgentTaskResult.model_calls`、`AgentTask.model_calls`，以及导出配置字段 `policy.Config.Shell`（零值为 POSIX）；磁盘 session schema、protocol v1 与既有字段语义未变。
 
 行为变化：Windows 且无 git-bash 时，单引号内的分隔符以及 `%`、`^`、括号不再自动放行，改为要求确认；运行中 `/compact` 返回 `conversation already has a running request`；模型可见的工具富结果变为有界投影（图片以描述+摘要代替 base64）；子代理用量口径由"最后一次调用"变为"整轮累计"，报表数字会变大；非法响应现在会写入运行摘要（`stop_reason=aborted`）并释放 pending，此前这些字段为空。
@@ -63,6 +57,20 @@
 已知未修复（本轮发现，尚未处理）：请求 context 在开始前就已被取消时，会以 `config_error: context canceled` 失败并被记为 `aborted`，且不写入 `request_started`/运行摘要/turn（CLI 与 TUI 行为一致，两个入口都已在此契约下断言）；plan（isolated profile）模式请求的会话日志不含 user turn，只含模型/工具 turn；plan 模式下写操作因工具不在 registry 而被报为 `failed` 而非 `rejected`，且该调用在事件日志中没有任何记录（只有运行摘要计数）；取消发生在模型调用进行中时报告 `aborted` 而非 `cancelled`；项目地图扫描仍在状态锁内；`EYLU_SHELL` 以 `-lc` 调用，因此仅适用于 POSIX 兼容 shell，指向其他 shell 时仍按 POSIX 规则解读。
 
 验证边界：本机无法运行 `go test -race`（无 C 编译器），因此竞态由 CI 的 `Race and static analysis` 作业发现：首次推送时该作业报告了测试替身 `orderedSink`/`faultSink` 的写竞争，以及跨入口取消场景对时序的依赖，两者均已修正并重新推送。除此之外，本轮在本机 Windows（go1.25.8）上执行了 `scripts/verify.ps1` 的全部阶段（gofmt 两种口径、`go mod verify`、`go vet ./...`、staticcheck v0.7.0、third-party notices、actionlint、`go test ./...`、`go build`、`smoke.ps1`、`smoke.sh`）并通过；Linux/macOS 原生运行、`go test -race`（本机无 C 编译器）与定向 fuzz 未在本地运行，由 CI 覆盖或记录为未执行；driver 验证全部离线，无真实 Provider 联调，也没有落盘的 SSE fixture 文件。
+
+## v1.0.0-rc.4 - 2026-07-24
+
+- 增加会话级索引代码上下文与只读检索子代理：`read_file` 支持 1-based 闭区间 `start_line`/`end_line` 并返回 `file_hash`、`slice_hash`、`artifact_id` 与续读游标 `next_start_line`；`search_code` 共享会话级增量三元组索引，支持 `offset` 分页与 `context_lines` 上下文；重复或被更大范围覆盖的代码切片在发送给模型前替换为稳定引用。模型可通过 `agent` 启动只读 `search` 子代理并取得结构化检索报告；子代理与主代理共享代码缓存、资源协调器与并行上限，同一路径写入保持有序。新增 `max_parallel_agents`、`code_context_cache_bytes`、`max_read_lines`、`code_index_workers` 与 `[search_agent]` 的 `max_turns`/`timeout_seconds`/`provider`/`model`，对应环境变量 `EYLU_MAX_PARALLEL_AGENTS`、`EYLU_CODE_CONTEXT_CACHE_BYTES`、`EYLU_MAX_READ_LINES`、`EYLU_CODE_INDEX_WORKERS`。
+- 增加后台子代理持久会话：所有任务强制后台执行并立即返回 `task_id`（兼容输入中的 `run_in_background=false` 会被忽略），`task_output` 只返回即时快照而不等待或消费完成通知，`task_stop` 取消当前轮次并清空待处理消息；新增 `general` 子代理，继承父上下文、模型、reasoning effort、权限模式、MCP 与已激活 Skill，使用独立 Conversation 与串行消息队列并禁用递归 `agent`。后台任务进入终态后空闲主会话自动续轮、运行中的主会话在下一次模型调用前接收结果，结果以一次性 `<agent_notification>` 注入且同时完成的任务合并交付；TUI 新增 `/agents` 全屏会话（Enter 打开与发送、`s` 停止、Esc 返回），退出时取消并等待活动代理、保存终态转录，恢复后的历史代理只读。
+- 修复父子代理并发写标准输出导致的交错：主代理与后台代理共享的 stdout/stderr writer 现在串行保护，避免两路输出互相穿插。
+
+## v1.0.0-rc.3 - 2026-07-23
+
+- 增加跨 Provider 的 hosted `web_search` / `web_fetch` 协议、目标能力解析、稳定工具规划、流式生命周期、引用、Web usage 和原始 Provider metadata；新增 Responses、Chat、Messages、Interactions、Conversations 与 Agent wire mapping。
+- 增加 delegated 与 MCP client fallback、提交级 `max_uses`、可选 Web 审批、URL/域名/公网地址校验、可信网络边界、TUI 活动与引用展示，以及 JSON/JSONL、指标和审计投影；Web 默认直接执行，兼容 Responses 中转上的 GPT 搜索支持单批最多 10 条客户端并发扇出与稳定归并；TUI 展示批量查询词和打开 URL，并以最多 5 项的动画窗口折叠旧活动，隐藏计数行支持点击展开。
+- 修复恢复会话后的空历史视图：TUI 和 `--no-tui` 交互模式回显用户、助手与工具历史，TUI 默认定位到最新内容。
+- 修复 MCP 管理体验：启动加载期间在 Banner 下展示动画并在终态后清除；完整输入 `/mcp` 后可直接打开，详情页支持左右方向键切换，Tools 页仅展示工具列表，按 Enter 进入工具详情、Esc 返回；连接错误进入内容区并去重显示，原始配置与诊断 JSON 不再挤占详情页或输入区。
+- 优化 MCP 启动与连接稳定性：TUI 首轮请求复用启动时建立的 manager，多个 server 最多并行连接 4 个；Streamable HTTP 握手中的每个 POST 独立应用 60 秒期限并携带稳定 User-Agent，工具目录就绪即进入 connected，日志级别、资源、资源模板和提示词改为后台加载；临时连接错误最多自动重试 3 次，最终失败后可手动执行 `reconnect`，退出清理采用有界等待。
 
 ## v1.0.0-rc.2 - 2026-07-21
 
