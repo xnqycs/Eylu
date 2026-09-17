@@ -471,22 +471,15 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	if submission.HistoryText != "" {
 		b.conversation.RecordPrompt(submission.HistoryText)
 	}
-	// reportErr holds the outcome of persisting the run summary. The deferred sync
-	// folds it in, so the report is written before the snapshot and a failure of
-	// either is reported instead of being silently dropped.
-	var reportErr error
+	run := b.runtime.newToolRun(b.runtime.session, b.conversation, b.manager, opts)
+	// The outcome of this request is published on every return path, including the
+	// ones that never reach the model: a request that failed before it started still
+	// leaves the session state it changed. The report is nil until the request
+	// reaches its execution phase, so a request that never ran does not claim a
+	// stop reason.
+	var report *agent.RunReport
 	defer func() {
-		if b.runtime.session == nil {
-			return
-		}
-		// The report is recorded before the snapshot sync, so the reason a request
-		// stopped survives even when the snapshot write fails. The sync error takes
-		// precedence because it means the session state itself is behind.
-		syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, returnErr)
-		if syncErr == nil {
-			syncErr = reportErr
-		}
-		if returnErr == nil {
+		if syncErr := run.settle(report, returnErr); returnErr == nil {
 			returnErr = syncErr
 		}
 	}()
@@ -541,20 +534,9 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 			contextEvents(event)
 		}
 	}
-	executor, err := b.runtime.toolExecutorWith(cfg, opts, b.skills, b.skillSession, confirm, ask, &tuiAuditSink{operationID: operationID, emit: emit})
+	executor, err := run.executor(cfg, modelRuntime, b.skills, b.skillSession, confirm, ask, &tuiAuditSink{operationID: operationID, emit: emit})
 	if err != nil {
 		return err
-	}
-	executor.SessionID, executor.ProviderName = b.conversation.SessionID(), modelRuntime.Provider.Name
-	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
-	// The interface and the text entry point share one reliability guarantee: a
-	// side-effecting call records its intent before it runs and its completion
-	// after, so a crash in the middle leaves evidence instead of a silent change.
-	// Installing the checkpoint here is what keeps the two entries from differing.
-	// A subagent inherits this executor, and with it the same sink, so its calls are
-	// recorded in the session they belong to as well.
-	if b.runtime.session != nil {
-		executor.Checkpoint = b.runtime.session
 	}
 	var taskObserverMu sync.Mutex
 	taskObserverActive := true
@@ -615,56 +597,36 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 		}
 		return nil
 	}
-	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
-	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
+	requestCtx, cancel := run.requestContext(ctx, cfg, modelRuntime)
 	defer cancel()
 	// The request is admitted under the settings that are in effect now; a later
 	// narrowing is measured against them rather than against the current values.
 	b.beginSafetyBaseline()
 	defer b.endSafetyBaseline()
 	sessionID := b.conversation.SessionID()
-	// Every committed turn is written while the request is still running, so a
-	// crash in the middle cannot lose a turn whose side effect already happened.
-	var onTurnCommitted func(protocol.Turn) error
-	var onToolPrepared func(protocol.ToolCall) error
-	if b.runtime.session != nil {
-		onTurnCommitted = b.runtime.session.RecordTurn
-		// The prepared-event source is the pending set of this conversation, so the
-		// log and the view cannot disagree about which call was prepared.
-		session := b.runtime.session
-		onToolPrepared = func(call protocol.ToolCall) error { return session.RecordToolPrepared(b.conversation, call) }
-		if err := session.RecordRequestStarted(observation.RequestID()); err != nil {
-			return err
-		}
-	}
 	var runReport agent.RunReport
 	// The accumulated usage of the whole request is collected separately from the
 	// last call's, so the two can never be read as each other.
 	var runUsage agent.RunUsage
-	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, agent.LoopOptions{
-		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
-		Report:          &runReport,
-		Usage:           &runUsage,
-		BeforeModel:     func() string { return b.runtime.completedAgentNotifications(sessionID) },
-		OnTurnCommitted: onTurnCommitted,
-		OnToolPrepared:  onToolPrepared,
-	}, true, modelEvents)
+	loopOptions, err := run.prepare(cfg, observation.RequestID(), &runReport, &runUsage)
+	if err != nil {
+		return err
+	}
+	loopOptions.BeforeModel = func() string { return b.runtime.completedAgentNotifications(sessionID) }
+	// The report is published by the deferred settle, so every return path below
+	// records it. It is kept here as well so the history and /run can state why the
+	// request ended.
+	report = &runReport
+	response, err := runConversationWithProfile(requestCtx, b.conversation, prompt, modelRuntime, executor, loopOptions, true, modelEvents)
 	flushText()
 	// The report is kept so the history can state why the request ended and so
 	// /run can show the summary of the most recent one.
 	b.mu.Lock()
 	b.lastRun = runReport
 	b.mu.Unlock()
-	// It is also written to the session, before the snapshot sync: the reason a
-	// request stopped has to survive a restart, and the interface must state it
-	// from the same record the text entry point does.
-	if b.runtime.session != nil {
-		reportErr = b.runtime.session.RecordRunReport(runReport)
-	}
-	report := b.conversation.ContextReport()
-	observation.ObserveCodeSlices(report.CodeSlices)
-	metric := observation.Finish(response.Usage, err)
-	metric.RequestUsage, metric.RequestModelCalls = requestUsageTotals(runUsage)
+	contextReport = b.conversation.ContextReport()
+	observation.ObserveCodeSlices(contextReport.CodeSlices)
+	metric := requestMetric(observation, response, runUsage, err)
 	interrupted := errors.Is(err, agent.ErrRequestInterrupted)
 	// A request that did not finish normally says so in the history, in the same
 	// wording the text output uses, so a truncated answer is never left looking
@@ -681,7 +643,7 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	// "Completed in 1ms" above a truncated answer is the same defect as showing the
 	// answer with no note at all.
 	emit(ui.Event{OperationID: operationID, Kind: ui.EventNotice, Notice: formatRequestCompletion(metric, interrupted, note != "")})
-	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &report})
+	emit(ui.Event{OperationID: operationID, Kind: ui.EventContext, Context: &contextReport})
 	if interrupted {
 		return ui.ErrRequestInterrupted
 	}

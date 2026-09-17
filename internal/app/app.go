@@ -389,8 +389,8 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		return err
 	}
 	modelRuntime.SkillCatalog = skillRegistry.Catalog()
-	overallTimeout := time.Duration(cfg.MaxTurns) * modelRuntime.Timeout
-	requestCtx, cancel := context.WithTimeout(ctx, overallTimeout)
+	run := r.newToolRun(r.session, conversation, manager, opts)
+	requestCtx, cancel := run.requestContext(ctx, cfg, modelRuntime)
 	defer cancel()
 	var emit driver.EmitFunc
 	if stream {
@@ -432,7 +432,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	if r.output == "jsonl" {
 		audit = &toolAuditWriter{writer: r.stdout, jsonl: true}
 	}
-	executor, err := r.toolExecutorWith(cfg, opts, skillRegistry, skillSession, confirm, ask, audit)
+	executor, err := run.executor(cfg, modelRuntime, skillRegistry, skillSession, confirm, ask, audit)
 	if err != nil {
 		return err
 	}
@@ -468,14 +468,6 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		InputCostPerMillion:  modelRuntime.Provider.Config.Routing.InputCostPerMillion,
 		OutputCostPerMillion: modelRuntime.Provider.Config.Routing.OutputCostPerMillion,
 	})
-	executor.SessionID, executor.ProviderName = conversation.SessionID(), modelRuntime.Provider.Name
-	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
-	// A side-effecting call persists its intent before it runs, so the window in
-	// which an operation has happened without a record is as small as the store
-	// allows.
-	if r.session != nil {
-		executor.Checkpoint = r.session
-	}
 	baseEmit := emit
 	emit = func(event protocol.ModelEvent) error {
 		observation.ObserveModelEvent(event)
@@ -489,43 +481,15 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	// The accumulated usage of the whole request is collected separately from the
 	// last call's, so the two can never be read as each other.
 	var runUsage agent.RunUsage
-	// Every committed turn is written while the request is still running, so a
-	// crash in the middle cannot lose a turn whose side effect already happened.
-	var onTurnCommitted func(protocol.Turn) error
-	var onToolPrepared func(protocol.ToolCall) error
-	if r.session != nil {
-		onTurnCommitted = r.session.RecordTurn
-		// The prepared-event source is the pending set of this conversation, so the
-		// log and the view cannot disagree about which call was prepared.
-		session := r.session
-		onToolPrepared = func(call protocol.ToolCall) error { return session.RecordToolPrepared(conversation, call) }
-		if err := session.RecordRequestStarted(observation.RequestID()); err != nil {
-			return err
-		}
+	loopOptions, err := run.prepare(cfg, observation.RequestID(), &runReport, &runUsage)
+	if err != nil {
+		return err
 	}
-	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, agent.LoopOptions{
-		MaxTurns: cfg.MaxTurns, MaxTotalTokens: cfg.MaxTotalTokens, RequestID: observation.RequestID(),
-		BeforeModel:     func() string { return r.completedAgentNotifications(sessionID) },
-		Report:          &runReport,
-		Usage:           &runUsage,
-		OnTurnCommitted: onTurnCommitted,
-		OnToolPrepared:  onToolPrepared,
-	}, stream, emit)
+	loopOptions.BeforeModel = func() string { return r.completedAgentNotifications(sessionID) }
+	response, err := runConversationWithProfile(requestCtx, conversation, prompt, modelRuntime, executor, loopOptions, stream, emit)
 	observation.ObserveCodeSlices(conversation.ContextReport().CodeSlices)
-	metric := observation.Finish(response.Usage, err)
-	metric.RequestUsage, metric.RequestModelCalls = requestUsageTotals(runUsage)
-	r.reportMetric(jsonlEncoder, metric)
-	syncErr := error(nil)
-	if r.session != nil {
-		// The report is recorded before the snapshot sync, so the reason a request
-		// stopped survives even when the snapshot write fails. The sync error takes
-		// precedence because it means the session state itself is behind.
-		reportErr := r.session.RecordRunReport(runReport)
-		syncErr = r.session.Sync(conversation, manager, opts, err)
-		if syncErr == nil {
-			syncErr = reportErr
-		}
-	}
+	r.reportMetric(jsonlEncoder, requestMetric(observation, response, runUsage, err))
+	syncErr := run.settle(&runReport, err)
 	if err != nil {
 		if r.output == "text" {
 			fmt.Fprintln(r.stdout)
