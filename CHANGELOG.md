@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.0.0-rc.5 - 2026-09-18
 
 - 修复 TUI 决策面板的内联输入被裁掉：三个面板都有"按 Tab 输入"的字段——权限审批的拒绝理由、计划门禁的修改意见、`ask` 的自定义答案——而面板高度没有为它们预留空间，输入又是面板的最后几行，于是典型终端高度下整段输入区被截掉，稍高一些只剩标签：按了 Tab、也输了字，却什么都看不见。现在面板按需申请输入所占的行数（审批/门禁为 3 行：空行、标签、输入框；`ask` 为 2 行）并在高度不足时按优先级放弃其它行——审批保留工具名与拒绝理由、计划门禁保留选项与反馈、`ask` 先压缩问题文字再退化为只显示高亮选项，输入行始终保留。编辑状态下页脚改为提示 `Enter` 提交 / `Esc` 返回选项，且已输入的内容在退出编辑后仍然可见（`ask` 的已提交自定义答案同样显示），提交的就是屏幕上显示的那一条。
 
@@ -58,7 +58,7 @@
 
 已知未修复（本轮发现，尚未处理）：请求 context 在开始前就已被取消时，会以 `config_error: context canceled` 失败并被记为 `aborted`，且不写入 `request_started`/运行摘要/turn（CLI 与 TUI 行为一致，两个入口都已在此契约下断言）；plan（isolated profile）模式请求的会话日志不含 user turn，只含模型/工具 turn；plan 模式下写操作因工具不在 registry 而被报为 `failed` 而非 `rejected`，且该调用在事件日志中没有任何记录（只有运行摘要计数）；取消发生在模型调用进行中时报告 `aborted` 而非 `cancelled`；项目地图扫描仍在状态锁内；`EYLU_SHELL` 以 `-lc` 调用，因此仅适用于 POSIX 兼容 shell，指向其他 shell 时仍按 POSIX 规则解读。
 
-验证边界：本机无法运行 `go test -race`（无 C 编译器），因此竞态由 CI 的 `Race and static analysis` 作业发现：首次推送时该作业报告了测试替身 `orderedSink`/`faultSink` 的写竞争，以及跨入口取消场景对时序的依赖，两者均已修正并重新推送。除此之外，本轮在本机 Windows（go1.25.8）上执行了 `scripts/verify.ps1` 的全部阶段（gofmt 两种口径、`go mod verify`、`go vet ./...`、staticcheck v0.7.0、third-party notices、actionlint、`go test ./...`、`go build`、`smoke.ps1`、`smoke.sh`）并通过；Linux/macOS 原生运行、`go test -race`（本机无 C 编译器）与定向 fuzz 未在本地运行，由 CI 覆盖或记录为未执行；driver 验证全部离线，无真实 Provider 联调，也没有落盘的 SSE fixture 文件。
+验证边界：发布门禁是标签提交上的 CI —— 三平台原生测试（Linux/Windows/macOS）、`go test -race ./...`、`go vet ./...`、staticcheck v0.7.0、gofmt、`go mod verify`、third-party notices、actionlint 与三平台 smoke，全部通过后才会公开 Release。本地只在 Windows（go1.25.8）上执行 `scripts/verify.ps1` 的全部阶段并通过，本机没有 C 编译器因此无法运行 race；竞态与跨平台分支由 CI 覆盖。driver 验证全部离线：没有真实 Provider 联调，也没有落盘的 SSE fixture 文件；定向 fuzz 未执行。
 
 ## v1.0.0-rc.4 - 2026-07-24
 
