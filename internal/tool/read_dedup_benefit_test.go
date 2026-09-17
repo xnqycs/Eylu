@@ -18,13 +18,13 @@ import (
 type dedupShape struct {
 	name    string
 	content string
-	// wantDedup is what the shape must earn today.
-	wantDedup bool
-	// wantBenefit marks the shape whose token effect must be a win. Small bodies
-	// deduplicate into a fixed-size reference that can cost more than the body it
-	// replaces, which is a measured fact about the design, not a failure.
+	// wantReplaced is what the shape must earn today.
+	wantReplaced bool
+	// wantBenefit marks the shape whose token effect must be a win. A small body is
+	// no longer replaced at all: the reference is very nearly a fixed size, so
+	// replacing a body smaller than it would grow the request.
 	wantBenefit bool
-	// knownGap explains why a shape does not earn the benefit yet.
+	// knownGap explains why a shape is not replaced.
 	knownGap string
 }
 
@@ -33,24 +33,27 @@ func dedupShapes() []dedupShape {
 	for index := 0; index < 40_000; index++ {
 		longLine.WriteString("x")
 	}
+	// Bodies below the reference size are deliberately kept: see
+	// TestASmallBodyKeepsItsContent in internal/agent for the rule and
+	// TestReadDeduplicationBenefitPerFileShape for what it is worth per shape.
+	const smallReference = "the reference that would stand for this body is larger than the body"
 	return []dedupShape{
-		{name: "empty file", content: "", wantDedup: false, knownGap: "there is no body to replace"},
-		{name: "single line", content: "one line only\n", wantDedup: true},
-		{name: "no trailing newline", content: "one line without a terminator", wantDedup: true},
-		{name: "crlf and lf mixed", content: "first\r\nsecond\nthird\r\n", wantDedup: true},
-		{name: "unicode multibyte", content: "第一行：中文与 emoji 🙂\n第二行：更多多字节字符\n", wantDedup: true},
+		{name: "empty file", content: "", wantReplaced: false, knownGap: "there is no body to replace"},
+		{name: "single line", content: "one line only\n", wantReplaced: false, knownGap: smallReference},
+		{name: "no trailing newline", content: "one line without a terminator", wantReplaced: false, knownGap: smallReference},
+		{name: "crlf and lf mixed", content: "first\r\nsecond\nthird\r\n", wantReplaced: false, knownGap: smallReference},
+		{name: "unicode multibyte", content: "第一行：中文与 emoji 🙂\n第二行：更多多字节字符\n", wantReplaced: false, knownGap: smallReference},
 		{
-			// The plan's A11 premise is that a body which cannot be kept whole by
-			// lines is trimmed by bytes with no reported line ranges, and therefore
-			// earns nothing. With a real read and a byte limit that does not trim, the
-			// long line deduplicates exactly like any other single-line file, so the
-			// premise does NOT reproduce from this shape. Reproducing it needs a
-			// result whose body was actually trimmed for the window
-			// (context_truncated, no line ranges), which is what the hand-built
-			// fixture in prompt_builder_slice_test.go models - and establishing that
-			// the read path really emits that shape is the open question, not
-			// something this baseline may assume.
-			name: "one very long line", content: longLine.String() + "\n", wantDedup: true,
+			// The long line is the shape the benefit is worth the most on: 40,001
+			// bytes become a reference of a couple of hundred.
+			//
+			// A11's premise - that a body which cannot be kept whole by lines is
+			// trimmed by bytes with no reported line ranges and therefore earns
+			// nothing - is real, and it is reproduced in
+			// internal/agent/long_line_dedup_test.go. It does not show up *here*,
+			// because this case reads the file without trimming it: the shape is made
+			// by the context budget, not by the read.
+			name: "one very long line", content: longLine.String() + "\n", wantReplaced: true, wantBenefit: true,
 		},
 	}
 }
@@ -87,17 +90,19 @@ func TestReadDeduplicationBenefitPerFileShape(t *testing.T) {
 			t.Logf("%s: body %d bytes, first read ~%d tokens, repeated read ~%d tokens, saved ~%d, deduplicated=%d",
 				shape.name, len(shape.content), firstTokens, secondTokens, saved, deduplicated)
 
-			if shape.wantDedup {
+			// The invariant the rule exists for: a repeated read may never cost more
+			// than it did the first time. Before the rule, the four small shapes below
+			// each grew by 106 to 159 tokens on the repeat.
+			if saved < 0 {
+				t.Fatalf("%s: the repeated read grew by %d tokens (%d -> %d)", shape.name, -saved, firstTokens, secondTokens)
+			}
+			if shape.wantBenefit && saved <= 0 {
+				t.Fatalf("%s saved %d tokens although it is the shape the benefit exists for", shape.name, saved)
+			}
+
+			if shape.wantReplaced {
 				if deduplicated == 0 {
 					t.Fatalf("%s earned no deduplication benefit although it must: %#v", shape.name, result.SliceStats)
-				}
-				if shape.wantBenefit && saved <= 0 {
-					t.Fatalf("%s saved %d tokens although it is the shape the benefit exists for", shape.name, saved)
-				}
-				if !shape.wantBenefit && saved > 0 {
-					// Not a failure: a small body can deduplicate and still save
-					// tokens. The opposite is what this baseline records.
-					t.Logf("%s: deduplicated and saved %d tokens", shape.name, saved)
 				}
 				// The deduplicated body is a reference, so it must still name the
 				// slice it stands for: the saving may never cost the model the
@@ -107,15 +112,15 @@ func TestReadDeduplicationBenefitPerFileShape(t *testing.T) {
 				}
 				return
 			}
-			// A shape that does not earn the benefit is recorded, not hidden: the
-			// measurement is the input the plan asked for.
+			// A shape that is not replaced says why, and its body must be untouched:
+			// declining to replace is a decision about size, never a reason to lose
+			// content.
 			if shape.knownGap == "" {
-				t.Fatalf("%s does not deduplicate and no reason is recorded", shape.name)
+				t.Fatalf("%s is not replaced and no reason is recorded", shape.name)
 			}
-			_ = firstBuilt
-			t.Logf("%s: no benefit today - %s", shape.name, shape.knownGap)
+			t.Logf("%s: kept as it is - %s", shape.name, shape.knownGap)
 			if deduplicated != 0 {
-				t.Fatalf("%s now deduplicates; the recorded gap is stale and the baseline must be updated", shape.name)
+				t.Fatalf("%s is now replaced; the recorded reason is stale and the baseline must be updated", shape.name)
 			}
 		})
 	}

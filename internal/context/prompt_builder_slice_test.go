@@ -71,11 +71,12 @@ func TestPromptBuilderTrimmedFragmentDoesNotSupersedeCompleteSlice(t *testing.T)
 // Complete fragments still deduplicate and still supersede each other.
 func TestPromptBuilderStillDeduplicatesCompleteSlices(t *testing.T) {
 	builder := NewPromptBuilder(ApproxEstimator{BytesPerToken: 1})
-	addSliceTurn(builder, "first", "first", "hash", "lines 10 through 20", 10, 20)
-	addSliceTurn(builder, "repeat", "repeat", "hash", "lines 10 through 20", 10, 20)
+	first := bodyLargerThanAReference("lines 10 through 20")
+	addSliceTurn(builder, "first", "first", "hash", first, 10, 20)
+	addSliceTurn(builder, "repeat", "repeat", "hash", first, 10, 20)
 
 	result := builder.Result()
-	if result.Turns[1].Parts[0].ToolResult.Content == "lines 10 through 20" {
+	if result.Turns[1].Parts[0].ToolResult.Content == first {
 		t.Fatal("a repeated complete read was not deduplicated")
 	}
 	if !strings.Contains(result.Turns[1].Parts[0].ToolResult.Content, "artifact_id=first") {

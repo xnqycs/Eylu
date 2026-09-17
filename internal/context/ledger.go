@@ -322,6 +322,9 @@ func (l *Ledger) ReportWithLimits(providerName, model string, limits LimitDetail
 			if canonical, _ := block.Metadata["canonical_artifact_id"].(string); canonical != "" {
 				sliceStats.Deduplicated++
 			}
+			if skipped, _ := block.Metadata["deduplication_not_worth_it"].(bool); skipped {
+				sliceStats.NotWorthReplacing++
+			}
 			if stale, _ := block.Metadata["stale"].(bool); stale {
 				sliceStats.Stale++
 			}

@@ -18,7 +18,11 @@ type PromptResult struct {
 type SliceStats struct {
 	CacheHits    int `json:"cache_hits"`
 	Deduplicated int `json:"deduplicated"`
-	Stale        int `json:"stale"`
+	// NotWorthReplacing counts the repeats that were left alone because the
+	// reference would have been larger than the body it replaced. It is a decision
+	// the reader can audit, not a failure.
+	NotWorthReplacing int `json:"not_worth_replacing,omitempty"`
+	Stale             int `json:"stale"`
 }
 
 func (r PromptResult) InputTokens() int {
@@ -190,11 +194,17 @@ func (b *PromptBuilder) AddTurn(turn protocol.Turn) {
 					metadata[key] = value
 				}
 				var canonicalID string
-				var stale bool
-				content, canonicalID, stale = b.deduplicateSlice(codeSlice, turnIndex, index, content)
+				var stale, notWorthReplacing bool
+				content, canonicalID, stale, notWorthReplacing = b.deduplicateSlice(codeSlice, turnIndex, index, content)
 				b.result.Turns[turnIndex].Parts[index].ToolResult.Content = content
 				metadata["canonical_artifact_id"] = canonicalID
 				metadata["stale"] = stale
+				if notWorthReplacing {
+					// The slice kept its body because a reference would have been larger,
+					// and this says so on the block it belongs to, so the ledger and the
+					// interface can report a decision rather than an absence.
+					metadata["deduplication_not_worth_it"] = true
+				}
 			}
 			b.addTextBlock(id, category, source, content, false, metadata)
 			if isSlice && !part.ToolResult.IsError {
@@ -354,7 +364,11 @@ func promptInt(value any) (int, bool) {
 	}
 }
 
-func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, partIndex int, content string) (string, string, bool) {
+// deduplicateSlice decides what to do with one code slice. It returns the content to
+// keep, the canonical it now points at (empty when it keeps its body), whether the
+// file changed under it, and whether it kept its body because a reference would have
+// been larger than the body - a decision the caller records on the block.
+func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, partIndex int, content string) (string, string, bool, bool) {
 	if current.cacheHit {
 		b.result.SliceStats.CacheHits++
 	}
@@ -376,20 +390,28 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 		b.result.SliceStats.Stale++
 	}
 	if containing != nil {
+		reference := sliceReference(containing.artifactID, current.path, current.startLine, current.endLine, current.fileHash, containing.retainedBytes)
+		if !worthReplacing(content, reference) {
+			// The body is smaller than the reference that would stand for it, so
+			// replacing it would grow the request instead of shrinking it. The body
+			// stays, and it is registered as a canonical below like any other.
+			b.result.SliceStats.NotWorthReplacing++
+			return content, "", stale, true
+		}
 		b.result.SliceStats.Deduplicated++
-		return sliceReference(containing.artifactID, current.path, current.startLine, current.endLine, current.fileHash, containing.retainedBytes), containing.artifactID, stale
+		return reference, containing.artifactID, stale, false
 	}
 	// A fragment becomes canonical for the lines it actually holds. A complete
 	// fragment holds its whole declared range; a trimmed one holds only its
 	// retained ranges, which the containment check above enforces.
 	if !current.complete && len(current.retained) == 0 && len(current.retainedBytes) == 0 {
-		return content, "", stale
+		return content, "", stale, false
 	}
 	// A fragment of a line never supersedes another canonical: it holds no whole
 	// line, so it cannot be the better authority for any line range. It is still
 	// registered below, so an identical later read can be replaced by it.
 	if current.partialLine() {
-		return content, "", stale
+		return content, "", stale, false
 	}
 	kept := b.slices[:0]
 	for _, existing := range b.slices {
@@ -413,6 +435,13 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 				block.Metadata["canonical_artifact_id"] = current.artifactID
 			}
 			reference := sliceReference(current.artifactID, existing.path, existing.startLine, existing.endLine, existing.fileHash, nil)
+			// The same rule applies when an earlier body is superseded: if its body is
+			// smaller than the reference, it keeps it and stays a canonical itself.
+			if !worthReplacing(b.result.Turns[existing.turnIndex].Parts[existing.partIndex].ToolResult.Content, reference) {
+				b.result.SliceStats.NotWorthReplacing++
+				kept = append(kept, existing)
+				continue
+			}
 			result := b.result.Turns[existing.turnIndex].Parts[existing.partIndex].ToolResult
 			result.Content = reference
 			block := &b.result.Blocks[existing.blockIndex]
@@ -431,7 +460,7 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 		kept = append(kept, existing)
 	}
 	b.slices = kept
-	return content, "", stale
+	return content, "", stale, false
 }
 
 func sliceReference(artifactID, path string, startLine, endLine int, fileHash string, spans []protocol.ByteRange) string {
@@ -450,6 +479,18 @@ func formatByteSpans(spans []protocol.ByteRange) string {
 		parts = append(parts, fmt.Sprintf("%d:%d-%d", span.Line, span.Start, span.End))
 	}
 	return strings.Join(parts, ",")
+}
+
+// worthReplacing reports whether a reference is smaller than the body it would
+// stand for.
+//
+// The comparison is by bytes, not by an estimated token count: an estimator can
+// round a tiny body down to zero tokens and would then happily replace it with
+// something larger, and bytes are the conservative direction for multi-byte content,
+// which costs fewer tokens per byte than the ASCII reference does. Equality is not
+// worth it either - the request would not shrink.
+func worthReplacing(body, reference string) bool {
+	return len(reference) < len(body)
 }
 
 func clonePromptMetadata(source map[string]any) map[string]any {

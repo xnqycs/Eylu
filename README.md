@@ -681,7 +681,8 @@ pwsh -NoProfile -File scripts/verify_selftest.ps1
 | Unicode 多字节 | 67 B | ~67 | ~173 | **−106** | 是 |
 | 超长单行 | 40,001 B | ~40,001 | ~173 | **+39,828** | 是 |
 
-- **小正文去重是净亏**：替换后的引用长度基本固定（此处 ~173 token），比它替换掉的正文还大。也就是说"去重总是省 token"不成立，省与不省取决于正文大小；这里的分界大约在几百字节。这不是缺陷，是设计的实测口径，收益基准存在的意义就是把它写下来而不是假设。
+- **小正文去重是净亏——已按此修正**：引用长度基本固定（~130–200 字节），所以正文比引用还短时，替换**只会让请求变大**。现在只有引用**确实更小**时才替换，否则保留正文；比较用**字节数**而不是估算 token 数（估算器会把极小正文四舍五入成 0，从而"省"成更大的东西；而多字节内容每字节的 token 更少，按字节比较是保守方向）。被跳过的次数记为 `NotWorthReplacing`，并写在该 block 的 `deduplication_not_worth_it` 元数据上——这是**可审计的决定，不是静默的缺失**。
+  - 这次改动动了既有契约：PR-05 的若干用例原本用 10–30 字节的正文断言"会去重"。它们考的是**规则**而不是 fixture 大小，所以 fixture 改为"明显大于引用的正文"（`bodyLargerThanAReference`）；**断言"保留正文"的用例也一并放大**，否则它们会因为"太小"而通过，等于悄悄失去判别力。
 - **A11 的前提成立，我最初的测量是错的**：第一版只跑了"读取工具 → prompt builder"，**跳过了 `contextualizeTurn` 的裁剪步骤**，所以量到的是未裁剪的正文，于是错误地写下"前提没有复现"。补上裁剪后复现了：4000 字节的单行在 512 字节预算下被**在行内按字节切开**（`trimToolResultContent` 的 `headLines == 0 && tailLines == 0` 分支，注释里就写着"这正是超长单行的样子"），返回 `nil` 行区间；`contextualizeTurn` 因 `len(retained) == 0` 不写 `retained_ranges`，只写 `context_truncated`。该片段既不是完整切片也不能作为片段 canonical，**重复读取每次仍支付 512 token**。见 `internal/agent/long_line_dedup_test.go`。
 - **已实施（§8.3 第 1 条，行内字节区间）**：裁剪在行内切开时改为报告**行内字节区间**（`retained_bytes`，`{line, start, end}`，相对行首、end 开区间），覆盖判定从"只有行区间"扩展为"行区间 **或** 行内字节区间"。实测（`internal/agent/long_line_dedup_test.go`）：4000 字节单行、512 字节预算下，重复读取从 **512 token 降到 198 token**（省 314）。
 - **红线 1 的保护规则**（每条都有对应测试，见 `internal/context/byte_spans_test.go`）：

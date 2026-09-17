@@ -36,8 +36,8 @@ func byteSpans(pairs ...int) []protocol.ByteRange {
 func TestFragmentOfOneLineBecomesCanonicalForItsOwnBytes(t *testing.T) {
 	builder := NewPromptBuilder(ApproxEstimator{BytesPerToken: 1})
 	spans := byteSpans(1, 0, 300, 1, 900, 1000)
-	partialSliceTurn(builder, "first", "first", "hash", "head ... tail", 1, spans)
-	second := partialSliceTurn(builder, "second", "second", "hash", "head ... tail", 1, spans)
+	partialSliceTurn(builder, "first", "first", "hash", bodyLargerThanAReference("head ... tail"), 1, spans)
+	second := partialSliceTurn(builder, "second", "second", "hash", bodyLargerThanAReference("head ... tail"), 1, spans)
 
 	result := builder.Result()
 	if result.SliceStats.Deduplicated != 1 {
@@ -46,7 +46,7 @@ func TestFragmentOfOneLineBecomesCanonicalForItsOwnBytes(t *testing.T) {
 	// The builder copies content into the result rather than mutating the input, so
 	// the replacement has to be read from what it built.
 	built := result.Turns[1].Parts[0].ToolResult.Content
-	if second.Content != "head ... tail" {
+	if second.Content != bodyLargerThanAReference("head ... tail") {
 		t.Fatalf("the input was mutated: %q", second.Content)
 	}
 	// The reference must say it stands for part of a line, or the model would read
@@ -72,7 +72,7 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 		{
 			name: "a whole line read later is not covered by a fragment of it",
 			current: func(builder *PromptBuilder) *protocol.ToolResult {
-				return addSliceTurn(builder, "whole", "whole", "hash", "the entire line", 1, 1)
+				return addSliceTurn(builder, "whole", "whole", "hash", bodyLargerThanAReference("the entire line"), 1, 1)
 			},
 			wantReference: false,
 			why:           "the canonical holds part of the line, so it cannot back a reference for all of it",
@@ -80,7 +80,7 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 		{
 			name: "a later fragment with wider spans is not covered",
 			current: func(builder *PromptBuilder) *protocol.ToolResult {
-				return partialSliceTurn(builder, "wider", "wider", "hash", "more head ... more tail", 1,
+				return partialSliceTurn(builder, "wider", "wider", "hash", bodyLargerThanAReference("more head ... more tail"), 1,
 					byteSpans(1, 0, 500, 1, 800, 1000))
 			},
 			wantReference: false,
@@ -89,7 +89,7 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 		{
 			name: "a later fragment of another line is not covered",
 			current: func(builder *PromptBuilder) *protocol.ToolResult {
-				return partialSliceTurn(builder, "other", "other", "hash", "another line", 2,
+				return partialSliceTurn(builder, "other", "other", "hash", bodyLargerThanAReference("another line"), 2,
 					byteSpans(2, 0, 300, 2, 900, 1000))
 			},
 			wantReference: false,
@@ -98,7 +98,7 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 		{
 			name: "a later fragment of a different revision is not covered",
 			current: func(builder *PromptBuilder) *protocol.ToolResult {
-				return partialSliceTurn(builder, "stale", "stale", "other-hash", "head ... tail", 1,
+				return partialSliceTurn(builder, "stale", "stale", "other-hash", bodyLargerThanAReference("head ... tail"), 1,
 					byteSpans(1, 0, 300, 1, 900, 1000))
 			},
 			wantReference: false,
@@ -107,7 +107,7 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 		{
 			name: "a later fragment inside the canonical spans is covered",
 			current: func(builder *PromptBuilder) *protocol.ToolResult {
-				return partialSliceTurn(builder, "narrower", "narrower", "hash", "less head ... less tail", 1,
+				return partialSliceTurn(builder, "narrower", "narrower", "hash", bodyLargerThanAReference("less head ... less tail"), 1,
 					byteSpans(1, 0, 100, 1, 950, 1000))
 			},
 			wantReference: true,
@@ -117,7 +117,7 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			builder := NewPromptBuilder(ApproxEstimator{BytesPerToken: 1})
-			partialSliceTurn(builder, "canonical", "canonical", "hash", "head ... tail", 1,
+			partialSliceTurn(builder, "canonical", "canonical", "hash", bodyLargerThanAReference("head ... tail"), 1,
 				byteSpans(1, 0, 300, 1, 900, 1000))
 			current := testCase.current(builder)
 			result := builder.Result()
@@ -147,14 +147,14 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 // complete read holds: the complete body is what the references should point at.
 func TestAFragmentOfALineDoesNotSupersedeAWholeLineCanonical(t *testing.T) {
 	builder := NewPromptBuilder(ApproxEstimator{BytesPerToken: 1})
-	whole := addSliceTurn(builder, "whole", "whole", "hash", "the entire line", 1, 1)
-	partialSliceTurn(builder, "partial", "partial", "hash", "head ... tail", 1, byteSpans(1, 0, 300, 1, 900, 1000))
+	whole := addSliceTurn(builder, "whole", "whole", "hash", bodyLargerThanAReference("the entire line"), 1, 1)
+	partialSliceTurn(builder, "partial", "partial", "hash", bodyLargerThanAReference("head ... tail"), 1, byteSpans(1, 0, 300, 1, 900, 1000))
 
 	result := builder.Result()
-	if result.Turns[0].Parts[0].ToolResult.Content != "the entire line" {
+	if result.Turns[0].Parts[0].ToolResult.Content != bodyLargerThanAReference("the entire line") {
 		t.Fatalf("the whole-line canonical was superseded: %q", result.Turns[0].Parts[0].ToolResult.Content)
 	}
-	if whole.Content != "the entire line" {
+	if whole.Content != bodyLargerThanAReference("the entire line") {
 		t.Fatalf("the input was mutated: %q", whole.Content)
 	}
 	// The later fragment is not covered by the whole line either: the whole line

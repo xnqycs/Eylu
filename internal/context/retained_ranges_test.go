@@ -23,11 +23,13 @@ func TestTrimmedFragmentDeduplicatesOnlyTheLinesItRetained(t *testing.T) {
 	builder.AddTurn(protocol.Turn{ID: "big", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: trimmed}}})
 
 	// A read inside the retained head is covered, so a reference is valid.
-	inside := addSliceTurn(builder, "inside", "inside", "hash", "lines 5 to 8", 5, 8)
+	insideBody := bodyLargerThanAReference("lines 5 to 8")
+	inside := addSliceTurn(builder, "inside", "inside", "hash", insideBody, 5, 8)
 	// A read over the omitted middle is not covered, so its body must stay.
 	middle := addSliceTurn(builder, "middle", "middle", "hash", "the omitted middle", 40, 45)
 	// A read over the retained tail is covered too.
-	tail := addSliceTurn(builder, "tail", "tail", "hash", "the retained tail", 82, 84)
+	tailBody := bodyLargerThanAReference("the retained tail")
+	tail := addSliceTurn(builder, "tail", "tail", "hash", tailBody, 82, 84)
 
 	result := builder.Result()
 	if got := result.Turns[1].Parts[0].ToolResult.Content; !strings.Contains(got, "artifact_id=big") {
@@ -42,7 +44,7 @@ func TestTrimmedFragmentDeduplicatesOnlyTheLinesItRetained(t *testing.T) {
 	if result.SliceStats.Deduplicated != 2 {
 		t.Fatalf("stats = %#v", result.SliceStats)
 	}
-	if inside.Content != "lines 5 to 8" || middle.Content != "the omitted middle" || tail.Content != "the retained tail" {
+	if inside.Content != insideBody || middle.Content != "the omitted middle" || tail.Content != tailBody {
 		t.Fatal("the input transcript was mutated")
 	}
 }
@@ -88,7 +90,7 @@ func TestTrimmedFragmentDoesNotSupersedeACompleteCanonical(t *testing.T) {
 		t.Fatal("the input transcript was mutated")
 	}
 	// The trimmed fragment is still usable for the lines it kept.
-	inside := addSliceTurn(builder, "inside", "inside", "hash", "lines 95 to 98", 95, 98)
+	inside := addSliceTurn(builder, "inside", "inside", "hash", bodyLargerThanAReference("lines 95 to 98"), 95, 98)
 	result = builder.Result()
 	_ = inside
 	if got := result.Turns[2].Parts[0].ToolResult.Content; !strings.Contains(got, "artifact_id=big") {
@@ -110,7 +112,7 @@ func TestRetainedRangesSurviveARebuild(t *testing.T) {
 		},
 	}}
 	builder.AddTurn(protocol.Turn{ID: "big", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: trimmed}}})
-	addSliceTurn(builder, "inside", "inside", "hash", "lines 3 to 6", 3, 6)
+	addSliceTurn(builder, "inside", "inside", "hash", bodyLargerThanAReference("lines 3 to 6"), 3, 6)
 	addSliceTurn(builder, "middle", "middle", "hash", "lines 40 to 45", 40, 45)
 
 	result := builder.Result()

@@ -57,9 +57,9 @@ func TestPromptBuilderDeduplicatesAndPromotesCodeSlices(t *testing.T) {
 			}},
 		}}})
 	}
-	addSlice("first", "artifact-first", "hash-one", "lines 10 through 20", 10, 20, false)
-	addSlice("contained", "artifact-contained", "hash-one", "lines 12 through 15", 12, 15, true)
-	addSlice("promoted", "artifact-promoted", "hash-one", "lines 5 through 25", 5, 25, true)
+	addSlice("first", "artifact-first", "hash-one", bodyLargerThanAReference("first"), 10, 20, false)
+	addSlice("contained", "artifact-contained", "hash-one", bodyLargerThanAReference("contained"), 12, 15, true)
+	addSlice("promoted", "artifact-promoted", "hash-one", bodyLargerThanAReference("promoted"), 5, 25, true)
 	addSlice("stale", "artifact-stale", "hash-two", "new file generation", 1, 2, false)
 
 	result := builder.Result()
@@ -72,7 +72,7 @@ func TestPromptBuilderDeduplicatesAndPromotesCodeSlices(t *testing.T) {
 	if !strings.Contains(first, "artifact-promoted") || !strings.Contains(contained, "artifact-promoted") {
 		t.Fatalf("references were not redirected: first=%q contained=%q", first, contained)
 	}
-	if promoted != "lines 5 through 25" || result.Turns[3].Parts[0].ToolResult.Content != "new file generation" {
+	if promoted != bodyLargerThanAReference("promoted") || result.Turns[3].Parts[0].ToolResult.Content != "new file generation" {
 		t.Fatalf("canonical content = %#v", result.Turns)
 	}
 	if result.Blocks[0].Category != CategoryCodeSlice || result.Blocks[1].Category != CategoryCodeSlice {

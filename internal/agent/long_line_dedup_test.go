@@ -104,11 +104,12 @@ func TestVeryLongSingleLineEarnsTheBenefitAfterTrimming(t *testing.T) {
 	}
 }
 
-// The same body, small enough to keep whole, keeps earning the benefit through the
-// line-range path - so the fix added a case rather than replacing one.
-func TestAShortBodyStillEarnsTheBenefit(t *testing.T) {
+// A body kept whole and larger than the reference still earns the benefit through
+// the line-range path, so the byte-span work added a case rather than replacing one.
+func TestAWholeBodyLargerThanAReferenceStillEarnsTheBenefit(t *testing.T) {
 	workspace := t.TempDir()
-	writeLongLine(t, workspace, "short.txt", "a short body\nwith two lines\n")
+	// Comfortably larger than the reference that will stand for it.
+	writeLongLine(t, workspace, "short.txt", strings.Repeat("a whole body line\n", 20))
 	reader, err := tool.NewReadFile(workspace, 1<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -137,5 +138,48 @@ func writeLongLine(t *testing.T, workspace, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(workspace, name), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A body smaller than the reference that would stand for it keeps its content: the
+// reference is very nearly a fixed size, so below that size replacing it grows the
+// request instead of shrinking it. This goes through the real read tool so the size
+// being compared is the one production produces.
+func TestASmallBodyKeepsItsContent(t *testing.T) {
+	workspace := t.TempDir()
+	writeLongLine(t, workspace, "tiny.txt", "one short line\n")
+	reader, err := tool.NewReadFile(workspace, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arguments, err := json.Marshal(map[string]any{"path": "tiny.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder := contextledger.NewPromptBuilder(contextledger.ApproxEstimator{BytesPerToken: 1})
+	turns := make([]protocol.Turn, 0, 2)
+	for attempt := 0; attempt < 2; attempt++ {
+		read := reader.Execute(context.Background(), arguments)
+		if read.IsError {
+			t.Fatalf("read failed: %s", read.Content)
+		}
+		turn, _ := contextualizeTurn(protocol.Turn{
+			ID: "turn", Role: protocol.RoleTool,
+			Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &read}},
+		}, 4096)
+		turns = append(turns, turn)
+		builder.AddTurn(turn)
+	}
+	result := builder.Result()
+	if result.SliceStats.Deduplicated != 0 || result.SliceStats.NotWorthReplacing != 1 {
+		t.Fatalf("stats = %#v", result.SliceStats)
+	}
+	body := turns[0].Parts[0].ToolResult.Content
+	if got := result.Turns[1].Parts[0].ToolResult.Content; got != body {
+		t.Fatalf("the small body was replaced anyway: %q", got)
+	}
+	// The decision is visible on the block rather than being an absence.
+	if skipped, _ := result.Blocks[1].Metadata["deduplication_not_worth_it"].(bool); !skipped {
+		t.Fatalf("the block does not record why it kept its body: %#v", result.Blocks[1].Metadata)
 	}
 }
