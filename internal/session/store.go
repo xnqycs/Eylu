@@ -230,6 +230,10 @@ func (s *Store) Append(id string, events []Event) ([]Event, error) {
 		written++
 	}
 	if written == 0 {
+		// Nothing was written, but the sequence the log ends at is now known, so the
+		// cache is filled in even though no record was added: a retried batch must
+		// not leave the next append to re-read the log.
+		s.sequences[id] = sequence
 		return prepared, nil
 	}
 	file, err := os.OpenFile(filepath.Join(directory, "events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
@@ -310,9 +314,12 @@ func (s *Store) Save(snapshot Snapshot) error {
 	if err := writeAtomic(filepath.Join(directory, "snapshot.json"), data, 0o600); err != nil {
 		return err
 	}
-	if snapshot.Sequence > s.sequences[snapshot.SessionID] {
-		s.sequences[snapshot.SessionID] = snapshot.Sequence
-	}
+	// The cached tail is deliberately left alone here. A snapshot watermark can lag
+	// behind the log - a repeated record consumed without being applied, or a
+	// snapshot written before the last append - and adopting it as the append
+	// position would write a sequence the log already contains. Only Append, which
+	// knows the record it actually wrote, and Load, which has just read the whole
+	// log, move it.
 	return nil
 }
 
@@ -425,14 +432,20 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 		skip[position] = struct{}{}
 	}
 	for position, event := range events {
-		if _, ignored := skip[position]; ignored {
-			continue
-		}
 		if event.Sequence <= snapshot.Sequence {
 			continue
 		}
 		if snapshot.Sequence > 0 && event.Sequence != snapshot.Sequence+1 {
 			return Snapshot{}, diagnostics, fmt.Errorf("session event sequence gap: have %d, next %d", snapshot.Sequence, event.Sequence)
+		}
+		if _, ignored := skip[position]; ignored {
+			// Deduplication stops the content from being applied twice. It does not
+			// make the physical record disappear: the record is valid and the
+			// watermark has to move past it, or the load would report a gap for
+			// every record behind it and an append would reuse the sequence of the
+			// record it skipped.
+			snapshot.Sequence = event.Sequence
+			continue
 		}
 		applyEvent(&snapshot, event)
 	}
@@ -442,8 +455,17 @@ func (s *Store) load(id string, repairEventTail bool) (Snapshot, []Diagnostic, e
 	for turnIndex := range snapshot.Turns {
 		diagnostics = append(diagnostics, s.hydrateTurn(directory, &snapshot.Turns[turnIndex])...)
 	}
+	// The cached tail is the last valid physical record in the log, which is where
+	// the next append continues from. It is deliberately not snapshot.Sequence:
+	// that watermark can lag behind the log, and continuing from a lagging value
+	// would write a sequence the log already holds and turn the file into a gap on
+	// the next read.
+	tail := snapshot.Sequence
+	if len(events) > 0 {
+		tail = events[len(events)-1].Sequence
+	}
 	s.mu.Lock()
-	s.sequences[id] = snapshot.Sequence
+	s.sequences[id] = tail
 	s.mu.Unlock()
 	return snapshot, diagnostics, nil
 }
