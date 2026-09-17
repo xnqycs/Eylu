@@ -109,6 +109,12 @@ type ToolIntent struct {
 
 // ToolCompletion is the durable record of one finished execution.
 type ToolCompletion struct {
+	// RequestID disambiguates the call ID when it is recorded, because a subagent
+	// runs its own model conversation inside the same session and its call IDs
+	// share a space with the parent's. A log written before this field existed
+	// leaves it empty, and an empty request ID keeps the call ID as the whole
+	// identity.
+	RequestID   string    `json:"request_id,omitempty"`
 	CallID      string    `json:"call_id"`
 	Tool        string    `json:"tool"`
 	State       string    `json:"state,omitempty"`
@@ -116,6 +122,21 @@ type ToolCompletion struct {
 	TargetPath  string    `json:"target_path,omitempty"`
 	ResultHash  string    `json:"result_hash,omitempty"`
 	CompletedAt time.Time `json:"completed_at,omitzero"`
+}
+
+// SamePendingCall reports whether a pending intent belongs to the call a lifecycle
+// record describes.
+//
+// The call ID identifies the call; the request ID refines it when both sides know
+// theirs, which keeps a subagent's call from closing a pending call of the parent
+// request. A record written before the request was part of a completion, or one
+// produced outside a request, carries an empty request ID and matches on the call
+// ID alone, so an older log behaves exactly as it did.
+func SamePendingCall(intent ToolIntent, requestID, callID string) bool {
+	if callID == "" || intent.CallID != callID {
+		return false
+	}
+	return intent.RequestID == "" || requestID == "" || intent.RequestID == requestID
 }
 
 type ProviderState struct {

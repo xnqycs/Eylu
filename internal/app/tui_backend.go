@@ -471,11 +471,22 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	if submission.HistoryText != "" {
 		b.conversation.RecordPrompt(submission.HistoryText)
 	}
+	// reportErr holds the outcome of persisting the run summary. The deferred sync
+	// folds it in, so the report is written before the snapshot and a failure of
+	// either is reported instead of being silently dropped.
+	var reportErr error
 	defer func() {
 		if b.runtime.session == nil {
 			return
 		}
-		if syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, returnErr); returnErr == nil {
+		// The report is recorded before the snapshot sync, so the reason a request
+		// stopped survives even when the snapshot write fails. The sync error takes
+		// precedence because it means the session state itself is behind.
+		syncErr := b.runtime.session.Sync(b.conversation, b.manager, opts, returnErr)
+		if syncErr == nil {
+			syncErr = reportErr
+		}
+		if returnErr == nil {
 			returnErr = syncErr
 		}
 	}()
@@ -536,6 +547,15 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	}
 	executor.SessionID, executor.ProviderName = b.conversation.SessionID(), modelRuntime.Provider.Name
 	executor.ProviderGeneration, executor.Model = modelRuntime.Provider.Generation, modelRuntime.Provider.Config.Model
+	// The interface and the text entry point share one reliability guarantee: a
+	// side-effecting call records its intent before it runs and its completion
+	// after, so a crash in the middle leaves evidence instead of a silent change.
+	// Installing the checkpoint here is what keeps the two entries from differing.
+	// A subagent inherits this executor, and with it the same sink, so its calls are
+	// recorded in the session they belong to as well.
+	if b.runtime.session != nil {
+		executor.Checkpoint = b.runtime.session
+	}
 	var taskObserverMu sync.Mutex
 	taskObserverActive := true
 	defer func() {
@@ -635,6 +655,12 @@ func (b *tuiBackend) Submit(ctx context.Context, operationID string, submission 
 	b.mu.Lock()
 	b.lastRun = runReport
 	b.mu.Unlock()
+	// It is also written to the session, before the snapshot sync: the reason a
+	// request stopped has to survive a restart, and the interface must state it
+	// from the same record the text entry point does.
+	if b.runtime.session != nil {
+		reportErr = b.runtime.session.RecordRunReport(runReport)
+	}
 	report := b.conversation.ContextReport()
 	observation.ObserveCodeSlices(report.CodeSlices)
 	metric := observation.Finish(response.Usage, err)

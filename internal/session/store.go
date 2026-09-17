@@ -1021,9 +1021,13 @@ func validEventType(eventType EventType) bool {
 }
 
 // recordToolIntent adds one started execution to the pending set.
+//
+// Two calls that share a call ID belong to the same entry only when their requests
+// agree: a subagent's call must not overwrite the pending record of a parent call
+// that is still running under the same name.
 func recordToolIntent(snapshot *Snapshot, intent ToolIntent) {
 	for index, existing := range snapshot.PendingIntents {
-		if existing.CallID == intent.CallID {
+		if SamePendingCall(existing, intent.RequestID, intent.CallID) {
 			snapshot.PendingIntents[index] = intent
 			return
 		}
@@ -1033,13 +1037,13 @@ func recordToolIntent(snapshot *Snapshot, intent ToolIntent) {
 
 // clearToolIntent removes the pending entry of one execution that reached a
 // terminal outcome.
-func clearToolIntent(snapshot *Snapshot, callID string) {
+func clearToolIntent(snapshot *Snapshot, requestID, callID string) {
 	if callID == "" || len(snapshot.PendingIntents) == 0 {
 		return
 	}
 	kept := snapshot.PendingIntents[:0]
 	for _, intent := range snapshot.PendingIntents {
-		if intent.CallID == callID {
+		if SamePendingCall(intent, requestID, callID) {
 			continue
 		}
 		kept = append(kept, intent)
@@ -1122,7 +1126,7 @@ func applyEvent(snapshot *Snapshot, event Event) {
 		}
 	case EventToolCompleted:
 		if event.Completion != nil {
-			clearToolIntent(snapshot, event.Completion.CallID)
+			clearToolIntent(snapshot, event.Completion.RequestID, event.Completion.CallID)
 		}
 	case EventRunReported:
 		if event.Run != nil {

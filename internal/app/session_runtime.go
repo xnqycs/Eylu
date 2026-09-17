@@ -302,8 +302,8 @@ func (s *sessionRuntime) eventIDFor(identity string) string {
 	// across runs and processes. Using it as the event ID makes the incremental
 	// write of a turn and a later replay of the same turn literally the same
 	// event, which is what lets the log recognize the second one as a retry
-	// instead of writing the turn twice. The same holds for an intent or a
-	// completion named after its call: replaying one is the same event.
+	// instead of writing the turn twice. The same holds for a tool lifecycle event
+	// named after its call and its request.
 	if strings.HasPrefix(identity, "turn:") || strings.HasPrefix(identity, "intent:") || strings.HasPrefix(identity, "completion:") {
 		return identity
 	}
@@ -317,6 +317,21 @@ func (s *sessionRuntime) eventIDFor(identity string) string {
 	eventID := fmt.Sprintf("%s-%d", s.log.eventPrefix, s.log.nextEventID)
 	s.log.pending[identity] = eventID
 	return eventID
+}
+
+// toolEventIdentity names one lifecycle event of one tool call.
+//
+// The call ID alone is not enough to name it. A subagent runs its own model
+// conversation inside the same session, so its provider-assigned call IDs live in
+// the same space as the parent's; naming the request as well keeps "the call the
+// parent started" and "the call the subagent started" two distinct logical events,
+// so replaying one of them is never mistaken for a conflicting rewrite of the
+// other. A call made outside a request keeps the call ID as its whole identity.
+func toolEventIdentity(kind, requestID, callID string) string {
+	if requestID == "" {
+		return kind + ":" + callID
+	}
+	return kind + ":" + requestID + ":" + callID
 }
 
 // stateChanged reports whether a state event has to be appended, comparing it
@@ -529,7 +544,7 @@ func (s *sessionRuntime) RecordToolPrepared(conversation *agent.Conversation, ca
 		RequestID: entry.RequestID, CallID: call.ID, Tool: call.Name,
 		Iteration: entry.Iteration, PreparedAt: time.Now().UTC(),
 	}
-	events := []session.Event{{Type: session.EventToolPrepared, Prepared: &prepared, ID: s.eventIDFor("prepared:" + call.ID)}}
+	events := []session.Event{{Type: session.EventToolPrepared, Prepared: &prepared, ID: s.eventIDFor(toolEventIdentity("prepared", entry.RequestID, call.ID))}}
 	appended, err := s.append(s.snapshot.SessionID, events)
 	if err != nil {
 		return sessionProtocolError("record prepared tool call", err)
@@ -573,9 +588,9 @@ func (s *sessionRuntime) RecordIntents(intents []tool.Intent) error {
 			Tool: intent.Tool, Risk: string(intent.Risk), TargetPath: intent.TargetPath,
 			PreviousHash: intent.PreviousHash, StartedAt: at,
 		}
-		// The identity is the call, so a retry after an uncertain append is the
-		// same event rather than a second intent.
-		events = append(events, session.Event{Type: session.EventToolExecutionIntent, ID: s.eventIDFor("intent:" + intent.CallID), Intent: &record})
+		// The identity is the call within its request, so a retry after an uncertain
+		// append is the same event rather than a second intent.
+		events = append(events, session.Event{Type: session.EventToolExecutionIntent, ID: s.eventIDFor(toolEventIdentity("intent", intent.RequestID, intent.CallID)), Intent: &record})
 		records = append(records, record)
 	}
 	appended, err := s.append(s.snapshot.SessionID, events)
@@ -593,7 +608,7 @@ func (s *sessionRuntime) RecordIntents(intents []tool.Intent) error {
 // so the next save carries it.
 func (s *sessionRuntime) rememberPendingIntent(record session.ToolIntent) {
 	for index, existing := range s.snapshot.PendingIntents {
-		if existing.CallID == record.CallID {
+		if session.SamePendingCall(existing, record.RequestID, record.CallID) {
 			s.snapshot.PendingIntents[index] = record
 			return
 		}
@@ -618,7 +633,7 @@ func (s *sessionRuntime) RecordIntent(intent tool.Intent) error {
 		Tool: intent.Tool, Risk: string(intent.Risk), TargetPath: intent.TargetPath,
 		PreviousHash: intent.PreviousHash, StartedAt: time.Now().UTC(),
 	}
-	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolExecutionIntent, Intent: &record}})
+	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolExecutionIntent, Intent: &record, ID: s.eventIDFor(toolEventIdentity("intent", record.RequestID, record.CallID))}})
 	if err != nil {
 		return sessionProtocolError("record tool intent", err)
 	}
@@ -640,11 +655,12 @@ func (s *sessionRuntime) RecordCompletion(completion tool.Completion) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record := session.ToolCompletion{
-		CallID: completion.CallID, Tool: completion.Tool, State: string(completion.State),
+		RequestID: completion.RequestID,
+		CallID:    completion.CallID, Tool: completion.Tool, State: string(completion.State),
 		IsError: completion.IsError, TargetPath: completion.TargetPath, ResultHash: completion.ResultHash,
 		CompletedAt: time.Now().UTC(),
 	}
-	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolCompleted, ID: s.eventIDFor("completion:" + record.CallID), Completion: &record}})
+	events, err := s.append(s.snapshot.SessionID, []session.Event{{Type: session.EventToolCompleted, ID: s.eventIDFor(toolEventIdentity("completion", record.RequestID, record.CallID)), Completion: &record}})
 	if err != nil {
 		// The operation already happened, so the result is not thrown away: it is
 		// held here and written by the next successful append. Without this, one
@@ -654,15 +670,15 @@ func (s *sessionRuntime) RecordCompletion(completion tool.Completion) error {
 		return sessionProtocolError("record tool completion", err)
 	}
 	s.acceptAppended(events)
-	s.forgetPendingIntent(record.CallID)
+	s.forgetPendingIntent(record.RequestID, record.CallID)
 	return nil
 }
 
 // forgetPendingIntent drops the intent a confirmed completion closed.
-func (s *sessionRuntime) forgetPendingIntent(callID string) {
+func (s *sessionRuntime) forgetPendingIntent(requestID, callID string) {
 	kept := s.snapshot.PendingIntents[:0]
 	for _, intent := range s.snapshot.PendingIntents {
-		if intent.CallID == callID {
+		if session.SamePendingCall(intent, requestID, callID) {
 			continue
 		}
 		kept = append(kept, intent)
@@ -684,7 +700,7 @@ func (s *sessionRuntime) flushCompensations() error {
 	events := make([]session.Event, 0, len(s.compensations))
 	for _, record := range s.compensations {
 		compensation := record
-		events = append(events, session.Event{Type: session.EventToolCompleted, ID: s.eventIDFor("completion:" + record.CallID), Completion: &compensation})
+		events = append(events, session.Event{Type: session.EventToolCompleted, ID: s.eventIDFor(toolEventIdentity("completion", record.RequestID, record.CallID)), Completion: &compensation})
 	}
 	appended, err := s.append(s.snapshot.SessionID, events)
 	if err != nil {
@@ -692,7 +708,7 @@ func (s *sessionRuntime) flushCompensations() error {
 	}
 	s.acceptAppended(appended)
 	for _, record := range s.compensations {
-		s.forgetPendingIntent(record.CallID)
+		s.forgetPendingIntent(record.RequestID, record.CallID)
 	}
 	s.compensations = nil
 	return nil
