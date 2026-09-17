@@ -99,6 +99,23 @@ func TestSoakParallelBatchesOnConflictingResources(t *testing.T) {
 				}
 				calls = append(calls, writeCall(fmt.Sprintf("r%d-%d", round, index), path, fmt.Sprintf("round-%d-call-%d", round, index)))
 			}
+			// The fixture must exercise claim-based concurrency. Without this the
+			// overlap assertion below could be measuring exclusive scheduling, which
+			// would make it look meaningful while testing something else.
+			for _, call := range calls {
+				item, ok := executor.Registry.Get(call.Name)
+				if !ok {
+					t.Fatalf("round %d: tool %q is not registered", round, call.Name)
+				}
+				classifier, ok := item.(ConcurrencyClassifier)
+				if !ok {
+					t.Fatalf("round %d: tool %q does not classify its concurrency", round, call.Name)
+				}
+				spec := normalizeConcurrencySpec(classifier.ClassifyConcurrency(call.Arguments, policy.Outcome{Risk: item.Risk()}))
+				if spec.Mode != ConcurrencyClaimed {
+					t.Fatalf("round %d: call %s on %s classified as %q; this fixture does not test conflicting claims", round, call.ID, call.Arguments, spec.Mode)
+				}
+			}
 			results, outcome := executor.ExecuteBatchOutcome(ctx(), fmt.Sprintf("request-%d", round), calls, BatchHooks{}, 0)
 			if outcome.Control != protocol.ControlContinue {
 				t.Fatalf("round %d control = %q cause = %v", round, outcome.Control, outcome.Cause)
@@ -122,13 +139,17 @@ func TestSoakParallelBatchesOnConflictingResources(t *testing.T) {
 			// value is impossible either way - which is why the overlap is observed
 			// inside the execution instead.
 			//
-			// Honest limit: this guard has not been shown to fire. Disabling the
-			// scheduler's `canStartCall`, the coordinator's conflict predicate, and
-			// both together all left the two same-path calls serialized, so the
-			// mechanism that produces that has not been identified. The witness is
-			// proven to be exercised (the assertion below), so the search is real and
-			// the invariant is worth asserting - but do not read a pass here as proof
-			// that the serialization path was tested.
+			// The guard is proven to fire: disabling the scheduler's `canStartCall`
+			// together with the coordinator's conflict predicate makes it report two
+			// calls running on one path at once. It took a second attempt to get
+			// there, and the reason is worth keeping: the first version of the
+			// witness forwarded only Definition and Risk to the real tool, which
+			// stripped the ConcurrencyClassifier interface, so the executor
+			// classified every call fail-closed as exclusive and the two writers
+			// could never overlap no matter which guard was removed. The wrapper now
+			// embeds the real tool so it stays interface-transparent, and the loop
+			// above asserts the fixture really classifies its calls as claimed
+			// rather than taking that for granted.
 			if overlapped := witness.overlaps(); len(overlapped) > 0 {
 				t.Fatalf("round %d ran two calls on the same path at once: %v", round, overlapped)
 			}
@@ -279,8 +300,15 @@ func (w *overlapWitness) overlaps() []string {
 }
 
 // wrappedWrite is the production write tool with the overlap observation around it.
+//
+// The write tool is embedded rather than forwarded field by field: forwarding only
+// Definition and Risk silently strips the optional interfaces the executor reads -
+// ConcurrencyClassifier and IntentReporter - and the executor then classifies every
+// call fail-closed as exclusive. That is a test double changing production
+// behaviour, and it is exactly why this wrapper is written with embedding: the
+// wrapped tool stays indistinguishable from the real one except for Execute.
 type wrappedWrite struct {
-	inner   *WriteFile
+	*WriteFile
 	witness *overlapWitness
 }
 
@@ -290,11 +318,8 @@ func (w *overlapWitness) wrap(t *testing.T, workspace string) *wrappedWrite {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &wrappedWrite{inner: inner, witness: w}
+	return &wrappedWrite{WriteFile: inner, witness: w}
 }
-
-func (w *wrappedWrite) Definition() protocol.ToolDefinition { return w.inner.Definition() }
-func (w *wrappedWrite) Risk() policy.Risk                   { return w.inner.Risk() }
 
 func (w *wrappedWrite) Execute(ctx context.Context, input json.RawMessage) protocol.ToolResult {
 	var fields struct {
@@ -316,7 +341,7 @@ func (w *wrappedWrite) Execute(ctx context.Context, input json.RawMessage) proto
 	if w.witness.hold > 0 {
 		time.Sleep(w.witness.hold)
 	}
-	return w.inner.Execute(ctx, input)
+	return w.WriteFile.Execute(ctx, input)
 }
 
 // recordingSink keeps what the executor recorded, so "exactly once" can be checked
