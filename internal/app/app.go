@@ -620,7 +620,15 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
-	checker := policy.NewChecker(policy.Config{Mode: mode, ReadOnlyCommands: cfg.ReadOnlyCommands, AutoAllowCommands: cfg.AutoAllowCommands, DangerousPatterns: cfg.DangerousCommands, BlockedPatterns: cfg.BlockedCommands})
+	checker := policy.NewChecker(policy.Config{
+		Mode: mode, ReadOnlyCommands: cfg.ReadOnlyCommands, AutoAllowCommands: cfg.AutoAllowCommands,
+		DangerousPatterns: cfg.DangerousCommands, BlockedPatterns: cfg.BlockedCommands,
+		// The classifier reads a command line the way the shell that will run it
+		// does. On a platform whose fallback shell is the command interpreter, a
+		// single-quoted separator is a separator, and reading it as text would let a
+		// read-only classification run a second command.
+		Shell: tool.ActiveShellDialect(),
+	})
 	registered := []tool.Tool{readFile, writeFile, bashTool, editFile, searchCode, listDirectory, tool.NewTodoList()}
 	if ask != nil {
 		registered = append(registered, tool.NewAsk(ask))

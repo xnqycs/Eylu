@@ -171,6 +171,20 @@ func (b *cappedBuffer) Write(value []byte) (int, error) {
 
 func (b *cappedBuffer) String() string { return strings.ToValidUTF8(b.buffer.String(), "�") }
 
+// ActiveShellDialect reports how the shell this process would run commands with
+// reads a command line, so the policy can read it the same way.
+//
+// It exists because the two readings have to agree: a construct the policy believes
+// is quoted text but the shell treats as a separator is a second command that was
+// never classified. The tool knows which shell it would use, so it answers rather
+// than letting the policy guess.
+func ActiveShellDialect() policy.ShellDialect {
+	if defaultShell().Name() == "cmd" {
+		return policy.ShellCommandPrompt
+	}
+	return policy.ShellPOSIX
+}
+
 func defaultShell() ShellAdapter {
 	if configured := os.Getenv("EYLU_SHELL"); configured != "" {
 		return commandShell{name: filepath.Base(configured), path: configured, args: []string{"-lc"}}

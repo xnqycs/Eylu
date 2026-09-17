@@ -190,12 +190,35 @@ type Checker interface {
 	Check(context.Context, Request) Outcome
 }
 
+// ShellDialect names how a shell reads a command line.
+//
+// The classifier reads the line the same way the shell that will run it does,
+// because the two readings have to agree: a construct the classifier believes is
+// inert text but the shell treats as a separator is a second command that was never
+// classified. The dialect is an input rather than a guess for exactly that reason.
+type ShellDialect string
+
+const (
+	// ShellPOSIX is the dialect of sh and of the POSIX-compatible shells the tool
+	// uses on Unix and in git-bash: single and double quotes group, a backslash
+	// escapes, and `&`, `|`, `;`, `<` and `>` separate or redirect outside quotes.
+	// It is the zero value, so every caller that does not name a dialect gets the
+	// historical reading.
+	ShellPOSIX ShellDialect = ""
+	// ShellCommandPrompt is the dialect of the Windows command interpreter. Single
+	// quotes are ordinary characters, `%` expands, `^` escapes, and `&`, `|`, `<`
+	// and `>` are active wherever they are not inside double quotes.
+	ShellCommandPrompt ShellDialect = "cmd"
+)
+
 type Config struct {
 	Mode              PermissionMode
 	ReadOnlyCommands  []string
 	AutoAllowCommands []string
 	DangerousPatterns []string
 	BlockedPatterns   []string
+	// Shell names the reading of a command line. An empty value is ShellPOSIX.
+	Shell ShellDialect
 }
 
 func DefaultConfig(mode PermissionMode) Config {
@@ -354,12 +377,12 @@ func ClassifyCommand(command string, config Config) CommandClass {
 			return CommandDangerous
 		}
 	}
-	if hasActiveShellSyntax(trimmed) {
+	if hasActiveShellSyntax(trimmed, config.Shell) {
 		return CommandUnknown
 	}
 	// Segments keep their original case: short options are case sensitive, and
 	// only the pattern lists and the auto-allow list are compared lowercased.
-	segments := splitShellCommands(trimmed)
+	segments := Segments(trimmed, config)
 	if len(segments) == 0 {
 		return CommandUnknown
 	}
@@ -389,7 +412,44 @@ func ClassifyCommand(command string, config Config) CommandClass {
 	}
 }
 
-func hasActiveShellSyntax(command string) bool {
+// Segments reports the invocations the classifier believes one command line
+// contains, read with the dialect of the shell that will run it.
+//
+// It is exported because the reading is the thing that has to match the shell: a
+// test can put the same line to the classifier and to the shell and compare how
+// many commands each of them sees. A line whose reading cannot be proven is
+// reported as a single segment, and ClassifyCommand refuses it separately through
+// hasActiveShellSyntax.
+func Segments(command string, config Config) []string {
+	return splitShellCommands(strings.TrimSpace(command), config.Shell)
+}
+
+// ReadsInertText reports whether the classifier reads a line as one command with no
+// active shell syntax at all.
+//
+// It is the claim a caller acts on when it auto-approves a line, so it is stated as
+// its own question: a test can put the same line to the classifier and to the shell
+// and require the two readings to agree about whether anything is active.
+func ReadsInertText(command string, config Config) bool {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return false
+	}
+	return !hasActiveShellSyntax(trimmed, config.Shell) && len(Segments(trimmed, config)) <= 1
+}
+
+// hasActiveShellSyntax reports whether a line contains syntax the classifier
+// cannot prove inert under the named dialect.
+//
+// The two dialects differ in the dangerous direction: a construct that a POSIX
+// shell treats as quoted text - an ampersand inside single quotes, for example - is
+// a command separator to the Windows command interpreter. Reading a line with the
+// wrong rules is what would let a read-only classification run a second command, so
+// each dialect is read on its own terms and anything unprovable fails closed.
+func hasActiveShellSyntax(command string, dialect ShellDialect) bool {
+	if dialect == ShellCommandPrompt {
+		return hasActiveCommandPromptSyntax(command)
+	}
 	var quote rune
 	escaped := false
 	runes := []rune(command)
@@ -430,6 +490,46 @@ func hasActiveShellSyntax(command string) bool {
 	return false
 }
 
+// hasActiveCommandPromptSyntax reads a line the way the Windows command
+// interpreter does, and refuses anything it cannot prove inert.
+//
+// The interpreter has no single-quote grouping at all, so a single-quoted region is
+// not a region: separators inside it are separators. Only double quotes group, and
+// even there `%` keeps expanding. `^` escapes the next character outside double
+// quotes, parentheses, a backtick and `$(` are refused because their effect depends
+// on context this reader does not model.
+func hasActiveCommandPromptSyntax(command string) bool {
+	quoted := false
+	runes := []rune(command)
+	for index, current := range runes {
+		if current == '"' {
+			quoted = !quoted
+			continue
+		}
+		if current == '^' && !quoted {
+			// An escaped character is the interpreter's own quoting, which this
+			// reader does not interpret: it fails closed rather than guessing.
+			return true
+		}
+		if current == '%' {
+			// Variable expansion changes the argument after classification, inside
+			// or outside double quotes.
+			return true
+		}
+		if quoted {
+			continue
+		}
+		switch current {
+		case '&', '|', '<', '>', '(', ')', '`':
+			return true
+		}
+		if current == '$' && index+1 < len(runes) && runes[index+1] == '(' {
+			return true
+		}
+	}
+	return false
+}
+
 func commandFromInput(input json.RawMessage) string {
 	var value struct {
 		Command string `json:"command"`
@@ -454,7 +554,12 @@ func matchesCommandList(command string, commands []string) bool {
 	return false
 }
 
-func splitShellCommands(command string) []string {
+// splitShellCommands splits a line into the invocations the named dialect reads.
+//
+// The Windows command interpreter has no single-quote grouping, so a single-quoted
+// region does not protect a separator: reading it as one would report one command
+// where the shell runs two.
+func splitShellCommands(command string, dialect ShellDialect) []string {
 	result := make([]string, 0)
 	start := 0
 	var quote rune
@@ -463,6 +568,29 @@ func splitShellCommands(command string) []string {
 	for index, current := range runes {
 		if escaped {
 			escaped = false
+			continue
+		}
+		if dialect == ShellCommandPrompt {
+			if current == '^' {
+				// The interpreter's own escape: the next character is literal, and
+				// hasActiveCommandPromptSyntax has already refused the line.
+				escaped = true
+				continue
+			}
+			if current == '"' {
+				if quote == 0 {
+					quote = current
+				} else if quote == current {
+					quote = 0
+				}
+				continue
+			}
+			if quote == 0 && (current == '&' || current == '|' || current == '\n') {
+				if segment := strings.TrimSpace(string(runes[start:index])); segment != "" {
+					result = append(result, segment)
+				}
+				start = index + 1
+			}
 			continue
 		}
 		if current == '\\' && quote != '\'' {
