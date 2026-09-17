@@ -57,10 +57,14 @@ type canonicalSlice struct {
 	endLine    int
 	// retained lists the line ranges whose bodies are really present in the
 	// request. An empty list means the whole declared range is present.
-	retained   []protocol.LineRange
-	turnIndex  int
-	partIndex  int
-	blockIndex int
+	retained []protocol.LineRange
+	// retainedBytes holds the byte spans of a single line for a body that could not
+	// be kept whole by lines. It is mutually exclusive with retained: a body is
+	// described by whole lines or by byte spans, never by both.
+	retainedBytes []protocol.ByteRange
+	turnIndex     int
+	partIndex     int
+	blockIndex    int
 }
 
 // covers reports whether a slice's real body contains one line range. Only a
@@ -76,6 +80,59 @@ func covers(declaredStart, declaredEnd int, retained []protocol.LineRange, start
 		}
 	}
 	return false
+}
+
+// coversCurrent reports whether a canonical slice's real body contains
+// everything the current slice declares *and holds*.
+//
+// The two kinds of evidence are kept apart on purpose. A body held as byte spans
+// is a fragment of one line: it covers nothing by line, and the only thing it can
+// cover is another fragment of that same line whose bytes it contains. Reading a
+// partial line as if it were a whole one is the mistake this rule exists to
+// prevent - it would replace a full read with a reference to a body that does not
+// contain it.
+func (c canonicalSlice) coversCurrent(current codeSliceMetadata) bool {
+	if len(c.retainedBytes) > 0 {
+		return current.partialLine() && current.startLine == current.endLine &&
+			byteSpansCover(c.retainedBytes, current.retainedBytes)
+	}
+	if current.partialLine() {
+		// A fragment of a line is covered by a canonical that holds that whole
+		// line - and only then, because it holds strictly less than the line.
+		if current.startLine != current.endLine {
+			return false
+		}
+		return covers(c.startLine, c.endLine, c.retained, current.startLine, current.endLine)
+	}
+	return covers(c.startLine, c.endLine, c.retained, current.startLine, current.endLine)
+}
+
+// partialLine reports whether a slice is a body cut inside a single line, which is
+// the shape no whole-line rule can describe.
+func (s codeSliceMetadata) partialLine() bool {
+	return !s.complete && len(s.retained) == 0 && len(s.retainedBytes) > 0
+}
+
+// byteSpansCover reports whether the canonical holds every byte the current slice
+// holds. A span that no canonical span contains makes the answer no: the canonical
+// is missing bytes the reference would have to stand for.
+func byteSpansCover(canonical, current []protocol.ByteRange) bool {
+	if len(current) == 0 {
+		return false
+	}
+	for _, want := range current {
+		covered := false
+		for _, span := range canonical {
+			if span.Line == want.Line && span.Start <= want.Start && span.End >= want.End {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
 }
 
 func NewPromptBuilder(estimator TokenEstimator) *PromptBuilder {
@@ -149,14 +206,15 @@ func (b *PromptBuilder) AddTurn(turn protocol.Turn) {
 						startLine: codeSlice.startLine, endLine: codeSlice.endLine,
 						turnIndex: turnIndex, partIndex: index, blockIndex: len(b.result.Blocks) - 1,
 					})
-				case codeSlice.complete || len(codeSlice.retained) > 0:
+				case codeSlice.complete || len(codeSlice.retained) > 0 || len(codeSlice.retainedBytes) > 0:
 					// A fragment is canonical for the lines it really holds: the
 					// whole declared range when it is complete, or only its
 					// retained ranges when it was trimmed.
 					b.slices = append(b.slices, canonicalSlice{
 						path: codeSlice.path, fileHash: codeSlice.fileHash, artifactID: codeSlice.artifactID,
 						startLine: codeSlice.startLine, endLine: codeSlice.endLine, retained: codeSlice.retained,
-						turnIndex: turnIndex, partIndex: index, blockIndex: len(b.result.Blocks) - 1,
+						retainedBytes: codeSlice.retainedBytes,
+						turnIndex:     turnIndex, partIndex: index, blockIndex: len(b.result.Blocks) - 1,
 					})
 				}
 			}
@@ -176,6 +234,9 @@ type codeSliceMetadata struct {
 	// retained lists the line ranges whose bodies really survived a trim, so a
 	// trimmed fragment can still be canonical for the lines it kept.
 	retained []protocol.LineRange
+	// retainedBytes lists the byte spans of one line that survived when no whole
+	// line could be kept.
+	retainedBytes []protocol.ByteRange
 }
 
 func (s codeSliceMetadata) metadata() map[string]any {
@@ -186,6 +247,9 @@ func (s codeSliceMetadata) metadata() map[string]any {
 	}
 	if len(s.retained) > 0 {
 		metadata["retained_ranges"] = s.retained
+	}
+	if len(s.retainedBytes) > 0 {
+		metadata["retained_bytes"] = s.retainedBytes
 	}
 	return metadata
 }
@@ -218,6 +282,7 @@ func parseCodeSlice(metadata map[string]any) (codeSliceMetadata, bool) {
 	return codeSliceMetadata{
 		path: path, fileHash: fileHash, artifactID: artifactID, startLine: startLine, endLine: endLine,
 		cacheHit: cacheHit, complete: complete, retained: parseRetainedRanges(metadata["retained_ranges"]),
+		retainedBytes: parseRetainedBytes(metadata["retained_bytes"]),
 	}, true
 }
 
@@ -243,6 +308,34 @@ func parseRetainedRanges(value any) []protocol.LineRange {
 			ranges = append(ranges, protocol.LineRange{Start: start, End: end})
 		}
 		return ranges
+	default:
+		return nil
+	}
+}
+
+// parseRetainedBytes reads the byte spans of a body that could not be kept by
+// lines. Like the retained ranges it survives a JSON round trip through the
+// session store, so both the typed and the decoded forms are accepted.
+func parseRetainedBytes(value any) []protocol.ByteRange {
+	switch typed := value.(type) {
+	case []protocol.ByteRange:
+		return append([]protocol.ByteRange(nil), typed...)
+	case []any:
+		spans := make([]protocol.ByteRange, 0, len(typed))
+		for _, item := range typed {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			line, lineOK := promptInt(entry["line"])
+			start, startOK := promptInt(entry["start"])
+			end, endOK := promptInt(entry["end"])
+			if !lineOK || !startOK || !endOK || line <= 0 || start < 0 || end <= start {
+				continue
+			}
+			spans = append(spans, protocol.ByteRange{Line: line, Start: start, End: end})
+		}
+		return spans
 	default:
 		return nil
 	}
@@ -274,8 +367,7 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 		// A canonical fragment is only usable for a range whose body it really
 		// holds: a trimmed fragment covers the lines it kept, and a range that
 		// spans its omitted middle is not covered at all.
-		if existing.path == current.path && existing.fileHash == current.fileHash &&
-			covers(existing.startLine, existing.endLine, existing.retained, current.startLine, current.endLine) {
+		if existing.path == current.path && existing.fileHash == current.fileHash && existing.coversCurrent(current) {
 			copy := existing
 			containing = &copy
 		}
@@ -285,12 +377,18 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 	}
 	if containing != nil {
 		b.result.SliceStats.Deduplicated++
-		return sliceReference(containing.artifactID, current.path, current.startLine, current.endLine, current.fileHash), containing.artifactID, stale
+		return sliceReference(containing.artifactID, current.path, current.startLine, current.endLine, current.fileHash, containing.retainedBytes), containing.artifactID, stale
 	}
 	// A fragment becomes canonical for the lines it actually holds. A complete
 	// fragment holds its whole declared range; a trimmed one holds only its
 	// retained ranges, which the containment check above enforces.
-	if !current.complete && len(current.retained) == 0 {
+	if !current.complete && len(current.retained) == 0 && len(current.retainedBytes) == 0 {
+		return content, "", stale
+	}
+	// A fragment of a line never supersedes another canonical: it holds no whole
+	// line, so it cannot be the better authority for any line range. It is still
+	// registered below, so an identical later read can be replaced by it.
+	if current.partialLine() {
 		return content, "", stale
 	}
 	kept := b.slices[:0]
@@ -307,14 +405,14 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 					continue
 				}
 				reference.canonicalID = current.artifactID
-				updated := sliceReference(current.artifactID, reference.path, reference.startLine, reference.endLine, reference.fileHash)
+				updated := sliceReference(current.artifactID, reference.path, reference.startLine, reference.endLine, reference.fileHash, nil)
 				b.result.Turns[reference.turnIndex].Parts[reference.partIndex].ToolResult.Content = updated
 				block := &b.result.Blocks[reference.blockIndex]
 				block.Bytes = len([]byte(updated))
 				block.Tokens = b.estimator.Estimate(updated)
 				block.Metadata["canonical_artifact_id"] = current.artifactID
 			}
-			reference := sliceReference(current.artifactID, existing.path, existing.startLine, existing.endLine, existing.fileHash)
+			reference := sliceReference(current.artifactID, existing.path, existing.startLine, existing.endLine, existing.fileHash, nil)
 			result := b.result.Turns[existing.turnIndex].Parts[existing.partIndex].ToolResult
 			result.Content = reference
 			block := &b.result.Blocks[existing.blockIndex]
@@ -336,8 +434,22 @@ func (b *PromptBuilder) deduplicateSlice(current codeSliceMetadata, turnIndex, p
 	return content, "", stale
 }
 
-func sliceReference(artifactID, path string, startLine, endLine int, fileHash string) string {
+func sliceReference(artifactID, path string, startLine, endLine int, fileHash string, spans []protocol.ByteRange) string {
+	// A reference that stands for part of a line says so: the model must not read it
+	// as the whole line, because the body it replaces was a fragment too.
+	if len(spans) > 0 {
+		return fmt.Sprintf("[code slice reference: artifact_id=%s path=%s lines=%d-%d bytes=%s file_hash=%s]",
+			artifactID, path, startLine, endLine, formatByteSpans(spans), fileHash)
+	}
 	return fmt.Sprintf("[code slice reference: artifact_id=%s path=%s lines=%d-%d file_hash=%s]", artifactID, path, startLine, endLine, fileHash)
+}
+
+func formatByteSpans(spans []protocol.ByteRange) string {
+	parts := make([]string, 0, len(spans))
+	for _, span := range spans {
+		parts = append(parts, fmt.Sprintf("%d:%d-%d", span.Line, span.Start, span.End))
+	}
+	return strings.Join(parts, ",")
 }
 
 func clonePromptMetadata(source map[string]any) map[string]any {

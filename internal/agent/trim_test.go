@@ -16,7 +16,7 @@ func TestTrimToolResultContentKeepsWholeLines(t *testing.T) {
 		lines[index] = "line-" + string(rune('a'+index%26)) + strings.Repeat("x", 20)
 	}
 	body := strings.Join(lines, "\n")
-	trimmed, retained, complete := trimToolResultContent(body, 600, 1)
+	trimmed, retained, _, complete := trimToolResultContent(body, 600, 1)
 	if complete {
 		t.Fatal("a trimmed body reported itself as complete")
 	}
@@ -53,30 +53,58 @@ func TestTrimToolResultContentKeepsWholeLines(t *testing.T) {
 // A complete body is returned untouched and reports no partial range.
 func TestTrimToolResultContentLeavesShortBodiesAlone(t *testing.T) {
 	for _, body := range []string{"", "one line", "a\nb\nc\n"} {
-		trimmed, retained, complete := trimToolResultContent(body, 4096, 1)
+		trimmed, retained, _, complete := trimToolResultContent(body, 4096, 1)
 		if !complete || trimmed != body || retained != nil {
 			t.Fatalf("body %q: trimmed=%q retained=%#v complete=%t", body, trimmed, retained, complete)
 		}
 	}
 }
 
-// A very long single line cannot be kept whole, so it is cut inside the line and
-// reports no retained range: a partial line may never back a reference.
+// A very long single line cannot be kept whole, so it is cut inside the line. No
+// line range is reported - a partial line may never be read as a whole one - and
+// the bytes that survived are reported instead, which is what lets a repeated read
+// of the same region be replaced by a reference.
 func TestTrimToolResultContentFallsBackForALongLine(t *testing.T) {
 	body := strings.Repeat("x", 4000) + "TAIL-MARKER"
-	trimmed, retained, complete := trimToolResultContent(body, 400, 10)
+	trimmed, retained, spans, complete := trimToolResultContent(body, 400, 10)
 	if complete || len(retained) != 0 {
 		t.Fatalf("retained=%#v complete=%t", retained, complete)
 	}
 	if !strings.Contains(trimmed, "summarized") || !strings.Contains(trimmed, "TAIL-MARKER") || len(trimmed) > 400 {
 		t.Fatalf("trimmed = %q", trimmed)
 	}
+	// Two spans of the one line that was cut: the head the body kept and the tail it
+	// kept, both relative to that line and both inside it.
+	if len(spans) != 2 {
+		t.Fatalf("spans = %#v", spans)
+	}
+	for _, span := range spans {
+		if span.Line != 10 {
+			t.Fatalf("span %#v is not on the declared line", span)
+		}
+		if span.Start >= span.End || span.End > len(body) {
+			t.Fatalf("span %#v is not a real range of a %d-byte body", span, len(body))
+		}
+	}
+	if spans[0].Start != 0 {
+		t.Fatalf("the head span does not start at the line start: %#v", spans[0])
+	}
+	if spans[1].End != len(body) {
+		t.Fatalf("the tail span does not reach the end of the body: %#v", spans[1])
+	}
+	// Everything the two spans hold is really in the trimmed body, byte for byte:
+	// the spans are a claim about the content and must match it.
+	for _, span := range spans {
+		if !strings.Contains(trimmed, body[span.Start:span.End]) {
+			t.Fatalf("the body does not hold span %#v", span)
+		}
+	}
 }
 
 // Multi-byte content stays valid UTF-8 and never splits a rune.
 func TestTrimToolResultContentKeepsValidUTF8(t *testing.T) {
 	body := strings.Repeat("中文内容行\n", 200)
-	trimmed, _, complete := trimToolResultContent(body, 200, 1)
+	trimmed, _, _, complete := trimToolResultContent(body, 200, 1)
 	if complete {
 		t.Fatal("a trimmed body reported itself as complete")
 	}

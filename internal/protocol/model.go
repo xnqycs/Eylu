@@ -239,6 +239,21 @@ type LineRange struct {
 	End   int `json:"end"`
 }
 
+// ByteRange is one retained byte span inside a single file line, reported when a
+// body could not be kept whole by lines at all - which is what a very long single
+// line looks like. Line is 1-based, Start and End are 0-based offsets within that
+// line with End exclusive.
+//
+// It exists so such a body can still back a reference for the bytes it really
+// holds. It must never be read as a line range: a partial line is not a whole one,
+// and the coverage rule treats the two as different kinds of evidence for exactly
+// that reason.
+type ByteRange struct {
+	Line  int `json:"line"`
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
 type ToolResult struct {
 	CallID            string          `json:"call_id"`
 	Content           string          `json:"content"`

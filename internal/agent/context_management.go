@@ -526,7 +526,7 @@ func contextualizeTurn(turn protocol.Turn, maxToolBytes int) (protocol.Turn, boo
 		if part.ToolResult != nil {
 			toolResult := *part.ToolResult
 			toolResult.Metadata = cloneMetadata(part.ToolResult.Metadata)
-			trimmed, retained, complete := trimToolResultContent(part.ToolResult.Content, maxToolBytes, declaredStartLine(toolResult.Metadata))
+			trimmed, retained, retainedBytes, complete := trimToolResultContent(part.ToolResult.Content, maxToolBytes, declaredStartLine(toolResult.Metadata))
 			if !complete {
 				// The body no longer covers the line range its metadata declares,
 				// so the copy is explicitly marked incomplete and reports the lines
@@ -540,6 +540,12 @@ func contextualizeTurn(turn protocol.Turn, maxToolBytes int) (protocol.Turn, boo
 				toolResult.Metadata["context_truncated"] = true
 				if len(retained) > 0 {
 					toolResult.Metadata["retained_ranges"] = retained
+				}
+				// When no whole line fitted, the bytes that survived are reported
+				// instead. Without them the body is unusable as a canonical and a
+				// repeated read of it earns nothing.
+				if len(retainedBytes) > 0 {
+					toolResult.Metadata["retained_bytes"] = retainedBytes
 				}
 				if _, declared := toolResult.Metadata["lines_complete"]; declared {
 					toolResult.Metadata["lines_complete"] = false
@@ -578,16 +584,16 @@ func declaredStartLine(metadata map[string]any) int {
 // Keeping whole lines, rather than cutting inside one, is what makes the retained
 // ranges trustworthy: a range either survived completely or is reported as
 // missing, so a reference may only be built on lines that are really present.
-func trimToolResultContent(content string, limit int, startLine int) (string, []protocol.LineRange, bool) {
+func trimToolResultContent(content string, limit int, startLine int) (string, []protocol.LineRange, []protocol.ByteRange, bool) {
 	if limit <= 0 || len(content) <= limit {
-		return content, nil, true
+		return content, nil, nil, true
 	}
 	marker := fmt.Sprintf("\n[tool result summarized: original_bytes=%d]\n", len(content))
 	available := limit - len(marker)
 	if available <= 0 {
 		// Not even the marker fits: the body is reported as fully omitted rather
 		// than as a partial range.
-		return marker[:min(len(marker), limit)], nil, false
+		return marker[:min(len(marker), limit)], nil, nil, false
 	}
 	lines := strings.Split(content, "\n")
 	// The beginning gets two thirds of the budget and the end one third, so the
@@ -623,8 +629,9 @@ func trimToolResultContent(content string, limit int, startLine int) (string, []
 	}
 	if headLines == 0 && tailLines == 0 {
 		// No whole line fits, which is what a very long single line looks like.
-		// The body is cut inside the line instead, and because a partially kept
-		// line cannot back a reliable range, no retained range is reported.
+		// The body is cut inside the line instead, so no retained *line* range can
+		// be reported - but the bytes that survived can be, and that is what lets a
+		// repeated read of the same region be replaced by a reference.
 		head := available * 2 / 3
 		tail := available - head
 		for head > 0 && !utf8.RuneStart(content[head]) {
@@ -637,7 +644,14 @@ func trimToolResultContent(content string, limit int, startLine int) (string, []
 		if start < head {
 			start = head
 		}
-		return content[:head] + marker + content[start:], nil, false
+		// The offsets are relative to the start of the line that was cut, which is
+		// the first declared line of the slice: the head of the body and its tail
+		// both come from that one line, because no whole line fitted.
+		spans := []protocol.ByteRange{{Line: startLine, Start: 0, End: head}}
+		if start < len(content) {
+			spans = append(spans, protocol.ByteRange{Line: startLine, Start: start, End: len(content)})
+		}
+		return content[:head] + marker + content[start:], nil, spans, false
 	}
 	var builder strings.Builder
 	builder.WriteString(strings.Join(lines[:headLines], "\n"))
@@ -659,7 +673,9 @@ func trimToolResultContent(content string, limit int, startLine int) (string, []
 			retained = append(retained, protocol.LineRange{Start: first, End: first + tailLines - 1})
 		}
 	}
-	return builder.String(), retained, false
+	// Whole lines survived, so no byte span is reported: the line ranges describe
+	// this body completely, and reporting both would be two accounts of one thing.
+	return builder.String(), retained, nil, false
 }
 
 func cloneMetadata(source map[string]any) map[string]any {

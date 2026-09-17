@@ -13,16 +13,17 @@ import (
 	"Eylu/internal/tool"
 )
 
-// A11, reproduced: a very long single line whose body does not fit the byte budget
-// is cut *inside* the line, and a partially kept line cannot back a range, so no
-// retained range is reported. The result is therefore neither a complete slice nor
-// a fragment canonical, and a repeated read of the same region earns nothing.
+// A11, fixed: a very long single line whose body does not fit the byte budget is cut
+// *inside* the line. No line range can describe a partial line, so for a long time
+// such a body was unusable as a canonical and a repeated read of it earned nothing.
+// The bytes that survived are now reported instead, and an identical repeated read is
+// replaced by a reference to the body that already holds them.
 //
 // The first attempt at measuring this reported that the premise did not reproduce,
 // and the measurement was wrong: it read the file and fed the result straight to the
-// prompt builder, skipping the trimming step that produces the shape. The case below
-// goes through contextualizeTurn, which is where the shape is made.
-func TestVeryLongSingleLineEarnsNoDeduplicationAfterTrimming(t *testing.T) {
+// prompt builder, skipping the trimming step that produces the shape. This case goes
+// through contextualizeTurn, which is where the shape is made.
+func TestVeryLongSingleLineEarnsTheBenefitAfterTrimming(t *testing.T) {
 	workspace := t.TempDir()
 	// One line, far larger than the budget below, with no newline to split on.
 	line := strings.Repeat("x", 4000)
@@ -55,40 +56,56 @@ func TestVeryLongSingleLineEarnsNoDeduplicationAfterTrimming(t *testing.T) {
 	if trimmed.Metadata["context_truncated"] != true {
 		t.Fatalf("the trimmed result was not marked: %#v", trimmed.Metadata)
 	}
-	if _, reported := trimmed.Metadata["retained_ranges"]; reported {
-		// If this ever starts reporting an in-line range, the gap is closed and this
-		// case must be rewritten to assert the benefit instead.
-		t.Fatalf("an in-line retained range is now reported: %#v", trimmed.Metadata["retained_ranges"])
-	}
 	if !trimmed.Truncated {
 		t.Fatal("the trimmed result does not say it was truncated")
 	}
+	// No line range is reported, because a partial line is not a whole one and must
+	// never be read as one.
+	if _, reported := trimmed.Metadata["retained_ranges"]; reported {
+		t.Fatalf("a partial line was reported as a line range: %#v", trimmed.Metadata["retained_ranges"])
+	}
+	// The bytes that survived are reported instead, and they are spans of the one
+	// line that was cut.
+	spans, ok := trimmed.Metadata["retained_bytes"].([]protocol.ByteRange)
+	if !ok || len(spans) != 2 {
+		t.Fatalf("retained bytes = %#v", trimmed.Metadata["retained_bytes"])
+	}
+	for _, span := range spans {
+		if span.Start >= span.End || span.End > len(line) {
+			t.Fatalf("span %#v is not a real range of the %d-byte line", span, len(line))
+		}
+	}
 
 	// Two reads of the same region, both trimmed the same way, through the real
-	// prompt builder: the second must not be replaced by a reference, because no
-	// range backs the replacement.
+	// prompt builder: the second is replaced by a reference, because the first body
+	// really does hold every byte of it.
 	builder := contextledger.NewPromptBuilder(contextledger.ApproxEstimator{BytesPerToken: 1})
 	builder.AddTurn(trimmedTurn)
 	builder.AddTurn(trimmedTurn)
 	result := builder.Result()
-	if result.SliceStats.Deduplicated != 0 {
-		t.Fatalf("the trimmed long line deduplicated after all: %#v", result.SliceStats)
+	if result.SliceStats.Deduplicated != 1 {
+		t.Fatalf("the trimmed long line still earns nothing: %#v", result.SliceStats)
 	}
 	second := result.Turns[1].Parts[0].ToolResult.Content
-	if second != trimmed.Content {
-		t.Fatalf("the second body changed: %q", second)
+	if !strings.Contains(second, "code slice reference") {
+		t.Fatalf("the second body was not replaced: %q", second)
 	}
-	// The saving that is therefore unavailable, which is what the fix would buy.
+	// The reference stands for part of a line and says so, so the model is not told
+	// it has the whole line.
+	if !strings.Contains(second, "bytes=") {
+		t.Fatalf("the reference does not name the bytes it stands for: %q", second)
+	}
 	estimator := contextledger.ApproxEstimator{BytesPerToken: 1}
-	t.Logf("long line %d bytes -> trimmed to %d bytes; a repeated read keeps paying %d tokens because no range is reported",
-		len(line), len(trimmed.Content), estimator.Estimate(trimmed.Content))
-	if estimator.Estimate(trimmed.Content) <= 0 {
-		t.Fatal("the trimmed body is empty, so this case proves nothing")
+	before, after := estimator.Estimate(trimmed.Content), estimator.Estimate(second)
+	t.Logf("long line %d bytes: first read %d tokens, repeated read %d tokens with the fix (was %d, saved %d)",
+		len(line), before, after, before, before-after)
+	if after >= before {
+		t.Fatalf("the repeated read still costs %d tokens, no better than %d", after, before)
 	}
 }
 
-// The same body, small enough to keep whole, does earn the benefit - so the loss
-// above is about the shape and not about deduplication being broken in general.
+// The same body, small enough to keep whole, keeps earning the benefit through the
+// line-range path - so the fix added a case rather than replacing one.
 func TestAShortBodyStillEarnsTheBenefit(t *testing.T) {
 	workspace := t.TempDir()
 	writeLongLine(t, workspace, "short.txt", "a short body\nwith two lines\n")
@@ -115,6 +132,7 @@ func TestAShortBodyStillEarnsTheBenefit(t *testing.T) {
 		t.Fatalf("a whole body did not deduplicate: %#v", result.SliceStats)
 	}
 }
+
 func writeLongLine(t *testing.T, workspace, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(workspace, name), []byte(content), 0o600); err != nil {
