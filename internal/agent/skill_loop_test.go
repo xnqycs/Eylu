@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,7 +50,12 @@ func (d *skillLoopDriver) Generate(_ context.Context, request driver.Request, _ 
 		return toolCallResponse("script-turn", call), nil
 	case 4:
 		if strings.Count(allText, "SECRET INSTRUCTION") != 1 || !strings.Contains(allText, "SKILL_SCRIPT_OK") {
-			d.t.Fatalf("script result context = %s", allText)
+			// What the tools returned comes first, because that is where the cause
+			// usually is: this failed once on a Windows runner because the shell could
+			// not be started at all (git-bash reported exit_code 2147483652 with an
+			// empty stdout), and the full context below is long enough to bury that.
+			d.t.Fatalf("the script result is not in the request (secret instructions = %d, tool results: %s); context = %s",
+				strings.Count(allText, "SECRET INSTRUCTION"), toolResultSummary(request.Model.Turns), allText)
 		}
 		return protocol.ModelResponse{Turn: protocol.Turn{ID: "final", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "skill complete"}}}, Stop: protocol.StopCompleted}, nil
 	default:
@@ -150,4 +156,28 @@ func requestText(turns []protocol.Turn) string {
 
 func toolCallResponse(id string, call protocol.ToolCall) protocol.ModelResponse {
 	return protocol.ModelResponse{Turn: protocol.Turn{ID: id, Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}}, Stop: protocol.StopToolUse}
+}
+
+// toolResultSummary lists what the tools returned in one line each, so a failure
+// states the cause before it states the symptom. A result is summarised rather than
+// dumped because the interesting part of a shell failure is its exit code and whether
+// there was any output at all.
+func toolResultSummary(turns []protocol.Turn) string {
+	summaries := make([]string, 0, 4)
+	for _, turn := range turns {
+		for _, part := range turn.Parts {
+			if part.Kind != protocol.PartToolResult || part.ToolResult == nil {
+				continue
+			}
+			content := strings.Join(strings.Fields(part.ToolResult.Content), " ")
+			if len(content) > 160 {
+				content = content[:160] + "..."
+			}
+			summaries = append(summaries, fmt.Sprintf("%s=%q", part.ToolResult.CallID, content))
+		}
+	}
+	if len(summaries) == 0 {
+		return "none"
+	}
+	return strings.Join(summaries, ", ")
 }
