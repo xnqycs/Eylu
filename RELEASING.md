@@ -106,7 +106,7 @@ Eylu_<version>_checksums.txt.sigstore.json
 
 每个平台归档只包含 `eylu` 或 `eylu.exe`。GitHub 还会提供 Source code ZIP 和 tar.gz，因此 Release 页面通常显示 10 个资产。
 
-Release notes 由 GoReleaser 根据上一个标签之后的 Git 提交生成，并排除 `docs:`、`test:`、`chore:` 和合并提交。
+Release notes 由 GoReleaser 根据上一个标签之后的 Git 提交生成，并排除 `docs:`、`test:`、`chore:` 和合并提交。排除规则是 `.goreleaser.yaml` 中 `changelog.filters.exclude` 的正则，因此必须覆盖带 scope 的写法（`docs(changelog):`、`fix(ui):` 这类），否则只有不带 scope 的提交会被排除，带 scope 的仍会进入发布说明；改动这些正则后重新执行 `goreleaser check`。
 
 ## 5. 发布后验证
 

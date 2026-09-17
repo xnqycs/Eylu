@@ -67,9 +67,14 @@ changelog:
   sort: asc
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+      # A conventional-commit subject may carry a scope - `docs(changelog): ...`,
+      # `fix(ui): ...` - so the scope is part of the pattern. Without it `^docs:`
+      # excludes only the unscoped form and lets the scoped one into the published
+      # notes, which is how release notes v1.0.0-rc.5 ended up listing chore and docs
+      # commits that this list says are excluded.
+      - '^docs(\([^)]*\))?:'
+      - '^test(\([^)]*\))?:'
+      - '^chore(\([^)]*\))?:'
       - "merge conflict"
       - Merge pull request
       - Merge remote-tracking branch
