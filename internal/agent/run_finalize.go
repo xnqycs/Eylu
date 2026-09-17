@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -174,6 +175,10 @@ type runFinalizer struct {
 	// deliver, and auditDetail describes the most recent one.
 	auditFailures func() int
 	auditDetail   func() string
+	// flushFailure is the error of the final event delivery, when the request had
+	// already failed for another reason and the two could not be reported as one
+	// error without hiding either.
+	flushFailure error
 }
 
 // closePending gives every call of the current response that has no result yet a
@@ -192,9 +197,19 @@ func (f *runFinalizer) closePending(message string) {
 // request are always drained and a consumer failure is never lost: when the
 // request itself succeeded, the sink failure becomes its error.
 func (f *runFinalizer) finish(response protocol.ModelResponse, last protocol.ModelResponse, err error, stop string) (protocol.ModelResponse, error) {
-	if sinkErr := f.events.stop(); sinkErr != nil && err == nil {
+	sinkErr := f.events.stop()
+	switch {
+	case sinkErr == nil:
+	case err == nil:
 		err = sinkErr
 		stop = eventSinkFailedStop
+	default:
+		// The request already failed and the final delivery failed too. The
+		// original failure stays the reason the request ended, and the second one
+		// is preserved beside it instead of being dropped: a host that never
+		// received the last events must be able to see that from the record.
+		f.flushFailure = sinkErr
+		err = errors.Join(err, sinkErr)
 	}
 	// A host that narrowed a safety setting owns the reason this request stopped
 	// for: the cancellation is only how it got there. A request that finished on
@@ -265,6 +280,9 @@ func (f *runFinalizer) publish(stop string, err error) {
 		if note := f.events.slowDiagnostic(); note != "" {
 			f.report.Warnings = append(f.report.Warnings, note)
 		}
+	}
+	if f.flushFailure != nil {
+		f.report.Warnings = append(f.report.Warnings, fmt.Sprintf("the last host events could not be delivered after the request had already failed: %v", f.flushFailure))
 	}
 }
 

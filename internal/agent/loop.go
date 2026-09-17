@@ -310,6 +310,11 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			}
 			return finish(protocol.ModelResponse{}, last, err, stop)
 		}
+		// The call happened and the provider reported what it cost, so the usage is
+		// recorded here, before the response is validated or persisted. Whether the
+		// turn can be written says nothing about whether the model was already paid
+		// for, and a request that fails afterwards must still report what it spent.
+		budget.add(callMain, response.Usage)
 		// Validate before committing: a malformed response must not become part
 		// of the history the next request is built from.
 		response, err = normalizeModelResponse(response, seenCalls)
@@ -318,7 +323,12 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			c.driverState = nil
 			c.rebuildLedger(runtime)
 			c.mu.Unlock()
-			return last, err
+			// A refused response is an outcome like any other, so it leaves through
+			// the one exit path: the report states why the request ended, the usage
+			// is published, the buffered host events are delivered and the pending
+			// set is released. Returning directly here left the report empty and the
+			// set behind for the next request.
+			return finish(protocol.ModelResponse{}, last, err, stopAborted)
 		}
 		c.mu.Lock()
 		c.commitResponse(response, effectiveRuntime)
@@ -351,7 +361,6 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 			closePending("tool call was not executed: hosted web activity was rejected")
 			return finish(protocol.ModelResponse{}, last, err, stopAborted)
 		}
-		budget.add(callMain, response.Usage)
 		if budget.exceeded() {
 			// The request spent more than it was allowed to. The response that
 			// caused it is kept and its calls are closed without executing, so the
