@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **中断后停止批次调度（修复）**：批次在运行期接受用户中断（宿主工具通过 `ControlReporter` 返回 `ControlInterruptRequest`，例如关闭 `ask` 提问）后，此前只有预检阶段会阻止后续调用，调度循环仍会启动同批次尚未运行的调用——实测 `[ask, write_file]` 在关闭提问后文件仍被写入、`[ask, bash]` 命令仍被执行。"是否允许启动下一个调用"收敛为单一判断 `batchStopped`（同时考虑用户中断、请求取消与审批/检查点/调度等基础设施故障），未启动调用统一闭合为 `not_executed` 并在结果 metadata 上带 `interrupt_request`；请求级终态优先级固定为 abort > cancel > interrupt > continue，中断在败给更高优先级时仍保留在调用状态与结果上。
+
+- **意图收集严格无副作用（修复）**：`ReportIntent` 此前经由 `forWrite` 解析目标路径，而该路径在 `create_parent_dirs` 为真时会 `MkdirAll`——意图写入失败会留下新建目录，"未执行"只说对了一半；它还用 `context.Background()` 掩盖请求取消。现在新增无副作用的 `pathResolver.writeTarget`/`resolvedDirectory`（保留原有符号链接与越界校验），`MkdirAll` 只发生在执行阶段且位于意图持久化之后；`IntentReporter` 契约改为接收请求 context，读取原文件证据遵守既有 `previousHashMaxBytes` 上界。批量意图写入也不再描述一个它无法知道的状态：同一批次内命中同一目标路径的调用退回逐调用写入（在自身执行前读证据），不同目标仍保留单次批量 append。
+
+- **日志物理水位与逻辑去重分离（修复）**：去重此前把被跳过记录的物理位置一并丢弃，于是中间重复事件让加载报 `session event sequence gap`、会话直接不可读，末尾重复事件让下一次 `Append` 复用日志已有的序号（再次加载即缺口）。现在去重只阻止内容被应用两次，被跳过的有效记录仍推进快照水位；`Load` 以最后一条有效物理记录作为追加位置，`Append` 在"整批都是重试"时也填充该缓存，`Save` 不再用可能落后于日志的快照水位驱动追加。磁盘 schema 未改动。
+
+- **Anthropic 系统段完整保留（修复）**：Anthropic 只有一个 `system` 字段，而会话会产生多个 system turn（基础提示、MCP 指令与资源、Skill 目录与正文、任务列表、项目图、压缩摘要）；此前每个 system turn 直接覆盖该字段，实际只发送最后一段——在压缩过的会话里就是摘要，模型因此完全丢失系统提示。现在按顺序累积并以内容块数组一次写入（保留段边界），空 system 段不产生空块。该要求已进入公共 Driver 契约（`TestDriversKeepEverySystemSegmentInOrder`，覆盖 `openai_chat`、`openai_responses`、`anthropic_messages`、`mistral_conversations`、`perplexity_agent`），并确认其他适配器没有同类覆盖、遗漏或角色降级。
+
+- **TUI 与 CLI 同享检查点与运行摘要（修复）**：TUI 此前未设置 `executor.Checkpoint`，副作用在日志里只留下 `tool_prepared` 与 turn append，没有意图与完成记录；运行摘要也只存在内存中、重启即失。现在两个入口共用同一套接线（见"共用请求执行服务"一条），TUI 也持久化 `run_reported`，且先写摘要再 Sync。同一处调查发现父子代理共用调用 ID 空间：general 子代理与父请求在同一会话内可能拿到相同 `call_id`，此前会把子代理意图判为"同 ID 不同内容"的冲突并直接拒绝执行。生命周期事件身份改为按请求限定（`intent:<request_id>:<call_id>`、`prepared:`/`completion:` 同理），逐调用意图路径补上此前完全缺失的稳定事件 ID，`session.ToolCompletion` 新增增量字段 `request_id`，`SamePendingCall` 在任一侧无 request_id 时退化为仅按 call_id 匹配，旧日志行为不变。
+
+- **统一请求收尾与用量入账（修复）**：非法模型响应（工具参数不是合法 JSON、同一请求内重复调用 ID）此前直接 `return last, err` 绕过 `runFinalizer`，于是运行摘要只有 request ID、停止原因为空，累计用量为零，宿主事件队列不 flush，pending 集合留给下一个请求。该出口现在走统一 `finish`。同时：主模型调用的用量提前到调用返回后立即记录（不再以 turn 成功持久化为前提），收尾阶段再次失败的事件投递不再静默丢弃——原始错误仍是原因，第二个失败经 `errors.Join` 与运行摘要 `warnings` 一并报出。
+
+- **会话轮换取得所有权、压缩移出状态锁（修复）**：`NewSessionWithEnvironment` 此前只 `await`（等待）而不占位，在"旧请求结束"与"轮换写入"之间存在窗口，新请求可在此启动、把消息写进即将被整体替换的会话；现在 `runGate.acquire` 在同一把锁下完成"等待+占位"，轮换期间 `begin` 返回 `ErrConversationBusy`，手动 `Compact` 同样取得所有权（运行中压缩请求会得到 busy 错误）。压缩摘要此前在状态锁内执行——手动压缩还在锁内做上下文窗口解析与宿主回调，回调读会话会直接死锁——期间 `ContextReport`/`ExportState`/`RequestStop` 全部阻塞；现在拆为"锁内确定性规划 → 锁外摘要模型调用 → 锁内校验并提交或拒绝 → 锁外交付回调"，快照已被取代时放弃该次压缩。
+
+- **统一模型可见的工具结果投影（修复）**：驱动此前把 `content`/`content_blocks`/`structured_content` 三个字段一起序列化进请求，而上下文账本只按 `content` 计费、裁剪也只裁 `content`——一个 1 MiB 图片块以 base64 进入文本字段，却只按几百字符计费（实测账本 7 字节 vs 请求 1,048,576 字节），MCP 结果还会把同一段文本发两遍。现在 `protocol.ProjectToolResult` 是唯一定义：重复文本块丢弃、二进制块只保留类型/MIME/字节数/摘要与说明、超限结构化内容整体替换为合法 JSON 摘要、超限文本按 rune 边界裁剪、块数与结构化内容有上界；账本、裁剪与驱动使用同一份投影，历史仍保留完整结果。
+
+- **预算准入与子代理用量（修复）**：压缩摘要是付费调用，此前在任何预算准入之前无条件发起，被预算拦下的请求已经为摘要付过费；现在上下文层接收 `admitSummary`（即 `budget.admits`），不足时改用确定性压缩，手动压缩不传准入（没有请求预算）。子代理此前只上报最后一次模型调用的用量（实测两次调用报 50/5 而非 150/15，因为第一次调用的用量被丢弃），现在读取整轮累计用量，并新增增量字段 `AgentTaskResult.model_calls`/`AgentTask.model_calls` 单独报告子代理成本。已复核无需改动：provider 未报告 usage 时调用次数照常计数、总量标记为估算。
+
+- **CLI 与 TUI 共用请求执行服务（重构）**：两个入口各自复制了同一段持久化逻辑（执行器身份与检查点、turn/prepared 回调、请求开始、请求超时、运行摘要、Sync 与错误优先级），TUI 缺少检查点与运行摘要正是这段复制造成的。现在集中到 `internal/app/request_runner.go` 的 `toolRun`（`executor`/`requestContext`/`prepare`/`settle`）与 `requestMetric`，前端只保留交互与展示，旧的重复路径删除。新增跨入口一致性测试：同一份脚本化模型分别驱动 `eylu chat` 与 TUI，比较调用终态、运行摘要计数、turn 角色序列、停止原因、用量与生命周期事件，同时忽略文本排版、时间戳与 ID；每个场景另带绝对契约（临时移除检查点绑定会让它失败），因此它也能发现"两个入口同样出错"，而不只是发现分叉。
+
+- **命令分类按实际执行 shell 的方言解读（安全修复）**：分类器此前一律按 POSIX 引号规则解读命令行，而 Windows 回退 shell 是命令解释器；后者没有单引号成组，单引号内的 `&`、`|`、`>` 仍是分隔符或重定向。实测（非破坏性探针 + 临时目录）此前会把这类行判为只读并自动放行，而 `cmd` 实际执行了第二条命令、甚至创建了文件。现在 `policy.Config.Shell`（`ShellPOSIX`/`ShellCommandPrompt`）是显式输入，`tool.ActiveShellDialect()` 报告本进程将使用的 shell；命令解释器分支刻意保守（单引号不成组、`%` 展开、`^` 与括号一律拒绝），无法证明即回退 `unknown` 并要求确认。对照测试带正向对照（未加引号的分隔符必须被 shell 观察到 active），避免"什么都没观察到"被当成"一致"。
+
+- 文档：新增 `docs/architecture-and-reliability.md`（架构图、请求生命周期与所有权、工具执行阶段与检查点顺序、日志水位与逻辑去重与恢复规则、两个入口的共同行为与允许差异、上下文投影与预算定义、应用层权限与 OS 沙箱边界、不变式到测试的映射、已知限制）；README 补充"命令按实际执行 shell 的方言解读"的规则，并新增"请求生命周期与入口一致性"小节。
+
 - 去重收益修正：只有引用**确实比正文小**时才替换（按字节比较，避免估算器把极小正文四舍五入成 0），否则保留正文；跳过次数记为 `NotWorthReplacing` 并写在 block 的 `deduplication_not_worth_it` 上。PR-05 若干用小正文断言"会去重"的用例改为使用"明显大于引用的正文"（考规则而非 fixture 大小），断言"保留正文"的用例同样放大以保持判别力。
 
 - §8.3 第 1 条已实施：超长单行被在行内切开时改为报告**行内字节区间**（`retained_bytes`），覆盖判定扩展为"行区间 或 行内字节区间"，重复读取的 token 从 512 降到 198（4000B 单行 / 512B 预算，省 314）。红线保护：行内字节区间永不被当作行区间（部分行的 canonical 不覆盖整行读取）、只有被完全包含时才用引用、行内片段永不取代其他 canonical、引用文本写明"部分行"；负向用例与正向用例同为验收条件。
@@ -31,6 +55,14 @@
 - 修复恢复会话后的空历史视图：TUI 和 `--no-tui` 交互模式回显用户、助手与工具历史，TUI 默认定位到最新内容。
 - 修复 MCP 管理体验：启动加载期间在 Banner 下展示动画并在终态后清除；完整输入 `/mcp` 后可直接打开，详情页支持左右方向键切换，Tools 页仅展示工具列表，按 Enter 进入工具详情、Esc 返回；连接错误进入内容区并去重显示，原始配置与诊断 JSON 不再挤占详情页或输入区。
 - 优化 MCP 启动与连接稳定性：TUI 首轮请求复用启动时建立的 manager，多个 server 最多并行连接 4 个；Streamable HTTP 握手中的每个 POST 独立应用 60 秒期限并携带稳定 User-Agent，工具目录就绪即进入 connected，日志级别、资源、资源模板和提示词改为后台加载；临时连接错误最多自动重试 3 次，最终失败后可手动执行 `reconnect`，退出清理采用有界等待。
+
+兼容性：生命周期事件 ID 形状变化（`intent:`/`prepared:`/`completion:` 现在携带 request ID，逐调用意图路径此前完全没有事件 ID），增量字段 `ToolCompletion.request_id`、`AgentTaskResult.model_calls`、`AgentTask.model_calls`，以及导出配置字段 `policy.Config.Shell`（零值为 POSIX）；磁盘 session schema、protocol v1 与既有字段语义未变。
+
+行为变化：Windows 且无 git-bash 时，单引号内的分隔符以及 `%`、`^`、括号不再自动放行，改为要求确认；运行中 `/compact` 返回 `conversation already has a running request`；模型可见的工具富结果变为有界投影（图片以描述+摘要代替 base64）；子代理用量口径由"最后一次调用"变为"整轮累计"，报表数字会变大；非法响应现在会写入运行摘要（`stop_reason=aborted`）并释放 pending，此前这些字段为空。
+
+已知未修复（本轮发现，尚未处理）：请求 context 在开始前就已被取消时，会以 `config_error: context canceled` 失败并被记为 `aborted`，且不写入 `request_started`/运行摘要/turn（CLI 与 TUI 行为一致，两个入口都已在此契约下断言）；plan（isolated profile）模式请求的会话日志不含 user turn，只含模型/工具 turn；plan 模式下写操作因工具不在 registry 而被报为 `failed` 而非 `rejected`，且该调用在事件日志中没有任何记录（只有运行摘要计数）；取消发生在模型调用进行中时报告 `aborted` 而非 `cancelled`；项目地图扫描仍在状态锁内；`EYLU_SHELL` 以 `-lc` 调用，因此仅适用于 POSIX 兼容 shell，指向其他 shell 时仍按 POSIX 规则解读。
+
+验证边界：本机无法运行 `go test -race`（无 C 编译器），因此竞态由 CI 的 `Race and static analysis` 作业发现：首次推送时该作业报告了测试替身 `orderedSink`/`faultSink` 的写竞争，以及跨入口取消场景对时序的依赖，两者均已修正并重新推送。除此之外，本轮在本机 Windows（go1.25.8）上执行了 `scripts/verify.ps1` 的全部阶段（gofmt 两种口径、`go mod verify`、`go vet ./...`、staticcheck v0.7.0、third-party notices、actionlint、`go test ./...`、`go build`、`smoke.ps1`、`smoke.sh`）并通过；Linux/macOS 原生运行、`go test -race`（本机无 C 编译器）与定向 fuzz 未在本地运行，由 CI 覆盖或记录为未执行；driver 验证全部离线，无真实 Provider 联调，也没有落盘的 SSE fixture 文件。
 
 ## v1.0.0-rc.2 - 2026-07-21
 

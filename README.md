@@ -269,12 +269,13 @@ TUI 中可通过 `Shift+Tab` 在四种模式间循环。运行期间的切换会
 - 参数按命令单独校验。`find` 的 `-delete`、`-exec`、`-execdir`、`-fprint`，`git branch` 的 `-d`、`-D`、`-m`、`-M`、`-c`、`-C`、"`--delete`"、"`--set-upstream-to`"，`git diff`/`git log`/`git show` 的 `--ext-diff`、`--textconv`、`--output`、`--show-signature`，`git grep -O`，以及 `git -c`、`--config-env`、`--exec-path`、`--paginate` 等参数被判定为高危，而不是只读。
 - 只读命令的短选项区分大小写，因此 `pwd -P` 是只读，`git grep -O` 会被判定为高危。
 - 无法可靠解释的输入回退为 unknown：未闭合引号、变量或命令替换（`$VAR`、`$(...)`）、管道、重定向、反引号，以及在 `read_only_commands` 中自定义、但没有内置参数规则的命令所携带的参数。`plan` 模式拒绝 unknown，`manual`/`auto` 按各自模式要求确认。
+- 命令按**实际执行它的 shell 的规则**解析，而不是一律按 POSIX 规则。`sh`、git-bash 等 POSIX shell 下单引号成组，因此单引号内的 `&`、`|`、`>` 是普通文本；Windows 命令解释器（`cmd`）没有单引号成组，同样的写法里 `&`、`|`、`>` 仍然是分隔符或重定向，`%` 会展开、`^` 是转义。命令解释器下的解析刻意保守：凡是无法证明为惰性文本的写法都回退为 unknown，宁可要求确认，也不把一条会被 shell 拆成两条命令的行当作只读。
 - 权限分层为：不可绕过的禁止规则、模式默认策略、工具领域策略（例如 Web 独立权限）、显式审批结果。明确的全局禁止不会被工具级策略放宽；零值或无法识别的权限决策一律按拒绝处理。
 - 审计记录保留模式、命中的规则、最终决策和覆盖来源。
 
-行为变化：此前仅按命令前缀无条件放行的参数形式（如 `find . -delete`、`git branch -D`、`git diff --ext-diff`）现在会被判定为高危或 unknown。
+行为变化：此前仅按命令前缀无条件放行的参数形式（如 `find . -delete`、`git branch -D`、`git diff --ext-diff`）现在会被判定为高危或 unknown；此外，在显式设置为命令解释器（`EYLU_SHELL`）时，单引号包裹的分隔符不再被视为惰性文本。
 
-命令分类只是应用层策略，不等同于操作系统沙箱：`working_directory` 只决定命令的启动目录，不限制命令自身能访问的路径。
+命令分类只是应用层策略，不等同于操作系统沙箱：`working_directory` 只决定命令的启动目录，不限制命令自身能访问的路径。分类器只建模 POSIX 与 Windows 命令解释器两种方言；把 `EYLU_SHELL` 指向其他 shell（例如 PowerShell）时会按 POSIX 规则解读，这是已知缺口而不是安全保证。
 
 ## Skills 与 MCP
 
@@ -599,6 +600,12 @@ Web 批量查询会把一次模型调用展开为多次并发执行，三类身�
 ### 核心 loop 的职责拆分
 
 Web 专用逻辑已从 `loop.go` 拆到同包协作者：`web_runtime.go`（方案解析与 MCP 刷新）、`web_calls.go`（批量展开与父子映射）、`web_results.go`（内容/活动/引用聚合）、`tool_events.go`（事件投影）、`run_finalize.go`（终态、pending 关闭与结束原因）、`event_queue.go`（事件投递）。核心循环只负责：取当前运行快照、准备上下文、调用并校验模型、提交响应、执行工具批次、提交结果、判断下一轮或结束。控制流不依赖 Web metadata，也不依赖事件投递细节。
+
+### 请求生命周期与入口一致性
+
+CLI 与 TUI 共用同一套请求生命周期（`internal/app/request_runner.go` 的 `toolRun`）：组装执行器并绑定会话检查点、装配 turn 与 prepared 回调、记录请求开始、设定请求超时、持久化运行摘要与最终 Sync，以及两者失败时的优先级。前端只保留交互适配（输入解析、审批与提问、事件渲染、输出排版）。CLI 与 TUI 的可靠性保证因此无法分叉：`internal/app/entry_consistency_test.go` 用同一份脚本化模型分别驱动两个入口，比较调用终态、运行摘要计数、turn 角色序列、停止原因、用量与生命周期事件，同时忽略文本排版、时间戳与 ID；每个场景另外带有绝对契约，因为"两边一样错"也能通过纯比较。
+
+架构图、请求生命周期与所有权状态、工具执行阶段与检查点顺序、日志水位与逻辑去重规则、模型可见内容投影与预算定义、以及各不变式对应的测试位置，见 [`docs/architecture-and-reliability.md`](docs/architecture-and-reliability.md)。
 
 ### 代码上下文与后台子代理
 
