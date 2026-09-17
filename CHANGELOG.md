@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修复 TUI 决策面板的内联输入被裁掉：权限审批按 Tab 输入拒绝理由、计划门禁按 Tab 输入修改意见时，面板高度没有为这三行（空行、标签、输入框）预留空间，而输入框是面板的最后一行——典型终端高度下整段输入区被截掉，稍高一些只剩标签，于是"按了 Tab、也输了字"却什么都看不见。现在面板按需申请这三行，高度受限时先放弃上方的说明行而不是输入行（审批面板优先保留工具名与拒绝理由，计划门禁优先保留选项与反馈输入），编辑状态下页脚改为提示 `Enter` 提交 / `Esc` 返回选项；已输入的理由在退出编辑后仍然可见，提交的就是屏幕上显示的那一条。
+
 - **中断后停止批次调度（修复）**：批次在运行期接受用户中断（宿主工具通过 `ControlReporter` 返回 `ControlInterruptRequest`，例如关闭 `ask` 提问）后，此前只有预检阶段会阻止后续调用，调度循环仍会启动同批次尚未运行的调用——实测 `[ask, write_file]` 在关闭提问后文件仍被写入、`[ask, bash]` 命令仍被执行。"是否允许启动下一个调用"收敛为单一判断 `batchStopped`（同时考虑用户中断、请求取消与审批/检查点/调度等基础设施故障），未启动调用统一闭合为 `not_executed` 并在结果 metadata 上带 `interrupt_request`；请求级终态优先级固定为 abort > cancel > interrupt > continue，中断在败给更高优先级时仍保留在调用状态与结果上。
 
 - **意图收集严格无副作用（修复）**：`ReportIntent` 此前经由 `forWrite` 解析目标路径，而该路径在 `create_parent_dirs` 为真时会 `MkdirAll`——意图写入失败会留下新建目录，"未执行"只说对了一半；它还用 `context.Background()` 掩盖请求取消。现在新增无副作用的 `pathResolver.writeTarget`/`resolvedDirectory`（保留原有符号链接与越界校验），`MkdirAll` 只发生在执行阶段且位于意图持久化之后；`IntentReporter` 契约改为接收请求 context，读取原文件证据遵守既有 `previousHashMaxBytes` 上界。批量意图写入也不再描述一个它无法知道的状态：同一批次内命中同一目标路径的调用退回逐调用写入（在自身执行前读证据），不同目标仍保留单次批量 append。

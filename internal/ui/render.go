@@ -60,14 +60,38 @@ func (m *Model) layout() tuiLayout {
 }
 
 func (m *Model) decisionPanelHeight() int {
+	maximum := max(1, m.height-1-minViewportRows)
 	if m.ask != nil {
 		desired := max(8, min(12, m.height/2))
-		maximum := max(1, m.height-1-minViewportRows)
 		return min(desired, maximum)
 	}
 	desired := max(6, m.height/3)
-	maximum := max(1, m.height-1-minViewportRows)
+	// A decision panel can hold an inline input - the rejection reason of an approval
+	// or the revision feedback of a plan gate - and that input is three more rows. A
+	// height that does not ask for them cannot show them, and the input is the panel's
+	// last row: the user would type into a field that is never rendered.
+	if m.panelEditVisible() {
+		desired += panelEditRows
+	}
 	return min(desired, maximum)
+}
+
+// panelEditRows is the number of rows an inline panel input occupies: a blank line,
+// its label, and the input itself.
+const panelEditRows = 3
+
+// panelEditVisible reports whether the panel on screen is showing its inline input.
+//
+// The input stays visible after it loses focus while it holds something, so the
+// decision about to be submitted is the one on screen.
+func (m *Model) panelEditVisible() bool {
+	if m.approval != nil {
+		return m.approvalEditing || strings.TrimSpace(m.approvalReason.Value()) != ""
+	}
+	if m.planGate != nil {
+		return m.planGate.editing || strings.TrimSpace(m.planGate.feedback.Value()) != ""
+	}
+	return false
 }
 
 func (m *Model) View() tea.View {
@@ -1652,28 +1676,55 @@ func (m *Model) renderApproval(height int) string {
 	}
 	contentWidth := max(12, m.width-4)
 	header := panelHeader(accent.Bold(true).Render("Action approval"), fmt.Sprintf("%d/%d  %s", approval.Step, approval.Total, strings.ToUpper(approval.Risk)), contentWidth, m.styles)
-	lines := []string{header}
-	if height <= 7 {
-		lines = append(lines,
-			m.styles.Tool.Bold(true).Render(approval.Tool)+"  "+truncateColumns(approval.Summary, max(8, contentWidth-lipgloss.Width(approval.Tool)-2)),
-			m.styles.Muted.Render("Why  ")+truncateColumns(approval.Reason, max(8, contentWidth-5)),
-			renderChoiceRow([]string{"Yes", "No"}, m.approvalCursor, contentWidth, m.styles),
-		)
-	} else {
-		lines = append(lines,
+
+	// The panel gives up its detail before it gives up a decision. What is always
+	// kept is the choices and the rejection reason: a reason nobody can see is a
+	// reason nobody can correct, and the tool's summary is already on the request line
+	// above the panel.
+	contentRows := max(0, height-2)
+	reasonRows := 0
+	if m.panelEditVisible() {
+		reasonRows = panelEditRows
+	}
+	detailRows := max(0, contentRows-1-1-reasonRows)
+	var details []string
+	if detailRows >= 4 {
+		details = []string{
 			m.styles.Tool.Bold(true).Render(approval.Tool),
 			m.styles.Agent.Render(wrapLimited(approval.Summary, contentWidth, 1)),
-			m.styles.Muted.Render("Why  ")+wrapLimited(approval.Reason, max(8, contentWidth-5), 1),
-			m.styles.Muted.Render("Policy  "+truncateColumns(approval.PolicyReason, max(8, contentWidth-8))),
-			renderChoiceRow([]string{"Yes, run once", "No, reject"}, m.approvalCursor, contentWidth, m.styles),
-		)
+			m.styles.Muted.Render("Why  ") + wrapLimited(approval.Reason, max(8, contentWidth-5), 1),
+			m.styles.Muted.Render("Policy  " + truncateColumns(approval.PolicyReason, max(8, contentWidth-8))),
+		}
+	} else {
+		// A panel with room for only a few rows keeps the tool and the model's reason,
+		// merged on one line, because those are what the decision is about.
+		compact := []string{
+			m.styles.Tool.Bold(true).Render(approval.Tool) + "  " + truncateColumns(approval.Summary, max(8, contentWidth-lipgloss.Width(approval.Tool)-2)),
+			m.styles.Muted.Render("Why  ") + truncateColumns(approval.Reason, max(8, contentWidth-5)),
+			m.styles.Muted.Render("Policy  " + truncateColumns(approval.PolicyReason, max(8, contentWidth-8))),
+		}
+		details = compact[:min(detailRows, len(compact))]
 	}
-	if m.approvalEditing || strings.TrimSpace(m.approvalReason.Value()) != "" {
+
+	lines := make([]string, 0, contentRows)
+	lines = append(lines, header)
+	lines = append(lines, details...)
+	if detailRows >= 4 {
+		lines = append(lines, renderChoiceRow([]string{"Yes, run once", "No, reject"}, m.approvalCursor, contentWidth, m.styles))
+	} else {
+		lines = append(lines, renderChoiceRow([]string{"Yes", "No"}, m.approvalCursor, contentWidth, m.styles))
+	}
+	if reasonRows > 0 {
 		lines = append(lines, "", m.styles.Muted.Render("Rejection feedback"), m.approvalReason.View())
 	}
 	footer := "↑/↓ select  ·  Enter confirm  ·  Tab add rejection reason  ·  Esc reject"
 	if m.height < 18 {
 		footer = "Enter confirm  ·  Tab reason  ·  Esc reject"
+	}
+	if m.approvalEditing {
+		// While the reason is being typed, the keys that matter are the ones that end
+		// or leave the edit - not the ones that would submit the decision without it.
+		footer = "Type a reason  ·  Enter reject with it  ·  Esc back to the choices"
 	}
 	return m.renderBottomPanel(lines, footer, height)
 }
@@ -1687,25 +1738,40 @@ func (m *Model) renderPlanGate(height int) string {
 	if m.copyToast != "" {
 		meta = m.copyToast
 	}
-	lines := []string{panelHeader(m.styles.Accent.Render("Start implementation"), meta, contentWidth, m.styles)}
-	if height <= 7 {
-		lines = append(lines,
-			m.styles.Muted.Render("Choose the implementation permission mode."),
-			renderChoiceRow([]string{"Auto", "Full", "Reject"}, m.planGate.cursor, contentWidth, m.styles),
-		)
-	} else {
-		lines = append(lines,
+	header := panelHeader(m.styles.Accent.Render("Start implementation"), meta, contentWidth, m.styles)
+
+	// Same rule as the approval panel: the revision feedback is the row the user is
+	// typing into, so the description above it is what a short panel gives up.
+	contentRows := max(0, height-2)
+	editRows := 0
+	if m.panelEditVisible() {
+		editRows = panelEditRows
+	}
+	detailRows := max(0, contentRows-1-1-editRows)
+	var details []string
+	if detailRows >= 2 {
+		details = []string{
 			m.styles.Agent.Render("The final plan remains visible in the history above."),
 			m.styles.Muted.Render("Choose the permission mode for implementation."),
-			renderChoiceRow([]string{"Auto", "Full", "Reject"}, m.planGate.cursor, contentWidth, m.styles),
-		)
+		}
+	} else {
+		compact := []string{m.styles.Muted.Render("Choose the implementation permission mode.")}
+		details = compact[:min(detailRows, len(compact))]
 	}
-	if m.planGate.editing || strings.TrimSpace(m.planGate.feedback.Value()) != "" {
+
+	lines := make([]string, 0, contentRows)
+	lines = append(lines, header)
+	lines = append(lines, details...)
+	lines = append(lines, renderChoiceRow([]string{"Auto", "Full", "Reject"}, m.planGate.cursor, contentWidth, m.styles))
+	if editRows > 0 {
 		lines = append(lines, "", m.styles.Muted.Render("Plan feedback"), m.planGate.feedback.View())
 	}
 	footer := "←/→ select  ·  Enter confirm  ·  Tab revise plan  ·  Esc exit plan"
 	if m.height < 18 {
 		footer = "Enter confirm  ·  Tab revise  ·  Esc exit"
+	}
+	if m.planGate.editing {
+		footer = "Type the revision  ·  Enter request it  ·  Esc back to the choices"
 	}
 	return m.renderBottomPanel(lines, footer, height)
 }
