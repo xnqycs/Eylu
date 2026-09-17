@@ -135,8 +135,8 @@ func TestRunCountsCompactionSummaryUsage(t *testing.T) {
 	// The context layer reports the summary usage.
 	callbackConversation := compactableConversation()
 	recorded := make([]protocol.Usage, 0, 1)
-	if _, _, err := callbackConversation.prepareRequestContext(context.Background(), compactionUsageRuntime(&compactionSummaryDriver{}), nil, func(usage protocol.Usage) {
-		recorded = append(recorded, usage)
+	if _, _, err := callbackConversation.prepareRequestContext(context.Background(), compactionUsageRuntime(&compactionSummaryDriver{}), nil, contextRequestOptions{
+		onSummaryUsage: func(usage protocol.Usage) { recorded = append(recorded, usage) },
 	}); err != nil {
 		t.Fatal(err)
 	}

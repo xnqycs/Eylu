@@ -129,6 +129,9 @@ type searchAgentRunner struct {
 	started     bool
 	usage       protocol.Usage
 	usageExact  bool
+	// modelCalls counts every model call the subagent's own request made, so its
+	// cost is reported with it rather than folded into the parent's.
+	modelCalls int
 }
 
 func (r *searchAgentRunner) run(ctx context.Context, request tool.AgentTaskRequest, emit tool.AgentTaskEmitter) (tool.AgentTaskResult, error) {
@@ -179,11 +182,15 @@ func (r *searchAgentRunner) run(ctx context.Context, request tool.AgentTaskReque
 		}
 		r.started = true
 	}
+	// A subagent request is its own request: every model call it made is charged to
+	// it, not only the response that happened to be last. Reading the usage back
+	// from the finished response would lose every round before the final one.
+	var runUsage agent.RunUsage
 	response, err := r.child.Run(taskCtx, prompt, modelRuntime, executor, agent.LoopOptions{
-		MaxTurns: profile.MaxTurns, MaxTotalTokens: environment.config.MaxTotalTokens,
+		MaxTurns: profile.MaxTurns, MaxTotalTokens: environment.config.MaxTotalTokens, Usage: &runUsage,
 	}, true, modelEventEmitter(emit))
-	r.addUsage(response.Usage)
-	result := tool.AgentTaskResult{Output: modelResponseText(response), Usage: r.usage, Transcript: r.child.Transcript()}
+	r.addUsage(runUsage)
+	result := tool.AgentTaskResult{Output: modelResponseText(response), Usage: r.usage, ModelCalls: r.modelCalls, Transcript: r.child.Transcript()}
 	if err != nil {
 		return result, err
 	}
@@ -195,10 +202,13 @@ func (r *searchAgentRunner) run(ctx context.Context, request tool.AgentTaskReque
 	return result, nil
 }
 
-func (r *searchAgentRunner) addUsage(usage protocol.Usage) {
+func (r *searchAgentRunner) addUsage(usage agent.RunUsage) {
 	r.usage.InputTokens += usage.InputTokens
 	r.usage.OutputTokens += usage.OutputTokens
 	r.usage.ReasoningTokens += usage.ReasoningTokens
+	// Cached input tokens are a subset of the input tokens, never an addition.
+	r.usage.CachedInputTokens += usage.CachedInputTokens
+	r.modelCalls += usage.ModelCalls
 	r.usageExact = r.usageExact && usage.Exact
 	r.usage.Exact = r.usageExact
 }
@@ -212,6 +222,9 @@ type generalAgentRunner struct {
 	started     bool
 	usage       protocol.Usage
 	usageExact  bool
+	// modelCalls counts every model call the subagent's own request made, so its
+	// cost is reported with it rather than folded into the parent's.
+	modelCalls int
 }
 
 func (r *generalAgentRunner) run(ctx context.Context, request tool.AgentTaskRequest, emit tool.AgentTaskEmitter) (tool.AgentTaskResult, error) {
@@ -247,17 +260,24 @@ func (r *generalAgentRunner) run(ctx context.Context, request tool.AgentTaskRequ
 	}
 	taskCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// A subagent request is its own request: every model call it made is charged to
+	// it, not only the response that happened to be last.
+	var runUsage agent.RunUsage
 	response, err := r.child.Run(taskCtx, prompt, modelRuntime, r.executor, agent.LoopOptions{
 		MaxTurns: profile.MaxTurns, MaxTotalTokens: r.environment.config.MaxTotalTokens, RequestID: r.taskID,
+		Usage: &runUsage,
 	}, true, modelEventEmitter(emit))
-	r.addUsage(response.Usage)
-	return tool.AgentTaskResult{Output: modelResponseText(response), Usage: r.usage, Transcript: r.child.Transcript()}, err
+	r.addUsage(runUsage)
+	return tool.AgentTaskResult{Output: modelResponseText(response), Usage: r.usage, ModelCalls: r.modelCalls, Transcript: r.child.Transcript()}, err
 }
 
-func (r *generalAgentRunner) addUsage(usage protocol.Usage) {
+func (r *generalAgentRunner) addUsage(usage agent.RunUsage) {
 	r.usage.InputTokens += usage.InputTokens
 	r.usage.OutputTokens += usage.OutputTokens
 	r.usage.ReasoningTokens += usage.ReasoningTokens
+	// Cached input tokens are a subset of the input tokens, never an addition.
+	r.usage.CachedInputTokens += usage.CachedInputTokens
+	r.modelCalls += usage.ModelCalls
 	r.usageExact = r.usageExact && usage.Exact
 	r.usage.Exact = r.usageExact
 }

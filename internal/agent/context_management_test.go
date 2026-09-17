@@ -229,7 +229,7 @@ func TestCompactionUsesConfiguredWatermarksAndModelSummary(t *testing.T) {
 		ContextRecentRounds: 2, ContextCompactTrigger: 85, ContextCompactTarget: 60, MaxSummaryBytes: 512,
 		ContextEvent: func(event contextledger.Event) { events = append(events, event) },
 	}
-	prepared, contextEvents, err := conversation.prepareRequestContext(context.Background(), runtime, nil, nil)
+	prepared, contextEvents, err := conversation.prepareRequestContext(context.Background(), runtime, nil, contextRequestOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

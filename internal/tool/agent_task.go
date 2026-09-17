@@ -53,9 +53,14 @@ type AgentTaskRequest struct {
 func (AgentTaskRequest) Background() bool { return true }
 
 type AgentTaskResult struct {
-	Output     string          `json:"output,omitempty"`
-	Report     *SearchReport   `json:"report,omitempty"`
-	Usage      protocol.Usage  `json:"usage,omitzero"`
+	Output string         `json:"output,omitempty"`
+	Report *SearchReport  `json:"report,omitempty"`
+	Usage  protocol.Usage `json:"usage,omitzero"`
+	// ModelCalls counts the model calls the subagent's own request made. A
+	// subagent runs its own request and may outlive the parent, so its cost is
+	// reported with it - tokens and calls - rather than being merged into the
+	// parent's totals.
+	ModelCalls int             `json:"model_calls,omitempty"`
 	Transcript []protocol.Turn `json:"transcript,omitempty"`
 }
 
@@ -79,6 +84,7 @@ type AgentTask struct {
 	Output               string                       `json:"output,omitempty"`
 	Report               *SearchReport                `json:"report,omitempty"`
 	Usage                protocol.Usage               `json:"usage,omitzero"`
+	ModelCalls           int                          `json:"model_calls,omitempty"`
 	Transcript           []protocol.Turn              `json:"transcript,omitempty"`
 	Conversation         []AgentTaskConversationEntry `json:"conversation,omitempty"`
 	ConversationRevision uint64                       `json:"conversation_revision,omitempty"`
@@ -646,6 +652,7 @@ func (m *AgentTaskManager) finishTurn(taskID string, result AgentTaskResult, err
 		task.Report = &report
 	}
 	task.Usage = result.Usage
+	task.ModelCalls = result.ModelCalls
 	if result.Transcript != nil {
 		task.Transcript = cloneAgentTurns(result.Transcript)
 	}

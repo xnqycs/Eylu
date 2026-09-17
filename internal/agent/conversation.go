@@ -469,8 +469,11 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 		// lock for its own short parts and releases it around the compaction
 		// summary, which is a model call. Only the immutable snapshot the request
 		// is built from is read under the lock.
-		prepared, contextEvents, err := c.prepareRequestContext(ctx, runtime, definitions, func(usage protocol.Usage) {
-			budget.add(callSummary, usage)
+		prepared, contextEvents, err := c.prepareRequestContext(ctx, runtime, definitions, contextRequestOptions{
+			// The summary is charged to this request, and a request that cannot
+			// afford it is not allowed to start one.
+			onSummaryUsage: func(usage protocol.Usage) { budget.add(callSummary, usage) },
+			admitSummary:   budget.admits,
 		})
 		c.mu.Lock()
 		request := driver.Request{

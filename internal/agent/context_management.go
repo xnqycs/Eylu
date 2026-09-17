@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -73,6 +74,20 @@ func optionsForRuntime(runtime Runtime) contextOptions {
 	return options
 }
 
+// contextRequestOptions carries the request-level decisions the context layer has
+// to respect.
+type contextRequestOptions struct {
+	// onSummaryUsage is told what a compaction summary cost. It is how the cost of
+	// a summary that belongs to this request reaches the request budget.
+	onSummaryUsage func(protocol.Usage)
+	// admitSummary decides whether a compaction summary may be started at all,
+	// given its estimated input and the output the call may produce. A request that
+	// cannot afford the summary uses deterministic compaction instead of spending
+	// budget it was told to respect. A nil value admits every summary, which is
+	// what a manual compaction wants: it has no request budget to respect.
+	admitSummary func(inputTokens, outputReserve int) bool
+}
+
 // prepareRequestContext builds the request context and buffers the host context
 // events it would report. The caller delivers them after the state lock is
 // released, so a context callback can read the conversation without deadlocking.
@@ -82,18 +97,18 @@ func optionsForRuntime(runtime Runtime) contextOptions {
 // must not stop the conversation from being read, exported or stopped. The result
 // of that call is committed only under the lock, and only while the state it was
 // computed from is still current.
-func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, []contextledger.Event, error) {
+func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, options contextRequestOptions) (contextledger.PromptResult, []contextledger.Event, error) {
 	var collected []contextledger.Event
 	if runtime.ContextEvent != nil {
 		runtime.ContextEvent = func(event contextledger.Event) { collected = append(collected, event) }
 	}
-	prepared, err := c.prepareRequestContextLocked(ctx, runtime, definitions, onSummaryUsage)
+	prepared, err := c.prepareRequestContextLocked(ctx, runtime, definitions, options)
 	return prepared, collected, err
 }
 
 // prepareRequestContextLocked does the work and takes the state lock around the
 // short parts of it.
-func (c *Conversation) prepareRequestContextLocked(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, error) {
+func (c *Conversation) prepareRequestContextLocked(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, requestOptions contextRequestOptions) (contextledger.PromptResult, error) {
 	options := optionsForRuntime(runtime)
 	c.mu.Lock()
 	c.ledger.SetEstimator(options.estimator)
@@ -121,12 +136,13 @@ func (c *Conversation) prepareRequestContextLocked(ctx context.Context, runtime 
 				c.mu.Unlock()
 				prepared = planned
 			} else {
+				plan.admitSummary = requestOptions.admitSummary
 				var event contextledger.CompressionEvent
 				prepared, event, err = c.runCompaction(ctx, *plan)
 				// A summary call is part of this request even when the compaction it
 				// was meant to produce is rejected, so its usage is always reported.
-				if onSummaryUsage != nil && (event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0) {
-					onSummaryUsage(event.Usage)
+				if requestOptions.onSummaryUsage != nil && (event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0) {
+					requestOptions.onSummaryUsage(event.Usage)
 				}
 				if err != nil {
 					return contextledger.PromptResult{}, err
@@ -294,6 +310,10 @@ type compactionPlan struct {
 
 	// summary is the input of the model call that produces the semantic summary.
 	summary summaryInput
+	// admitSummary decides whether that call may be started at all. It is the
+	// request's budget admission, so a request that cannot afford the summary uses
+	// the deterministic result instead of spending budget it was told to respect.
+	admitSummary func(inputTokens, outputReserve int) bool
 
 	event       contextledger.CompressionEvent
 	window      int
@@ -404,6 +424,14 @@ func (c *Conversation) runCompaction(ctx context.Context, plan compactionPlan) (
 		startEvent := plan.event
 		plan.runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionStarted, InputTokens: plan.prepared.InputTokens(), OutputReserve: plan.options.outputReserve, ContextWindow: plan.window, Compression: &startEvent})
 	}
+	if plan.admitSummary != nil && !plan.admitSummary(plan.summaryInputTokens(), plan.options.outputReserve) {
+		// The summary is a paid model call, and the request cannot afford it. It is
+		// not started: the deterministic compaction is used instead, which costs
+		// nothing and is what the request is allowed to spend.
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.commitCompactionLocked(plan, "", errSummaryNotAdmitted)
+	}
 	summary, usage, semanticErr := c.buildSemanticSummary(ctx, plan.runtime, plan.options, plan.summary)
 	// The summary call already happened, so its usage belongs to the request even
 	// when the compaction is later rejected or falls back.
@@ -417,6 +445,26 @@ func (c *Conversation) runCompaction(ctx context.Context, plan compactionPlan) (
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.commitCompactionLocked(plan, summary, semanticErr)
+}
+
+// errSummaryNotAdmitted reports that a compaction summary was not started because
+// the request could not afford it.
+var errSummaryNotAdmitted = errors.New("the compaction summary was not admitted by the request budget")
+
+// summaryInputTokens estimates the summary request this plan would send. It is
+// what the budget admission is asked about, so it has to describe the same input
+// the call would carry.
+func (p compactionPlan) summaryInputTokens() int {
+	return p.options.estimator.Estimate(semanticSummaryPrompt) + p.options.estimator.Estimate(summarySource(p.summary))
+}
+
+// summarySource renders the input of a compaction summary.
+func summarySource(input summaryInput) string {
+	encoded, err := json.Marshal(input.turns)
+	if err != nil {
+		encoded = nil
+	}
+	return "<previous_summary>\n" + input.previousSummary + "\n</previous_summary>\n<continuity_ledger>\n" + input.stagedSummary + "\n</continuity_ledger>\n<compressed_turns>\n" + string(encoded) + "\n</compressed_turns>"
 }
 
 // commitCompactionLocked validates the summary against the state the plan was
@@ -534,11 +582,7 @@ func (c *Conversation) buildSemanticSummary(ctx context.Context, runtime Runtime
 	if runtime.Driver == nil {
 		return "", protocol.Usage{}, fmt.Errorf("model driver is nil")
 	}
-	encoded, err := json.Marshal(input.turns)
-	if err != nil {
-		return "", protocol.Usage{}, err
-	}
-	source := "<previous_summary>\n" + input.previousSummary + "\n</previous_summary>\n<continuity_ledger>\n" + input.stagedSummary + "\n</continuity_ledger>\n<compressed_turns>\n" + string(encoded) + "\n</compressed_turns>"
+	source := summarySource(input)
 	window := runtime.Provider.ContextWindowLimit()
 	if window > 0 && options.estimator.Estimate(semanticSummaryPrompt+source)+max(512, options.estimator.Estimate(strings.Repeat("x", options.summaryBytes))) > window {
 		return "", protocol.Usage{}, fmt.Errorf("semantic compaction input exceeds the model context window")
