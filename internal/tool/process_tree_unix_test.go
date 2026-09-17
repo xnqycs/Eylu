@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -32,7 +33,11 @@ func TestCancellingACommandKillsItsProcessGroup(t *testing.T) {
 	// The shell backgrounds a long sleep and prints its pid, so the test knows
 	// which process must not survive.
 	command := exec.Command("sh", "-c", "sleep 30 & echo $!; wait")
-	var output strings.Builder
+	// The command writes to this buffer from its own goroutine while the test polls
+	// it, so it is guarded: the first version used a bare strings.Builder and the
+	// race detector found it. That is a race in the test, not in the code under
+	// test, and it is reported here rather than hidden by a sleep.
+	var output guardedBuffer
 	command.Stdout = &output
 	done := make(chan error, 1)
 	go func() { done <- runCommandTree(ctx, command) }()
@@ -80,6 +85,24 @@ func TestCancellingACommandKillsItsProcessGroup(t *testing.T) {
 	if !gone {
 		t.Fatalf("the child %d survived the cancellation", childPID)
 	}
+}
+
+// guardedBuffer is a writer that can be read while another goroutine writes it.
+type guardedBuffer struct {
+	mu    sync.Mutex
+	value strings.Builder
+}
+
+func (b *guardedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.value.Write(p)
+}
+
+func (b *guardedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.value.String()
 }
 
 // A command that finishes before its context is cancelled is reported normally, so

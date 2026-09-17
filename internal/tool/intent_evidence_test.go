@@ -28,16 +28,19 @@ func TestIntentEvidenceIsAHashForSmallTargetsAndAMarkerForLargeOnes(t *testing.T
 	}
 
 	smallPath, smallEvidence := write.ReportIntent(json.RawMessage(`{"path":"small.txt"}`))
-	if smallPath != small {
-		t.Fatalf("path = %q", smallPath)
+	// The resolver reports the path with symlinks and short names resolved, so the
+	// assertion is about identity and not about the string: on a runner whose temp
+	// directory is reached through a symlink the two legitimately differ.
+	if !sameFile(t, smallPath, small) {
+		t.Fatalf("path = %q, want the same file as %q", smallPath, small)
 	}
 	if strings.HasPrefix(smallEvidence, weakEvidencePrefix) || smallEvidence != fileContentHash(small) {
 		t.Fatalf("a small target should be hashed: %q", smallEvidence)
 	}
 
 	largePath, largeEvidence := write.ReportIntent(json.RawMessage(`{"path":"large.txt"}`))
-	if largePath != large {
-		t.Fatalf("path = %q", largePath)
+	if !sameFile(t, largePath, large) {
+		t.Fatalf("path = %q, want the same file as %q", largePath, large)
 	}
 	if !strings.HasPrefix(largeEvidence, weakEvidencePrefix) {
 		t.Fatalf("a large target should carry a marked weak marker: %q", largeEvidence)
@@ -45,6 +48,20 @@ func TestIntentEvidenceIsAHashForSmallTargetsAndAMarkerForLargeOnes(t *testing.T
 	if largeEvidence == fileContentHash(large) {
 		t.Fatal("a large target was hashed anyway")
 	}
+}
+
+// sameFile reports whether two paths name the same file.
+func sameFile(t *testing.T, left, right string) bool {
+	t.Helper()
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		t.Fatalf("stat %q: %v", left, err)
+	}
+	rightInfo, err := os.Stat(right)
+	if err != nil {
+		t.Fatalf("stat %q: %v", right, err)
+	}
+	return os.SameFile(leftInfo, rightInfo)
 }
 
 // The weakness is real and the marker says so: a rewrite that preserves size and
