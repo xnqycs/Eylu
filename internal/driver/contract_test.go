@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -402,6 +403,75 @@ func generateOnce(t *testing.T, dialect stopDialect, body string, stream, accept
 		}}},
 	}
 	return dialect.new(server.Client()).Generate(context.Background(), request, nil)
+}
+
+// A rich tool result must reach every provider as the same bounded projection the
+// context ledger measures.
+//
+// The ledger charges by characters while a provider request can only carry text, so
+// a driver that serialized the stored blocks and structured content on its own
+// would send content nobody counted - megabytes of base64 for one image, charged as
+// a few hundred characters. Every dialect has to send the protocol's projection.
+func TestDriversSendTheProjectedToolResult(t *testing.T) {
+	imageBytes := []byte(strings.Repeat("A", 1<<20))
+	deep := make(map[string]any, 64)
+	for index := 0; index < 64; index++ {
+		deep[strings.Repeat("k", index+1)] = strings.Repeat("v", 512)
+	}
+	structured, err := json.Marshal(deep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := protocol.ToolResult{
+		CallID: "call-1", Content: "a summary",
+		ContentBlocks:     []protocol.ContentBlock{{Type: protocol.ContentImage, MIMEType: "image/png", Data: imageBytes}},
+		StructuredContent: structured,
+	}
+	projection := protocol.ToolResultText(result)
+	if !strings.Contains(projection, strconv.Itoa(len(imageBytes))) {
+		t.Fatalf("the fixture does not describe its binary payload: %q", projection)
+	}
+
+	for _, dialect := range stopContractDialects() {
+		t.Run(dialect.name, func(t *testing.T) {
+			call := protocol.ToolCall{ID: "call-1", Name: "fixture", Arguments: json.RawMessage(`{}`)}
+			turns := []protocol.Turn{
+				{ID: "user", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "run"}}},
+				{ID: "agent", Role: protocol.RoleAgent, Parts: []protocol.Part{{Kind: protocol.PartToolCall, ToolCall: &call}}},
+				{ID: "tools", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: &result}}},
+			}
+			body := requestBodyOnce(t, dialect, turns)
+			sent := strings.Join(collectStrings(body), "\n")
+			if strings.Contains(sent, "AAAAAAAA") {
+				t.Fatal("the binary payload was inlined into the request")
+			}
+			if !strings.Contains(sent, "a summary") {
+				t.Fatalf("the result text is missing from the request: %q", sent)
+			}
+			if !strings.Contains(sent, "image/png") {
+				t.Fatalf("the projection of the image is missing: %q", sent)
+			}
+		})
+	}
+}
+
+// collectStrings walks a decoded request and returns every string in document
+// order, which is enough to assert what a dialect actually put on the wire.
+func collectStrings(value any) []string {
+	result := make([]string, 0, 16)
+	switch typed := value.(type) {
+	case string:
+		return append(result, typed)
+	case []any:
+		for _, item := range typed {
+			result = append(result, collectStrings(item)...)
+		}
+	case map[string]any:
+		for _, item := range typed {
+			result = append(result, collectStrings(item)...)
+		}
+	}
+	return result
 }
 
 // Every system segment a session builds must reach the provider, in order, on

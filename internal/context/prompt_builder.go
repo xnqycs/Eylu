@@ -160,6 +160,17 @@ func (b *PromptBuilder) AddTurn(turn protocol.Turn) {
 		if part.ToolResult != nil {
 			result := *part.ToolResult
 			result.Metadata = clonePromptMetadata(part.ToolResult.Metadata)
+			// The request carries the projection of the stored result, never the
+			// stored result itself. The ledger charges by characters, so counting
+			// one field while three are sent is how a request silently exceeds the
+			// window it was budgeted for.
+			projection := protocol.ProjectToolResult(*part.ToolResult)
+			result.Content = projection.Text
+			result.ContentBlocks = nil
+			result.StructuredContent = nil
+			if projection.Omitted {
+				result.Truncated = true
+			}
 			turn.Parts[index].ToolResult = &result
 		}
 	}

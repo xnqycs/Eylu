@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,22 +11,17 @@ import (
 	"Eylu/internal/protocol"
 )
 
-// ToolResultContent preserves the historical plain-string representation and
-// carries richer MCP result fields when a tool returned them.
+// ToolResultContent returns the text one provider request carries for a tool
+// result.
+//
+// It is the protocol's own projection, not a second rendering of the same result:
+// the context ledger estimates that projection, so a driver that serialized the
+// stored rich fields by itself would send content nobody measured. A result that
+// only carries text therefore still arrives as plain text, exactly as before, and
+// a rich one arrives as the bounded projection of its blocks and structured
+// content.
 func ToolResultContent(result protocol.ToolResult) string {
-	if len(result.ContentBlocks) == 0 && len(result.StructuredContent) == 0 {
-		return result.Content
-	}
-	value := struct {
-		Content           string                  `json:"content"`
-		ContentBlocks     []protocol.ContentBlock `json:"content_blocks,omitempty"`
-		StructuredContent json.RawMessage         `json:"structured_content,omitempty"`
-	}{Content: result.Content, ContentBlocks: result.ContentBlocks, StructuredContent: result.StructuredContent}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return result.Content
-	}
-	return string(encoded)
+	return protocol.ToolResultText(result)
 }
 
 type Capabilities struct {

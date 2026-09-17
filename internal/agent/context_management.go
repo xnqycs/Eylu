@@ -728,7 +728,22 @@ func contextualizeTurn(turn protocol.Turn, maxToolBytes int) (protocol.Turn, boo
 		if part.ToolResult != nil {
 			toolResult := *part.ToolResult
 			toolResult.Metadata = cloneMetadata(part.ToolResult.Metadata)
-			trimmed, retained, retainedBytes, complete := trimToolResultContent(part.ToolResult.Content, maxToolBytes, declaredStartLine(toolResult.Metadata))
+			// The projection is applied before the trim, not after it: the trim is
+			// what bounds the request, and it can only bound what the request will
+			// actually carry. The stored result keeps its blocks and its structured
+			// content; only this copy is projected.
+			projection := protocol.ProjectToolResult(*part.ToolResult)
+			toolResult.Content = projection.Text
+			toolResult.ContentBlocks = nil
+			toolResult.StructuredContent = nil
+			if projection.Omitted {
+				toolResult.Truncated = true
+				if toolResult.Metadata == nil {
+					toolResult.Metadata = make(map[string]any, 1)
+				}
+				toolResult.Metadata["projection_omitted"] = true
+			}
+			trimmed, retained, retainedBytes, complete := trimToolResultContent(projection.Text, maxToolBytes, declaredStartLine(toolResult.Metadata))
 			if !complete {
 				// The body no longer covers the line range its metadata declares,
 				// so the copy is explicitly marked incomplete and reports the lines
