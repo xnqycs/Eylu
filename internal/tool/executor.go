@@ -402,10 +402,18 @@ func (e *Executor) ExecuteBatchOutcome(ctx context.Context, requestID string, ca
 // resolveBatchControl maps the failures observed by one batch to its
 // request-level control state.
 //
-// batchErr only ever holds an approval-channel, hook or scheduler failure: an
-// ordinary tool failure never reaches it, so the model keeps the chance to
-// adjust. The request cancellation is a separate cause and is preserved beside
-// an infrastructure failure.
+// batchErr only ever holds an approval-channel, hook, checkpoint or scheduler
+// failure: an ordinary tool failure never reaches it, so the model keeps the
+// chance to adjust. The request cancellation is a separate cause and is
+// preserved beside an infrastructure failure.
+//
+// The order below is the priority between competing stop reasons, and it is
+// deliberately fixed: an infrastructure failure leads because a batch that
+// cannot record what it does must not keep working whatever else happened; a
+// request cancellation leads a user interruption because it is the wider stop.
+// The interruption is never lost when it loses here - it stays on the call
+// states and on the not-executed results, so "the user stopped this" is still
+// readable from the outcome.
 func resolveBatchControl(ctx context.Context, batchErr error, interrupted bool) (protocol.BatchControl, error) {
 	if batchErr != nil {
 		return protocol.ControlAbortRequest, joinBatchError(batchErr, ctx.Err())
@@ -417,6 +425,42 @@ func resolveBatchControl(ctx context.Context, batchErr error, interrupted bool) 
 		return protocol.ControlInterruptRequest, nil
 	}
 	return protocol.ControlContinue, nil
+}
+
+// batchStopped reports whether the batch may still start the next call.
+//
+// It is the single answer to "may another call begin", and it is deliberately
+// derived from the same three observations resolveBatchControl reports: an
+// accepted user interruption, a request cancellation, and an infrastructure
+// failure. Every place that decides to start a call asks this one function, so
+// a control state that says "stopped" can never coexist with a call that
+// started after it.
+func batchStopped(ctx context.Context, batchErr error, interrupted bool) bool {
+	return interrupted || batchErr != nil || ctx.Err() != nil
+}
+
+// notStartedResult builds the terminal result of a call that was prepared but
+// never allowed to start. It says why no work happened and never claims
+// success; the interruption flag is carried explicitly so a reader does not
+// have to infer "the user stopped this" from the message text.
+func notStartedResult(call protocol.ToolCall, message string, interrupted bool) protocol.ToolResult {
+	metadata := map[string]any{"batch_cancelled": true}
+	if interrupted {
+		metadata["interrupt_request"] = true
+	}
+	return protocol.ToolResult{CallID: call.ID, Content: message, IsError: true, Metadata: metadata}
+}
+
+// notStartedMessage names the reason a prepared call was never allowed to start.
+func notStartedMessage(batchErr error, interrupted bool) string {
+	switch {
+	case batchErr != nil:
+		return "tool execution cancelled"
+	case interrupted:
+		return "tool execution cancelled by user interruption"
+	default:
+		return "tool execution cancelled by batch preflight"
+	}
 }
 
 func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []protocol.ToolCall, hooks BatchHooks, limit int) ([]protocol.ToolResult, protocol.BatchOutcome) {
@@ -451,7 +495,7 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 		// cancelled request never reaches the approval or execution stage.
 		batchErr = joinBatchError(batchErr, ctx.Err())
 		if interrupted || batchErr != nil {
-			prepared[index] = e.cancelledPrepared(requestID, batchID, index, call, queuedAt, "tool execution cancelled by batch preflight")
+			prepared[index] = e.cancelledPrepared(requestID, batchID, index, call, queuedAt, notStartedMessage(batchErr, interrupted), interrupted)
 			continue
 		}
 		prepared[index] = e.prepareCall(batchCtx, requestID, batchID, index, call, queuedAt)
@@ -466,15 +510,12 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 		}
 	}
 	if interrupted || batchErr != nil {
-		message := "tool execution cancelled by batch preflight"
-		if batchErr != nil {
-			message = "tool execution cancelled"
-		}
+		message := notStartedMessage(batchErr, interrupted)
 		for index, item := range prepared {
 			if item == nil {
-				prepared[index] = e.cancelledPrepared(requestID, batchID, index, calls[index], queuedAt, message)
+				prepared[index] = e.cancelledPrepared(requestID, batchID, index, calls[index], queuedAt, message, interrupted)
 			} else if item.terminal == nil {
-				result := protocol.ToolResult{CallID: item.call.ID, Content: message, IsError: true, Metadata: map[string]any{"batch_cancelled": true}}
+				result := notStartedResult(item.call, message, interrupted)
 				item.terminal = &result
 				item.state = protocol.CallNotExecuted
 			}
@@ -517,12 +558,12 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 	completion := make(chan batchCompletion, len(prepared))
 	contextDone := batchCtx.Done()
 	for completed < len(prepared) {
-		if batchErr == nil && batchCtx.Err() == nil {
+		if !batchStopped(batchCtx, batchErr, interrupted) {
 			for len(active) < limit {
-				// A cancellation observed at any point before this call starts
-				// must prevent the call from starting. The cancellation reaches
+				// A stop observed at any point before this call starts
+				// must prevent the call from starting. The stop reason reaches
 				// the caller through resolveBatchControl.
-				if batchCtx.Err() != nil {
+				if batchStopped(batchCtx, batchErr, interrupted) {
 					break
 				}
 				index := nextRunnable(prepared, active)
@@ -539,11 +580,11 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 					}
 					item.startNotified = true
 				}
-				// OnStart may itself observe or trigger a cancellation, so the
-				// check is repeated before the call is actually started. The
+				// OnStart may itself observe or trigger a stop, so the check is
+				// repeated before the call is actually started. The
 				// cancellation is reported by resolveBatchControl rather than
 				// being folded into the infrastructure failure.
-				if batchCtx.Err() != nil {
+				if batchStopped(batchCtx, batchErr, interrupted) {
 					break
 				}
 				item.running = true
@@ -556,19 +597,22 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 				}
 			}
 		}
-		if batchCtx.Err() != nil {
-			// Drain the calls that never started. The cancellation itself is
-			// reported by resolveBatchControl, which owns the request-level
-			// control state; a batch-local cancel derived from a hook failure is
-			// deliberately not reported again, so the original failure stays the
-			// leading cause.
+		if batchStopped(batchCtx, batchErr, interrupted) {
+			// Close the calls that never started. An interruption accepted while
+			// the batch was running reaches this point with the request context
+			// still alive, so the drain must be driven by the stop predicate and
+			// not by the cancellation alone. The stop reason itself is reported
+			// by resolveBatchControl, which owns the request-level control state;
+			// a batch-local cancel derived from a hook failure is deliberately
+			// not reported again, so the original failure stays the leading
+			// cause.
+			message := notStartedMessage(batchErr, interrupted)
 			for index, item := range prepared {
 				if item.done || item.running {
 					continue
 				}
 				item.state = protocol.CallNotExecuted
-				result := protocol.ToolResult{CallID: item.call.ID, Content: "tool execution cancelled", IsError: true, Metadata: map[string]any{"batch_cancelled": true}}
-				result, hookErr := e.deliverTerminal(item, result, hooks)
+				result, hookErr := e.deliverTerminal(item, notStartedResult(item.call, message, interrupted), hooks)
 				results[index] = result
 				item.done = true
 				completed++
@@ -583,7 +627,7 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 			break
 		}
 		if len(active) == 0 {
-			if batchErr == nil && batchCtx.Err() == nil {
+			if !batchStopped(batchCtx, batchErr, interrupted) {
 				batchErr = fmt.Errorf("tool scheduler could not make progress")
 				cancel()
 				continue
@@ -757,14 +801,14 @@ func cancelledExecution(prepared *preparedCall, err error) protocol.ToolResult {
 	return protocol.ToolResult{CallID: prepared.call.ID, Content: message, IsError: true}
 }
 
-func (e *Executor) cancelledPrepared(requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time, message string) *preparedCall {
+func (e *Executor) cancelledPrepared(requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time, message string, interrupted bool) *preparedCall {
 	prepared := &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}, state: protocol.CallNotExecuted}
 	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, ParentCallID: call.ParentCallID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
 	if e != nil {
 		prepared.record.SessionID, prepared.record.ProviderName = e.SessionID, e.ProviderName
 		prepared.record.ProviderGeneration, prepared.record.Model = e.ProviderGeneration, e.Model
 	}
-	result := protocol.ToolResult{CallID: call.ID, Content: message, IsError: true, Metadata: map[string]any{"batch_cancelled": true}}
+	result := notStartedResult(call, message, interrupted)
 	prepared.terminal = &result
 	return prepared
 }
@@ -892,6 +936,7 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 // A sink that does not implement BatchCheckpointSink is left alone: the per-call
 // path in executePrepared writes its own intent immediately before its call, which
 // is the same guarantee at a higher cost.
+
 func (e *Executor) recordBatchIntents(ctx context.Context, prepared []*preparedCall) error {
 	if e == nil || e.Checkpoint == nil {
 		return nil
