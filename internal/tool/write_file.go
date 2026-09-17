@@ -62,6 +62,11 @@ const previousHashMaxBytes = 4 << 20
 // ReportIntent describes the recovery hints of one call without running it: the
 // resolved path and the evidence of what the target held before.
 //
+// It is preparation, not execution: it creates no directory and writes no file.
+// The path comes from the side-effect-free resolver because the parent directories
+// of the write are created later, by the write itself, and only after this intent
+// is durable.
+//
 // Below the size bound that evidence is the hash of the content, which is strong:
 // if the content still matches, the operation provably did not change the target.
 // Above it only the size and modification time are recorded, marked as weak.
@@ -69,19 +74,21 @@ const previousHashMaxBytes = 4 << 20
 // preserves both size and timestamp (within the filesystem's granularity) leaves
 // the same marker, so a match is a hint rather than proof, and recovery reports it
 // as weak instead of drawing a firm conclusion from it.
-func (w *WriteFile) ReportIntent(raw json.RawMessage) (string, string) {
+func (w *WriteFile) ReportIntent(ctx context.Context, raw json.RawMessage) (string, string) {
+	if ctx.Err() != nil {
+		return "", ""
+	}
 	var input struct {
-		Path             string `json:"path"`
-		CreateParentDirs bool   `json:"create_parent_dirs"`
+		Path string `json:"path"`
 	}
 	if json.Unmarshal(raw, &input) != nil {
 		return "", ""
 	}
-	path, err := w.paths.forWrite(context.Background(), input.Path, input.CreateParentDirs)
+	path, err := w.paths.writeTarget(input.Path)
 	if err != nil {
 		return input.Path, ""
 	}
-	return path, previousContentEvidence(path)
+	return path, previousContentEvidence(ctx, path)
 }
 
 // weakEvidencePrefix marks evidence that is a size and a timestamp rather than a
@@ -91,7 +98,14 @@ const weakEvidencePrefix = "weak:"
 // previousContentEvidence returns what the target held before the call: the hash
 // of its content when it is small enough to read, a weak size/timestamp marker
 // when it is not, and nothing when it does not exist.
-func previousContentEvidence(path string) string {
+//
+// The read is bounded by previousHashMaxBytes, so describing an intent cannot turn
+// into an unbounded read of a large target, and it gives up when the request is
+// cancelled: a request that will not write must not keep reading.
+func previousContentEvidence(ctx context.Context, path string) string {
+	if ctx.Err() != nil {
+		return ""
+	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return ""
@@ -99,15 +113,19 @@ func previousContentEvidence(path string) string {
 	if info.Size() > previousHashMaxBytes {
 		return fmt.Sprintf("%ssize=%d:mtime=%d", weakEvidencePrefix, info.Size(), info.ModTime().Unix())
 	}
-	return fileContentHash(path)
+	return fileContentHash(ctx, path)
 }
 
 // fileContentHash returns the hash of a file's current content, or an empty
-// string when it does not exist or cannot be read. It is evidence for recovery,
-// never a precondition for writing.
-func fileContentHash(path string) string {
+// string when it does not exist, cannot be read, or the request was cancelled
+// while it was being read. It is evidence for recovery, never a precondition for
+// writing.
+func fileContentHash(ctx context.Context, path string) string {
+	if ctx.Err() != nil {
+		return ""
+	}
 	data, err := os.ReadFile(path)
-	if err != nil {
+	if err != nil || ctx.Err() != nil {
 		return ""
 	}
 	sum := sha256.Sum256(data)
@@ -162,7 +180,7 @@ func (w *WriteFile) Execute(ctx context.Context, raw json.RawMessage) protocol.T
 		return toolError(statErr.Error())
 	}
 	content := []byte(input.Content)
-	previousHash := fileContentHash(path)
+	previousHash := fileContentHash(ctx, path)
 	if err := writeFileAtomically(ctx, path, content, mode); err != nil {
 		// Once the atomic replace succeeded the write has happened, so a
 		// cancellation observed afterwards must not be reported as a failure.

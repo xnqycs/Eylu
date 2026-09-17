@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -27,25 +28,25 @@ func TestIntentEvidenceIsAHashForSmallTargetsAndAMarkerForLargeOnes(t *testing.T
 		t.Fatal(err)
 	}
 
-	smallPath, smallEvidence := write.ReportIntent(json.RawMessage(`{"path":"small.txt"}`))
+	smallPath, smallEvidence := write.ReportIntent(context.Background(), json.RawMessage(`{"path":"small.txt"}`))
 	// The resolver reports the path with symlinks and short names resolved, so the
 	// assertion is about identity and not about the string: on a runner whose temp
 	// directory is reached through a symlink the two legitimately differ.
 	if !sameFile(t, smallPath, small) {
 		t.Fatalf("path = %q, want the same file as %q", smallPath, small)
 	}
-	if strings.HasPrefix(smallEvidence, weakEvidencePrefix) || smallEvidence != fileContentHash(small) {
+	if strings.HasPrefix(smallEvidence, weakEvidencePrefix) || smallEvidence != fileContentHash(context.Background(), small) {
 		t.Fatalf("a small target should be hashed: %q", smallEvidence)
 	}
 
-	largePath, largeEvidence := write.ReportIntent(json.RawMessage(`{"path":"large.txt"}`))
+	largePath, largeEvidence := write.ReportIntent(context.Background(), json.RawMessage(`{"path":"large.txt"}`))
 	if !sameFile(t, largePath, large) {
 		t.Fatalf("path = %q, want the same file as %q", largePath, large)
 	}
 	if !strings.HasPrefix(largeEvidence, weakEvidencePrefix) {
 		t.Fatalf("a large target should carry a marked weak marker: %q", largeEvidence)
 	}
-	if largeEvidence == fileContentHash(large) {
+	if largeEvidence == fileContentHash(context.Background(), large) {
 		t.Fatal("a large target was hashed anyway")
 	}
 }
@@ -78,7 +79,7 @@ func TestWeakEvidenceCannotTellARewriteFromTheOriginal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := previousContentEvidence(path)
+	before := previousContentEvidence(context.Background(), path)
 
 	// Same length, and the timestamp is restored to what it was.
 	rewritten := []byte(strings.Repeat("b", len(content)))
@@ -88,12 +89,12 @@ func TestWeakEvidenceCannotTellARewriteFromTheOriginal(t *testing.T) {
 	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	if after := previousContentEvidence(path); after != before {
+	if after := previousContentEvidence(context.Background(), path); after != before {
 		t.Fatalf("weak evidence changed for a rewrite that preserved size and time: %q -> %q", before, after)
 	}
 	// The content really is different, so the marker agreeing means the marker is
 	// weak - which is exactly what a reader has to be told.
-	if fileContentHash(path) == "" {
+	if fileContentHash(context.Background(), path) == "" {
 		t.Fatal("the fixture is unreadable")
 	}
 }
@@ -106,7 +107,7 @@ func TestIntentEvidenceForAMissingTargetIsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, evidence := write.ReportIntent(json.RawMessage(`{"path":"missing.txt"}`)); evidence != "" {
+	if _, evidence := write.ReportIntent(context.Background(), json.RawMessage(`{"path":"missing.txt"}`)); evidence != "" {
 		t.Fatalf("evidence = %q, want none", evidence)
 	}
 }
@@ -117,7 +118,7 @@ func TestIntentEvidenceForADirectoryIsEmpty(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(workspace, "sub"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if evidence := previousContentEvidence(filepath.Join(workspace, "sub")); evidence != "" {
+	if evidence := previousContentEvidence(context.Background(), filepath.Join(workspace, "sub")); evidence != "" {
 		t.Fatalf("evidence = %q, want none", evidence)
 	}
 	// A timestamp-based marker carries the size it observed, so a reader can see
@@ -126,7 +127,7 @@ func TestIntentEvidenceForADirectoryIsEmpty(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("x", previousHashMaxBytes+1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	marker := previousContentEvidence(path)
+	marker := previousContentEvidence(context.Background(), path)
 	if !strings.Contains(marker, "size=") || !strings.Contains(marker, "mtime=") {
 		t.Fatalf("weak marker = %q", marker)
 	}

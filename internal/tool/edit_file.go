@@ -51,8 +51,15 @@ func (e *EditFile) Definition() protocol.ToolDefinition {
 func (e *EditFile) Risk() policy.Risk { return policy.RiskWrite }
 
 // ReportIntent describes the recovery hints of one call without running it: the
-// resolved path and the hash of the content it found there.
-func (e *EditFile) ReportIntent(raw json.RawMessage) (string, string) {
+// resolved path and the evidence of the content it found there.
+//
+// Like the write tool it only reads: the path is resolved with the same
+// side-effect-free rules, and the evidence is bounded and observes the request
+// context, so a cancelled request stops describing work it will not do.
+func (e *EditFile) ReportIntent(ctx context.Context, raw json.RawMessage) (string, string) {
+	if ctx.Err() != nil {
+		return "", ""
+	}
 	var input struct {
 		Path string `json:"path"`
 	}
@@ -63,7 +70,7 @@ func (e *EditFile) ReportIntent(raw json.RawMessage) (string, string) {
 	if err != nil {
 		return input.Path, ""
 	}
-	return path, fileContentHash(path)
+	return path, previousContentEvidence(ctx, path)
 }
 
 func (e *EditFile) ClassifyConcurrency(raw json.RawMessage, _ policy.Outcome) ConcurrencySpec {

@@ -847,7 +847,7 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 	// cannot be written the call does not start: an operation the host cannot log
 	// must not happen. A batch that already wrote every intent in one append owns
 	// this, so the call is only skipped, not recorded twice.
-	intent := e.executionIntent(prepared)
+	intent := e.executionIntent(ctx, prepared)
 	if e.Checkpoint != nil && intent != nil && !prepared.intentRecorded {
 		if err := e.Checkpoint.RecordIntent(*intent); err != nil {
 			prepared.state = protocol.CallNotExecuted
@@ -936,7 +936,15 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 // A sink that does not implement BatchCheckpointSink is left alone: the per-call
 // path in executePrepared writes its own intent immediately before its call, which
 // is the same guarantee at a higher cost.
-
+//
+// The batch write describes the state of the world before any call of the batch
+// has run, which is exactly what the evidence of a call that starts now should
+// say. That is only true while no other call of the same batch touches the same
+// target, so a target that more than one call of the batch names is deliberately
+// left to the per-call path: the later call then describes the state its own
+// predecessor left behind, instead of a state that is already stale. The
+// optimization is kept where it is sound rather than being allowed to make the
+// evidence wrong.
 func (e *Executor) recordBatchIntents(ctx context.Context, prepared []*preparedCall) error {
 	if e == nil || e.Checkpoint == nil {
 		return nil
@@ -947,6 +955,10 @@ func (e *Executor) recordBatchIntents(ctx context.Context, prepared []*preparedC
 	}
 	intents := make([]Intent, 0, len(prepared))
 	owners := make([]*preparedCall, 0, len(prepared))
+	// targets counts how many calls of this batch would run against one target.
+	// Only calls from the same batch can invalidate each other's evidence: a call
+	// that already ran is serialized against these by the resource coordinator.
+	targets := make(map[string]int, len(prepared))
 	for _, item := range prepared {
 		// A call that already reached a terminal state or was cancelled by the
 		// preflight must not be given an intent: the intent is evidence that the
@@ -957,13 +969,29 @@ func (e *Executor) recordBatchIntents(ctx context.Context, prepared []*preparedC
 		if ctx.Err() != nil {
 			continue
 		}
-		intent := e.executionIntent(item)
+		intent := e.executionIntent(ctx, item)
 		if intent == nil {
 			continue
+		}
+		if intent.TargetPath != "" {
+			targets[intent.TargetPath]++
 		}
 		intents = append(intents, *intent)
 		owners = append(owners, item)
 	}
+	// A target more than one call of this batch would touch is described by the
+	// per-call path instead: the evidence of the later call has to be read after
+	// its predecessor ran, not before the batch started.
+	kept := intents[:0]
+	keptOwners := owners[:0]
+	for index := range intents {
+		if target := intents[index].TargetPath; target != "" && targets[target] > 1 {
+			continue
+		}
+		kept = append(kept, intents[index])
+		keptOwners = append(keptOwners, owners[index])
+	}
+	intents, owners = kept, keptOwners
 	if len(intents) == 0 {
 		return nil
 	}
@@ -987,7 +1015,12 @@ func (e *Executor) recordBatchIntents(ctx context.Context, prepared []*preparedC
 
 // executionIntent builds the lifecycle record of one side-effecting call. A call
 // that only reads anything, or that is already a terminal result, needs none.
-func (e *Executor) executionIntent(prepared *preparedCall) *Intent {
+//
+// The evidence it carries is collected without the resource claim the call will
+// later hold, so it is a hint about the state before the call rather than proof
+// of it: another writer outside this process can change the target between this
+// read and the write. Recovery reports it as a hint for exactly that reason.
+func (e *Executor) executionIntent(ctx context.Context, prepared *preparedCall) *Intent {
 	if e.Checkpoint == nil || prepared.item == nil {
 		return nil
 	}
@@ -1000,9 +1033,11 @@ func (e *Executor) executionIntent(prepared *preparedCall) *Intent {
 		Tool: prepared.call.Name, Risk: prepared.outcome.Risk,
 	}
 	// A tool that can describe its target without running gives the verifiable
-	// recovery hints; otherwise the path from the call arguments is used.
+	// recovery hints; otherwise the path from the call arguments is used. The
+	// request context is what the tool observes: preparing an intent must not hide
+	// a cancellation behind a background context.
 	if reporter, ok := prepared.item.(IntentReporter); ok {
-		intent.TargetPath, intent.PreviousHash = reporter.ReportIntent(prepared.input)
+		intent.TargetPath, intent.PreviousHash = reporter.ReportIntent(ctx, prepared.input)
 		return intent
 	}
 	var fields struct {

@@ -86,6 +86,73 @@ func (r *pathResolver) forWrite(ctx context.Context, path string, createParents 
 	return filepath.Join(realParent, filepath.Base(candidate)), nil
 }
 
+// writeTarget resolves the path a write would produce without changing anything:
+// no directory is created and no file is touched.
+//
+// It exists because describing an intent and performing the write are two
+// different phases, and only the second one may modify the filesystem. The path
+// an intent records therefore comes from here, while the write itself still goes
+// through forWrite, which creates the parents - after the intent is durable.
+//
+// The resolution matches forWrite whenever forWrite can succeed: the deepest
+// existing ancestor is resolved through the real filesystem and checked to stay
+// inside the workspace, and the missing tail is rebuilt on top of it. A path
+// whose parent does not exist yet and whose call did not ask for it to be created
+// still resolves here; the intent then names the target the call aimed at, and the
+// call itself fails at execution and records that failure.
+func (r *pathResolver) writeTarget(path string) (string, error) {
+	candidate, err := r.lexical(path)
+	if err != nil {
+		return "", err
+	}
+	dir, err := r.resolvedDirectory(filepath.Dir(candidate))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(candidate)), nil
+}
+
+// resolvedDirectory rebuilds a directory path from its deepest existing ancestor
+// without creating anything, and verifies through the real filesystem that the
+// result stays inside the workspace.
+func (r *pathResolver) resolvedDirectory(dir string) (string, error) {
+	ancestor := dir
+	tail := make([]string, 0)
+	for {
+		info, statErr := os.Lstat(ancestor)
+		if statErr == nil {
+			if !info.IsDir() {
+				// Lstat does not follow the link, so a symlink may still name a
+				// directory: the resolved form is what decides.
+				if resolved, err := os.Stat(ancestor); err != nil || !resolved.IsDir() {
+					return "", fmt.Errorf("%s is not a directory", ancestor)
+				}
+			}
+			break
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return "", statErr
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return "", errors.New("cannot find an existing parent inside workspace")
+		}
+		tail = append(tail, filepath.Base(ancestor))
+		ancestor = parent
+	}
+	real, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return "", err
+	}
+	if !inside(r.real, real) {
+		return "", errors.New("parent resolves outside workspace")
+	}
+	resolved := real
+	for index := len(tail) - 1; index >= 0; index-- {
+		resolved = filepath.Join(resolved, tail[index])
+	}
+	return resolved, nil
+}
+
 func (r *pathResolver) lexical(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", errors.New("path is required")

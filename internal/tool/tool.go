@@ -28,8 +28,14 @@ type PolicyOverride interface {
 // runs: the path it intends to change and the content hash it observed first.
 // They only help decide whether an interrupted operation happened, and are never
 // used to replay it.
+//
+// Describing an intent is preparation, so it must not create directories, write
+// files or run commands, and it must observe the request context instead of
+// hiding a cancellation behind a background one. The context is what lets a
+// cancelled request stop reading a target it will not write; the read itself is
+// bounded by the tool.
 type IntentReporter interface {
-	ReportIntent(json.RawMessage) (targetPath, previousHash string)
+	ReportIntent(ctx context.Context, raw json.RawMessage) (targetPath, previousHash string)
 }
 
 // ParallelSafe is an explicit opt-in for tools whose executions do not mutate
