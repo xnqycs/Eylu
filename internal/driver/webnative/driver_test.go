@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"Eylu/internal/driver"
@@ -174,6 +175,101 @@ func TestAnthropicPauseTurnContinuesInsideGenerate(t *testing.T) {
 	if requests != 2 || starts != 1 || dones != 1 || response.Usage.InputTokens != 8 || len(response.Turn.Parts) != 2 || response.Turn.Parts[0].WebActivity == nil || response.Turn.Parts[1].Text != "continued answer" {
 		t.Fatalf("requests=%d response=%#v events=%#v", requests, response, events)
 	}
+}
+
+// Anthropic has a single system field, and a session builds many system turns:
+// the base prompt, MCP instructions and resources, the skill catalog and bodies,
+// the task list, the project map and the compaction summary. The translation must
+// keep every one of them, in order.
+//
+// Assigning the field once per turn keeps only the last one, which in a compacted
+// session is the summary: the model would silently lose its instructions.
+func TestAnthropicKeepsEverySystemSegment(t *testing.T) {
+	segments := []string{"BASE_SYSTEM_PROMPT", "MCP_INSTRUCTIONS", "SKILL_CATALOG", "SKILL_BODY", "TASK_LIST", "PROJECT_MAP", "COMPACTION_SUMMARY"}
+	turns := make([]protocol.Turn, 0, len(segments)+2)
+	for index, text := range segments {
+		turns = append(turns, protocol.Turn{
+			ID: "system-" + text, Role: protocol.RoleSystem,
+			Parts: []protocol.Part{{Kind: protocol.PartText, Text: text + " payload " + string(rune('a'+index))}},
+		})
+	}
+	// An activation that carries no text must not add an empty block, and it must
+	// not disturb the order of the segments around it.
+	turns = append(turns, protocol.Turn{ID: "empty", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: ""}}})
+	turns = append(turns, protocol.Turn{ID: "user", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "do the thing"}}})
+
+	body := captureRequestBody(t, DialectAnthropic, turns)
+	system := systemText(t, body)
+	position := 0
+	for _, text := range segments {
+		index := strings.Index(system[position:], text)
+		if index < 0 {
+			t.Fatalf("the segment %q was lost or reordered: %q", text, system)
+		}
+		position += index + len(text)
+	}
+	if strings.Contains(system, "empty") {
+		t.Fatalf("an empty system segment was serialized: %q", system)
+	}
+	messages, _ := body["messages"].([]any)
+	if len(messages) != 1 || messages[0].(map[string]any)["role"] != "user" {
+		t.Fatalf("the system segments were moved into the conversation: %#v", messages)
+	}
+}
+
+// systemText reads the system-level instruction of a serialized Anthropic request,
+// in both the string and the content-block form the API accepts.
+func systemText(t *testing.T, body map[string]any) string {
+	t.Helper()
+	raw, exists := body["system"]
+	if !exists {
+		t.Fatalf("the request carries no system instruction: %#v", body)
+	}
+	switch typed := raw.(type) {
+	case string:
+		return typed
+	case []any:
+		var builder strings.Builder
+		for _, item := range typed {
+			block, ok := item.(map[string]any)
+			if !ok || block["type"] != "text" {
+				t.Fatalf("unexpected system block %#v", item)
+			}
+			text, _ := block["text"].(string)
+			builder.WriteString(text)
+			builder.WriteString("\n")
+		}
+		return builder.String()
+	default:
+		t.Fatalf("unexpected system field %#v", raw)
+		return ""
+	}
+}
+
+// captureRequestBody runs one request against a stub server and returns the JSON
+// body the driver actually sent.
+func captureRequestBody(t *testing.T, dialect Dialect, turns []protocol.Turn) map[string]any {
+	t.Helper()
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"msg_1","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+	model := New(server.Client(), dialect)
+	if _, err := model.Generate(context.Background(), driver.Request{
+		BaseURL: server.URL + "/v1", APIKey: "secret", Stream: false,
+		Model: protocol.ModelRequest{Model: "model", Turns: turns},
+	}, nil); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("the driver sent no request body")
+	}
+	return captured
 }
 
 func genericNativeResponse(callType string) string {

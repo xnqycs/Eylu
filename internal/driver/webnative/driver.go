@@ -202,9 +202,22 @@ func appendAnthropicContinuation(body map[string]any, raw json.RawMessage) error
 func (d *Driver) requestBody(request driver.Request) (map[string]any, error) {
 	body := map[string]any{"model": request.Model.Model, "stream": request.Stream}
 	messages := make([]any, 0, len(request.Model.Turns))
+	// Anthropic expresses instructions in one system field, while a session builds
+	// several system turns: the base prompt, MCP instructions and resources, the
+	// skill catalog and bodies, the task list, the project map and the compaction
+	// summary. The field is therefore accumulated and assigned once, after the
+	// loop: assigning it per turn would keep only the last segment, which in a
+	// compacted session is the summary, and the model would silently lose the
+	// instructions it was given.
+	systemBlocks := make([]any, 0, 4)
 	for _, turn := range request.Model.Turns {
 		if d.dialect == DialectAnthropic && turn.Role == protocol.RoleSystem {
-			body["system"] = turnText(turn)
+			// A system turn that carries no text contributes nothing; skipping it
+			// keeps the request free of empty blocks without disturbing the order
+			// of the segments around it.
+			if text := turnText(turn); text != "" {
+				systemBlocks = append(systemBlocks, map[string]any{"type": "text", "text": text})
+			}
 			continue
 		}
 		message := map[string]any{"role": roleName(turn.Role)}
@@ -241,6 +254,9 @@ func (d *Driver) requestBody(request driver.Request) (map[string]any, error) {
 	}
 	if d.dialect == DialectAnthropic {
 		body["max_tokens"] = 4096
+		if len(systemBlocks) > 0 {
+			body["system"] = systemBlocks
+		}
 	}
 	tools := make([]any, 0, len(request.Model.Tools))
 	for _, definition := range request.Model.Tools {

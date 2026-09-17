@@ -2,6 +2,7 @@ package driver_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"Eylu/internal/driver/mistral_conversations"
 	"Eylu/internal/driver/openai_chat"
 	"Eylu/internal/driver/openai_responses"
+	"Eylu/internal/driver/perplexity_agent"
 	"Eylu/internal/protocol"
 )
 
@@ -54,6 +56,50 @@ type stopDialect struct {
 	reason func(canonical string, hasCalls bool) (driver.StopReason, bool)
 	// body renders the provider response.
 	body func(canonical string, hasCalls, stream bool) (string, bool)
+	// system reads back the system-level instruction a serialized request carries,
+	// in the order the dialect sends it. The dialects place it in different
+	// fields, and only the dialect under test knows which.
+	system func(body map[string]any) []string
+}
+
+// systemMessages reads the segments one dialect sends as role "system" records of
+// a message or input array.
+func systemMessages(field string) func(map[string]any) []string {
+	return func(body map[string]any) []string {
+		items, _ := body[field].([]any)
+		segments := make([]string, 0, len(items))
+		for _, item := range items {
+			message, ok := item.(map[string]any)
+			if !ok || message["role"] != "system" {
+				continue
+			}
+			if text, ok := message["content"].(string); ok {
+				segments = append(segments, text)
+			}
+		}
+		return segments
+	}
+}
+
+// anthropicSystem reads the single system field of an Anthropic request, in both
+// the string and the content-block form the API accepts.
+func anthropicSystem(body map[string]any) []string {
+	switch typed := body["system"].(type) {
+	case string:
+		return []string{typed}
+	case []any:
+		segments := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if block, ok := item.(map[string]any); ok && block["type"] == "text" {
+				if text, ok := block["text"].(string); ok {
+					segments = append(segments, text)
+				}
+			}
+		}
+		return segments
+	default:
+		return nil
+	}
 }
 
 func stopContractDialects() []stopDialect {
@@ -64,6 +110,7 @@ func stopContractDialects() []stopDialect {
 			streams: []bool{false, true},
 			reason:  chatContractReason,
 			body:    chatContractBody,
+			system:  systemMessages("messages"),
 		},
 		{
 			name:    "openai_responses",
@@ -71,6 +118,7 @@ func stopContractDialects() []stopDialect {
 			streams: []bool{false, true},
 			reason:  responsesContractReason,
 			body:    responsesContractBody,
+			system:  systemMessages("input"),
 		},
 		{
 			name:    "anthropic_messages",
@@ -78,6 +126,7 @@ func stopContractDialects() []stopDialect {
 			streams: []bool{false},
 			reason:  anthropicContractReason,
 			body:    anthropicContractBody,
+			system:  anthropicSystem,
 		},
 		{
 			// The remaining named adapters share this driver, so the dialect
@@ -87,6 +136,15 @@ func stopContractDialects() []stopDialect {
 			streams: []bool{false},
 			reason:  contentContractReason,
 			body:    contentContractBody,
+			system:  systemMessages("inputs"),
+		},
+		{
+			name:    "perplexity_agent",
+			new:     func(client *http.Client) driver.ModelDriver { return perplexity_agent.New(client) },
+			streams: []bool{false},
+			reason:  contentContractReason,
+			body:    contentContractBody,
+			system:  systemMessages("messages"),
 		},
 	}
 }
@@ -344,4 +402,76 @@ func generateOnce(t *testing.T, dialect stopDialect, body string, stream, accept
 		}}},
 	}
 	return dialect.new(server.Client()).Generate(context.Background(), request, nil)
+}
+
+// Every system segment a session builds must reach the provider, in order, on
+// every dialect.
+//
+// The session sends the base prompt, MCP instructions and resources, the skill
+// catalog and bodies, the task list, the project map and the compaction summary as
+// separate system turns. A dialect that can only express one instruction field has
+// to merge them; keeping just one - the last - drops the instructions silently,
+// and moving them into the conversation would change what the model was asked.
+func TestDriversKeepEverySystemSegmentInOrder(t *testing.T) {
+	segments := []string{"BASE_SYSTEM_PROMPT", "MCP_INSTRUCTIONS", "SKILL_CATALOG", "SKILL_BODY", "TASK_LIST", "PROJECT_MAP", "COMPACTION_SUMMARY"}
+	for _, dialect := range stopContractDialects() {
+		t.Run(dialect.name, func(t *testing.T) {
+			turns := make([]protocol.Turn, 0, len(segments)+2)
+			for _, text := range segments {
+				turns = append(turns, protocol.Turn{
+					ID: text, Role: protocol.RoleSystem,
+					Parts: []protocol.Part{{Kind: protocol.PartText, Text: "<" + text + ">"}},
+				})
+			}
+			// An empty segment must not erase the ones around it.
+			turns = append(turns, protocol.Turn{ID: "empty", Role: protocol.RoleSystem, Parts: []protocol.Part{{Kind: protocol.PartText, Text: ""}}})
+			turns = append(turns, protocol.Turn{ID: "user", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "hello"}}})
+
+			body := requestBodyOnce(t, dialect, turns)
+			sent := strings.Join(dialect.system(body), "\n")
+			position := 0
+			for _, text := range segments {
+				index := strings.Index(sent[position:], "<"+text+">")
+				if index < 0 {
+					t.Fatalf("segment %q is missing or reordered in %q", text, sent)
+				}
+				position += index + len(text) + 2
+			}
+			if strings.Count(sent, "<BASE_SYSTEM_PROMPT>") != 1 {
+				t.Fatalf("the base prompt was duplicated or dropped: %q", sent)
+			}
+		})
+	}
+}
+
+// requestBodyOnce runs one request against a stub provider and returns the JSON
+// body the driver actually sent, so a contract can be asserted on the wire format
+// rather than on the driver's internal state.
+func requestBodyOnce(t *testing.T, dialect stopDialect, turns []protocol.Turn) map[string]any {
+	t.Helper()
+	responseBody, ok := dialect.body("completed", false, false)
+	if !ok {
+		t.Fatalf("%s cannot express a completion", dialect.name)
+	}
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(responseBody))
+	}))
+	defer server.Close()
+
+	request := driver.Request{
+		BaseURL: server.URL, APIKey: "key",
+		Model: protocol.ModelRequest{Model: "model", Turns: turns},
+	}
+	if _, err := dialect.new(server.Client()).Generate(context.Background(), request, nil); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("the driver sent no request body")
+	}
+	return captured
 }
