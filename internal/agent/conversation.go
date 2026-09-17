@@ -224,12 +224,16 @@ func (c *Conversation) NewSession() string {
 
 // NewSessionWithEnvironment rotates the conversation to a new session.
 //
-// Rotation changes the conversation as a whole, so it waits for an active request
-// to finish before it touches any state: a rotation can never interleave with a
-// request that is still committing its transcript. A request that does not finish
-// within the grace period is cancelled first.
+// Rotation changes the conversation as a whole, so it takes the same exclusive
+// ownership a request takes: it waits for the running request to finish and then
+// holds the conversation until the rotation is complete. Waiting without claiming
+// would leave a gap in which a new request starts, appends its prompt to the old
+// session and then watches its own transcript be replaced.
+//
+// A request that does not finish within the grace period is cancelled first.
 func (c *Conversation) NewSessionWithEnvironment(environmentContext environment.Context) string {
-	c.gate.await()
+	c.gate.acquire()
+	defer c.gate.release()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	old := c.sessionID
@@ -461,12 +465,14 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 	}
 	responseStarted := false
 	for attempt := 0; attempt <= 3; attempt++ {
-		// The request is prepared and the immutable snapshot is taken under the
-		// state lock; the model call itself runs outside it.
-		c.mu.Lock()
+		// The request is prepared outside the state lock: the preparation takes the
+		// lock for its own short parts and releases it around the compaction
+		// summary, which is a model call. Only the immutable snapshot the request
+		// is built from is read under the lock.
 		prepared, contextEvents, err := c.prepareRequestContext(ctx, runtime, definitions, func(usage protocol.Usage) {
 			budget.add(callSummary, usage)
 		})
+		c.mu.Lock()
 		request := driver.Request{
 			BaseURL:                 runtime.Provider.Config.BaseURL,
 			APIKey:                  runtime.APIKey,

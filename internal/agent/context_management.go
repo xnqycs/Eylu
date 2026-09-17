@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -74,6 +76,12 @@ func optionsForRuntime(runtime Runtime) contextOptions {
 // prepareRequestContext builds the request context and buffers the host context
 // events it would report. The caller delivers them after the state lock is
 // released, so a context callback can read the conversation without deadlocking.
+//
+// The deterministic preparation runs under the state lock and is released around
+// the compaction summary, which is a model call: a summary that takes a minute
+// must not stop the conversation from being read, exported or stopped. The result
+// of that call is committed only under the lock, and only while the state it was
+// computed from is still current.
 func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, []contextledger.Event, error) {
 	var collected []contextledger.Event
 	if runtime.ContextEvent != nil {
@@ -83,38 +91,58 @@ func (c *Conversation) prepareRequestContext(ctx context.Context, runtime Runtim
 	return prepared, collected, err
 }
 
-// prepareRequestContextLocked does the work and assumes the caller holds the
-// state lock.
+// prepareRequestContextLocked does the work and takes the state lock around the
+// short parts of it.
 func (c *Conversation) prepareRequestContextLocked(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, onSummaryUsage func(protocol.Usage)) (contextledger.PromptResult, error) {
 	options := optionsForRuntime(runtime)
+	c.mu.Lock()
 	c.ledger.SetEstimator(options.estimator)
 	c.refreshProjectMap(runtime)
 	prepared := c.buildPromptContext(runtime, definitions)
+	c.mu.Unlock()
 	window := runtime.Provider.ContextWindowLimit()
 	if window > 0 {
 		total := prepared.InputTokens() + options.outputReserve
 		trigger := percentageTokens(window, options.compactTrigger)
+		c.mu.Lock()
+		lastFingerprint := c.lastCompressionFingerprint
 		fingerprint := c.compactionFingerprint(prepared, runtime)
-		if total >= trigger && fingerprint != c.lastCompressionFingerprint {
-			var event contextledger.CompressionEvent
-			var err error
-			prepared, event, err = c.compactPrepared(ctx, runtime, definitions, options, prepared, "auto", false)
-			// A summary call is part of this request even when the compaction it
-			// was meant to produce is rejected, so its usage is always reported.
-			if onSummaryUsage != nil && (event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0) {
-				onSummaryUsage(event.Usage)
-			}
+		c.mu.Unlock()
+		if total >= trigger && fingerprint != lastFingerprint {
+			// The decision event of a plan that does exist is carried inside the
+			// plan, so only the "nothing to compact" answer is read here.
+			planned, _, plan, err := c.planCompactionLocked(runtime, definitions, options, prepared, "auto", false)
 			if err != nil {
 				return contextledger.PromptResult{}, err
 			}
-			if event.Noop {
+			if plan == nil {
+				c.mu.Lock()
 				c.lastCompressionFingerprint = fingerprint
+				c.mu.Unlock()
+				prepared = planned
+			} else {
+				var event contextledger.CompressionEvent
+				prepared, event, err = c.runCompaction(ctx, *plan)
+				// A summary call is part of this request even when the compaction it
+				// was meant to produce is rejected, so its usage is always reported.
+				if onSummaryUsage != nil && (event.Usage.InputTokens > 0 || event.Usage.OutputTokens > 0) {
+					onSummaryUsage(event.Usage)
+				}
+				if err != nil {
+					return contextledger.PromptResult{}, err
+				}
+				if event.Noop {
+					c.mu.Lock()
+					c.lastCompressionFingerprint = fingerprint
+					c.mu.Unlock()
+				}
 			}
 		}
 		if prepared.InputTokens()+options.outputReserve > window {
 			return contextledger.PromptResult{}, contextBudgetError(prepared.InputTokens(), options.outputReserve, window)
 		}
 	}
+	c.mu.Lock()
 	c.ledger.ReplaceBlocks(prepared.Blocks)
 	if runtime.ContextEvent != nil {
 		percent := 0.0
@@ -123,6 +151,7 @@ func (c *Conversation) prepareRequestContextLocked(ctx context.Context, runtime 
 		}
 		runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventBudget, InputTokens: prepared.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: window, Percent: percent})
 	}
+	c.mu.Unlock()
 	return prepared, nil
 }
 
@@ -134,12 +163,32 @@ func contextBudgetError(input, reserve, window int) error {
 	return &protocol.Error{Code: protocol.ErrContextWindow, Message: fmt.Sprintf("context budget exceeded: %d input + %d reserved > %d", input, reserve, window), ContextLimit: window}
 }
 
+// Compact compacts the conversation on demand.
+//
+// It takes the same exclusive ownership a request takes: a manual compaction
+// changes the conversation as a whole, so it must not interleave with a running
+// request. A request that is already running is therefore reported as busy rather
+// than being silently compacted underneath.
 func (c *Conversation) Compact(ctx context.Context, runtime Runtime) (contextledger.CompressionEvent, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.applyRuntime(runtime); err != nil {
+	if err := c.gate.begin(); err != nil {
 		return contextledger.CompressionEvent{}, err
 	}
+	defer c.gate.release()
+	// Host context events are buffered and delivered once the state lock is free,
+	// so a callback that reads the conversation cannot deadlock against the
+	// compaction that produced it.
+	hostEvent := runtime.ContextEvent
+	var collected []contextledger.Event
+	if hostEvent != nil {
+		runtime.ContextEvent = func(event contextledger.Event) { collected = append(collected, event) }
+		defer func() {
+			for _, event := range collected {
+				hostEvent(event)
+			}
+		}()
+	}
+	// Resolving the context window is a provider call, so it runs before the state
+	// lock is taken rather than inside it.
 	if runtime.LimitResolver != nil {
 		resolved, err := runtime.LimitResolver.Resolve(ctx, runtime.Provider, runtime.APIKey)
 		if err != nil {
@@ -148,25 +197,132 @@ func (c *Conversation) Compact(ctx context.Context, runtime Runtime) (contextled
 		runtime.Provider = resolved
 	}
 	options := optionsForRuntime(runtime)
-	c.ledger.SetEstimator(options.estimator)
-	c.refreshProjectMap(runtime)
-	prepared := c.buildPromptContext(runtime, c.toolDefinitions)
-	prepared, event, err := c.compactPrepared(ctx, runtime, c.toolDefinitions, options, prepared, "manual", true)
-	if err != nil {
+	c.mu.Lock()
+	if err := c.applyRuntime(runtime); err != nil {
+		c.mu.Unlock()
 		return contextledger.CompressionEvent{}, err
 	}
 	c.lastRuntime = runtime
+	c.ledger.SetEstimator(options.estimator)
+	c.refreshProjectMap(runtime)
+	definitions := append([]protocol.ToolDefinition(nil), c.toolDefinitions...)
+	prepared := c.buildPromptContext(runtime, definitions)
+	// The decision is made under the lock; only the summary model call it may need
+	// is made outside it.
+	prepared, event, plan, err := c.planCompactionLocked(runtime, definitions, options, prepared, "manual", true)
+	c.mu.Unlock()
+	if err != nil {
+		return contextledger.CompressionEvent{}, err
+	}
+	if plan == nil {
+		c.mu.Lock()
+		c.ledger.ReplaceBlocks(prepared.Blocks)
+		c.mu.Unlock()
+		return event, nil
+	}
+	prepared, event, err = c.runCompaction(ctx, *plan)
+	if err != nil {
+		return contextledger.CompressionEvent{}, err
+	}
+	c.mu.Lock()
+	c.lastRuntime = runtime
 	c.ledger.ReplaceBlocks(prepared.Blocks)
+	c.mu.Unlock()
 	return event, nil
 }
 
-func (c *Conversation) compactPrepared(ctx context.Context, runtime Runtime, definitions []protocol.ToolDefinition, options contextOptions, prepared contextledger.PromptResult, trigger string, force bool) (contextledger.PromptResult, contextledger.CompressionEvent, error) {
+// compactionState identifies the conversation state one compaction decision was
+// computed from. A summary is a model call, so it runs with the state lock
+// released; the state it was based on is re-checked before its result is used.
+type compactionState struct {
+	sessionID     string
+	turns         int
+	summary       string
+	omittedDigest string
+}
+
+func (c *Conversation) compactionStateLocked() compactionState {
+	return compactionState{
+		sessionID: c.sessionID, turns: len(c.turns), summary: c.summary,
+		omittedDigest: turnIDSetDigest(c.omittedTurnIDs),
+	}
+}
+
+// supersededBy reports whether the conversation has moved on from the state a
+// decision was based on. A superseded result is rejected, never committed.
+func (s compactionState) supersededBy(c *Conversation) bool {
+	return c.sessionID != s.sessionID || len(c.turns) != s.turns || c.summary != s.summary ||
+		turnIDSetDigest(c.omittedTurnIDs) != s.omittedDigest
+}
+
+// turnIDSetDigest is a stable digest of a set of turn IDs, so two states can be
+// compared without copying the set.
+func turnIDSetDigest(set map[string]struct{}) string {
+	if len(set) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	sum := sha256.Sum256([]byte(strings.Join(ids, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
+// compactionPlan is a compaction that has been decided but not committed: the
+// summary it still needs is a model call, which must not run while the state lock
+// is held.
+//
+// The plan carries the immutable input of the summary call and everything needed
+// to commit the result, so nothing it depends on has to be read again from the
+// conversation while the lock is released.
+type compactionPlan struct {
+	state compactionState
+
+	runtime     Runtime
+	definitions []protocol.ToolDefinition
+	options     contextOptions
+
+	// prepared is the prompt the request would send without this compaction, and
+	// staged is the deterministic result, which is always usable.
+	prepared      contextledger.PromptResult
+	staged        contextledger.PromptResult
+	stagedOmitted map[string]struct{}
+	stagedSummary string
+	newlyOmitted  map[string]struct{}
+
+	// summary is the input of the model call that produces the semantic summary.
+	summary summaryInput
+
+	event       contextledger.CompressionEvent
+	window      int
+	target      int
+	beforeTotal int
+	started     time.Time
+}
+
+// summaryInput is everything one compaction summary needs, captured under the
+// state lock so the model call itself can run without it.
+type summaryInput struct {
+	turns           []protocol.Turn
+	previousSummary string
+	stagedSummary   string
+}
+
+// planCompactionLocked decides whether the prepared prompt has to be compacted and
+// prepares every part of the decision that needs no model call.
+//
+// It assumes the caller holds the state lock, and it never calls the model: the
+// caller runs the returned plan outside the lock. A nil plan means there is
+// nothing to compact, and the returned event still describes the decision.
+func (c *Conversation) planCompactionLocked(runtime Runtime, definitions []protocol.ToolDefinition, options contextOptions, prepared contextledger.PromptResult, trigger string, force bool) (contextledger.PromptResult, contextledger.CompressionEvent, *compactionPlan, error) {
 	window := runtime.Provider.ContextWindowLimit()
 	beforeTotal := prepared.InputTokens() + options.outputReserve
 	event := contextledger.CompressionEvent{Trigger: trigger, BeforeTokens: beforeTotal, AfterTokens: beforeTotal, OccurredAt: time.Now().UTC()}
 	if window <= 0 {
 		event.Noop = true
-		return prepared, event, nil
+		return prepared, event, nil, nil
 	}
 	threshold := percentageTokens(window, options.compactTrigger)
 	if force {
@@ -174,7 +330,7 @@ func (c *Conversation) compactPrepared(ctx context.Context, runtime Runtime, def
 	}
 	if beforeTotal < threshold {
 		event.Noop = true
-		return prepared, event, nil
+		return prepared, event, nil, nil
 	}
 
 	stagedOmitted := cloneTurnIDSet(c.omittedTurnIDs)
@@ -208,67 +364,116 @@ func (c *Conversation) compactPrepared(ctx context.Context, runtime Runtime, def
 	if len(newlyOmitted) == 0 {
 		event.Noop = true
 		if beforeTotal > window {
-			return prepared, event, contextBudgetError(prepared.InputTokens(), options.outputReserve, window)
+			return prepared, event, nil, contextBudgetError(prepared.InputTokens(), options.outputReserve, window)
 		}
-		return prepared, event, nil
+		return prepared, event, nil, nil
 	}
 
-	started := time.Now()
-	if runtime.ContextEvent != nil {
-		startEvent := event
-		runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionStarted, InputTokens: prepared.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: window, Compression: &startEvent})
+	plan := &compactionPlan{
+		state: c.compactionStateLocked(), runtime: runtime,
+		definitions: append([]protocol.ToolDefinition(nil), definitions...), options: options,
+		prepared: prepared, staged: staged, stagedOmitted: stagedOmitted, stagedSummary: stagedSummary,
+		newlyOmitted: newlyOmitted,
+		summary:      c.summaryInputLocked(newlyOmitted, stagedSummary, options),
+		event:        event, window: window, target: target, beforeTotal: beforeTotal,
+		started: time.Now(),
 	}
+	return prepared, event, plan, nil
+}
 
-	strategy := "model"
-	semantic, usage, semanticErr := c.buildSemanticSummary(ctx, runtime, options, newlyOmitted, stagedSummary)
+// summaryInputLocked collects the turns and summaries one summary call needs.
+func (c *Conversation) summaryInputLocked(newlyOmitted map[string]struct{}, stagedSummary string, options contextOptions) summaryInput {
+	turns := make([]protocol.Turn, 0, len(newlyOmitted))
+	for _, turn := range c.turns {
+		if _, include := newlyOmitted[turn.ID]; !include {
+			continue
+		}
+		contextTurn, keep := contextualizeTurn(turn, min(options.toolContextBytes, 2<<10))
+		if keep {
+			turns = append(turns, contextTurn)
+		}
+	}
+	return summaryInput{turns: turns, previousSummary: c.summary, stagedSummary: stagedSummary}
+}
+
+// runCompaction produces and commits one compaction: the summary model call runs
+// with the state lock released, and the result is committed under the lock only
+// when the state it was computed from is still current.
+func (c *Conversation) runCompaction(ctx context.Context, plan compactionPlan) (contextledger.PromptResult, contextledger.CompressionEvent, error) {
+	if plan.runtime.ContextEvent != nil {
+		startEvent := plan.event
+		plan.runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionStarted, InputTokens: plan.prepared.InputTokens(), OutputReserve: plan.options.outputReserve, ContextWindow: plan.window, Compression: &startEvent})
+	}
+	summary, usage, semanticErr := c.buildSemanticSummary(ctx, plan.runtime, plan.options, plan.summary)
 	// The summary call already happened, so its usage belongs to the request even
 	// when the compaction is later rejected or falls back.
-	event.Usage = usage
-	if semanticErr != nil {
-		if ctx.Err() != nil {
-			if runtime.ContextEvent != nil {
-				runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionFailed, InputTokens: prepared.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: window, Compression: &event, Error: ctx.Err().Error()})
-			}
-			return prepared, event, ctx.Err()
+	plan.event.Usage = usage
+	if semanticErr != nil && ctx.Err() != nil {
+		if plan.runtime.ContextEvent != nil {
+			plan.runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionFailed, InputTokens: plan.prepared.InputTokens(), OutputReserve: plan.options.outputReserve, ContextWindow: plan.window, Compression: &plan.event, Error: ctx.Err().Error()})
 		}
-		strategy = "deterministic_fallback"
-		semantic = stagedSummary
+		return plan.prepared, plan.event, ctx.Err()
 	}
-	final := c.buildPromptContextWithState(runtime, definitions, semantic, stagedOmitted)
-	if final.InputTokens()+options.outputReserve > target && staged.InputTokens()+options.outputReserve <= target {
-		strategy = "deterministic_fallback"
-		semantic = stagedSummary
-		final = staged
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.commitCompactionLocked(plan, summary, semanticErr)
+}
+
+// commitCompactionLocked validates the summary against the state the plan was
+// computed from and either commits it or rejects the decision. The caller holds
+// the state lock.
+func (c *Conversation) commitCompactionLocked(plan compactionPlan, semantic string, semanticErr error) (contextledger.PromptResult, contextledger.CompressionEvent, error) {
+	options, runtime, definitions, event := plan.options, plan.runtime, plan.definitions, plan.event
+	if plan.state.supersededBy(c) {
+		// The conversation moved on while the summary was being produced, so both
+		// the decision and the summary describe a state that no longer exists.
+		// Nothing is committed: the caller keeps the uncompacted prompt and decides
+		// again from the state that exists now, instead of applying a summary that
+		// drops turns the newer state still needs.
+		event.Noop = true
+		return plan.prepared, event, nil
 	}
-	if final.InputTokens()+options.outputReserve >= beforeTotal || final.InputTokens()+options.outputReserve > window {
-		err := contextBudgetError(final.InputTokens(), options.outputReserve, window)
-		if beforeTotal <= window {
+	strategy := "model"
+	if semanticErr != nil {
+		strategy = "deterministic_fallback"
+		semantic = plan.stagedSummary
+	}
+	final := c.buildPromptContextWithState(runtime, definitions, semantic, plan.stagedOmitted)
+	if final.InputTokens()+options.outputReserve > plan.target && plan.staged.InputTokens()+options.outputReserve <= plan.target {
+		strategy = "deterministic_fallback"
+		semantic = plan.stagedSummary
+		final = plan.staged
+	}
+	if final.InputTokens()+options.outputReserve >= plan.beforeTotal || final.InputTokens()+options.outputReserve > plan.window {
+		err := contextBudgetError(final.InputTokens(), options.outputReserve, plan.window)
+		if plan.beforeTotal <= plan.window {
 			err = &protocol.Error{Code: protocol.ErrProtocol, Message: "context compaction did not reduce the active prompt"}
 		}
 		if runtime.ContextEvent != nil {
-			runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionFailed, InputTokens: prepared.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: window, Compression: &event, Error: err.Error()})
+			runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionFailed, InputTokens: plan.prepared.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: plan.window, Compression: &event, Error: err.Error()})
 		}
-		return prepared, event, err
+		return plan.prepared, event, err
 	}
 
 	c.summary = semantic
-	c.omittedTurnIDs = stagedOmitted
+	c.omittedTurnIDs = plan.stagedOmitted
 	c.driverState = nil
 	c.lastCompressionFingerprint = c.compactionFingerprint(final, runtime)
 	event.Strategy = strategy
 	event.AfterTokens = final.InputTokens() + options.outputReserve
-	event.OmittedTurns = len(newlyOmitted)
+	event.OmittedTurns = len(plan.newlyOmitted)
 	event.SummaryBytes = len([]byte(semantic))
-	event.DurationMS = time.Since(started).Milliseconds()
+	event.DurationMS = time.Since(plan.started).Milliseconds()
 	c.ledger.ReplaceBlocks(final.Blocks)
 	c.ledger.RecordCompression(event)
 	if runtime.ContextEvent != nil {
 		completed := event
-		runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompression, InputTokens: final.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: window, Compression: &completed})
+		runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompression, InputTokens: final.InputTokens(), OutputReserve: options.outputReserve, ContextWindow: plan.window, Compression: &completed})
 	}
 	return final, event, nil
 }
 
+// cloneTurnIDSet copies a set of omitted turn IDs.
 func cloneTurnIDSet(source map[string]struct{}) map[string]struct{} {
 	result := make(map[string]struct{}, len(source))
 	for id := range source {
@@ -277,6 +482,8 @@ func cloneTurnIDSet(source map[string]struct{}) map[string]struct{} {
 	return result
 }
 
+// fitDeterministicSummary builds the largest deterministic summary that fits the
+// total limit, so a compaction always has a result that needs no model call.
 func (c *Conversation) fitDeterministicSummary(runtime Runtime, definitions []protocol.ToolDefinition, options contextOptions, omitted map[string]struct{}, totalLimit int) (string, contextledger.PromptResult) {
 	minimum := "<conversation_summary>\nContinue the latest retained user goal and task list.\n</conversation_summary>"
 	bestSummary := minimum
@@ -296,6 +503,8 @@ func (c *Conversation) fitDeterministicSummary(runtime Runtime, definitions []pr
 	return bestSummary, best
 }
 
+// compactionFingerprint identifies the state a compaction produced, so the same
+// state is not summarized twice.
 func (c *Conversation) compactionFingerprint(prepared contextledger.PromptResult, runtime Runtime) string {
 	return fmt.Sprintf("%s:%d:%d:%d:%d", runtime.Provider.Config.Model, runtime.Provider.ContextWindowLimit(), len(c.turns), len(c.omittedTurnIDs), prepared.InputTokens())
 }
@@ -318,25 +527,18 @@ Key files:
 - ...
 </conversation_summary>`
 
-func (c *Conversation) buildSemanticSummary(ctx context.Context, runtime Runtime, options contextOptions, newlyOmitted map[string]struct{}, continuityLedger string) (string, protocol.Usage, error) {
+// buildSemanticSummary asks the model for the compaction summary of one plan.
+// It reads nothing from the conversation: every input it needs was captured under
+// the state lock, so it can run with the lock released.
+func (c *Conversation) buildSemanticSummary(ctx context.Context, runtime Runtime, options contextOptions, input summaryInput) (string, protocol.Usage, error) {
 	if runtime.Driver == nil {
 		return "", protocol.Usage{}, fmt.Errorf("model driver is nil")
 	}
-	turns := make([]protocol.Turn, 0, len(newlyOmitted))
-	for _, turn := range c.turns {
-		if _, include := newlyOmitted[turn.ID]; !include {
-			continue
-		}
-		contextTurn, keep := contextualizeTurn(turn, min(options.toolContextBytes, 2<<10))
-		if keep {
-			turns = append(turns, contextTurn)
-		}
-	}
-	encoded, err := json.Marshal(turns)
+	encoded, err := json.Marshal(input.turns)
 	if err != nil {
 		return "", protocol.Usage{}, err
 	}
-	source := "<previous_summary>\n" + c.summary + "\n</previous_summary>\n<continuity_ledger>\n" + continuityLedger + "\n</continuity_ledger>\n<compressed_turns>\n" + string(encoded) + "\n</compressed_turns>"
+	source := "<previous_summary>\n" + input.previousSummary + "\n</previous_summary>\n<continuity_ledger>\n" + input.stagedSummary + "\n</continuity_ledger>\n<compressed_turns>\n" + string(encoded) + "\n</compressed_turns>"
 	window := runtime.Provider.ContextWindowLimit()
 	if window > 0 && options.estimator.Estimate(semanticSummaryPrompt+source)+max(512, options.estimator.Estimate(strings.Repeat("x", options.summaryBytes))) > window {
 		return "", protocol.Usage{}, fmt.Errorf("semantic compaction input exceeds the model context window")

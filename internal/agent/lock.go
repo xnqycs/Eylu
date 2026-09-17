@@ -77,31 +77,40 @@ func (g *runGate) idle() bool {
 	return !g.active
 }
 
-// await waits for the active request to finish. A request that does not finish
-// within the grace period is cancelled first, so a session-level operation can
-// never wait forever on a model or a tool that will not return.
+// acquire claims the writer slot for an operation that changes the conversation as
+// a whole, waiting for the current owner to finish first.
 //
-// It is only called by an operation that must change the conversation as a whole,
-// such as rotating to a new session.
-func (g *runGate) await() {
-	g.mu.Lock()
-	if !g.active {
+// Waiting and claiming are one protocol, and that is the whole point: releasing
+// the wait and taking the slot happen under the same lock, so no request can start
+// in the gap. Observing "no request is running" and then acting on it is not the
+// same as holding the conversation, and the difference is a request that commits
+// its turn into a session the rotation is about to replace.
+//
+// A request that does not finish within the grace period is cancelled first, so a
+// whole-conversation operation can never wait forever on a model or a tool that
+// will not return.
+func (g *runGate) acquire() {
+	for {
+		g.mu.Lock()
+		if !g.active {
+			g.active = true
+			g.done = make(chan struct{})
+			g.cancel = nil
+			g.mu.Unlock()
+			return
+		}
+		done := g.done
 		g.mu.Unlock()
-		return
+		select {
+		case <-done:
+		case <-time.After(ownershipGrace):
+			g.mu.Lock()
+			cancel := g.cancel
+			g.mu.Unlock()
+			if cancel != nil {
+				cancel()
+			}
+			<-done
+		}
 	}
-	done := g.done
-	g.mu.Unlock()
-
-	select {
-	case <-done:
-		return
-	case <-time.After(ownershipGrace):
-	}
-	g.mu.Lock()
-	cancel := g.cancel
-	g.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	<-done
 }
