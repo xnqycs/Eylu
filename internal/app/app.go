@@ -50,6 +50,52 @@ const (
 	exitInternal = 10
 )
 
+// runtime is the process-wide state one invocation of Eylu runs against.
+//
+// Lock hierarchy
+//
+// Eight mutexes guard it. Three of them describe the request lifecycle and are
+// never held together; the fifth through eighth are taken in a fixed order in the
+// two places where two are held at once. The order is written down here because a
+// nesting rule that exists only in the callers is a rule nobody can check, and
+// `internal/agent/lock.go` documents the same thing for the agent's own locks.
+//
+//	secretMu      the API keys the process runs with, and nothing else.
+//	inputMu       the interactive reader and the question currently being asked.
+//	              It is never held while a request runs.
+//	limitMu       the provider limit resolver and the warnings already reported.
+//	              It guards bookkeeping, never a call.
+//	mcpStateMu    the live MCP catalog the agent reads: tools, contexts, the
+//	              fingerprint and the per-conversation watch counts. It is
+//	              independent of the two MCP lifecycle locks below, and reading the
+//	              catalog never holds them.
+//	mcpMu         the MCP manager itself: which manager exists, which
+//	              configuration produced it, and its watcher. Outermost of the MCP
+//	              locks.
+//	mcpHostMu     the host callbacks the manager was opened with. Taken after
+//	              mcpMu, directly in loadMCPWithCurrentHost and indirectly through
+//	              setMCPHost in loadMCPWithHost. Never the other way round.
+//	searchTaskMu  the subagent task manager and its per-session observers. Taken
+//	              after mcpMu and before toolRuntimeMu.
+//	toolRuntimeMu the code context and the resource coordinator the tool executor
+//	              is built from. Innermost of the three ordering locks: taken last,
+//	              and never while searchTaskMu or mcpMu is held.
+//
+// The two nesting sites are configureSearchAgent (searchTaskMu -> toolRuntimeMu)
+// and the two loadMCP entry points (mcpMu -> mcpHostMu). Nothing else holds two at
+// once, so the order above is the whole of the rule.
+//
+// One call is made while a lock is held, and it is worth naming: the subagent
+// configuration reads the conversation's exported state under searchTaskMu, which
+// takes the conversation's own lock. The reverse edge cannot exist, because
+// internal/agent does not know internal/app: a conversation never calls back into
+// this runtime, so searchTaskMu -> Conversation.mu has no counterpart and cannot
+// form a cycle. Adding a callback from the agent into the app would create one, so
+// that direction is the thing to check before adding one.
+//
+// What is deliberately not done here: no third-party deadlock detector replaces
+// sync.Mutex. The hierarchy above is short enough to state, and the alternative is
+// a global substitution with a runtime cost.
 type runtime struct {
 	stdin               io.Reader
 	stdout              io.Writer
