@@ -58,6 +58,8 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Check third-party notices
         run: go run ./scripts/generate-third-party-notices -check
+      - name: Check the invariant table against the tests it names
+        run: go test ./internal/docscheck/...
       - name: Lint GitHub Actions workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - run: go test -race ./...

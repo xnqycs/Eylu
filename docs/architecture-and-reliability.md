@@ -234,6 +234,11 @@ system sandbox:
 | the classifier reads a line as the shell does | `internal/tool/bash_shell_semantics_test.go` |
 | every system segment reaches the provider | `internal/driver/contract_test.go`: `TestDriversKeepEverySystemSegmentInOrder`, `internal/driver/webnative/driver_test.go`: `TestAnthropicKeepsEverySystemSegment` |
 
+The table is not prose on its own. `internal/docscheck` reads it and fails the build
+when a row names a test file or a test function that does not exist
+(`TestInvariantTableTestsExist`), so a rename or a deletion cannot leave this document
+claiming a guarantee that nothing holds up any more.
+
 ## 9. Known limitations and unverified scenarios
 
 - **Platforms.** The three-platform CI matrix is the only native cross-platform run.
