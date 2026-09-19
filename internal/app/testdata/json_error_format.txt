@@ -1,0 +1,7 @@
+# Every field below is part of this format's promise.
+# A field may be added - record it here in the same change, which is
+# what makes the addition a reviewed decision - but never renamed,
+# removed, or given a different meaning within this major version.
+# Regenerate with EYLU_UPDATE_GOLDEN=1 go test ./...
+error
+schema_version

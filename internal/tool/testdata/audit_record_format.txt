@@ -1,0 +1,54 @@
+# Every field below is part of this format's promise.
+# A field may be added - record it here in the same change, which is
+# what makes the addition a reviewed decision - but never renamed,
+# removed, or given a different meaning within this major version.
+# Regenerate with EYLU_UPDATE_GOLDEN=1 go test ./...
+allowed_tools optional
+batch_id optional
+batch_index
+call_id
+classification
+concurrency_mode optional
+confirmations
+confirmed
+decision
+duration_ms
+execution_duration_ms optional
+exit_code optional
+input_bytes
+is_error
+mode
+model optional
+output_bytes
+parent_call_id optional
+policy_override_ignored optional
+policy_rule optional
+policy_source optional
+provider_generation optional
+provider_name optional
+queue_duration_ms optional
+reason
+request_id
+resource_bytes optional
+resource_claims optional
+risk
+schema_version
+session_id optional
+skill_activated_at optional
+skill_digest optional
+skill_name optional
+skill_resource optional
+skill_source optional
+skill_trigger optional
+timestamp
+tool
+truncated
+untrusted_web_content optional
+warning
+web_backend optional
+web_cost_usd optional
+web_input_tokens optional
+web_output_tokens optional
+web_sources optional
+web_status optional
+web_target optional

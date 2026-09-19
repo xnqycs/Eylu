@@ -161,6 +161,15 @@ Allowed to differ, because it is presentation and interaction:
 - how events are rendered, and the text layout of an answer;
 - the identifiers and timestamps the output happens to use.
 
+`docs/compatibility.md` states which of these are promised to a program that
+parses Eylu's output and which are not. In short: the session log, the
+configuration file and the program-facing formats (`--output json`, `--output
+jsonl`, the audit record and the run summary) are promised, each names its own
+schema version, and their field names are enforced by a test; presentation is not,
+and the Go API is not promised at all, because every package lives under
+`internal/` and staying there keeps a structural refactor from being a
+compatibility event.
+
 `internal/app/entry_consistency_test.go` drives both entries with the same scripted
 model and compares which calls ran and how they ended, the run report's counters,
 the roles of the turns the session holds, the reason the request stopped, its cost

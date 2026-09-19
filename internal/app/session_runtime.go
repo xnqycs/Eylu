@@ -742,7 +742,8 @@ func (s *sessionRuntime) RecordRunReport(report agent.RunReport) error {
 		message = s.redact(message)
 	}
 	summary := session.RunSummary{
-		RequestID: report.RequestID, Iterations: report.Iterations, StopReason: report.StopReason,
+		SchemaVersion: session.RunSummarySchemaVersion,
+		RequestID:     report.RequestID, Iterations: report.Iterations, StopReason: report.StopReason,
 		Error: message, ModelCalls: report.ModelCalls, ToolCalls: report.ToolCalls,
 		Succeeded: report.Succeeded, Failed: report.Failed, Rejected: report.Rejected,
 		Cancelled: report.Cancelled, NotExecuted: report.NotExecuted, OutcomeUnknown: report.OutcomeUnknown,

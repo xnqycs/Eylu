@@ -8,6 +8,14 @@ import (
 	"Eylu/internal/protocol"
 )
 
+// RunReportSchemaVersion identifies the shape of a RunReport.
+//
+// The report is a program-facing document: a reader parses it without being able
+// to ask which version produced it, so it carries its own version. Within a major
+// version a field may be added, but never removed and never given a different
+// meaning.
+const RunReportSchemaVersion = 1
+
 // RunReport is the durable summary of one finished request.
 //
 // It answers, from the record alone, why a request stopped, which executions it
@@ -15,8 +23,10 @@ import (
 // separate from the UI event stream: a critical execution record must not exist
 // only in a transient event.
 type RunReport struct {
-	RequestID  string `json:"request_id"`
-	Iterations int    `json:"iterations"`
+	// SchemaVersion is the shape of this report.
+	SchemaVersion int    `json:"schema_version"`
+	RequestID     string `json:"request_id"`
+	Iterations    int    `json:"iterations"`
 	// StopReason is why the request ended: a model stop reason, the iteration
 	// limit, the token budget, a cancellation, an interruption or a failure.
 	StopReason string `json:"stop_reason"`

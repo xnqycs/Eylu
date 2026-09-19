@@ -35,7 +35,8 @@ func recordHostedWebActivities(executor *tool.Executor, runtime Runtime, request
 		}
 		inputBytes := webActivityInputBytes(activity)
 		executor.Audit.Record(tool.AuditRecord{
-			Timestamp: time.Now().UTC(), RequestID: requestID, SessionID: executor.SessionID,
+			SchemaVersion: tool.AuditSchemaVersion,
+			Timestamp:     time.Now().UTC(), RequestID: requestID, SessionID: executor.SessionID,
 			ProviderName: runtime.Provider.Name, ProviderGeneration: runtime.Provider.Generation, Model: runtime.Provider.Config.Model,
 			CallID: activity.CallID, Tool: string(activity.Kind), Risk: policy.RiskNetwork, Decision: policy.DecisionAllow,
 			Reason: "hosted web execution", Confirmed: runtime.Provider.Config.WebTools.Permission == "ask", DurationMS: activity.DurationMS,

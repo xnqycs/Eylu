@@ -19,6 +19,12 @@ const SchemaVersion = 3
 // document is refused rather than guessed at.
 const MinReadableSchemaVersion = 2
 
+// RunSummarySchemaVersion identifies the shape of a RunSummary. It is nested
+// inside the session document, whose own version governs the envelope; this one
+// says which shape of the summary a reader holding only that object is looking
+// at.
+const RunSummarySchemaVersion = 1
+
 type EventType string
 
 const (
@@ -74,6 +80,11 @@ type ToolPrepared struct {
 // it cost. Counters are kept per terminal state so "ran", "refused", "cancelled"
 // and "unknown" never collapse into one number.
 type RunSummary struct {
+	// SchemaVersion is the shape of this summary. The session document already
+	// carries its own version and this one is nested inside it, but a summary is
+	// also read on its own - from a `last_run` field or an exported event - and a
+	// reader there has no way to ask which build wrote it.
+	SchemaVersion  int       `json:"schema_version"`
 	RequestID      string    `json:"request_id"`
 	Iterations     int       `json:"iterations"`
 	StopReason     string    `json:"stop_reason"`

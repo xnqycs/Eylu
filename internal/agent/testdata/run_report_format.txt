@@ -1,0 +1,30 @@
+# Every field below is part of this format's promise.
+# A field may be added - record it here in the same change, which is
+# what makes the addition a reviewed decision - but never renamed,
+# removed, or given a different meaning within this major version.
+# Regenerate with EYLU_UPDATE_GOLDEN=1 go test ./...
+audit_failures optional
+cached_input_tokens optional
+cancelled
+error optional
+estimated_usage
+events_dropped optional
+exact_usage
+failed
+input_tokens
+interop optional
+iterations
+model_calls
+not_executed
+outcome_unknown
+output_tokens
+pending_at_end optional
+reasoning_tokens optional
+recovered_calls optional
+rejected
+request_id
+schema_version
+stop_reason
+succeeded
+tool_calls
+warnings optional

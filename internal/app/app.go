@@ -330,7 +330,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	jsonlEncoder := json.NewEncoder(r.stdout)
 	if routeDecision != nil {
 		if r.output == "jsonl" {
-			_ = jsonlEncoder.Encode(map[string]any{"type": "routing", "routing": routeDecision})
+			_ = jsonlEncoder.Encode(jsonlLine("routing", map[string]any{"routing": routeDecision}))
 		} else {
 			fmt.Fprintf(r.stderr, "[routing] task=%s provider=%s %s\n", routeDecision.Task, routeDecision.Provider, routeDecision.Candidates[0].Reason)
 		}
@@ -372,7 +372,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 			observation.ObserveContextEvent(event)
 		}
 		if r.output == "jsonl" {
-			_ = jsonlEncoder.Encode(map[string]any{"type": "context", "context": event})
+			_ = jsonlEncoder.Encode(jsonlLine("context", map[string]any{"context": event}))
 			return
 		}
 		switch event.Kind {
@@ -397,7 +397,7 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 		var emitMu sync.Mutex
 		rawEmit := func(event protocol.ModelEvent) error {
 			if r.output == "jsonl" {
-				return jsonlEncoder.Encode(map[string]any{"type": "model_event", "event": event})
+				return jsonlEncoder.Encode(jsonlLine("model_event", map[string]any{"event": event}))
 			}
 			switch event.Kind {
 			case protocol.EventTextDelta:
@@ -501,25 +501,23 @@ func (r *runtime) sendPrompt(ctx context.Context, conversation *agent.Conversati
 	}
 	if r.output == "json" {
 		// The response keeps every field it had, under the same names, and the
-		// request totals are added beside them: a reader that only knows the old
-		// shape is unaffected, and a reader that wants the cost of the whole
-		// request no longer has to mistake the last call for it.
+		// request totals and the schema version are added beside them: a reader
+		// that only knows the old shape is unaffected, and a reader that wants the
+		// cost of the whole request no longer has to mistake the last call for it.
 		totals, modelCalls := requestUsageTotals(runUsage)
-		return json.NewEncoder(r.stdout).Encode(struct {
-			protocol.ModelResponse
-			RequestUsage      protocol.Usage `json:"request_usage"`
-			RequestModelCalls int            `json:"request_model_calls"`
-		}{ModelResponse: response, RequestUsage: totals, RequestModelCalls: modelCalls})
+		return json.NewEncoder(r.stdout).Encode(jsonResponse{
+			ModelResponse: response, RequestUsage: totals, RequestModelCalls: modelCalls, SchemaVersion: JSONEnvelopeSchemaVersion,
+		})
 	}
 	if r.output == "jsonl" {
 		// The stream is already a sequence of typed objects, so the request totals
 		// are one more of them rather than a change to the response the caller
 		// already reads.
 		totals, modelCalls := requestUsageTotals(runUsage)
-		if err := jsonlEncoder.Encode(map[string]any{"type": "request_usage", "request_usage": totals, "request_model_calls": modelCalls}); err != nil {
+		if err := jsonlEncoder.Encode(jsonlLine("request_usage", map[string]any{"request_usage": totals, "request_model_calls": modelCalls})); err != nil {
 			return err
 		}
-		return jsonlEncoder.Encode(map[string]any{"type": "response", "response": response})
+		return jsonlEncoder.Encode(jsonlLine("response", map[string]any{"response": response}))
 	}
 	// A stop reason that is not a genuine completion is stated explicitly, so a
 	// truncated or cancelled answer is never presented as a finished one. The
@@ -572,7 +570,7 @@ func (r *runtime) metricCollector() *metrics.Collector {
 
 func (r *runtime) reportMetric(jsonlEncoder *json.Encoder, metric metrics.RequestMetric) {
 	if r.output == "jsonl" {
-		_ = jsonlEncoder.Encode(map[string]any{"type": "metrics", "metrics": metric})
+		_ = jsonlEncoder.Encode(jsonlLine("metrics", map[string]any{"metrics": metric}))
 		return
 	}
 	if r.output == "text" {
@@ -1000,9 +998,10 @@ func (r *runtime) printError(err error) {
 	}
 	message := r.redact(typed.Message)
 	if r.output == "json" || r.output == "jsonl" {
-		payload := map[string]any{"error": map[string]any{"code": typed.Code, "message": message, "retryable": typed.Retryable}}
+		detail := map[string]any{"code": typed.Code, "message": message, "retryable": typed.Retryable}
+		var payload any = jsonError{Error: detail, SchemaVersion: JSONEnvelopeSchemaVersion}
 		if r.output == "jsonl" {
-			payload["type"] = "error"
+			payload = jsonlLine("error", map[string]any{"error": detail})
 		}
 		_ = json.NewEncoder(r.stderr).Encode(payload)
 		return

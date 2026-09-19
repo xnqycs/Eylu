@@ -237,7 +237,7 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 		requestID = uuid.NewString()
 	}
 	if options.Report != nil {
-		*options.Report = RunReport{RequestID: requestID}
+		*options.Report = RunReport{SchemaVersion: RunReportSchemaVersion, RequestID: requestID}
 	}
 	// finalizer owns every exit path of this request: it closes pending calls,
 	// publishes the run usage and fills the report.

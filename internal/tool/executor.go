@@ -126,7 +126,19 @@ func joinBatchError(primary, cancel error) error {
 	}
 }
 
+// AuditSchemaVersion identifies the shape of an AuditRecord.
+//
+// An audit trail is written to be read long after the build that produced it, by
+// a program that has no way to ask what version it is reading. The record
+// therefore names its own shape. Within a major version a field may be added,
+// but never removed and never given a different meaning, and every new field is
+// optional so that a reader written against an older record keeps working.
+const AuditSchemaVersion = 1
+
 type AuditRecord struct {
+	// SchemaVersion is the shape of this record, so a reader can tell which
+	// version of the format it is parsing instead of guessing.
+	SchemaVersion       int                 `json:"schema_version"`
 	Timestamp           time.Time           `json:"timestamp"`
 	RequestID           string              `json:"request_id"`
 	SessionID           string              `json:"session_id,omitempty"`
@@ -672,7 +684,7 @@ func (e *Executor) executeBatch(ctx context.Context, requestID string, calls []p
 
 func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time) (prepared *preparedCall) {
 	prepared = &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}}
-	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, ParentCallID: call.ParentCallID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
+	prepared.record = AuditRecord{SchemaVersion: AuditSchemaVersion, Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, ParentCallID: call.ParentCallID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
 	if e != nil {
 		prepared.record.SessionID, prepared.record.ProviderName = e.SessionID, e.ProviderName
 		prepared.record.ProviderGeneration, prepared.record.Model = e.ProviderGeneration, e.Model
@@ -803,7 +815,7 @@ func cancelledExecution(prepared *preparedCall, err error) protocol.ToolResult {
 
 func (e *Executor) cancelledPrepared(requestID, batchID string, batchIndex int, call protocol.ToolCall, queuedAt time.Time, message string, interrupted bool) *preparedCall {
 	prepared := &preparedCall{call: call, queuedAt: queuedAt, spec: ConcurrencySpec{Mode: ConcurrencyExclusive}, state: protocol.CallNotExecuted}
-	prepared.record = AuditRecord{Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, ParentCallID: call.ParentCallID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
+	prepared.record = AuditRecord{SchemaVersion: AuditSchemaVersion, Timestamp: time.Now().UTC(), RequestID: requestID, BatchID: batchID, BatchIndex: batchIndex, CallID: call.ID, ParentCallID: call.ParentCallID, Tool: call.Name, InputBytes: len(call.Arguments), ConcurrencyMode: string(ConcurrencyExclusive)}
 	if e != nil {
 		prepared.record.SessionID, prepared.record.ProviderName = e.SessionID, e.ProviderName
 		prepared.record.ProviderGeneration, prepared.record.Model = e.ProviderGeneration, e.Model
