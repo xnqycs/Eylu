@@ -233,6 +233,14 @@ func resourceKey(path string) string {
 // through different paths, a UNC path versus the drive letter it is mapped to,
 // and per-directory case sensitivity on Windows. A path whose identity cannot be
 // established must stay exclusive.
+//
+// One more boundary is checked rather than assumed. Cleaning is not a normal form
+// for every Windows volume-relative spelling - fuzzing found a three-character
+// path that cleans to one value and cleans again to another - and a key that
+// changes when it is passed through a second time is not a key: two spellings of
+// one path could produce two of them, which is the missed conflict this function
+// exists to prevent. A value that is not its own cleaning result is therefore
+// refused as an unknown identity.
 func resourceKeyFor(goos, path string) string {
 	key := filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
 	if key == "." || key == "" {
@@ -241,10 +249,13 @@ func resourceKeyFor(goos, path string) string {
 	if goos == "windows" {
 		key = strings.ToLower(key)
 	}
-	if key == "/" || strings.HasSuffix(key, ":/") {
-		return key
+	if key != "/" && !strings.HasSuffix(key, ":/") {
+		key = strings.TrimSuffix(key, "/")
 	}
-	return strings.TrimSuffix(key, "/")
+	if filepath.ToSlash(filepath.Clean(key)) != key {
+		return ""
+	}
+	return key
 }
 
 func inside(root, candidate string) bool {

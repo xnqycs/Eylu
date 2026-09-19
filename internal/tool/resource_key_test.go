@@ -160,6 +160,33 @@ func TestResourceClaimsAllowParallelWorkAndSeparateConflicts(t *testing.T) {
 	}
 }
 
+// A value that is not its own cleaning result is refused rather than returned: a
+// key that changes when it is passed through a second time would let two
+// spellings of one path produce two keys, which is a conflict the coordinator
+// would miss.
+//
+// The input below is the one fuzzing found on Windows: a colon, a backslash and a
+// digit, which cleans to `:/0` and cleans again to `./:/0`.
+func TestResourceKeyRefusesAValueThatIsNotItsOwnCleaningResult(t *testing.T) {
+	unstable := ":\\0"
+	if runtime.GOOS != "windows" {
+		t.Skip("the unstable spelling is a Windows volume-relative form")
+	}
+	if cleaned := filepath.ToSlash(filepath.Clean(unstable)); filepath.ToSlash(filepath.Clean(cleaned)) == cleaned {
+		t.Skipf("this platform cleans %q to a fixed point, so there is nothing to refuse", unstable)
+	}
+	for _, goos := range []string{"windows", "linux", "darwin"} {
+		if got := resourceKeyFor(goos, unstable); got != "" {
+			t.Fatalf("resourceKeyFor(%q, %q) = %q, want an unknown identity", goos, unstable, got)
+		}
+	}
+	// An empty identity stays empty, which is what makes the refusal a fixed point
+	// itself and what the executor reads as "serialize this work".
+	if got := resourceKeyFor("windows", ""); got != "" {
+		t.Fatalf("resourceKeyFor(windows, \"\") = %q, want an empty key", got)
+	}
+}
+
 // A claim whose identity cannot be established falls back to exclusive work.
 func TestNormalizeConcurrencySpecFallsBackToExclusive(t *testing.T) {
 	tests := []ConcurrencySpec{

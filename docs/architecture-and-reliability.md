@@ -289,7 +289,7 @@ function it happens to exercise, and those tests are listed in section 8.
 | I-08 what the model sees matches the budget | `internal/protocol/projection_test.go`, `internal/context/projection_test.go`, `internal/driver/contract_test.go`: `TestDriversSendTheProjectedToolResult` |
 | I-09 front ends differ only in presentation | `internal/app/entry_consistency_test.go` |
 | I-10 an unknown outcome is never replayed | `internal/session/lifecycle_test.go`, `internal/app/checkpoint_test.go`: `TestResumeReportsAnUnrecordedExecutionAsUnknown` |
-| the classifier reads a line as the shell does | `internal/tool/bash_shell_semantics_test.go` |
+| the classifier reads a line as the shell does | `internal/tool/bash_shell_semantics_test.go`, `internal/policy/fuzz_test.go`: `FuzzClassifyCommand`, `FuzzReadOnlyArgumentVerdict`; `internal/tool/shell_dialect_test.go`: `TestAnUnmodelledShellIsRefusedRatherThanReadAsPOSIX` |
 | every system segment reaches the provider | `internal/driver/contract_test.go`: `TestDriversKeepEverySystemSegmentInOrder`, `internal/driver/webnative/driver_test.go`: `TestAnthropicKeepsEverySystemSegment` |
 | T-01 a server cannot declare its own tool read-only | `internal/mcpclient/trust_boundary_test.go`: `TestMCPServerCannotDeclareItsOwnToolReadOnly` |
 | T-02 an MCP tool name cannot collide with a built-in tool | `internal/mcpclient/trust_boundary_test.go`: `TestMCPToolNamesCannotCollideWithBuiltinTools` |
@@ -301,6 +301,7 @@ function it happens to exercise, and those tests are listed in section 8.
 | T-08 a subagent's cost is not folded into the parent request | `internal/app/trust_boundary_test.go`: `TestSubagentUsageIsNotFoldedIntoTheParentRequest`, `internal/app/subagent_usage_test.go`: `TestASubagentIsChargedForEveryModelCallItMade` |
 | T-09 untrusted content enters the request framed, and content cannot close its own envelope | `internal/context/untrusted_frame_test.go`: `TestAToolResultEntersTheRequestInsideTheUntrustedEnvelope`, `TestAToolResultCannotCloseItsOwnEnvelope`; `internal/agent/untrusted_context_test.go`: `TestContentReadFromOutsideTheConversationEntersFramed`; `internal/protocol/untrusted_test.go`: `TestContentCannotCloseItsOwnEnvelope`, `TestAForgedEnvelopeIsNotAccepted` |
 | T-10 a shell whose rules are not modelled is refused | `internal/tool/shell_dialect_test.go`: `TestAnUnmodelledShellIsRefusedRatherThanReadAsPOSIX`, `TestTheModelledShellsAreUnaffected` |
+| a tool path stays inside the workspace | `internal/tool/file_test.go`: `TestReadRejectsSymlinkEscape`; `internal/tool/fuzz_test.go`: `FuzzPathResolver`, `FuzzResourceKey`; `internal/tool/resource_key_test.go`: `TestResourceKeyRefusesAValueThatIsNotItsOwnCleaningResult` |
 
 The table is not prose on its own. `internal/docscheck` reads it and fails the build
 when a row names a test file or a test function that does not exist
@@ -333,6 +334,12 @@ claiming a guarantee that nothing holds up any more.
   is not.
 - **The soft budget.** A single model call can still overshoot the request budget,
   because no driver forwards a remaining output limit.
+- **Fuzzing is a search, not a proof.** The command classifier, the argument
+  validator, the path resolver and the resource key have fuzz targets with a
+  committed corpus. The corpus is replayed by `go test ./...`; the bounded search
+  on top of it runs in CI and is deliberately short, because a long search in the
+  gate every change waits on is a search that gets skipped. A property the engine
+  did not reach is unverified rather than verified.
 - **Prompt injection.** Content read from outside the conversation is delivered inside
   the untrusted envelope described in section 6, and the system prompt states what the
   envelope means. That is a statement about provenance, not immunity: a model can

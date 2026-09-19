@@ -63,7 +63,9 @@ func (p Problem) Error() string {
 
 var (
 	backtickPattern = regexp.MustCompile("`([^`]+)`")
-	testNamePattern = regexp.MustCompile(`^Test[A-Za-z0-9_]*$`)
+	// A fuzz target is a test: the table promises coverage, and a fuzz target is
+	// coverage for the inputs no example can enumerate.
+	testNamePattern = regexp.MustCompile(`^(Test|Fuzz)[A-Za-z0-9_]*$`)
 	labelPattern    = regexp.MustCompile(`^[A-Z]-[0-9]+$`)
 )
 
@@ -253,7 +255,8 @@ func VerifyInvariants(root string, invariants []Invariant) []Problem {
 	return problems
 }
 
-// declaresTest reports whether the file declares a top-level `func name(t *testing.T)`.
+// declaresTest reports whether the file declares the named test or fuzz target at
+// the top level, with the signature the testing package requires.
 func declaresTest(path, name string) (bool, error) {
 	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
 	if err != nil {
@@ -264,13 +267,21 @@ func declaresTest(path, name string) (bool, error) {
 		if !ok || fn.Recv != nil || fn.Name == nil || fn.Name.Name != name {
 			continue
 		}
-		return isGoTestSignature(fn), nil
+		return isGoTestSignature(fn, name), nil
 	}
 	return false, nil
 }
 
-func isGoTestSignature(fn *ast.FuncDecl) bool {
+// isGoTestSignature reports whether a declaration is a test function or a fuzz
+// target. A fuzz target takes *testing.F rather than *testing.T, and a row that
+// names one is promising a search rather than an example.
+func isGoTestSignature(fn *ast.FuncDecl, name string) bool {
 	if fn.Type == nil || fn.Type.Params == nil || len(fn.Type.Params.List) != 1 {
+		return false
+	}
+	// `a, b *testing.T` is one parameter field holding two names, and a test takes
+	// exactly one parameter.
+	if len(fn.Type.Params.List[0].Names) != 1 {
 		return false
 	}
 	star, ok := fn.Type.Params.List[0].Type.(*ast.StarExpr)
@@ -282,10 +293,13 @@ func isGoTestSignature(fn *ast.FuncDecl) bool {
 		return false
 	}
 	pkg, ok := selector.X.(*ast.Ident)
-	if !ok {
+	if !ok || pkg.Name != "testing" || selector.Sel == nil {
 		return false
 	}
-	return pkg.Name == "testing" && selector.Sel != nil && selector.Sel.Name == "T"
+	if strings.HasPrefix(name, "Fuzz") {
+		return selector.Sel.Name == "F"
+	}
+	return selector.Sel.Name == "T"
 }
 
 // FindRepositoryRoot walks up from dir until it finds the go.mod that roots the

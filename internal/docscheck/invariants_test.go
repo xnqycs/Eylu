@@ -1,6 +1,9 @@
 package docscheck
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,6 +166,85 @@ func TestVerifyInvariantsCatchesAMisspelledTestName(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the report must name both the invariant and the failing test: %#v", problems)
+	}
+}
+
+// A fuzz target is coverage for the inputs no example can enumerate, so the table
+// may promise one.
+func TestVerifyInvariantsAcceptsAFuzzTarget(t *testing.T) {
+	root, err := FindRepositoryRoot(".")
+	if err != nil {
+		t.Fatalf("locate repository root: %v", err)
+	}
+	doc := strings.Join([]string{
+		"## 8. Invariants and where they are tested",
+		"",
+		"| invariant | test |",
+		"|---|---|",
+		"| I-92 a tested property | `internal/docscheck/invariants_test.go`: `TestParseInvariantTableReadsEveryCellForm` |",
+		"| I-91 a fuzzed property | `internal/policy/fuzz_test.go`: `FuzzClassifyCommand`, `FuzzReadOnlyArgumentVerdict` |",
+		"| I-90 a fuzz name nobody declared | `internal/policy/fuzz_test.go`: `FuzzNotATarget` |",
+	}, "\n")
+	invariants, err := ParseInvariantTable(doc)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(invariants) != 3 {
+		t.Fatalf("rows = %d", len(invariants))
+	}
+	problems := VerifyInvariants(root, invariants)
+	if len(problems) != 1 || problems[0].Invariant != "I-90" {
+		t.Fatalf("problems = %#v, want only the fuzz name nobody declared", problems)
+	}
+}
+
+// The signature is read as well as the name, so a fuzz name on a plain test
+// function is not accepted as a fuzz target. The source below is parsed rather
+// than compiled: a wrong signature would be a vet error in this package.
+func TestIsGoTestSignatureReadsTheSignature(t *testing.T) {
+	source := `package x
+
+import "testing"
+
+func TestReal(t *testing.T) {}
+func FuzzReal(f *testing.F) {}
+func TestWrong(f *testing.F) {}
+func FuzzWrong(t *testing.T) {}
+func TestNoArgument() {}
+func TestTwoArguments(a, b *testing.T) {}
+func TestNotATestingPackage(t *other.T) {}
+func helper(t *testing.T) {}
+`
+	file, err := parser.ParseFile(token.NewFileSet(), "x_test.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := map[string]*ast.FuncDecl{}
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			declared[fn.Name.Name] = fn
+		}
+	}
+	for name, want := range map[string]bool{
+		"TestReal": true, "FuzzReal": true,
+		"TestWrong": false, "FuzzWrong": false,
+		"TestNoArgument": false, "TestTwoArguments": false, "TestNotATestingPackage": false,
+		// A helper has the shape of a test; the name filter is what keeps it out,
+		// and the table only ever names something that filter accepted.
+		"helper": true,
+	} {
+		fn, present := declared[name]
+		if !present {
+			t.Fatalf("%s was not parsed out of the fixture", name)
+		}
+		if got := isGoTestSignature(fn, name); got != want {
+			t.Fatalf("isGoTestSignature(%s) = %t, want %t", name, got, want)
+		}
+	}
+	for name, want := range map[string]bool{"TestReal": true, "FuzzReal": true, "helper": false, "FuzzNotATarget": true} {
+		if got := testNamePattern.MatchString(name); got != want {
+			t.Fatalf("the name filter accepts %s = %t, want %t", name, got, want)
+		}
 	}
 }
 

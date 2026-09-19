@@ -76,3 +76,13 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
+      # The committed corpus under testdata/fuzz is already replayed by
+      # `go test ./...`; this is a bounded search on top of it. A long search
+      # belongs in a periodic job, not in the gate every change waits on.
+      - name: Fuzz regression (30s per target)
+        shell: bash
+        run: |
+          go test ./internal/policy -run '^$' -fuzz FuzzClassifyCommand -fuzztime 30s
+          go test ./internal/policy -run '^$' -fuzz FuzzReadOnlyArgumentVerdict -fuzztime 30s
+          go test ./internal/tool -run '^$' -fuzz FuzzPathResolver -fuzztime 30s
+          go test ./internal/tool -run '^$' -fuzz FuzzResourceKey -fuzztime 30s
