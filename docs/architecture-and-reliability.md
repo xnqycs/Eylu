@@ -192,6 +192,31 @@ The bounds are `MaxProjectedTextBlockBytes`, `MaxProjectedStructuredBytes` and
 `MaxProjectedBlocks`. The estimator counts the projection rather than the stored
 result, which is what keeps "what was charged" and "what was sent" the same object.
 
+**Trust.** The projection says what the model reads; it does not say where the text
+came from. `internal/context` grades every category of context by authorship -
+`TrustHost`, `TrustUser`, `TrustDerived` and `TrustExternal` - and everything graded
+external arrives inside an untrusted envelope:
+
+```
+<<<untrusted-data id=0123456789abcdef>>>
+...the text as the host read it...
+<<<end-untrusted-data id=0123456789abcdef>>>
+```
+
+The identifier is a digest of the text between the markers, which is what makes the
+envelope a pure function of the content and what makes it impossible for content to
+close its own envelope: a body that ended it early would have to contain the digest
+of the text containing it. Because the frame is deterministic, a repeated projection
+is byte-identical - so the ledger charges the framed bytes and a driver sends those
+same bytes, and the frame costs budget rather than escaping it.
+
+The envelope is applied where the request is assembled, around the projection rather
+than inside it, so the projection keeps its own contract of being valid JSON. It
+covers tool results, a server's instructions and resource catalog, the skill catalog
+and a skill body. It does not cover the system prompt, the user's own messages or the
+host's own bookkeeping, and it does not cover tool schemas and their descriptions,
+which travel as protocol fields rather than as content.
+
 **Budget.** The budget is soft and covers the whole request: the main model calls,
 the compaction summaries and the context-recovery retries. A call is counted when it
 happens, whether or not the provider reported tokens; a request with any unreported
@@ -234,6 +259,7 @@ one of them is worth more than the implementation that satisfies it today.
 | T-06 | A subagent shares its parent's resource coordinator and checkpoint: two agents still cannot write one path at a time, and a side effect the subagent commits is still recorded. |
 | T-07 | A subagent can create a file but cannot overwrite one, because it cannot see the conversation that would justify replacing it. |
 | T-08 | A subagent's cost is its own: every model call its own request made is charged to it, in its own session, and never folded into the request that delegated to it. |
+| T-09 | Content read from outside the conversation - a file, a command's output, a tool result, a server's instructions, a skill's text - reaches the model inside an untrusted envelope, and text the host or the user wrote does not. The envelope's identifier is derived from the content it wraps, so it is deterministic and content cannot close its own envelope. |
 
 Each of these is pinned by a test named after the guarantee rather than after the
 function it happens to exercise, and those tests are listed in section 8.
@@ -262,6 +288,7 @@ function it happens to exercise, and those tests are listed in section 8.
 | T-06 a subagent shares the parent coordinator and checkpoint | `internal/app/trust_boundary_test.go`: `TestSubagentSharesTheParentCoordinatorAndCheckpoint` |
 | T-07 a subagent cannot overwrite an existing file | `internal/app/trust_boundary_test.go`: `TestSubagentWriteFileCannotOverwriteAnExistingFile` |
 | T-08 a subagent's cost is not folded into the parent request | `internal/app/trust_boundary_test.go`: `TestSubagentUsageIsNotFoldedIntoTheParentRequest`, `internal/app/subagent_usage_test.go`: `TestASubagentIsChargedForEveryModelCallItMade` |
+| T-09 untrusted content enters the request framed, and content cannot close its own envelope | `internal/context/untrusted_frame_test.go`: `TestAToolResultEntersTheRequestInsideTheUntrustedEnvelope`, `TestAToolResultCannotCloseItsOwnEnvelope`; `internal/agent/untrusted_context_test.go`: `TestContentReadFromOutsideTheConversationEntersFramed`; `internal/protocol/untrusted_test.go`: `TestContentCannotCloseItsOwnEnvelope`, `TestAForgedEnvelopeIsNotAccepted` |
 
 The table is not prose on its own. `internal/docscheck` reads it and fails the build
 when a row names a test file or a test function that does not exist
@@ -291,6 +318,14 @@ claiming a guarantee that nothing holds up any more.
   is not.
 - **The soft budget.** A single model call can still overshoot the request budget,
   because no driver forwards a remaining output limit.
+- **Prompt injection.** Content read from outside the conversation is delivered inside
+  the untrusted envelope described in section 6, and the system prompt states what the
+  envelope means. That is a statement about provenance, not immunity: a model can
+  still choose to follow text that is framed as data. Eylu does not scan content for
+  injection patterns, because a pattern match would report a confidence it does not
+  have and would flag ordinary technical documents. The envelope does not cover tool
+  schemas and their descriptions, which travel as protocol fields; a tool description
+  is a claim by whoever supplied the tool.
 - **Recovery is advice.** A pending intent's evidence decides what a human should
   conclude; Eylu never replays an operation, and it cannot prove that a file was not
   changed by something else in between.

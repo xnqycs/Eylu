@@ -37,8 +37,11 @@ func TestTheLedgerCountsTheProjectionOfARichToolResult(t *testing.T) {
 	if sent.ContentBlocks != nil || sent.StructuredContent != nil {
 		t.Fatalf("the request still carries the stored rich fields: %#v", sent)
 	}
-	if sent.Content != projection.Text {
-		t.Fatalf("the request carries something other than the projection:\n got %q\nwant %q", sent.Content, projection.Text)
+	// The request carries the projection inside the untrusted envelope, so the
+	// framed bytes are what has to be charged and sent further down.
+	framed := protocol.FrameUntrusted(projection.Text)
+	if sent.Content != framed {
+		t.Fatalf("the request carries something other than the framed projection:\n got %q\nwant %q", sent.Content, framed)
 	}
 	if !sent.Truncated {
 		t.Fatal("a projected result was presented as complete")
@@ -52,12 +55,12 @@ func TestTheLedgerCountsTheProjectionOfARichToolResult(t *testing.T) {
 		}
 		counted += block.Bytes
 	}
-	if counted != len(projection.Text) {
-		t.Fatalf("the ledger counted %d bytes of a %d byte projection", counted, len(projection.Text))
+	if counted != len(framed) {
+		t.Fatalf("the ledger counted %d bytes of a %d byte framed projection", counted, len(framed))
 	}
 
 	// And the driver sends exactly what was counted.
-	if driverText := protocol.ToolResultText(*sent); driverText != projection.Text {
-		t.Fatalf("the driver would send %d bytes for a counted %d", len(driverText), len(projection.Text))
+	if driverText := protocol.ToolResultText(*sent); driverText != framed {
+		t.Fatalf("the driver would send %d bytes for a counted %d", len(driverText), len(framed))
 	}
 }

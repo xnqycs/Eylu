@@ -428,7 +428,10 @@ func TestReasoningIsRetainedLocallyAndExcludedFromReplay(t *testing.T) {
 func compressionRuntime(model driver.ModelDriver, workspace string, event func(contextledger.Event)) Runtime {
 	return Runtime{
 		Provider: provider.Snapshot{Name: "work", Generation: 1, Config: config.ProviderConfig{
-			Adapter: model.Name(), BaseURL: "https://example.com/v1", Model: "small-context", ContextWindow: 1900,
+			// Wide enough to carry twenty tool results inside the untrusted
+			// envelope every one of them now travels in, and narrow enough that
+			// twenty file writes still force compaction.
+			Adapter: model.Name(), BaseURL: "https://example.com/v1", Model: "small-context", ContextWindow: 2400,
 		}},
 		Driver: model, Workspace: workspace, TokenEstimator: contextledger.ApproxEstimator{BytesPerToken: 2},
 		OutputReserveTokens: 128, ContextRecentRounds: 2, MaxProjectMapBytes: 2048, MaxToolContextBytes: 512,

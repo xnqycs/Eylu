@@ -191,7 +191,18 @@ func (b *PromptBuilder) AddTurn(turn protocol.Turn) {
 		case part.Kind == protocol.PartToolResult && part.ToolResult != nil:
 			category, source := toolResultCategory(part.ToolResult)
 			metadata := map[string]any{"call_id": part.ToolResult.CallID, "is_error": part.ToolResult.IsError, "truncated": part.ToolResult.Truncated}
-			content := part.ToolResult.Content
+			// Everything a tool returned came from somewhere the host does not
+			// control - the filesystem, a shell, a remote server - so the request
+			// carries it inside the untrusted envelope the system prompt describes.
+			//
+			// The frame is applied here, on top of the projection, rather than
+			// inside it: the projection's own contract is to be valid JSON the
+			// model can read, and this is a wrapper around the text a request
+			// carries. Applying it here also keeps the frame a pure function of the
+			// result, which is what lets the ledger below charge exactly the bytes
+			// the driver will send.
+			content := protocol.FrameUntrusted(part.ToolResult.Content)
+			part.ToolResult.Content = content
 			codeSlice, isSlice := parseCodeSlice(part.ToolResult.Metadata)
 			if isSlice {
 				// A body that was trimmed for the context window no longer

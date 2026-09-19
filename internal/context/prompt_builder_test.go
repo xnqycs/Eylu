@@ -68,11 +68,11 @@ func TestPromptBuilderDeduplicatesAndPromotesCodeSlices(t *testing.T) {
 	}
 	first := result.Turns[0].Parts[0].ToolResult.Content
 	contained := result.Turns[1].Parts[0].ToolResult.Content
-	promoted := result.Turns[2].Parts[0].ToolResult.Content
+	promoted := unwrap(result.Turns[2].Parts[0].ToolResult.Content)
 	if !strings.Contains(first, "artifact-promoted") || !strings.Contains(contained, "artifact-promoted") {
 		t.Fatalf("references were not redirected: first=%q contained=%q", first, contained)
 	}
-	if promoted != bodyLargerThanAReference("promoted") || result.Turns[3].Parts[0].ToolResult.Content != "new file generation" {
+	if promoted != bodyLargerThanAReference("promoted") || unwrap(result.Turns[3].Parts[0].ToolResult.Content) != "new file generation" {
 		t.Fatalf("canonical content = %#v", result.Turns)
 	}
 	if result.Blocks[0].Category != CategoryCodeSlice || result.Blocks[1].Category != CategoryCodeSlice {
@@ -91,7 +91,7 @@ func TestPromptBuilderLeavesPartialOverlapAndTranscriptInputUntouched(t *testing
 	builder.AddTurn(protocol.Turn{ID: "first", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: first}}})
 	builder.AddTurn(protocol.Turn{ID: "second", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: second}}})
 	result := builder.Result()
-	if result.SliceStats.Deduplicated != 0 || result.Turns[0].Parts[0].ToolResult.Content != "full first" || result.Turns[1].Parts[0].ToolResult.Content != "full second" {
+	if result.SliceStats.Deduplicated != 0 || unwrap(result.Turns[0].Parts[0].ToolResult.Content) != "full first" || unwrap(result.Turns[1].Parts[0].ToolResult.Content) != "full second" {
 		t.Fatalf("result = %#v", result)
 	}
 	if first.Content != "full first" || second.Content != "full second" {

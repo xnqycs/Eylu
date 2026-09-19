@@ -35,7 +35,7 @@ func TestTrimmedFragmentDeduplicatesOnlyTheLinesItRetained(t *testing.T) {
 	if got := result.Turns[1].Parts[0].ToolResult.Content; !strings.Contains(got, "artifact_id=big") {
 		t.Fatalf("a retained range was not deduplicated: %q", got)
 	}
-	if got := result.Turns[2].Parts[0].ToolResult.Content; got != "the omitted middle" {
+	if got := unwrap(result.Turns[2].Parts[0].ToolResult.Content); got != "the omitted middle" {
 		t.Fatalf("the omitted middle was replaced by a reference: %q", got)
 	}
 	if got := result.Turns[3].Parts[0].ToolResult.Content; !strings.Contains(got, "artifact_id=big") {
@@ -62,7 +62,7 @@ func TestReferenceRequiresOneRetainedRange(t *testing.T) {
 	spanning := addSliceTurn(builder, "spanning", "spanning", "hash", "lines 5 to 95", 5, 95)
 
 	result := builder.Result()
-	if got := result.Turns[1].Parts[0].ToolResult.Content; got != "lines 5 to 95" {
+	if got := unwrap(result.Turns[1].Parts[0].ToolResult.Content); got != "lines 5 to 95" {
 		t.Fatalf("a range spanning the omitted middle was deduplicated: %q", got)
 	}
 	if spanning.Content != "lines 5 to 95" {
@@ -83,7 +83,7 @@ func TestTrimmedFragmentDoesNotSupersedeACompleteCanonical(t *testing.T) {
 	builder.AddTurn(protocol.Turn{ID: "big", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: trimmed}}})
 
 	result := builder.Result()
-	if got := result.Turns[0].Parts[0].ToolResult.Content; got != "the complete middle" {
+	if got := unwrap(result.Turns[0].Parts[0].ToolResult.Content); got != "the complete middle" {
 		t.Fatalf("the complete canonical was replaced: %q", got)
 	}
 	if complete.Content != "the complete middle" {
@@ -119,7 +119,7 @@ func TestRetainedRangesSurviveARebuild(t *testing.T) {
 	if got := result.Turns[1].Parts[0].ToolResult.Content; !strings.Contains(got, "artifact_id=big") {
 		t.Fatalf("a decoded retained range was ignored: %q", got)
 	}
-	if got := result.Turns[2].Parts[0].ToolResult.Content; got != "lines 40 to 45" {
+	if got := unwrap(result.Turns[2].Parts[0].ToolResult.Content); got != "lines 40 to 45" {
 		t.Fatalf("a decoded omitted range was deduplicated: %q", got)
 	}
 }

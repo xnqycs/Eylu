@@ -662,11 +662,11 @@ func (c *Conversation) buildPromptContextWithState(runtime Runtime, definitions 
 	for _, server := range runtime.MCPContexts {
 		if server.Instructions != "" {
 			content := fmt.Sprintf("<mcp_instructions server=%q>\n%s\n</mcp_instructions>", server.Server, server.Instructions)
-			builder.AddTextTurn("mcp-instructions:"+server.Server, protocol.RoleSystem, content, contextledger.CategoryMCPInstructions, server.Server, true, map[string]any{"server": server.Server})
+			builder.AddTextTurn("mcp-instructions:"+server.Server, protocol.RoleSystem, protocol.FrameUntrusted(content), contextledger.CategoryMCPInstructions, server.Server, true, map[string]any{"server": server.Server})
 		}
 		if server.ResourceCatalog != "" {
 			content := fmt.Sprintf("<mcp_resources server=%q>\n%s\n</mcp_resources>", server.Server, server.ResourceCatalog)
-			builder.AddTextTurn("mcp-resources:"+server.Server, protocol.RoleSystem, content, contextledger.CategoryMCPResource, server.Server, true, map[string]any{"server": server.Server})
+			builder.AddTextTurn("mcp-resources:"+server.Server, protocol.RoleSystem, protocol.FrameUntrusted(content), contextledger.CategoryMCPResource, server.Server, true, map[string]any{"server": server.Server})
 		}
 	}
 	pages := contextledger.PaginateSkillCatalog(c.skillCatalog, options.catalogPageBytes)
@@ -676,11 +676,11 @@ func (c *Conversation) buildPromptContextWithState(runtime Runtime, definitions 
 			content = skillCatalogInstructions + "\n" + page
 		}
 		source := fmt.Sprintf("page:%d/%d", index+1, len(pages))
-		builder.AddTextTurn("skill-catalog:"+source, protocol.RoleSystem, content, contextledger.CategorySkillCatalog, source, true, map[string]any{"page": index + 1, "pages": len(pages)})
+		builder.AddTextTurn("skill-catalog:"+source, protocol.RoleSystem, protocol.FrameUntrusted(content), contextledger.CategorySkillCatalog, source, true, map[string]any{"page": index + 1, "pages": len(pages)})
 	}
 	for _, name := range protectedNamesFromMap(c.protectedSkills) {
 		protected := c.protectedSkills[name]
-		builder.AddTextTurn("skill:"+name+":"+protected.Digest, protocol.RoleSystem, protected.Content, contextledger.CategorySkillBody, name+":"+protected.Digest, true, map[string]any{"name": name, "source": protected.Source, "digest": protected.Digest})
+		builder.AddTextTurn("skill:"+name+":"+protected.Digest, protocol.RoleSystem, protocol.FrameUntrusted(protected.Content), contextledger.CategorySkillBody, name+":"+protected.Digest, true, map[string]any{"name": name, "source": protected.Source, "digest": protected.Digest})
 	}
 	if len(c.todoList.Items) > 0 {
 		builder.AddTextTurn("task-list", protocol.RoleSystem, formatTodoListContext(c.todoList), contextledger.CategoryTaskState, "session", true, nil)

@@ -175,7 +175,7 @@ func TestASmallBodyKeepsItsContent(t *testing.T) {
 		t.Fatalf("stats = %#v", result.SliceStats)
 	}
 	body := turns[0].Parts[0].ToolResult.Content
-	if got := result.Turns[1].Parts[0].ToolResult.Content; got != body {
+	if got := result.Turns[1].Parts[0].ToolResult.Content; got != protocol.FrameUntrusted(body) {
 		t.Fatalf("the small body was replaced anyway: %q", got)
 	}
 	// The decision is visible on the block rather than being an absence.

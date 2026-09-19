@@ -30,7 +30,7 @@ func TestPromptBuilderKeepsBodyOfSliceReadAfterTrimmedFragment(t *testing.T) {
 	middle := addSliceTurn(builder, "middle", "middle", "hash", "the omitted middle lines", 400, 450)
 
 	result := builder.Result()
-	got := result.Turns[1].Parts[0].ToolResult.Content
+	got := unwrap(result.Turns[1].Parts[0].ToolResult.Content)
 	if got != "the omitted middle lines" {
 		t.Fatalf("middle slice was replaced by a reference: %q", got)
 	}
@@ -57,7 +57,7 @@ func TestPromptBuilderTrimmedFragmentDoesNotSupersedeCompleteSlice(t *testing.T)
 	builder.AddTurn(protocol.Turn{ID: "big", Role: protocol.RoleTool, Parts: []protocol.Part{{Kind: protocol.PartToolResult, ToolResult: big}}})
 
 	result := builder.Result()
-	if result.Turns[0].Parts[0].ToolResult.Content != "exact small body" {
+	if unwrap(result.Turns[0].Parts[0].ToolResult.Content) != "exact small body" {
 		t.Fatalf("complete slice was superseded: %q", result.Turns[0].Parts[0].ToolResult.Content)
 	}
 	if small.Content != "exact small body" || big.Content != "trimmed body" {
@@ -76,10 +76,10 @@ func TestPromptBuilderStillDeduplicatesCompleteSlices(t *testing.T) {
 	addSliceTurn(builder, "repeat", "repeat", "hash", first, 10, 20)
 
 	result := builder.Result()
-	if result.Turns[1].Parts[0].ToolResult.Content == first {
+	if unwrap(result.Turns[1].Parts[0].ToolResult.Content) == first {
 		t.Fatal("a repeated complete read was not deduplicated")
 	}
-	if !strings.Contains(result.Turns[1].Parts[0].ToolResult.Content, "artifact_id=first") {
+	if !strings.Contains(unwrap(result.Turns[1].Parts[0].ToolResult.Content), "artifact_id=first") {
 		t.Fatalf("repeat content = %q", result.Turns[1].Parts[0].ToolResult.Content)
 	}
 	if got := result.Blocks[1].Metadata["slice_complete"]; got != true {
@@ -98,7 +98,7 @@ func TestPromptBuilderTreatsToolTruncatedRangeAsIncomplete(t *testing.T) {
 	addSliceTurn(builder, "middle", "middle", "hash", "middle body", 400, 450)
 
 	result := builder.Result()
-	if result.Turns[1].Parts[0].ToolResult.Content != "middle body" {
+	if unwrap(result.Turns[1].Parts[0].ToolResult.Content) != "middle body" {
 		t.Fatalf("middle slice = %q", result.Turns[1].Parts[0].ToolResult.Content)
 	}
 	if got := result.Blocks[0].Metadata["slice_complete"]; got != false {
@@ -113,7 +113,7 @@ func TestPromptBuilderNeverReferencesAnotherFileGeneration(t *testing.T) {
 	addSliceTurn(builder, "new", "new", "hash-two", "new generation body", 10, 20)
 
 	result := builder.Result()
-	if got := result.Turns[1].Parts[0].ToolResult.Content; got != "new generation body" {
+	if got := unwrap(result.Turns[1].Parts[0].ToolResult.Content); got != "new generation body" {
 		t.Fatalf("new generation was replaced: %q", got)
 	}
 	if result.SliceStats.Stale != 1 {

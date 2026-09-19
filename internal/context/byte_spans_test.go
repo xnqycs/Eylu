@@ -133,7 +133,7 @@ func TestFragmentOfOneLineNeverCoversMoreThanItHolds(t *testing.T) {
 				t.Fatalf("the later body was replaced=%t, want %t: %s (content = %q)",
 					replaced, testCase.wantReference, testCase.why, later)
 			}
-			if !testCase.wantReference && later != current.Content {
+			if !testCase.wantReference && unwrap(later) != current.Content {
 				t.Fatalf("the later body was changed: %q, want %q", later, current.Content)
 			}
 			if testCase.wantReference && later == "" {
@@ -151,7 +151,7 @@ func TestAFragmentOfALineDoesNotSupersedeAWholeLineCanonical(t *testing.T) {
 	partialSliceTurn(builder, "partial", "partial", "hash", bodyLargerThanAReference("head ... tail"), 1, byteSpans(1, 0, 300, 1, 900, 1000))
 
 	result := builder.Result()
-	if result.Turns[0].Parts[0].ToolResult.Content != bodyLargerThanAReference("the entire line") {
+	if unwrap(result.Turns[0].Parts[0].ToolResult.Content) != bodyLargerThanAReference("the entire line") {
 		t.Fatalf("the whole-line canonical was superseded: %q", result.Turns[0].Parts[0].ToolResult.Content)
 	}
 	if whole.Content != bodyLargerThanAReference("the entire line") {
