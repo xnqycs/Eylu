@@ -52,7 +52,7 @@ const (
 
 // runtime is the process-wide state one invocation of Eylu runs against.
 //
-// Lock hierarchy
+// # Lock hierarchy
 //
 // Eight mutexes guard it. Three of them describe the request lifecycle and are
 // never held together; the fifth through eighth are taken in a fixed order in the
