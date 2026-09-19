@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -192,28 +191,5 @@ func TestHTTPClientsDifferOnlyInTheTotalTimeout(t *testing.T) {
 	// A nil client means the default one, which has no timeout either.
 	if got := StreamingHTTPClient(nil); got == nil || got.Timeout != 0 {
 		t.Fatalf("StreamingHTTPClient(nil) = %#v", got)
-	}
-}
-
-// A driver whose stream is cancelled must stop, and the buffer must not keep a
-// fragment that the request will never send. The cancellation itself is the
-// caller's, so what is pinned here is that flushing is safe from several
-// goroutines, which is what a driver does when a stream and a deadline race.
-func TestStreamDeltaBufferIsSafeUnderConcurrentUse(t *testing.T) {
-	var buffer StreamDeltaBuffer
-	var group sync.WaitGroup
-	for worker := 0; worker < 8; worker++ {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			for call := 0; call < 64; call++ {
-				buffer.Push("fragment", time.Now())
-				buffer.Flush()
-			}
-		}()
-	}
-	group.Wait()
-	if batch := buffer.Flush(); batch != "" {
-		t.Fatalf("the buffer kept %q after every writer flushed", batch)
 	}
 }

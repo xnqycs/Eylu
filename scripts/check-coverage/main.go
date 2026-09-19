@@ -23,6 +23,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -177,6 +178,23 @@ func readFloor(path string) (map[string]float64, bool, error) {
 	return floor, true, nil
 }
 
+// floorSlack is how far below its floor a package may measure before the gate
+// fails, and how far above it a package must measure before the floor is raised.
+//
+// It exists because the number is not exact. A package's statement coverage moves
+// between runs when a branch is only reached under a schedule the test cannot pin:
+// internal/tool measures 82.1% and 82.3% on alternate runs of the same commit,
+// because its cancellation branches depend on which of two goroutines gets there
+// first. A gate that fails on that is a gate people learn to re-run, and then to
+// ignore. The slack is roughly four times the largest spread observed; a real loss
+// - tests deleted, a feature's coverage dropped - costs several points and is
+// still caught.
+//
+// Raising the floor uses the same number in the other direction, so the file does
+// not churn on noise either: a package is only recorded higher when it has more
+// than a point of real headroom.
+const floorSlack = 1.0
+
 // compare reports every package that fell below its floor, and every package whose
 // coverage improved enough to record.
 func compare(path string, floor map[string]float64, measured []measurement) error {
@@ -187,11 +205,11 @@ func compare(path string, floor map[string]float64, measured []measurement) erro
 			unrecorded = append(unrecorded, fmt.Sprintf("  %s %.1f%% (no floor yet)", item.pkg, item.percent))
 			continue
 		}
-		if item.percent+0.05 < committed {
-			regressions = append(regressions, fmt.Sprintf("  %s %.1f%% < %.1f%%", item.pkg, item.percent, committed))
+		if item.percent < committed-floorSlack {
+			regressions = append(regressions, fmt.Sprintf("  %s %.1f%% is more than %.1f point(s) below %.1f%%", item.pkg, item.percent, floorSlack, committed))
 			continue
 		}
-		if item.percent > committed+0.05 {
+		if item.percent > committed+floorSlack {
 			improvements = append(improvements, fmt.Sprintf("  %s %.1f%% > %.1f%%", item.pkg, item.percent, committed))
 		}
 	}
@@ -208,15 +226,20 @@ func compare(path string, floor map[string]float64, measured []measurement) erro
 }
 
 // writeFloor records the measured coverage, and refuses to lower anything.
+//
+// A recorded floor is the measurement rounded down to a whole percentage point,
+// because that is the precision the number has: the digits after the point move
+// between runs of the same commit (see floorSlack), so recording them would record
+// noise and make the file churn.
 func writeFloor(path string, floor map[string]float64, measured []measurement) error {
 	for _, item := range measured {
-		if committed, recorded := floor[item.pkg]; recorded && item.percent+0.05 < committed {
+		if committed, recorded := floor[item.pkg]; recorded && item.percent < committed-floorSlack {
 			return fmt.Errorf("%s: %.1f%% is below the committed floor of %.1f%%; a floor is raised by adding tests, never lowered to make a build pass", item.pkg, item.percent, committed)
 		}
 	}
 	next := map[string]float64{}
 	for _, item := range measured {
-		next[item.pkg] = item.percent
+		next[item.pkg] = math.Floor(item.percent)
 	}
 	names := make([]string, 0, len(next))
 	for name := range next {
@@ -231,15 +254,22 @@ func writeFloor(path string, floor map[string]float64, measured []measurement) e
 	builder.WriteString("# `go run ./scripts/check-coverage -update` refuses to lower one. Lowering\n")
 	builder.WriteString("# a floor is an explicit edit to this file, which is the review it forces.\n")
 	builder.WriteString("#\n")
+	builder.WriteString("# A floor is a whole percentage point, and the gate allows one point of slack\n")
+	builder.WriteString("# below it. Statement coverage moves by a few tenths between runs of the same\n")
+	builder.WriteString("# commit when a branch is only reached under a schedule the test cannot pin -\n")
+	builder.WriteString("# internal/tool alternates between 82.1% and 82.3% for that reason - and a\n")
+	builder.WriteString("# gate that fires on that teaches people to re-run it. A real loss costs\n")
+	builder.WriteString("# several points and is still caught.\n")
+	builder.WriteString("#\n")
 	builder.WriteString("# Every package that reports coverage is listed, including the ones that\n")
 	builder.WriteString("# report none. The module root, the command entry points and the four dialect\n")
 	builder.WriteString("# packages exist to be called rather than to be tested - each dialect package is\n")
-	builder.WriteString("# thirteen lines of wrapping around webnative - so a floor of 0.0 for them says\n")
+	builder.WriteString("# thirteen lines of wrapping around webnative - so a floor of 0 for them says\n")
 	builder.WriteString("# that rather than pretending they are measured against a target. They are still\n")
 	builder.WriteString("# compared: a package that reported coverage before and reports none now falls\n")
 	builder.WriteString("# below the floor recorded for it and fails the gate.\n")
 	for _, name := range names {
-		builder.WriteString(fmt.Sprintf("%s %.1f\n", name, next[name]))
+		builder.WriteString(fmt.Sprintf("%s %.0f\n", name, next[name]))
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err

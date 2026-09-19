@@ -236,13 +236,23 @@ func isCommandInterpreter(name string) bool {
 }
 
 // shellName reduces an executable name to the form the dialect table is written
-// in: lower case, without its directory and without its extension. On Windows the
-// same shell is PowerShell.exe, powershell.exe and pwsh.exe depending on how it
-// was installed, and the command interpreter is both `cmd` and `cmd.exe`.
+// in: lower case, without its directory and without its extension.
+//
+// Both separators are recognised whatever the host is. A dialect is a property of
+// the shell, not of the machine reading the configuration, so `filepath.Base` is
+// deliberately not used here: on Linux it would take `C:\...\pwsh.exe` as one file
+// name, decide the shell is not PowerShell, and return the one answer that must
+// never be given. The extension is stripped the same way, for the same reason.
 func shellName(name string) string {
-	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
-	if extension := filepath.Ext(base); extension != "" {
-		base = strings.TrimSuffix(base, extension)
+	trimmed := strings.TrimSpace(name)
+	if index := strings.LastIndexAny(trimmed, `/\`); index >= 0 {
+		trimmed = trimmed[index+1:]
+	}
+	base := strings.ToLower(trimmed)
+	// A leading dot names a hidden file rather than an extension, so only a dot
+	// with something in front of it is stripped.
+	if index := strings.LastIndexByte(base, '.'); index > 0 {
+		base = base[:index]
 	}
 	return base
 }

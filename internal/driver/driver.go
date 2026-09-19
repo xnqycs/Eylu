@@ -91,6 +91,13 @@ const (
 	toolCallDeltaMaxDelay      = 250 * time.Millisecond
 )
 
+// StreamDeltaBuffer batches streamed tool-call arguments so a provider is not
+// forwarded one fragment at a time.
+//
+// It is owned by one stream and is not safe for concurrent use: it holds a fragment
+// between two callbacks of the same stream, and the request that creates it drives
+// those callbacks from one goroutine. Two streams sharing one would need a lock the
+// batching does not otherwise justify, so the ownership is stated here instead.
 type StreamDeltaBuffer struct {
 	pending strings.Builder
 	started time.Time

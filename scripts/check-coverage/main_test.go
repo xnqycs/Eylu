@@ -90,7 +90,7 @@ func TestCompareReportsARegression(t *testing.T) {
 	path := floorFile(t, "Eylu/internal/agent 85.2\nEylu/internal/driver 60.0\n")
 	measured := []measurement{{pkg: "Eylu/internal/agent", percent: 85.2}, {pkg: "Eylu/internal/driver", percent: 54.5}}
 	err := compare(path, map[string]float64{"Eylu/internal/agent": 85.2, "Eylu/internal/driver": 60.0}, measured)
-	if err == nil || !strings.Contains(err.Error(), "Eylu/internal/driver 54.5% < 60.0%") {
+	if err == nil || !strings.Contains(err.Error(), "Eylu/internal/driver 54.5% is more than 1.0 point(s) below 60.0%") {
 		t.Fatalf("compare = %v", err)
 	}
 	if !strings.Contains(err.Error(), "never lowered") {
@@ -119,11 +119,33 @@ func TestCompareReportsAnImprovementAndAcceptsAnExactMatch(t *testing.T) {
 	if err := compare("floor", map[string]float64{"Eylu/internal/agent": 90.0}, measured); err != nil {
 		t.Fatalf("an exact match was refused: %v", err)
 	}
-	// A fraction below is rounding, not a regression: the summary is printed with
-	// one decimal, so a package cannot be asked to reproduce more precision than
-	// the report carries.
-	if err := compare("floor", map[string]float64{"Eylu/internal/agent": 90.04}, measured); err != nil {
-		t.Fatalf("a rounding difference was treated as a regression: %v", err)
+	// A run-to-run difference is not a regression. The number moves by a few tenths
+	// between runs of the same commit, so the gate allows a point of slack below the
+	// floor and only fails on a loss bigger than that.
+	noise := []measurement{{pkg: "Eylu/internal/agent", percent: 84.6}}
+	if err := compare("floor", map[string]float64{"Eylu/internal/agent": 85}, noise); err != nil {
+		t.Fatalf("run-to-run noise failed the gate: %v", err)
+	}
+	real := []measurement{{pkg: "Eylu/internal/agent", percent: 82.0}}
+	err = compare("floor", map[string]float64{"Eylu/internal/agent": 85}, real)
+	if err == nil || !strings.Contains(err.Error(), "below 85.0%") {
+		t.Fatalf("a three-point loss passed the gate: %v", err)
+	}
+	// A package deliberately recorded just below its floor is the boundary: exactly
+	// one point away still passes, a hair more does not.
+	if err := compare("floor", map[string]float64{"Eylu/internal/agent": 85}, []measurement{{pkg: "Eylu/internal/agent", percent: 84.0}}); err != nil {
+		t.Fatalf("a one-point difference failed the gate: %v", err)
+	}
+	if err := compare("floor", map[string]float64{"Eylu/internal/agent": 85}, []measurement{{pkg: "Eylu/internal/agent", percent: 83.9}}); err == nil {
+		t.Fatal("more than a one-point difference passed the gate")
+	}
+	// An improvement is only recorded when there is more than a point of headroom,
+	// so the file does not churn on noise either.
+	if err := compare("floor", map[string]float64{"Eylu/internal/agent": 85}, []measurement{{pkg: "Eylu/internal/agent", percent: 85.5}}); err != nil {
+		t.Fatalf("half a point of headroom was reported as an improvement: %v", err)
+	}
+	if err := compare("floor", map[string]float64{"Eylu/internal/agent": 85}, []measurement{{pkg: "Eylu/internal/agent", percent: 87.0}}); err == nil {
+		t.Fatal("two points of headroom were not reported")
 	}
 }
 
@@ -139,7 +161,9 @@ func TestUpdateRaisesFloorsAndRefusesToLowerThem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(content), "Eylu/internal/agent 90.5") || !strings.Contains(string(content), "Eylu/internal/new 40.0") {
+	// A floor is a whole point: the digits after it are the noise the slack exists
+	// for, so recording them would record noise.
+	if !strings.Contains(string(content), "Eylu/internal/agent 90") || !strings.Contains(string(content), "Eylu/internal/new 40") {
 		t.Fatalf("the floor was not recorded:\n%s", content)
 	}
 	if !strings.Contains(string(content), "never lowered") {
@@ -156,7 +180,7 @@ func TestUpdateRaisesFloorsAndRefusesToLowerThem(t *testing.T) {
 
 	// A measurement below a committed floor is refused rather than recorded.
 	lower := []measurement{{pkg: "Eylu/internal/agent", percent: 80.0}}
-	err = writeFloor(path, map[string]float64{"Eylu/internal/agent": 90.5}, lower)
+	err = writeFloor(path, map[string]float64{"Eylu/internal/agent": 90}, lower)
 	if err == nil || !strings.Contains(err.Error(), "below the committed floor") {
 		t.Fatalf("writeFloor = %v", err)
 	}
