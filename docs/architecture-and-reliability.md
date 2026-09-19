@@ -242,7 +242,8 @@ system sandbox:
 
 - a command is classified by reading the line with the rules of the shell that will
   run it (`policy.Config.Shell`), so a construct that is quoted text to one shell and
-  a separator to another is not mistaken for inert;
+  a separator to another is not mistaken for inert; a shell whose rules are not
+  modelled is refused rather than approximated (T-10);
 - argument validation fails closed: an option family that can delete, move, execute
   another program or write a file is refused rather than trusted;
 - anything the reader cannot prove falls back to `unknown`, which requires
@@ -269,6 +270,7 @@ one of them is worth more than the implementation that satisfies it today.
 | T-07 | A subagent can create a file but cannot overwrite one, because it cannot see the conversation that would justify replacing it. |
 | T-08 | A subagent's cost is its own: every model call its own request made is charged to it, in its own session, and never folded into the request that delegated to it. |
 | T-09 | Content read from outside the conversation - a file, a command's output, a tool result, a server's instructions, a skill's text - reaches the model inside an untrusted envelope, and text the host or the user wrote does not. The envelope's identifier is derived from the content it wraps, so it is deterministic and content cannot close its own envelope. |
+| T-10 | The shell named by `EYLU_SHELL` is either one whose command line rules the policy layer models or the configuration is refused. A shell is never read with another shell's rules, because a classification the classifier cannot justify is worse than no support at all. |
 
 Each of these is pinned by a test named after the guarantee rather than after the
 function it happens to exercise, and those tests are listed in section 8.
@@ -298,6 +300,7 @@ function it happens to exercise, and those tests are listed in section 8.
 | T-07 a subagent cannot overwrite an existing file | `internal/app/trust_boundary_test.go`: `TestSubagentWriteFileCannotOverwriteAnExistingFile` |
 | T-08 a subagent's cost is not folded into the parent request | `internal/app/trust_boundary_test.go`: `TestSubagentUsageIsNotFoldedIntoTheParentRequest`, `internal/app/subagent_usage_test.go`: `TestASubagentIsChargedForEveryModelCallItMade` |
 | T-09 untrusted content enters the request framed, and content cannot close its own envelope | `internal/context/untrusted_frame_test.go`: `TestAToolResultEntersTheRequestInsideTheUntrustedEnvelope`, `TestAToolResultCannotCloseItsOwnEnvelope`; `internal/agent/untrusted_context_test.go`: `TestContentReadFromOutsideTheConversationEntersFramed`; `internal/protocol/untrusted_test.go`: `TestContentCannotCloseItsOwnEnvelope`, `TestAForgedEnvelopeIsNotAccepted` |
+| T-10 a shell whose rules are not modelled is refused | `internal/tool/shell_dialect_test.go`: `TestAnUnmodelledShellIsRefusedRatherThanReadAsPOSIX`, `TestTheModelledShellsAreUnaffected` |
 
 The table is not prose on its own. `internal/docscheck` reads it and fails the build
 when a row names a test file or a test function that does not exist
@@ -312,9 +315,12 @@ claiming a guarantee that nothing holds up any more.
 - **Windows shell dialects.** The comparison between the classifier and the shell is
   verified against `cmd.exe` and git-bash on Windows. A POSIX shell on Unix is probed
   by the same test where one exists, but the Unix leg has not been run here.
-- **PowerShell.** `EYLU_SHELL` can point at any executable; the classifier only
-  models the POSIX and command-interpreter dialects. A PowerShell shell is read with
-  POSIX rules, which is a gap, not a proof of safety.
+- **PowerShell.** The classifier models the POSIX and command-interpreter dialects
+  and no others. `EYLU_SHELL` naming PowerShell is refused as a configuration error
+  rather than read with POSIX rules, so this is a gap rather than a silent
+  misreading; supporting PowerShell would mean adding its dialect to the classifier
+  rather than patching individual misreadings, which would leave a set of cases that
+  look supported and are not.
 - **Real providers.** All driver verification is offline, against fixed stubs. There
   is no live provider round-trip in the test suite, and none is run automatically.
 - **Multimodal input.** Binary content is described rather than sent. A provider that

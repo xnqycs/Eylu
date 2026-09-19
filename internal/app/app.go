@@ -600,6 +600,14 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	r.toolWorkspace = r.workspace
 	codeContext, coordinator := r.codeContext, r.resourceCoordinator
 	r.toolRuntimeMu.Unlock()
+	// The shell is resolved before anything is built with it, so an unmodelled
+	// one (PowerShell, whose quoting and separators Eylu does not implement) is
+	// refused as a configuration problem. Letting it through would mean the
+	// classifier reads the line with POSIX rules while the shell reads it with its
+	// own, which is the one disagreement the policy layer must not have.
+	if err := tool.ValidateShell(); err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+	}
 	readFile := tool.NewReadFileWithContext(codeContext, cfg.MaxReadBytes)
 	writeFile := tool.NewWriteFileWithContext(codeContext)
 	bashTool, err := tool.NewBashWithContext(codeContext, cfg.MaxOutputBytes, nil)
@@ -618,6 +626,10 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 	if err != nil {
 		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
 	}
+	shellDialect, err := tool.ActiveShellDialect()
+	if err != nil {
+		return nil, &protocol.Error{Code: protocol.ErrConfig, Message: err.Error()}
+	}
 	checker := policy.NewChecker(policy.Config{
 		Mode: mode, ReadOnlyCommands: cfg.ReadOnlyCommands, AutoAllowCommands: cfg.AutoAllowCommands,
 		DangerousPatterns: cfg.DangerousCommands, BlockedPatterns: cfg.BlockedCommands,
@@ -625,7 +637,7 @@ func (r *runtime) toolExecutorWith(cfg config.Config, opts chatOptions, skillReg
 		// does. On a platform whose fallback shell is the command interpreter, a
 		// single-quoted separator is a separator, and reading it as text would let a
 		// read-only classification run a second command.
-		Shell: tool.ActiveShellDialect(),
+		Shell: shellDialect,
 	})
 	registered := []tool.Tool{readFile, writeFile, bashTool, editFile, searchCode, listDirectory, tool.NewTodoList()}
 	if ask != nil {

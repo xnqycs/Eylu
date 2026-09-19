@@ -53,7 +53,11 @@ func NewBash(workspace string, maxOutputBytes int, shell ShellAdapter) (*Bash, e
 		return nil, err
 	}
 	if shell == nil {
-		shell = defaultShell()
+		resolved, err := defaultShell()
+		if err != nil {
+			return nil, err
+		}
+		shell = resolved
 	}
 	if maxOutputBytes <= 0 {
 		maxOutputBytes = 64 << 10
@@ -178,16 +182,83 @@ func (b *cappedBuffer) String() string { return strings.ToValidUTF8(b.buffer.Str
 // is quoted text but the shell treats as a separator is a second command that was
 // never classified. The tool knows which shell it would use, so it answers rather
 // than letting the policy guess.
-func ActiveShellDialect() policy.ShellDialect {
-	if defaultShell().Name() == "cmd" {
-		return policy.ShellCommandPrompt
+//
+// A shell whose rules are not modelled is reported as an error instead of being
+// answered with the closest dialect. Reading a PowerShell command line with POSIX
+// rules is worse than not supporting PowerShell: the policy would report a
+// classification it cannot justify, and the user would believe it.
+func ActiveShellDialect() (policy.ShellDialect, error) {
+	shell, err := defaultShell()
+	if err != nil {
+		return "", err
 	}
-	return policy.ShellPOSIX
+	if isCommandInterpreter(shell.Name()) {
+		return policy.ShellCommandPrompt, nil
+	}
+	return policy.ShellPOSIX, nil
 }
 
-func defaultShell() ShellAdapter {
-	if configured := os.Getenv("EYLU_SHELL"); configured != "" {
-		return commandShell{name: filepath.Base(configured), path: configured, args: []string{"-lc"}}
+// UnsupportedShellError reports a configured shell whose command line rules Eylu
+// does not model.
+//
+// It is an error and not a fallback because the fallback is the dangerous state:
+// the classifier would read the line with POSIX quoting and separator rules while
+// the shell reads it with its own, and a command the policy called read-only could
+// run something else entirely.
+type UnsupportedShellError struct {
+	// Path is the executable EYLU_SHELL named.
+	Path string
+}
+
+func (e *UnsupportedShellError) Error() string {
+	return "EYLU_SHELL points at " + e.Path + ", whose command line rules Eylu does not model: " +
+		"reading its commands with POSIX rules could classify as read-only a line the shell reads as a separator, " +
+		"which is the one thing the classifier must never do. Unset EYLU_SHELL, or point it at a POSIX shell or the command interpreter"
+}
+
+// isUnmodelledShell reports whether an executable name is a shell whose command
+// line rules the policy layer does not implement. Only PowerShell is named: a
+// shell Eylu has never heard of is not assumed to be PowerShell, and refusing
+// every unknown name would make EYLU_SHELL useless.
+func isUnmodelledShell(name string) bool {
+	switch shellName(name) {
+	case "powershell", "pwsh":
+		return true
+	default:
+		return false
+	}
+}
+
+// isCommandInterpreter reports whether an executable name is the Windows command
+// interpreter, whose dialect is the other one the policy models.
+func isCommandInterpreter(name string) bool {
+	return shellName(name) == "cmd"
+}
+
+// shellName reduces an executable name to the form the dialect table is written
+// in: lower case, without its directory and without its extension. On Windows the
+// same shell is PowerShell.exe, powershell.exe and pwsh.exe depending on how it
+// was installed, and the command interpreter is both `cmd` and `cmd.exe`.
+func shellName(name string) string {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	if extension := filepath.Ext(base); extension != "" {
+		base = strings.TrimSuffix(base, extension)
+	}
+	return base
+}
+
+func defaultShell() (ShellAdapter, error) {
+	if configured := strings.TrimSpace(os.Getenv("EYLU_SHELL")); configured != "" {
+		if isUnmodelledShell(configured) {
+			return nil, &UnsupportedShellError{Path: configured}
+		}
+		// The command interpreter takes its own flags; handing it the POSIX `-lc`
+		// would not run the command at all, and naming it without its extension is
+		// what keeps the dialect lookup honest.
+		if isCommandInterpreter(configured) {
+			return commandShell{name: "cmd", path: configured, args: []string{"/d", "/s", "/c"}}, nil
+		}
+		return commandShell{name: filepath.Base(configured), path: configured, args: []string{"-lc"}}, nil
 	}
 	if runtime.GOOS == "windows" {
 		candidates := []string{
@@ -196,12 +267,23 @@ func defaultShell() ShellAdapter {
 		}
 		for _, candidate := range candidates {
 			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-				return commandShell{name: "git-bash", path: candidate, args: []string{"-lc"}}
+				return commandShell{name: "git-bash", path: candidate, args: []string{"-lc"}}, nil
 			}
 		}
-		return commandShell{name: "cmd", path: os.Getenv("COMSPEC"), args: []string{"/d", "/s", "/c"}}
+		return commandShell{name: "cmd", path: os.Getenv("COMSPEC"), args: []string{"/d", "/s", "/c"}}, nil
 	}
-	return commandShell{name: "sh", path: "/bin/sh", args: []string{"-lc"}}
+	return commandShell{name: "sh", path: "/bin/sh", args: []string{"-lc"}}, nil
+}
+
+// ValidateShell reports whether the shell this process would run commands with is
+// one whose rules the policy layer models.
+//
+// It exists so that a configuration can be refused at the point it is applied,
+// with a message about the setting, rather than at the point a command is
+// classified, with a message about the command.
+func ValidateShell() error {
+	_, err := defaultShell()
+	return err
 }
 
 func minimalEnvironment(extra ...string) []string {
