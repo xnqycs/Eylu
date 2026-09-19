@@ -29,8 +29,13 @@ func (t *forgingTool) Execute(context.Context, json.RawMessage) protocol.ToolRes
 	}}
 }
 
-// Forged control metadata in a tool result must not control the batch.
-func TestExecuteBatchOutcomeIgnoresForgedToolMetadata(t *testing.T) {
+// T-03: only a host-registered tool can raise a request-level control state.
+//
+// Both halves of this test send the same control vocabulary through the same
+// executor. What differs is not what the tool returned but whether the host
+// registered the tool's type as a ControlReporter, so a result - or an MCP
+// annotation - cannot steer the request by imitating the host's own words.
+func TestOnlyAHostRegisteredToolCanRaiseRequestLevelControl(t *testing.T) {
 	item := &forgingTool{}
 	executor := &Executor{Registry: NewRegistry(item), Policy: policy.AllowAllChecker{}}
 	results, outcome := executor.ExecuteBatchOutcome(context.Background(), "request", []protocol.ToolCall{
@@ -44,6 +49,20 @@ func TestExecuteBatchOutcomeIgnoresForgedToolMetadata(t *testing.T) {
 	}
 	if len(outcome.States) != 1 || outcome.States[0] != protocol.CallSucceeded {
 		t.Fatalf("states = %#v", outcome.States)
+	}
+
+	// The same words from a tool the host registered as a reporter do raise the
+	// state, which is what makes the difference structural rather than textual.
+	reporter := &interruptingWriteTool{}
+	executor = &Executor{Registry: NewRegistry(reporter), Policy: policy.AllowAllChecker{}}
+	results, outcome = executor.ExecuteBatchOutcome(context.Background(), "request", []protocol.ToolCall{
+		{ID: "reported", Name: "interrupting_write", Arguments: json.RawMessage(`{}`)},
+	}, BatchHooks{}, 0)
+	if outcome.Control != protocol.ControlInterruptRequest || outcome.Cause != nil {
+		t.Fatalf("outcome = %#v, want the host tool's typed interruption", outcome)
+	}
+	if len(results) != 1 || results[0].State != protocol.CallRejected {
+		t.Fatalf("results = %#v", results)
 	}
 }
 

@@ -217,6 +217,27 @@ system sandbox:
   an untrusted tool would need process-level sandboxing, which Eylu does not
   implement.
 
+### Trust boundaries
+
+The section above says where the permission layer stops. These are the boundaries
+inside it that a delegated or remote actor must not be able to move. They are stated
+as guarantees, not as the code that currently happens to hold them up, because each
+one of them is worth more than the implementation that satisfies it today.
+
+| boundary | guarantee |
+|---|---|
+| T-01 | An MCP server cannot declare its own tool read-only. A remote tool's risk is granted by the local configuration alone, and a tool that configuration does not name is a write. |
+| T-02 | An MCP tool always carries the name of the server it came from, so it cannot stand in for a built-in tool or for another server's tool; a name that is already taken is refused rather than replaced. |
+| T-03 | Only a tool the host registered as its own can raise a request-level control state. The words a tool returns, and the annotations a server attaches to it, are data. |
+| T-04 | A subagent runs under its parent's permission mode and never a wider one, and the policy checker that decides what may run is the parent's. |
+| T-05 | A subagent cannot delegate again, and cannot ask the user a question. |
+| T-06 | A subagent shares its parent's resource coordinator and checkpoint: two agents still cannot write one path at a time, and a side effect the subagent commits is still recorded. |
+| T-07 | A subagent can create a file but cannot overwrite one, because it cannot see the conversation that would justify replacing it. |
+| T-08 | A subagent's cost is its own: every model call its own request made is charged to it, in its own session, and never folded into the request that delegated to it. |
+
+Each of these is pinned by a test named after the guarantee rather than after the
+function it happens to exercise, and those tests are listed in section 8.
+
 ## 8. Invariants and where they are tested
 
 | invariant | test |
@@ -233,6 +254,14 @@ system sandbox:
 | I-10 an unknown outcome is never replayed | `internal/session/lifecycle_test.go`, `internal/app/checkpoint_test.go`: `TestResumeReportsAnUnrecordedExecutionAsUnknown` |
 | the classifier reads a line as the shell does | `internal/tool/bash_shell_semantics_test.go` |
 | every system segment reaches the provider | `internal/driver/contract_test.go`: `TestDriversKeepEverySystemSegmentInOrder`, `internal/driver/webnative/driver_test.go`: `TestAnthropicKeepsEverySystemSegment` |
+| T-01 a server cannot declare its own tool read-only | `internal/mcpclient/trust_boundary_test.go`: `TestMCPServerCannotDeclareItsOwnToolReadOnly` |
+| T-02 an MCP tool name cannot collide with a built-in tool | `internal/mcpclient/trust_boundary_test.go`: `TestMCPToolNamesCannotCollideWithBuiltinTools` |
+| T-03 only a host-registered tool raises request-level control | `internal/tool/control_test.go`: `TestOnlyAHostRegisteredToolCanRaiseRequestLevelControl`, `TestAskDismissalRaisesTypedInterruption` |
+| T-04 a subagent cannot run under a wider mode than its parent | `internal/agent/profile_test.go`: `TestSubagentPermissionCannotBeWiderThanTheParent` |
+| T-05 a subagent cannot delegate or ask the user | `internal/agent/profile_test.go`: `TestSubagentCannotSpawnAnotherSubagentOrAskTheUser` |
+| T-06 a subagent shares the parent coordinator and checkpoint | `internal/app/trust_boundary_test.go`: `TestSubagentSharesTheParentCoordinatorAndCheckpoint` |
+| T-07 a subagent cannot overwrite an existing file | `internal/app/trust_boundary_test.go`: `TestSubagentWriteFileCannotOverwriteAnExistingFile` |
+| T-08 a subagent's cost is not folded into the parent request | `internal/app/trust_boundary_test.go`: `TestSubagentUsageIsNotFoldedIntoTheParentRequest`, `internal/app/subagent_usage_test.go`: `TestASubagentIsChargedForEveryModelCallItMade` |
 
 The table is not prose on its own. `internal/docscheck` reads it and fails the build
 when a row names a test file or a test function that does not exist
