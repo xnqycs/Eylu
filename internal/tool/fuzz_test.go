@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,12 @@ var fuzzPaths = []string{
 	"com1",
 	"trailing.",
 	"trailing ",
+	// A name that is only whitespace away from a parent reference. It is a seed
+	// because it is exactly where the key normalization used to walk out of the
+	// workspace: trimming `".. "` produced `".."`.
+	".. ",
+	". ",
+	" ..",
 	"nested/a/b/c/d/e/f/g/h",
 	strings.Repeat("a", 512),
 	strings.Repeat("../", 64) + "outside.txt",
@@ -129,7 +136,7 @@ func FuzzPathResolver(f *testing.F) {
 			if key == "" {
 				t.Fatalf("resourcePath(%q) accepted the path and produced no key", path)
 			}
-			assertKeyInside(t, "resourcePath", resolver.rootResourceKey(), key)
+			assertKeyInside(t, "resourcePath(%q)", []any{path}, resolver.rootResourceKey(), key)
 		}
 	})
 }
@@ -184,11 +191,12 @@ func assertInside(t *testing.T, what, root, resolved string) {
 }
 
 // assertKeyInside re-verifies that a resource key names something inside the
-// workspace key, at a path boundary rather than at a string boundary.
-func assertKeyInside(t *testing.T, what, rootKey, key string) {
+// workspace key, at a path boundary rather than at a string boundary. The input is
+// part of the message because the key alone does not say which path produced it.
+func assertKeyInside(t *testing.T, what string, args []any, rootKey, key string) {
 	t.Helper()
 	if key == rootKey || strings.HasPrefix(key, rootKey+"/") {
 		return
 	}
-	t.Fatalf("%s produced key %q, which is not inside %q", what, key, rootKey)
+	t.Fatalf("%s produced key %q, which is not inside %q", fmt.Sprintf(what, args...), key, rootKey)
 }

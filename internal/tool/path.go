@@ -241,9 +241,21 @@ func resourceKey(path string) string {
 // one path could produce two of them, which is the missed conflict this function
 // exists to prevent. A value that is not its own cleaning result is therefore
 // refused as an unknown identity.
+//
+// Only the blank check trims. Trimming the path itself would change which file the
+// key names, and a name that differs from a parent reference only by surrounding
+// whitespace - `".. "` - would be normalized into `".."` and walk out of the
+// workspace. Fuzzing found exactly that: the resolver produced the key of the
+// workspace's parent for a path that names a file inside it, so a write there would
+// have claimed a key that never conflicts with the tree it is inside. A path is
+// named the way it was written, and a blank one names nothing.
 func resourceKeyFor(goos, path string) string {
-	key := filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	key := filepath.ToSlash(filepath.Clean(path))
 	if key == "." || key == "" {
+		// The current directory names no file of its own.
 		return ""
 	}
 	if goos == "windows" {
