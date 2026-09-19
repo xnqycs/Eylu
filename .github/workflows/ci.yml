@@ -86,3 +86,8 @@ jobs:
           go test ./internal/policy -run '^$' -fuzz FuzzReadOnlyArgumentVerdict -fuzztime 30s
           go test ./internal/tool -run '^$' -fuzz FuzzPathResolver -fuzztime 30s
           go test ./internal/tool -run '^$' -fuzz FuzzResourceKey -fuzztime 30s
+      # A floor is raised by adding tests and never lowered to make a build pass;
+      # the tool refuses to lower one, so lowering it is an explicit edit to the
+      # committed file rather than a flag someone reaches for.
+      - name: Coverage floor
+        run: go run ./scripts/check-coverage

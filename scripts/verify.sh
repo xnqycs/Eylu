@@ -36,9 +36,10 @@ Phases, in order:
 govulncheck needs the vulnerability database, so it reaches the network on a
 cold cache; --skip-extras is the offline path.
 
-The race detector and the bounded fuzz search are CI-only: run
-`go test -race ./...` and `go test -run '^$' -fuzz <target> -fuzztime 30s` on the
-CI matrix. The corpus under testdata/fuzz is replayed here by `go test ./...`.
+The race detector, the bounded fuzz search and the coverage floor are CI-only:
+run `go test -race ./...`, `go test -run '^$' -fuzz <target> -fuzztime 30s` and
+`go run ./scripts/check-coverage` on the CI matrix. The corpus under testdata/fuzz
+is replayed here by `go test ./...`.
 EOF
 }
 

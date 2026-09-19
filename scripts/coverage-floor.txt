@@ -1,0 +1,47 @@
+# Statement coverage floors, one package per line.
+#
+# The rule is "do not go backwards", not "reach a number". A floor is
+# raised by adding tests; it is never lowered to make a build pass, and
+# `go run ./scripts/check-coverage -update` refuses to lower one. Lowering
+# a floor is an explicit edit to this file, which is the review it forces.
+#
+# Every package that reports coverage is listed, including the ones that
+# report none. The module root, the command entry points and the four dialect
+# packages exist to be called rather than to be tested - each dialect package is
+# thirteen lines of wrapping around webnative - so a floor of 0.0 for them says
+# that rather than pretending they are measured against a target. They are still
+# compared: a package that reported coverage before and reports none now falls
+# below the floor recorded for it and fails the gate.
+Eylu 0.0
+Eylu/cmd/agent 0.0
+Eylu/internal/agent 85.2
+Eylu/internal/app 67.6
+Eylu/internal/buildinfo 100.0
+Eylu/internal/config 77.2
+Eylu/internal/context 87.5
+Eylu/internal/docscheck 79.9
+Eylu/internal/driver 100.0
+Eylu/internal/driver/anthropic_messages 0.0
+Eylu/internal/driver/gemini_interactions 0.0
+Eylu/internal/driver/mistral_conversations 0.0
+Eylu/internal/driver/openai_chat 67.4
+Eylu/internal/driver/openai_responses 79.0
+Eylu/internal/driver/perplexity_agent 0.0
+Eylu/internal/driver/webnative 92.4
+Eylu/internal/environment 83.7
+Eylu/internal/logging 87.5
+Eylu/internal/mcpclient 76.8
+Eylu/internal/metrics 97.1
+Eylu/internal/policy 95.6
+Eylu/internal/protocol 69.1
+Eylu/internal/provider 67.5
+Eylu/internal/routing 88.6
+Eylu/internal/session 78.0
+Eylu/internal/skill 78.7
+Eylu/internal/skilldist 68.5
+Eylu/internal/testfault 97.0
+Eylu/internal/tool 82.3
+Eylu/internal/ui 80.5
+Eylu/internal/webtool 72.5
+Eylu/scripts/check-coverage 73.4
+Eylu/scripts/generate-third-party-notices 15.1
