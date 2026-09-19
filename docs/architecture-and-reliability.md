@@ -231,9 +231,19 @@ the compaction summaries and the context-recovery retries. A call is counted whe
 happens, whether or not the provider reported tokens; a request with any unreported
 usage reports itself as an estimate rather than as exact. A compaction summary is a
 paid call and is only started when the request's admission check accepts it;
-otherwise the deterministic compaction is used, which costs nothing. The current
-drivers do not forward a remaining output limit to the provider, so a single call may
-still overshoot the limit - this is a known boundary, not a hidden one.
+otherwise the deterministic compaction is used, which costs nothing.
+
+Two mechanisms bound what a single call may spend, and they are different things.
+The admission check is the wallet: a call that cannot fit in what is left is not
+started at all. The output bound is the ceiling on an admitted call: what is left of
+the budget is forwarded to the provider as a maximum output length, so a call cannot
+overshoot it by asking for an unbounded answer. The bound is only as good as the
+provider's willingness to honour it - a provider whose wire format has no such field
+receives none, and one that ignores the field still overshoots, which is why the
+admission check remains the mechanism that decides whether the request continues.
+The compaction summary is a paid call admitted the same way and carries no output
+bound of its own: its size is bounded by the summary budget, which is what the
+admission check is asked about.
 
 ## 7. Application-layer permission versus an OS sandbox
 
@@ -332,8 +342,11 @@ claiming a guarantee that nothing holds up any more.
 - **Gemini.** `gemini_interactions` sends system turns as `role: "system"` input
   items. That they arrive intact is verified; whether the provider accepts that role
   is not.
-- **The soft budget.** A single model call can still overshoot the request budget,
-  because no driver forwards a remaining output limit.
+- **The output bound is the provider's to honour.** A request forwards what is left
+  of its budget as a maximum output length, so an admitted call cannot overshoot by
+  asking for an unbounded answer. A dialect whose wire format has no such field is
+  sent none, and a provider that ignores the field still overshoots: the admission
+  check remains what stops the request from starting a call it cannot afford.
 - **Fuzzing is a search, not a proof.** The command classifier, the argument
   validator, the path resolver and the resource key have fuzz targets with a
   committed corpus. The corpus is replayed by `go test ./...`; the bounded search

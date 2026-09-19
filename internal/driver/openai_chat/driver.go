@@ -60,6 +60,7 @@ func (d *Driver) CapabilitiesFor(target driver.CapabilityTarget) driver.Capabili
 
 type chatRequest struct {
 	Model             string        `json:"model"`
+	MaxOutputTokens   int           `json:"max_completion_tokens,omitempty"`
 	Messages          []chatMessage `json:"messages"`
 	Tools             []chatTool    `json:"tools,omitempty"`
 	ReasoningEffort   string        `json:"reasoning_effort,omitempty"`
@@ -143,7 +144,7 @@ type chatResponse struct {
 }
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
-	body := chatRequest{Model: req.Model.Model, Stream: req.Stream}
+	body := chatRequest{Model: req.Model.Model, Stream: req.Stream, MaxOutputTokens: req.MaxOutputTokens}
 	parallelKey := requestCapabilityKey(req)
 	if req.ParallelToolCalls && len(req.Model.Tools) > 0 {
 		_, unsupported := d.parallelUnsupported.Load(parallelKey)

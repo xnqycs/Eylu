@@ -70,8 +70,17 @@ type Request struct {
 	// default, and a driver that uses it names it on the response so the run
 	// report and the audit trail record it.
 	AcceptToolCallsWithStop bool
-	Target                  CapabilityTarget
-	Model                   protocol.ModelRequest
+	// MaxOutputTokens bounds the answer one call may produce, so a request cannot
+	// overshoot its budget by asking for an unbounded one. Zero means no bound,
+	// which is what a caller with no budget sends and what every driver did before
+	// this field existed: an unset value reproduces the previous request exactly.
+	//
+	// It is a bound, not a reservation. The admission check that decides whether a
+	// call may start at all is the wallet; this only stops an admitted call from
+	// spending more than what is left.
+	MaxOutputTokens int
+	Target          CapabilityTarget
+	Model           protocol.ModelRequest
 }
 
 type EmitFunc func(protocol.ModelEvent) error

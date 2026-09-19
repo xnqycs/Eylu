@@ -27,7 +27,7 @@ Eylu/internal/driver/mistral_conversations 0.0
 Eylu/internal/driver/openai_chat 67.4
 Eylu/internal/driver/openai_responses 79.0
 Eylu/internal/driver/perplexity_agent 0.0
-Eylu/internal/driver/webnative 92.4
+Eylu/internal/driver/webnative 92.5
 Eylu/internal/environment 83.7
 Eylu/internal/logging 87.5
 Eylu/internal/mcpclient 76.8

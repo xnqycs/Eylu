@@ -107,6 +107,28 @@ func (b *BudgetTracker) admits(estimatedInput, outputReserve int) bool {
 	return b.usage.Total()+estimatedInput+outputReserve <= b.limit
 }
 
+// outputAllowance reports how many output tokens one admitted call may still
+// produce: what is left of the budget after what the request has spent and the
+// input it is about to send, capped by the reserve the request declared.
+//
+// It returns 0 when no budget is set, which is what a driver reads as "no bound".
+// A returned zero with a budget set means nothing is left, and it cannot happen
+// for a call that passed admits: the admission check requires the reserve to fit,
+// so a request with a reserve has strictly more than the reserve left.
+func (b *BudgetTracker) outputAllowance(estimatedInput, reserve int) int {
+	if b == nil || b.limit <= 0 {
+		return 0
+	}
+	remaining := b.limit - b.usage.Total() - estimatedInput
+	if remaining <= 0 {
+		return 0
+	}
+	if reserve > 0 && remaining > reserve {
+		return reserve
+	}
+	return remaining
+}
+
 // remaining returns the tokens still available, or 0 when no budget is set.
 func (b *BudgetTracker) remaining() int {
 	if b == nil || b.limit <= 0 {

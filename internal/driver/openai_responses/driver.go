@@ -77,6 +77,7 @@ func responsesProvider(target driver.CapabilityTarget) string {
 
 type requestBody struct {
 	Model              string           `json:"model"`
+	MaxOutputTokens    int              `json:"max_output_tokens,omitempty"`
 	Input              []any            `json:"input"`
 	Tools              []tool           `json:"tools,omitempty"`
 	ToolChoice         any              `json:"tool_choice,omitempty"`
@@ -263,7 +264,7 @@ func (u responseUsage) cachedInputTokens() int {
 }
 
 func (d *Driver) Generate(ctx context.Context, req driver.Request, emit driver.EmitFunc) (protocol.ModelResponse, error) {
-	body := requestBody{Model: req.Model.Model, Stream: req.Stream}
+	body := requestBody{Model: req.Model.Model, Stream: req.Stream, MaxOutputTokens: req.MaxOutputTokens}
 	parallelKey := requestCapabilityKey(req)
 	if req.ParallelToolCalls && len(req.Model.Tools) > 0 {
 		_, unsupported := d.parallelUnsupported.Load(parallelKey)

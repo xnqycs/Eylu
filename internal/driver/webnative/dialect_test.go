@@ -467,3 +467,48 @@ func TestResponseItemsCarryTheirBoundedRawForm(t *testing.T) {
 		t.Fatal("a malformed item was accepted")
 	}
 }
+
+// Anthropic requires an output bound, so the dialect has a fixed one. A request
+// that declares what is left of its budget takes the more conservative of the two:
+// declaring a budget can narrow the bound and never widen it, which is what keeps a
+// request with no budget exactly what it was before the field existed.
+func TestAnthropicNarrowsItsFixedOutputBound(t *testing.T) {
+	request := driver.Request{Model: protocol.ModelRequest{Model: "model", Turns: []protocol.Turn{
+		{ID: "user", Role: protocol.RoleUser, Parts: []protocol.Part{{Kind: protocol.PartText, Text: "ask"}}},
+	}}}
+	model := New(nil, DialectAnthropic)
+
+	body, err := model.requestBody(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body["max_tokens"] != 4096 {
+		t.Fatalf("the fixed bound = %#v, want the dialect's own", body["max_tokens"])
+	}
+	request.MaxOutputTokens = 777
+	if body, err = model.requestBody(request); err != nil {
+		t.Fatal(err)
+	}
+	if body["max_tokens"] != 777 {
+		t.Fatalf("a narrower declared bound was not used: %#v", body["max_tokens"])
+	}
+	request.MaxOutputTokens = 8192
+	if body, err = model.requestBody(request); err != nil {
+		t.Fatal(err)
+	}
+	if body["max_tokens"] != 4096 {
+		t.Fatalf("a wider declared bound widened the fixed one: %#v", body["max_tokens"])
+	}
+	// The dialects without a bound of their own are sent none, so a declared budget
+	// is never mapped onto a field their format does not have.
+	for _, dialect := range []Dialect{DialectGemini, DialectMistral, DialectPerplexity} {
+		request.MaxOutputTokens = 777
+		other, err := New(nil, dialect).requestBody(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, present := other["max_tokens"]; present {
+			t.Fatalf("%s gained an output bound it does not have: %#v", dialect, other)
+		}
+	}
+}

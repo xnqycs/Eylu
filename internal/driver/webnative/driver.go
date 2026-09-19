@@ -253,7 +253,14 @@ func (d *Driver) requestBody(request driver.Request) (map[string]any, error) {
 		body["messages"] = messages
 	}
 	if d.dialect == DialectAnthropic {
-		body["max_tokens"] = 4096
+		// The provider requires an output bound. A request that declared one takes
+		// the more conservative of the two, so declaring a budget can only narrow
+		// this and never widen the fixed default.
+		bound := 4096
+		if request.MaxOutputTokens > 0 && request.MaxOutputTokens < bound {
+			bound = request.MaxOutputTokens
+		}
+		body["max_tokens"] = bound
 		if len(systemBlocks) > 0 {
 			body["system"] = systemBlocks
 		}

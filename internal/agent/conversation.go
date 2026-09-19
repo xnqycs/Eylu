@@ -515,6 +515,11 @@ func (c *Conversation) generate(ctx context.Context, runtime Runtime, definition
 		if !budget.admits(prepared.InputTokens(), runtime.OutputReserveTokens) {
 			return protocol.ModelResponse{}, runtime, budgetError(budget.limit, true)
 		}
+		// A call that was admitted still may not produce an unbounded answer: the
+		// bound is what is left of the budget, so the request cannot overshoot it by
+		// asking the provider for more than the wallet holds. A request with no
+		// budget sends no bound, which is what every driver did before this existed.
+		request.MaxOutputTokens = budget.outputAllowance(prepared.InputTokens(), runtime.OutputReserveTokens)
 		visible := false
 		wrappedEmit := emit
 		if emit != nil {

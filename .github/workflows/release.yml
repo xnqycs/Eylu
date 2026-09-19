@@ -55,6 +55,9 @@ jobs:
           go-version-file: go.mod
           cache: true
       - uses: sigstore/cosign-installer@v4.1.2
+      # The SBOM pipe runs syft, which the runner does not have. Pinned like the
+      # other actions: a supply-chain tool that floats is not a supply-chain control.
+      - uses: anchore/sbom-action/download-syft@v0.20.6
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
@@ -70,6 +73,7 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*_checksums.txt
+            dist/*.spdx.json
       - name: Publish draft release
         shell: bash
         env:

@@ -102,9 +102,11 @@ Eylu_<version>_Darwin_amd64.tar.gz
 Eylu_<version>_Darwin_arm64.tar.gz
 Eylu_<version>_checksums.txt
 Eylu_<version>_checksums.txt.sigstore.json
+Eylu_<version>_<Os>_<Arch>.<ext>.spdx.json
+Eylu_<version>_<Os>_<Arch>.<ext>.spdx.json.sigstore.json
 ```
 
-每个平台归档只包含 `eylu` 或 `eylu.exe`。GitHub 还会提供 Source code ZIP 和 tar.gz，因此 Release 页面通常显示 10 个资产。
+每个平台归档只包含 `eylu` 或 `eylu.exe`。SBOM 由 syft 生成（`.goreleaser.yaml` 的 `sboms`），与校验文件用同一套 cosign 身份签名（`signs` 的 `sbom-cosign`）。签名证明产物没有被替换，SBOM 说明产物里有什么——两者缺一不可。
 
 Release notes 由 GoReleaser 根据上一个标签之后的 Git 提交生成，并排除 `docs:`、`test:`、`chore:` 和合并提交。排除规则是 `.goreleaser.yaml` 中 `changelog.filters.exclude` 的正则，因此必须覆盖带 scope 的写法（`docs(changelog):`、`fix(ui):` 这类），否则只有不带 scope 的提交会被排除，带 scope 的仍会进入发布说明；改动这些正则后重新执行 `goreleaser check`。
 
@@ -133,7 +135,20 @@ cosign verify-blob \
   Eylu_1.1.0-rc.1_checksums.txt
 ```
 
-运行对应平台的程序并确认构建元数据：
+验证某个归档的 SBOM（内容与签名）：签名验证的命令与校验文件一致，只把文件名换掉：
+
+```bash
+cosign verify-blob \
+  --bundle Eylu_1.1.0-rc.1_Linux_amd64.tar.gz.spdx.json.sigstore.json \
+  --certificate-identity "https://github.com/xnqycs/Eylu/.github/workflows/release.yml@refs/tags/v1.1.0-rc.1" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  Eylu_1.1.0-rc.1_Linux_amd64.tar.gz.spdx.json
+```
+
+再确认 SBOM 描述的是这个归档里的依赖（`jq` 只用于阅读，不参与验证）：
+
+```bash
+jq -r 
 
 ```bash
 ./eylu version

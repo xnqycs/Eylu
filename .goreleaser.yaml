@@ -49,11 +49,37 @@ checksum:
   name_template: Eylu_{{ .Version }}_checksums.txt
   algorithm: sha256
 
+# An SBOM says what is inside the artifact, which is the half the signature cannot
+# tell you: a signature proves a release was not tampered with after it was built,
+# and says nothing about whether what was built contains a dependency with a known
+# vulnerability. syft writes one per archive, in the format the ecosystem reads.
+sboms:
+  - id: eylu-archive
+    artifacts: archive
+    documents:
+      - "${artifact}.spdx.json"
+    cmd: syft
+    args:
+      - "$artifact"
+      - "--output"
+      - "spdx-json=$document"
+
 signs:
   - id: checksum-cosign
     cmd: cosign
     artifacts: checksum
     signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - --yes
+  # The SBOM is signed with the same identity as the checksums, so a reader can
+  # verify it is the one the release published rather than one supplied alongside.
+  - id: sbom-cosign
+    cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    artifacts: sbom
     args:
       - sign-blob
       - "--bundle=${signature}"
