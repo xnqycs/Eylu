@@ -149,6 +149,16 @@ func FuzzPathResolver(f *testing.F) {
 // the production call site passes: the resolver hands resourceKey a path it has
 // already proven to be inside the workspace, and Clean leaves a relative input
 // alone.
+// FuzzResourceKey states the algebra of the key itself: total, deterministic,
+// idempotent, and case-folded exactly where the platform says so.
+//
+// It deliberately does not check that a key stays inside the workspace. That is a
+// property of the path the key came from, and it is checked where the path is:
+// FuzzPathResolver resolves through the real filesystem against a real workspace
+// and re-verifies containment with filepath.Rel, which is also how the whitespace
+// defect was found. Asking it here instead means asking it of a slash-normalized
+// name, and Go's Windows path rules make that name's syntax its own thing - `//..`
+// cleans to itself because it is a UNC prefix, not because it is a parent.
 func FuzzResourceKey(f *testing.F) {
 	for _, seed := range fuzzPaths {
 		f.Add(seed)
@@ -159,19 +169,22 @@ func FuzzResourceKey(f *testing.F) {
 			if again := resourceKeyFor(goos, key); again != key {
 				t.Fatalf("resourceKeyFor(%s, %q) = %q, which is not a fixed point (%q)", goos, path, key, again)
 			}
+			// A key answers the same way twice, whatever it was derived from.
+			if again := resourceKeyFor(goos, path); again != key {
+				t.Fatalf("resourceKeyFor(%s, %q) = %q then %q", goos, path, key, again)
+			}
 			if goos == "windows" && key != strings.ToLower(key) {
 				t.Fatalf("resourceKeyFor(%s, %q) = %q, which kept its case on a case-insensitive platform", goos, path, key)
 			}
-			if !filepath.IsAbs(path) {
-				continue
+			// Case is folded on Windows and only on Windows: two names that differ
+			// only in case are one file there and two files elsewhere.
+			if goos != "windows" && key != "" && strings.ToLower(key) != key && resourceKeyFor(goos, strings.ToLower(path)) == key {
+				t.Fatalf("resourceKeyFor(%s, %q) merged two case-different names", goos, path)
 			}
-			if !filepath.IsAbs(filepath.FromSlash(key)) {
-				t.Fatalf("resourceKeyFor(%s, %q) = %q, which is no longer absolute", goos, path, key)
-			}
-			for _, segment := range strings.Split(key, "/") {
-				if segment == ".." {
-					t.Fatalf("resourceKeyFor(%s, %q) = %q, which names a parent", goos, path, key)
-				}
+			// A key never keeps a trailing separator: that is what makes two
+			// spellings of one directory the same key.
+			if len(key) > 1 && strings.HasSuffix(key, "/") && !strings.HasSuffix(key, ":/") {
+				t.Fatalf("resourceKeyFor(%s, %q) = %q, which kept a trailing separator", goos, path, key)
 			}
 		}
 	})

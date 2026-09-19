@@ -261,10 +261,30 @@ func resourceKeyFor(goos, path string) string {
 	if goos == "windows" {
 		key = strings.ToLower(key)
 	}
-	if key != "/" && !strings.HasSuffix(key, ":/") {
-		key = strings.TrimSuffix(key, "/")
+	// A key keeps a volume root and otherwise never keeps a trailing separator.
+	// Every one of them goes, not just the last: Windows cleaning preserves a run of
+	// leading separators - `//` is a UNC prefix it must not collapse - so trimming
+	// one separator at a time left `///` as `//`, which normalizes again to `/`.
+	// Fuzzing found that, and a key that changes when it is passed through a second
+	// time is not a key. Collapsing the run may merge spellings that Windows treats
+	// as distinct, which serializes work unnecessarily; the other direction is a
+	// conflict nobody sees.
+	if !strings.HasSuffix(key, ":/") {
+		if trimmed := strings.TrimRight(key, "/"); trimmed != "" {
+			key = trimmed
+		} else {
+			key = "/"
+		}
 	}
 	if filepath.ToSlash(filepath.Clean(key)) != key {
+		return ""
+	}
+	// A key that is nothing but whitespace names nothing, and says so the same way
+	// a blank path does. The two have to agree because a caller may hand the key
+	// back - one of them normalizes what a tool put in a claim - and the answer for
+	// a key has to be that key. Fuzzing found the disagreement: `"./ "` cleaned to
+	// `" "`, which is a key, while `" "` alone was refused as blank.
+	if strings.TrimSpace(key) == "" {
 		return ""
 	}
 	return key
