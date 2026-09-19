@@ -1,6 +1,7 @@
 package context
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -95,48 +96,29 @@ func TestTrustLevelsFollowTheSource(t *testing.T) {
 
 // declaredCategories reads every `X Category = "y"` constant the package
 // declares, from the source rather than from a list that has to be maintained.
+//
+// The files are enumerated rather than handed to parser.ParseDir, which is
+// deprecated because it does not consider build tags; a category declared behind
+// a build tag is still a category this package can put in a request.
 func declaredCategories(t *testing.T) []Category {
 	t.Helper()
-	fset := token.NewFileSet()
-	packages, err := parser.ParseDir(fset, ".", func(info os.FileInfo) bool {
-		return !strings.HasSuffix(info.Name(), "_test.go")
-	}, 0)
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse the package: %v", err)
+		t.Fatalf("read the package directory: %v", err)
 	}
 	seen := map[Category]bool{}
-	for _, parsed := range packages {
-		for _, file := range parsed.Files {
-			for _, declaration := range file.Decls {
-				group, ok := declaration.(*ast.GenDecl)
-				if !ok || group.Tok != token.CONST {
-					continue
-				}
-				for _, spec := range group.Specs {
-					values, ok := spec.(*ast.ValueSpec)
-					if !ok || values.Type == nil {
-						continue
-					}
-					typed, ok := values.Type.(*ast.Ident)
-					if !ok || typed.Name != "Category" {
-						continue
-					}
-					for index := range values.Names {
-						if index >= len(values.Values) {
-							continue
-						}
-						literal, ok := values.Values[index].(*ast.BasicLit)
-						if !ok || literal.Kind != token.STRING {
-							continue
-						}
-						text, err := strconv.Unquote(literal.Value)
-						if err != nil {
-							t.Fatalf("unquote %s: %v", literal.Value, err)
-						}
-						seen[Category(text)] = true
-					}
-				}
-			}
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		if err := collectCategoryConstants(file, seen); err != nil {
+			t.Fatalf("%s: %v", name, err)
 		}
 	}
 	result := make([]Category, 0, len(seen))
@@ -145,4 +127,38 @@ func declaredCategories(t *testing.T) []Category {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
 	return result
+}
+
+func collectCategoryConstants(file *ast.File, seen map[Category]bool) error {
+	for _, declaration := range file.Decls {
+		group, ok := declaration.(*ast.GenDecl)
+		if !ok || group.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range group.Specs {
+			values, ok := spec.(*ast.ValueSpec)
+			if !ok || values.Type == nil {
+				continue
+			}
+			typed, ok := values.Type.(*ast.Ident)
+			if !ok || typed.Name != "Category" {
+				continue
+			}
+			for index := range values.Names {
+				if index >= len(values.Values) {
+					continue
+				}
+				literal, ok := values.Values[index].(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					continue
+				}
+				text, err := strconv.Unquote(literal.Value)
+				if err != nil {
+					return fmt.Errorf("unquote %s: %w", literal.Value, err)
+				}
+				seen[Category(text)] = true
+			}
+		}
+	}
+	return nil
 }

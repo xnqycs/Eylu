@@ -36,9 +36,12 @@ Phases, in order:
   1. gofmt   committed content (index bytes) and CRLF-normalised working tree
   2. verify  go mod verify, go vet ./...
   3. static  staticcheck ./...                    (-SkipStatic)
-  4. extras  third-party notices, actionlint      (-SkipExtras)
+  4. extras  third-party notices, actionlint, govulncheck   (-SkipExtras)
   5. test    go test ./...
   6. smoke   go build + smoke.ps1 + smoke.sh      (-SkipSmoke)
+
+govulncheck needs the vulnerability database, so it reaches the network on a
+cold cache; -SkipExtras is the offline path.
 
 The race detector is CI-only: run `go test -race ./...` on the CI matrix.
 '@
@@ -151,6 +154,12 @@ try {
 
         Write-Step 'actionlint (github.com/rhysd/actionlint/cmd/actionlint@v1.7.12)'
         Invoke-Native 'actionlint' { go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 }
+
+        # Pinned rather than @latest: the newest govulncheck already wants a newer
+        # Go than go.mod asks for, and a gate that silently changes toolchain is a
+        # gate nobody can reproduce.
+        Write-Step 'govulncheck ./... (golang.org/x/vuln/cmd/govulncheck@v1.1.4)'
+        Invoke-Native 'govulncheck' { go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./... }
     }
 
     Write-Step 'go test ./...'

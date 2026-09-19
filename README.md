@@ -61,7 +61,7 @@ install -m 755 eylu "$HOME/.local/bin/eylu"
 
 ### 从源码构建
 
-需要 Go 1.25.8 或更高版本：
+需要 Go 1.25.13 或更高版本：
 
 ```bash
 git clone https://github.com/xnqycs/Eylu.git

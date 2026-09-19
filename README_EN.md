@@ -90,7 +90,7 @@ The [release guide (Chinese)](RELEASING.md#5-发布后验证) covers the complet
 
 ### Build from source
 
-Go 1.25.8 or later is required:
+Go 1.25.13 or later is required:
 
 ```bash
 git clone https://github.com/xnqycs/Eylu.git

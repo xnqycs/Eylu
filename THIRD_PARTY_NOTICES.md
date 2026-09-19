@@ -1711,9 +1711,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## github.com/yuin/goldmark v1.7.8
+## github.com/yuin/goldmark v1.7.17
 
-- Source: https://pkg.go.dev/github.com/yuin/goldmark@v1.7.8
+- Source: https://pkg.go.dev/github.com/yuin/goldmark@v1.7.17
 - Release targets: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64, windows/arm64
 - Detected terms: MIT
 
@@ -1743,7 +1743,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## Go standard library go1.25.8
+## Go standard library go1.25.13
 
 - Source: https://go.dev/
 - Release targets: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64, windows/arm64
@@ -1873,9 +1873,9 @@ rights granted to you under this License for this implementation of Go
 shall terminate as of the date such litigation is filed.
 ```
 
-## golang.org/x/net v0.39.0
+## golang.org/x/net v0.55.0
 
-- Source: https://pkg.go.dev/golang.org/x/net@v0.39.0
+- Source: https://pkg.go.dev/golang.org/x/net@v0.55.0
 - Release targets: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64, windows/arm64
 - Detected terms: BSD-3-Clause
 
@@ -2106,9 +2106,9 @@ rights granted to you under this License for this implementation of Go
 shall terminate as of the date such litigation is filed.
 ```
 
-## golang.org/x/term v0.34.0
+## golang.org/x/term v0.43.0
 
-- Source: https://pkg.go.dev/golang.org/x/term@v0.34.0
+- Source: https://pkg.go.dev/golang.org/x/term@v0.43.0
 - Release targets: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64, windows/arm64
 - Detected terms: BSD-3-Clause
 
@@ -2171,9 +2171,9 @@ rights granted to you under this License for this implementation of Go
 shall terminate as of the date such litigation is filed.
 ```
 
-## golang.org/x/text v0.24.0
+## golang.org/x/text v0.39.0
 
-- Source: https://pkg.go.dev/golang.org/x/text@v0.24.0
+- Source: https://pkg.go.dev/golang.org/x/text@v0.39.0
 - Release targets: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64, windows/amd64, windows/arm64
 - Detected terms: BSD-3-Clause
 
