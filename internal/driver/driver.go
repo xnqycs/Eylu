@@ -58,6 +58,9 @@ func CapabilitiesFor(model ModelDriver, target CapabilityTarget) Capabilities {
 }
 
 type Request struct {
+	// Purpose distinguishes conversation generation from context compaction for
+	// drivers whose host owns accounting and model dispatch.
+	Purpose           string
 	BaseURL           string
 	APIKey            string
 	Headers           map[string]string

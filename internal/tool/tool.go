@@ -18,6 +18,12 @@ type Tool interface {
 	Execute(context.Context, json.RawMessage) protocol.ToolResult
 }
 
+// CallExecutor is for host adapters that need the engine-owned call identity.
+// It does not grant authorization; the configured policy still runs first.
+type CallExecutor interface {
+	ExecuteCall(context.Context, protocol.ToolCall) protocol.ToolResult
+}
+
 // PolicyOverride lets a tool apply a domain-specific decision after the
 // workspace policy has classified the call.
 type PolicyOverride interface {

@@ -16,10 +16,13 @@ import (
 )
 
 type LoopOptions struct {
-	MaxTurns       int
-	MaxTotalTokens int
-	RequestID      string
-	BeforeModel    func() string
+	// OnUserCommitted persists the newly appended input before any preflight or
+	// model request. It is separate from the legacy turn hook for compatibility.
+	OnUserCommitted func(protocol.Turn) error
+	MaxTurns        int
+	MaxTotalTokens  int
+	RequestID       string
+	BeforeModel     func() string
 	// Usage, when non-nil, receives the accumulated usage of this run. The
 	// response returned by Run keeps its own usage, which describes only the
 	// final model call.
@@ -203,7 +206,11 @@ func (c *Conversation) Run(ctx context.Context, prompt string, runtime Runtime, 
 	}
 	baseTools := registryToolsExcluding(executor.Registry, runtime.MCPToolServers)
 	c.appendUser(prompt)
+	userTurn := cloneTurns(c.turns[len(c.turns)-1:])[0]
 	c.mu.Unlock()
+	if err := commitTurn(options.OnUserCommitted, userTurn); err != nil {
+		return protocol.ModelResponse{}, err
+	}
 
 	webBudget := webtool.NewUsageBudget()
 	hostedAuthorized := false

@@ -223,7 +223,7 @@ func (r *runtime) rootCommand(ctx context.Context) *cobra.Command {
 	root.PersistentFlags().StringVar(&r.workspace, "workspace", "", "workspace directory")
 	root.PersistentFlags().StringVar(&r.output, "output", "text", "output format: text, json, or jsonl")
 	bindChatFlags(root, &opts)
-	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand(ctx), r.sessionsCommand(), r.mcpCommand(ctx), r.versionCommand())
+	root.AddCommand(r.chatCommand(ctx), r.providersCommand(ctx), r.skillsCommand(ctx), r.sessionsCommand(), r.mcpCommand(ctx), r.versionCommand(), r.serveCommand(ctx))
 	return root
 }
 

@@ -84,14 +84,12 @@ func (t *toolRun) prepare(cfg config.Config, requestID string, report *agent.Run
 	session, conversation := t.session, t.conversation
 	// Every committed turn is written while the request is still running, so a crash
 	// in the middle cannot lose a turn whose side effect already happened.
-	options.OnTurnCommitted = session.RecordTurn
+	lifecycle := agent.RequestLifecycle{TurnCommitted: session.RecordTurn}
 	// The prepared-event source is the pending set of this conversation, so the log
 	// and the view cannot disagree about which call was prepared.
-	options.OnToolPrepared = func(call protocol.ToolCall) error { return session.RecordToolPrepared(conversation, call) }
-	if err := session.RecordRequestStarted(requestID); err != nil {
-		return agent.LoopOptions{}, err
-	}
-	return options, nil
+	lifecycle.ToolPrepared = func(call protocol.ToolCall) error { return session.RecordToolPrepared(conversation, call) }
+	lifecycle.Started = session.RecordRequestStarted
+	return lifecycle.Prepare(options)
 }
 
 // requestMetric finishes one request's observation and adds its totals.
@@ -116,13 +114,8 @@ func (t *toolRun) settle(report *agent.RunReport, runErr error) error {
 	if t.session == nil {
 		return nil
 	}
-	var reportErr error
-	if report != nil {
-		reportErr = t.session.RecordRunReport(*report)
-	}
-	syncErr := t.session.Sync(t.conversation, t.manager, t.options, runErr)
-	if syncErr == nil {
-		syncErr = reportErr
-	}
-	return syncErr
+	return (agent.RequestLifecycle{
+		Finished: t.session.RecordRunReport,
+		Sync:     func(err error) error { return t.session.Sync(t.conversation, t.manager, t.options, err) },
+	}).Settle(report, runErr)
 }

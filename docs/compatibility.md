@@ -13,6 +13,21 @@ in turn tolerate fields it does not know.
 
 ## Promised
 
+### Bastion host protocol
+
+`eylu serve --transport stdio --protocol bastion-host/1.0` is a separate,
+bidirectional JSON-RPC protocol, with storage schema `eylu-host-state/1`.
+Its versioned DTOs and fixtures are in [docs/host](host/README.md). They do not
+expose the internal Go API or the CLI session format.
+
+The additive-field rule above does **not** apply to this strictly negotiated
+boundary: unknown fields are rejected. A future field requires an explicitly
+negotiated protocol version or capability; it cannot silently appear in 1.0.
+Only `bastion-host/1.0` and `eylu-host-state/1` are currently accepted. No automatic
+state migration, remote operation replay, provider fallback, or exactly-once
+execution guarantee is implied. Native platform evidence is recorded separately
+in the [acceptance matrix](host/acceptance.md).
+
 ### Session logs
 
 A session written by any 1.x build is readable by any later 1.x build. The

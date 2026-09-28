@@ -228,6 +228,16 @@ eylu --no-tui --output jsonl "检查项目并运行测试"
 
 JSONL 会逐行输出路由、上下文、模型、工具审计和最终响应事件，适合日志采集与自动化消费。
 
+### Bastion 宿主接入
+
+宿主产品集成使用独立的双向入口：
+
+```sh
+eylu serve --transport stdio --protocol bastion-host/1.0
+```
+
+该入口由宿主提供模型、工具、授权与持久化，不加载本地配置或内置工具。接入格式、可运行模拟宿主及验证范围见 [宿主模式文档](docs/host/README.md)。
+
 ### 自动选择 Provider
 
 为 Provider 声明任务和优先级：

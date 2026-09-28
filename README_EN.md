@@ -257,6 +257,18 @@ eylu --no-tui --output jsonl "Inspect the project and run its tests"
 
 JSONL emits routing, context, model, tool audit, and final response events one line at a time, making it suitable for log collection and automation.
 
+### Bastion host integration
+
+Embedded products can use the separate bidirectional host entry point:
+
+```sh
+eylu serve --transport stdio --protocol bastion-host/1.0
+```
+
+The host supplies models, tools, authorization and persistence. This entry point
+does not load local configuration or built-in tools. See the [host protocol,
+executable mock and verification matrix](docs/host/README.md).
+
 ### Automatic provider selection
 
 Declare the tasks and priority for a provider:

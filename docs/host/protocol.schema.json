@@ -1,0 +1,2037 @@
+{
+  "$defs": {
+    "Accepted": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "Binding": {
+      "additionalProperties": false,
+      "properties": {
+        "binding_id": {
+          "type": "string"
+        },
+        "binding_revision": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "binding_id",
+        "binding_revision"
+      ],
+      "type": "object"
+    },
+    "CallProgress": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "operation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "phase": {
+          "enum": [
+            "awaiting_approval",
+            "awaiting_input",
+            "executing"
+          ],
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "run_id",
+        "request_id",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "CancelCalls": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "request_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "run_id",
+        "request_ids",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "Commit": {
+      "additionalProperties": false,
+      "properties": {
+        "base_event_seq": {
+          "type": "integer"
+        },
+        "checkpoint_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "events": {
+          "items": {
+            "$ref": "#/$defs/Event"
+          },
+          "type": "array"
+        },
+        "expected_revision": {
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        },
+        "state_schema": {
+          "const": "eylu-host-state/1"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "checkpoint_id",
+        "expected_revision",
+        "base_event_seq",
+        "state_schema",
+        "state",
+        "events",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "Committed": {
+      "additionalProperties": false,
+      "properties": {
+        "event_seq": {
+          "type": "integer"
+        },
+        "event_seq_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SeqRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "event_seq",
+        "event_seq_range"
+      ],
+      "type": "object"
+    },
+    "CommittedNotification": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_id": {
+          "type": "string"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "event_seq": {
+          "type": "integer"
+        },
+        "event_seq_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SeqRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "checkpoint_id",
+        "revision",
+        "event_seq",
+        "event_seq_range"
+      ],
+      "type": "object"
+    },
+    "ContextItem": {
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "text"
+      ],
+      "type": "object"
+    },
+    "Create": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "items": {
+            "$ref": "#/$defs/ContextItem"
+          },
+          "type": "array"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "instructions": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "instructions",
+        "context"
+      ],
+      "type": "object"
+    },
+    "Delta": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "delta_seq": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "run_id",
+        "request_id",
+        "delta_seq",
+        "text"
+      ],
+      "type": "object"
+    },
+    "ErrorData": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "details": {
+          "additionalProperties": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "Event": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/Create"
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "conversation.created"
+            }
+          },
+          "required": [
+            "event_id",
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/StoredMessage"
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "message.committed"
+            }
+          },
+          "required": [
+            "event_id",
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/Start"
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "run.started"
+            }
+          },
+          "required": [
+            "event_id",
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ModelRequest"
+                },
+                {
+                  "$ref": "#/$defs/ToolRequest"
+                }
+              ]
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "call.prepared"
+            }
+          },
+          "required": [
+            "event_id",
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ModelResult"
+                },
+                {
+                  "$ref": "#/$defs/ToolResult"
+                },
+                {
+                  "$ref": "#/$defs/Reconciliation"
+                }
+              ]
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "call.settled"
+            }
+          },
+          "required": [
+            "event_id",
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "$ref": "#/$defs/Run"
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "run.finished"
+            }
+          },
+          "required": [
+            "event_id",
+            "type",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "additionalProperties": false,
+              "properties": {
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "summary"
+              ],
+              "type": "object"
+            },
+            "event_id": {
+              "type": "string"
+            },
+            "run_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "context.compacted"
+            }
+          },
+          "required": [
+            "event_id",
+            "type",
+            "data"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Get": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id"
+      ],
+      "type": "object"
+    },
+    "Initialize": {
+      "additionalProperties": false,
+      "properties": {
+        "host_name": {
+          "type": "string"
+        },
+        "host_version": {
+          "type": "string"
+        },
+        "max_message_bytes": {
+          "maximum": 16777216,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "optional_capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "protocol_version": {
+          "const": "bastion-host/1.0"
+        },
+        "required_capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "host_name",
+        "host_version",
+        "max_message_bytes",
+        "required_capabilities",
+        "optional_capabilities"
+      ],
+      "type": "object"
+    },
+    "Initialized": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "engine_name": {
+          "type": "string"
+        },
+        "engine_version": {
+          "type": "string"
+        },
+        "max_message_bytes": {
+          "maximum": 16777216,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "protocol_version": {
+          "const": "bastion-host/1.0"
+        },
+        "state_schema": {
+          "const": "eylu-host-state/1"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "engine_name",
+        "engine_version",
+        "max_message_bytes",
+        "capabilities",
+        "state_schema"
+      ],
+      "type": "object"
+    },
+    "Interrupt": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "run_id",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "properties": {
+        "callback_timeout_ms": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_elapsed_ms": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_model_calls": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_output_tokens_total": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "stop_grace_ms": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_model_calls",
+        "max_output_tokens_total",
+        "max_elapsed_ms",
+        "callback_timeout_ms",
+        "stop_grace_ms"
+      ],
+      "type": "object"
+    },
+    "Message": {
+      "additionalProperties": false,
+      "properties": {
+        "parts": {
+          "items": {
+            "$ref": "#/$defs/Part"
+          },
+          "type": "array"
+        },
+        "role": {
+          "enum": [
+            "system",
+            "user",
+            "assistant",
+            "tool"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "parts"
+      ],
+      "type": "object"
+    },
+    "ModelBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "binding_id": {
+          "type": "string"
+        },
+        "binding_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "context_window_tokens": {
+          "type": "integer"
+        },
+        "max_output_tokens": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "binding_id",
+        "binding_revision",
+        "context_window_tokens",
+        "max_output_tokens",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "ModelRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "type": "array"
+        },
+        "model_binding": {
+          "$ref": "#/$defs/ModelBinding"
+        },
+        "purpose": {
+          "enum": [
+            "conversation",
+            "compaction"
+          ],
+          "type": "string"
+        },
+        "remaining_limits": {
+          "$ref": "#/$defs/RemainingLimits"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolDefinition"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "run_id",
+        "request_id",
+        "model_binding",
+        "purpose",
+        "messages",
+        "tools",
+        "remaining_limits"
+      ],
+      "type": "object"
+    },
+    "ModelResult": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "message": {
+                "$ref": "#/$defs/Message"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "finish_reason": {
+                "enum": [
+                  "length",
+                  "blocked"
+                ],
+                "type": "string"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "message": {
+                "$ref": "#/$defs/StoppedModelMessage"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "finish_reason": {
+          "enum": [
+            "completed",
+            "tool_calls",
+            "length",
+            "blocked"
+          ],
+          "type": "string"
+        },
+        "message": {},
+        "request_id": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage"
+        }
+      },
+      "required": [
+        "request_id",
+        "message",
+        "finish_reason",
+        "usage"
+      ],
+      "type": "object"
+    },
+    "Part": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TextPart"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "arguments": {
+              "type": "object"
+            },
+            "name": {
+              "type": "string"
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_call"
+            }
+          },
+          "required": [
+            "type",
+            "tool_call_id",
+            "name",
+            "arguments"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "$ref": "#/$defs/ToolResult"
+            },
+            "tool_call_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_result"
+            }
+          },
+          "required": [
+            "type",
+            "tool_call_id",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PendingCall": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "model",
+            "tool"
+          ],
+          "type": "string"
+        },
+        "model_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ModelRequest"
+            },
+            {
+              "$ref": "#/$defs/ToolRequest"
+            }
+          ]
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "tool_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "request_id",
+        "run_id",
+        "kind",
+        "digest",
+        "request"
+      ],
+      "type": "object"
+    },
+    "RPCError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "integer"
+        },
+        "data": {
+          "$ref": "#/$defs/ErrorData"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "data"
+      ],
+      "type": "object"
+    },
+    "Reconciliation": {
+      "additionalProperties": false,
+      "properties": {
+        "model_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "not_dispatched",
+            "settled",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "tool_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "request_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "RemainingLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "max_output_tokens": {
+          "type": "integer"
+        },
+        "model_calls": {
+          "type": "integer"
+        },
+        "output_tokens": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model_calls",
+        "output_tokens",
+        "elapsed_ms",
+        "max_output_tokens"
+      ],
+      "type": "object"
+    },
+    "Restore": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "event_seq": {
+          "type": "integer"
+        },
+        "reconciliations": {
+          "items": {
+            "$ref": "#/$defs/Reconciliation"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/State"
+        },
+        "state_schema": {
+          "const": "eylu-host-state/1"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "revision",
+        "event_seq",
+        "state_schema",
+        "state",
+        "reconciliations"
+      ],
+      "type": "object"
+    },
+    "Run": {
+      "additionalProperties": false,
+      "properties": {
+        "blocking_reason": {
+          "type": "string"
+        },
+        "known_effects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model_calls": {
+          "type": "integer"
+        },
+        "phase": {
+          "enum": [
+            "preparing",
+            "waiting_model",
+            "waiting_host",
+            "committing"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "stopping",
+            "completed",
+            "interrupted",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "unresolved_request_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "usage": {
+          "$ref": "#/$defs/Usage"
+        }
+      },
+      "required": [
+        "run_id",
+        "status",
+        "usage",
+        "model_calls",
+        "known_effects",
+        "unresolved_request_ids"
+      ],
+      "type": "object"
+    },
+    "RunRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "$ref": "#/$defs/Accepted"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "digest",
+        "accepted",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "SafeError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "SeqRange": {
+      "additionalProperties": false,
+      "properties": {
+        "first": {
+          "type": "integer"
+        },
+        "last": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "first",
+        "last"
+      ],
+      "type": "object"
+    },
+    "Shutdown": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "wait_ms": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "reason",
+        "wait_ms"
+      ],
+      "type": "object"
+    },
+    "Start": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "type": "string"
+        },
+        "expected_revision": {
+          "type": "integer"
+        },
+        "input": {
+          "$ref": "#/$defs/TextInput"
+        },
+        "limits": {
+          "$ref": "#/$defs/Limits"
+        },
+        "model_binding": {
+          "$ref": "#/$defs/ModelBinding"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/Binding"
+        },
+        "tool_catalog": {
+          "$ref": "#/$defs/ToolCatalog"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "expected_revision",
+        "run_id",
+        "input",
+        "model_binding",
+        "tool_catalog",
+        "target_binding",
+        "limits"
+      ],
+      "type": "object"
+    },
+    "State": {
+      "additionalProperties": false,
+      "properties": {
+        "active_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context": {
+          "items": {
+            "$ref": "#/$defs/ContextItem"
+          },
+          "type": "array"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "create_digest": {
+          "type": "string"
+        },
+        "event_seq": {
+          "type": "integer"
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "last_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/StoredMessage"
+          },
+          "type": "array"
+        },
+        "pending_calls": {
+          "items": {
+            "$ref": "#/$defs/PendingCall"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "run_input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Start"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RunRecord"
+          },
+          "type": "object"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "used_tool_call_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "revision",
+        "event_seq",
+        "create_digest",
+        "instructions",
+        "context",
+        "messages",
+        "summary",
+        "active_run",
+        "last_run",
+        "run_input",
+        "runs",
+        "pending_calls",
+        "used_tool_call_ids"
+      ],
+      "type": "object"
+    },
+    "StoppedModelMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "parts": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/TextPart"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "arguments": {},
+                  "name": {
+                    "type": "string"
+                  },
+                  "tool_call_id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "tool_call"
+                  }
+                },
+                "required": [
+                  "type",
+                  "tool_call_id",
+                  "name",
+                  "arguments"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "role": {
+          "const": "assistant"
+        }
+      },
+      "required": [
+        "role",
+        "parts"
+      ],
+      "type": "object"
+    },
+    "StoredMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "$ref": "#/$defs/Message"
+        },
+        "message_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message_id",
+        "message"
+      ],
+      "type": "object"
+    },
+    "TextInput": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "TextPart": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "type": {
+          "const": "text"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ],
+      "type": "object"
+    },
+    "ToolCatalog": {
+      "additionalProperties": false,
+      "properties": {
+        "binding_id": {
+          "type": "string"
+        },
+        "binding_revision": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolDefinition"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "binding_id",
+        "binding_revision",
+        "tools"
+      ],
+      "type": "object"
+    },
+    "ToolDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "input_schema": {
+          "type": "object"
+        },
+        "name": {
+          "type": "string"
+        },
+        "read_only": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "input_schema"
+      ],
+      "type": "object"
+    },
+    "ToolRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments": {},
+        "conversation_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/Binding"
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "tool_catalog": {
+          "$ref": "#/$defs/Binding"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "run_id",
+        "request_id",
+        "tool_call_id",
+        "tool_catalog",
+        "target_binding",
+        "name",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "ToolResult": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "items": {
+            "$ref": "#/$defs/TextPart"
+          },
+          "type": "array"
+        },
+        "effect": {
+          "enum": [
+            "none",
+            "applied",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "resource_ref": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "denied",
+            "cancelled",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "truncation_reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "request_id",
+        "operation_id",
+        "status",
+        "effect",
+        "content",
+        "error",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "Usage": {
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "type": "integer"
+        },
+        "output_tokens": {
+          "type": "integer"
+        },
+        "source": {
+          "enum": [
+            "provider",
+            "estimated",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "source"
+      ],
+      "type": "object"
+    },
+    "View": {
+      "additionalProperties": false,
+      "properties": {
+        "active_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "blocking_request_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "conversation_id": {
+          "type": "string"
+        },
+        "event_seq": {
+          "type": "integer"
+        },
+        "has_uncommitted_progress": {
+          "type": "boolean"
+        },
+        "last_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Run"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "revision",
+        "event_seq",
+        "active_run",
+        "last_run",
+        "has_uncommitted_progress",
+        "blocking_request_ids"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:eylu:bastion-host:1.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^h:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "initialize"
+        },
+        "params": {
+          "$ref": "#/$defs/Initialize"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^h:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "conversation.create"
+        },
+        "params": {
+          "$ref": "#/$defs/Create"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^h:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "conversation.restore"
+        },
+        "params": {
+          "$ref": "#/$defs/Restore"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^h:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "conversation.get"
+        },
+        "params": {
+          "$ref": "#/$defs/Get"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^h:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "run.start"
+        },
+        "params": {
+          "$ref": "#/$defs/Start"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^h:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "run.interrupt"
+        },
+        "params": {
+          "$ref": "#/$defs/Interrupt"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^h:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "shutdown"
+        },
+        "params": {
+          "$ref": "#/$defs/Shutdown"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^e:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "host.model.generate"
+        },
+        "params": {
+          "$ref": "#/$defs/ModelRequest"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^e:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "host.tool.execute"
+        },
+        "params": {
+          "$ref": "#/$defs/ToolRequest"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^e:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "host.checkpoint.commit"
+        },
+        "params": {
+          "$ref": "#/$defs/Commit"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^e:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "host.calls.cancel"
+        },
+        "params": {
+          "$ref": "#/$defs/CancelCalls"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params",
+        "id"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "host.model.delta"
+        },
+        "params": {
+          "$ref": "#/$defs/Delta"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "host.call.progress"
+        },
+        "params": {
+          "$ref": "#/$defs/CallProgress"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "engine.committed"
+        },
+        "params": {
+          "$ref": "#/$defs/CommittedNotification"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "engine.progress"
+        },
+        "params": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Delta"
+            },
+            {
+              "$ref": "#/$defs/CallProgress"
+            }
+          ]
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^[he]:",
+          "type": "string"
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "result": {}
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/RPCError"
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jsonrpc": {
+          "const": "2.0"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "error"
+      ],
+      "type": "object"
+    }
+  ],
+  "title": "Bastion host protocol 1.0 (DTO and checkpoint schema 1)"
+}

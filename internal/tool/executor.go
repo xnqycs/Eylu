@@ -194,11 +194,14 @@ type AuditSink interface {
 }
 
 type Executor struct {
-	Registry  *Registry
-	Policy    policy.Checker
-	Confirm   ConfirmFunc
-	Audit     AuditSink
-	Workspace string
+	// OpaqueInputs preserves a host-owned catalog and arguments byte for byte;
+	// host approval is supplied by the registered proxy, not a synthetic reason.
+	OpaqueInputs bool
+	Registry     *Registry
+	Policy       policy.Checker
+	Confirm      ConfirmFunc
+	Audit        AuditSink
+	Workspace    string
 	// Timeout bounds one tool execution. It is a cooperative deadline, not a
 	// hard preemption mechanism: the executor relies on the tool honouring
 	// context cancellation and never starts an unreclaimable goroutine to fake a
@@ -349,7 +352,7 @@ func (e *Executor) Definitions() []protocol.ToolDefinition {
 	definitions := e.Registry.Definitions()
 	for index := range definitions {
 		item, ok := e.Registry.Get(definitions[index].Name)
-		if ok && item.Risk() != policy.RiskRead && item.Risk() != policy.RiskSession {
+		if ok && !e.OpaqueInputs && item.Risk() != policy.RiskRead && item.Risk() != policy.RiskSession {
 			definitions[index] = withApprovalReason(definitions[index])
 		}
 	}
@@ -792,7 +795,7 @@ func (e *Executor) prepareCall(ctx context.Context, requestID, batchID string, b
 		return prepared
 	}
 	prepared.input = call.Arguments
-	if !schemaHasProperty(item.Definition().InputSchema, "reason") {
+	if !e.OpaqueInputs && !schemaHasProperty(item.Definition().InputSchema, "reason") {
 		prepared.input = withoutJSONField(prepared.input, "reason")
 	}
 	prepared.spec = concurrencySpec(item, prepared.input, outcome)
@@ -886,7 +889,13 @@ func (e *Executor) executePrepared(ctx context.Context, prepared *preparedCall) 
 		toolCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
 	defer cancel()
-	result = prepared.item.Execute(toolCtx, prepared.input)
+	if proxy, ok := prepared.item.(CallExecutor); ok {
+		call := prepared.call
+		call.Arguments = prepared.input
+		result = proxy.ExecuteCall(toolCtx, call)
+	} else {
+		result = prepared.item.Execute(toolCtx, prepared.input)
+	}
 	// A result that reports success is never rewritten as cancelled or timed
 	// out: the tool may have committed a side effect before the cancellation was
 	// observed, and a committed effect must never be reported as if it had not

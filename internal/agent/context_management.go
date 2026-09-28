@@ -436,6 +436,9 @@ func (c *Conversation) runCompaction(ctx context.Context, plan compactionPlan) (
 	// The summary call already happened, so its usage belongs to the request even
 	// when the compaction is later rejected or falls back.
 	plan.event.Usage = usage
+	if semanticErr != nil && plan.runtime.Host != nil {
+		return plan.prepared, plan.event, semanticErr
+	}
 	if semanticErr != nil && ctx.Err() != nil {
 		if plan.runtime.ContextEvent != nil {
 			plan.runtime.ContextEvent(contextledger.Event{Kind: contextledger.EventCompressionFailed, InputTokens: plan.prepared.InputTokens(), OutputReserve: plan.options.outputReserve, ContextWindow: plan.window, Compression: &plan.event, Error: ctx.Err().Error()})
@@ -583,6 +586,10 @@ func (c *Conversation) buildSemanticSummary(ctx context.Context, runtime Runtime
 		return "", protocol.Usage{}, fmt.Errorf("model driver is nil")
 	}
 	source := summarySource(input)
+	summaryPrompt := semanticSummaryPrompt
+	if runtime.Host != nil {
+		summaryPrompt = strings.Replace(semanticSummaryPrompt, "a coding agent", "the host's assistant", 1)
+	}
 	window := runtime.Provider.ContextWindowLimit()
 	if window > 0 && options.estimator.Estimate(semanticSummaryPrompt+source)+max(512, options.estimator.Estimate(strings.Repeat("x", options.summaryBytes))) > window {
 		return "", protocol.Usage{}, fmt.Errorf("semantic compaction input exceeds the model context window")
@@ -596,10 +603,11 @@ func (c *Conversation) buildSemanticSummary(ctx context.Context, runtime Runtime
 	}
 	now := time.Now().UTC()
 	request := driver.Request{
+		Purpose: "compaction",
 		BaseURL: runtime.Provider.Config.BaseURL, APIKey: runtime.APIKey, Headers: runtime.Provider.Config.Headers,
 		ReasoningEffort: reasoningEffort, Stream: false,
 		Model: protocol.ModelRequest{ProtocolVersion: protocol.Version, Model: runtime.Provider.Config.Model, Turns: []protocol.Turn{
-			{ID: uuid.NewString(), Role: protocol.RoleSystem, CreatedAt: now, Parts: []protocol.Part{{Kind: protocol.PartText, Text: semanticSummaryPrompt}}},
+			{ID: uuid.NewString(), Role: protocol.RoleSystem, CreatedAt: now, Parts: []protocol.Part{{Kind: protocol.PartText, Text: summaryPrompt}}},
 			{ID: uuid.NewString(), Role: protocol.RoleUser, CreatedAt: now, Parts: []protocol.Part{{Kind: protocol.PartText, Text: source}}},
 		}},
 	}
@@ -659,6 +667,11 @@ func (c *Conversation) buildPromptContextWithState(runtime Runtime, definitions 
 		systemPrompt += "\n\n" + environmentPrompt
 	}
 	builder.AddTextTurn("system", protocol.RoleSystem, systemPrompt, contextledger.CategorySystemPrompt, "eylu", true, nil)
+	if runtime.Host != nil {
+		for index, item := range runtime.Host.Context {
+			builder.AddTextTurn(fmt.Sprintf("host-context:%d", index), protocol.RoleUser, protocol.FrameUntrusted(item), contextledger.CategoryProjectContext, "host", true, nil)
+		}
+	}
 	for _, server := range runtime.MCPContexts {
 		if server.Instructions != "" {
 			content := fmt.Sprintf("<mcp_instructions server=%q>\n%s\n</mcp_instructions>", server.Server, server.Instructions)
@@ -706,6 +719,10 @@ func (c *Conversation) buildPromptContextWithState(runtime Runtime, definitions 
 	visible, recovered := repairDanglingToolCalls(visible)
 	c.recoveryNotes = recovered
 	for _, turn := range visible {
+		if runtime.Host != nil {
+			builder.AddTurn(turn)
+			continue
+		}
 		contextTurn, keep := contextualizeTurn(turn, options.toolContextBytes)
 		if keep {
 			builder.AddTurn(contextTurn)
