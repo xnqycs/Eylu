@@ -21,6 +21,8 @@
 # below the floor recorded for it and fails the gate.
 Eylu 0
 Eylu/cmd/agent 0
+Eylu/cmd/host-mock 0
+Eylu/cmd/host-schema 0
 Eylu/internal/agent 85
 Eylu/internal/app 67
 Eylu/internal/buildinfo 100
@@ -36,6 +38,8 @@ Eylu/internal/driver/openai_responses 79
 Eylu/internal/driver/perplexity_agent 0
 Eylu/internal/driver/webnative 92
 Eylu/internal/environment 83
+Eylu/internal/host 79
+Eylu/internal/hostmock 0
 Eylu/internal/logging 87
 Eylu/internal/mcpclient 76
 Eylu/internal/metrics 97
