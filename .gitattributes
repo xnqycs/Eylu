@@ -1,0 +1,3 @@
+# Keep generated protocol artifacts byte-identical on every platform.
+/docs/host/protocol.schema.json text eol=lf
+/docs/host/fixtures.jsonl text eol=lf

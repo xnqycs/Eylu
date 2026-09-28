@@ -517,6 +517,17 @@ func TestC05LengthRetainsTextAndDiscardsPartialToolArguments(t *testing.T) {
 
 func TestC13CompactionUsesHostAndCountsBudget(t *testing.T) {
 	m := newMock(t)
+	// Persisting a checkpoint precedes the engine processing its acknowledgement.
+	// Make that interval observable instead of relying on local scheduling speed.
+	m.checkpoint = func(c Commit) (bool, *RPCError) {
+		if c.Reason == "run.finished" {
+			if _, err := m.save(c); err != nil {
+				return false, err
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return false, nil
+	}
 	var summaries atomic.Int32
 	m.handle = func(method string, raw json.RawMessage) (any, *RPCError) {
 		if method != "host.model.generate" {
@@ -541,7 +552,19 @@ func TestC13CompactionUsesHostAndCountsBudget(t *testing.T) {
 			v.ModelBinding.MaxOutputTokens = 512
 			v.Limits.MaxModelCalls = 3
 		}
-		m.must("run.start", v, nil)
+		// Re-send the same business request while the preceding committed run is
+		// still settling. Never replace its ID or revision to bypass a conflict.
+		startDeadline := time.Now().Add(3 * time.Second)
+		for {
+			_, err := m.request("run.start", v)
+			if err == nil {
+				break
+			}
+			if (err.Data.Code != "SESSION_BUSY" && err.Data.Code != "STALE_REVISION") || time.Now().After(startDeadline) {
+				t.Fatalf("run %d did not become ready: %v", i, err)
+			}
+			time.Sleep(time.Millisecond)
+		}
 		deadline := time.Now().Add(3 * time.Second)
 		var state State
 		for time.Now().Before(deadline) {
